@@ -1,0 +1,17 @@
+# 依赖与构建产物
+node_modules/
+dist/
+src-tauri/target/
+
+# Tauri 生成的能力 schema（构建时重新生成）
+src-tauri/gen/schemas/
+
+# 本地运行时数据
+*.local
+src-tauri/**/*.db
+src-tauri/**/*.db-*
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+*.log

@@ -1,0 +1,51 @@
+[package]
+name = "nexus-term"
+version = "0.1.0"
+description = "原生 macOS SSH / SFTP 终端"
+authors = ["chris"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+russh = "0.49"
+russh-sftp = "2"
+ssh-key = { version = "0.6", features = ["ed25519", "rsa", "ecdsa", "encryption"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+portable-pty = "0.8"
+
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+parking_lot = "0.12"
+
+# 凭据存储后端随平台切换。keyring 的通用 API 三端一致，
+# 只是 native backend 要按目标选择，否则在别的平台上编译不过或退化到 secret-service。
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["linux-native"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
