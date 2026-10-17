@@ -3,7 +3,9 @@
 跨平台 SSH / SFTP 终端。Rust 后端 + TypeScript / React 前端，基于 Tauri 2。
 
 macOS / Windows / Linux 三端可构建（详见 [跨平台说明](./docs/portability.md)）。
-当前**只有 macOS 是实测过的**，Windows / Linux 的代码分支已就位但尚未实机构建。
+
+实测状态：**macOS 与 Windows 均已实机构建并跑通**，Windows 产物为 NSIS 安装包
+（约 2.5 MiB，见 [docs/build.md](./docs/build.md)）；Linux 仍是「代码已就位、未实机验证」。
 
 > **独立性声明**：本项目所有代码均为独立实现，依据 SSH 公开标准（RFC 4251–4254）、
 > Xshell `.xsh` 的公开文档格式，以及开源组件（russh / xterm.js / SQLite / zmodem.js）编写。
@@ -53,6 +55,7 @@ nexus-term/
 │   ├── components/           TitleBar / Toolbar / TabBar / SessionList / TerminalView …
 │   ├── lib/                  theme（配色）· chrome（外壳派生）· errors（友好报错）
 │   │                         · zmodem（lrzsz）· auth（认证判定）
+│   │                         · platform（宿主平台探测）
 │   ├── api.ts                IPC 封装 · base64 转码
 │   └── types.ts
 ├── src-tauri/src/           后端（Rust）
@@ -61,10 +64,11 @@ nexus-term/
 │   ├── local/                本地 PTY（portable-pty）
 │   ├── sftp/                 SFTP 子系统
 │   ├── store/                SQLite 会话仓库 + 系统凭据封装
-│   ├── keys/                 OpenSSH 私钥解析 · ~/.ssh 自动发现
+│   ├── keys/                 OpenSSH 私钥解析 · 家目录 / ~/.ssh 自动发现
 │   ├── xsh.rs                Xshell 会话文件解析 / 生成
-│   ├── errors.rs             网络 errno → 中文可读提示
+│   ├── errors.rs             errno（含 Windows WSAE*）→ 中文可读提示
 │   └── capabilities/         权限集
+├── src-tauri/tauri.windows.conf.json   Windows 专属配置（无边框 + NSIS）
 ├── docs/                     文档（索引见 docs/README.md）
 └── src-tauri/icons/          macOS .icns / Windows .ico / Linux PNG
 ```
@@ -105,7 +109,8 @@ nexus-term/
 - [ ] 多窗格拆分（布局树已设计，尚未实现拖拽）
 - [ ] 端口转发隧道
 - [ ] 会话 / 外观配置持久化（目前每次启动回到默认值）
-- [ ] Windows / Linux 实机构建验证
+- [x] Windows 实机构建验证（x86_64-pc-windows-msvc，NSIS 安装包）
+- [ ] Linux 实机构建验证
 - [ ] 旧 ssh-dss 算法兼容（russh 不支持，需老旧设备时再加 `ssh2` 回退路径）
 
 ## 安全边界

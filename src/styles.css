@@ -16,6 +16,17 @@
   font-size: 13px;
 }
 
+/* 只有 macOS 的 Overlay 标题栏需要给交通灯留白。Windows / Linux 归零，
+   否则标题会被平白推到中间偏右。data-platform 由 lib/platform.ts 在挂载前写入。 */
+html:not([data-platform="macos"]) {
+  --lights-w: 0px;
+}
+
+/* Windows 上没有 -apple-system，且默认 sans-serif 下中文会掉到宋体 */
+html[data-platform="windows"] {
+  font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+}
+
 * { box-sizing: border-box; }
 
 html, body, #root {
@@ -46,6 +57,14 @@ html, body, #root {
   height: 100%;
   pointer-events: none;
 }
+/* 非 macOS 的应用图标。pointer-events 关掉，别阻断标题栏拖动 */
+.titlebar-appicon {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  margin-left: 10px;
+  pointer-events: none;
+}
 .titlebar-title {
   flex: 1;
   min-width: 0;
@@ -55,8 +74,33 @@ html, body, #root {
   font-size: 12.5px;
   color: var(--text-dim);
   pointer-events: none;
+  padding-left: 10px;
 }
 .titlebar-actions { display: flex; align-items: center; gap: 6px; padding-right: 10px; }
+
+/* ——— 自绘窗口控制按钮（Windows / Linux，无系统装饰）——— */
+.titlebar-controls {
+  display: flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+  height: 100%;
+}
+.win-btn {
+  width: 45px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.win-btn:hover { background: var(--bg-elev); color: var(--text); }
+/* 关闭按钮用系统红，hover 时整块变色是 Windows 的习惯 */
+.win-btn-close:hover { background: #e81123; color: #fff; }
+.win-btn svg { width: 10px; height: 10px; fill: currentColor; stroke: currentColor; }
 .tb-btn {
   height: 22px;
   padding: 0 8px;
@@ -268,11 +312,26 @@ html, body, #root {
 .welcome h1 { color: var(--text); font-weight: 500; font-size: 22px; margin: 0 0 6px; }
 .welcome ul { line-height: 1.9; font-size: 12.5px; }
 
+/* 错误弹层的容器：覆盖整个终端区做 flex 居中。
+   此前 .term-error 自己用 inset+margin:auto 绝对定位，与 xterm 的 canvas
+   合成层叠时 hit-test 不可靠 —— 弹窗看得见、按钮点不着。改成容器居中 +
+   显式 z-index 后，任何渲染器下都可点击。 */
+.term-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 容器不拦截事件，点击穿透到下面的终端；只有卡片本身可交互 */
+  pointer-events: none;
+}
 .term-error {
-  position: absolute; inset: 40px; margin: auto;
-  width: fit-content; height: fit-content; max-width: 520px;
+  pointer-events: auto;
+  width: fit-content; max-width: 520px;
   background: var(--bg-elev); border: 1px solid var(--danger);
   border-radius: var(--radius); padding: 20px 26px; text-align: center;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
 }
 .term-error strong { color: var(--danger); font-size: 14px; font-weight: 500; }
 .term-error-msg {
@@ -497,6 +556,35 @@ html, body, #root {
 }
 .wp-dim { color: var(--text-dim); }
 .wp-cmd { color: var(--accent); }
+
+/* ——— 会话右键菜单 ——— */
+.ctx-backdrop {
+  position: fixed; inset: 0; z-index: 199;
+  background: transparent;
+}
+.ctx-menu {
+  position: fixed; z-index: 200;
+  min-width: 150px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  padding: 4px;
+}
+.ctx-item {
+  width: 100%;
+  display: block;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 12px;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  font-size: 12.5px;
+}
+.ctx-item:hover:not(:disabled) { background: var(--bg-panel); color: var(--accent); }
+.ctx-item:disabled { opacity: 0.45; cursor: default; }
 
 /* ——— 轻量提示条 ——— */
 .toast {

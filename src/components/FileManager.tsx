@@ -3,6 +3,7 @@ import { homeDir } from "@tauri-apps/api/path";
 import { api } from "../api";
 import { resolveAuth } from "../lib/auth";
 import { normalizeTimeout, toFriendlyError } from "../lib/errors";
+import { isWindows } from "../lib/platform";
 import type { RemoteEntry, SessionRecord } from "../types";
 
 function formatSize(n: number): string {
@@ -19,16 +20,44 @@ function formatTime(sec: number | null): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/** POSIX 路径拼接。SFTP 一律用 `/`，不能用标准库的 join。 */
+/** 远端（SFTP）路径拼接：SFTP 协议一律用 `/`，与本机平台无关。 */
 function joinPath(dir: string, name: string): string {
   return dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`;
 }
 
+/** 远端上级目录（POSIX）。 */
 function parentPath(p: string): string {
   const trimmed = p.replace(/\/+$/, "");
   if (trimmed === "") return "/";
   const idx = trimmed.lastIndexOf("/");
   return idx <= 0 ? "/" : trimmed.slice(0, idx);
+}
+
+/**
+ * 本地路径拼接。Windows 是 `C:\Users\…`，分隔符可能是 `\`；
+ * 沿用上面的 `/` 版本会拼出 `C:\Users\dell/file` 这种混写路径。
+ */
+function joinLocal(dir: string, name: string): string {
+  const sep = isWindows() ? "\\" : "/";
+  return /[\\/]$/.test(dir) ? `${dir}${name}` : `${dir}${sep}${name}`;
+}
+
+/**
+ * 本地上级目录。Windows 要额外认盘符根：
+ * `C:\Users\dell` → `C:\Users`，`C:\` → `C:\`（不再往上），
+ * 否则按 `/` 切会得到 -1，一路跳到 `/`，整个面板就废了。
+ * 已到盘符根时返回空串 —— 后端会据此列出所有可用盘符。
+ */
+function parentLocal(p: string): string {
+  const sep = isWindows() ? "\\" : "/";
+  const t = p.replace(/[\\/]+$/, "");
+  if (t === "") return "";
+  if (/^[A-Za-z]:$/.test(t)) return "";
+  const idx = Math.max(t.lastIndexOf("\\"), t.lastIndexOf("/"));
+  if (idx < 0) return sep;
+  const cut = t.slice(0, idx);
+  if (cut === "") return sep;
+  return /^[A-Za-z]:$/.test(cut) ? `${cut}${sep}` : cut;
 }
 
 interface PaneProps {
@@ -183,11 +212,11 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
     };
   }, [sftpId, session, loadRemote]);
 
-  // 本地面板从家目录起步
+  // 本地面板从家目录起步。取不到时 Windows 退回盘符根，而不是 POSIX 的 `/`
   useEffect(() => {
     homeDir()
       .then(setLocalPath)
-      .catch(() => setLocalPath("/"));
+      .catch(() => setLocalPath(isWindows() ? "C:\\" : "/"));
   }, []);
 
   useEffect(() => {
@@ -242,7 +271,11 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
     }
     setTransferMsg("下载中…");
     try {
-      const n = await api.sftpDownload(sftpId, src.path, joinPath(localPath, src.name));
+      const n = await api.sftpDownload(
+        sftpId,
+        src.path,
+        joinLocal(localPath, src.name)
+      );
       setTransferMsg(`下载完成 · ${formatSize(n)}`);
       await loadLocal(localPath);
     } catch (e) {
@@ -315,7 +348,7 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
           selected={localSel}
           onSelect={(e) => setLocalSel(e.path)}
           onActivate={enterLocal}
-          onUp={() => setLocalPath(parentPath(localPath))}
+          onUp={() => setLocalPath(parentLocal(localPath))}
         >
           <button className="btn" onClick={doUpload} disabled={status !== "ready"}>
             上传 →

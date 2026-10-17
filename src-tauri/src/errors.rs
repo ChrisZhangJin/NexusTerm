@@ -60,10 +60,36 @@ pub fn connect_error(host: &str, port: u16, err: &russh::Error) -> String {
     }
 }
 
+/// TCP 错误码。BSD/macOS 与 Linux 用 errno，Windows 用 Winsock 的 `WSAE*` 系列
+/// —— 后者的数值恰好是 errno + 10000。同一份代码要覆盖三端，故两种值都列出。
+const ETIMEDOUT: &[i32] = &[60, 10060];
+const ECONNREFUSED: &[i32] = &[61, 10061];
+/// ENETUNREACH / EHOSTUNREACH
+const EUNREACH: &[i32] = &[51, 65, 10051, 10065];
+const EHOSTDOWN: &[i32] = &[64, 10064];
+const ECONNRESET: &[i32] = &[54, 10054];
+
+/// 测试只构造当前平台的 errno，故按平台取一个代表值。
+#[cfg(test)]
+#[cfg(windows)]
+mod errno {
+    pub const TIMEDOUT: i32 = 10060;
+    pub const CONNREFUSED: i32 = 10061;
+    pub const NETUNREACH: i32 = 10051;
+}
+
+#[cfg(test)]
+#[cfg(not(windows))]
+mod errno {
+    pub const TIMEDOUT: i32 = 60;
+    pub const CONNREFUSED: i32 = 61;
+    pub const NETUNREACH: i32 = 51;
+}
+
 /// io::Error → 中文提示。
 ///
-/// 先匹配 `raw_os_error()`（BSD/macOS 的 errno 稳定且信息量最大），
-/// 再用 `ErrorKind` 兜底，保证 Linux / Windows 上也有合理文案。
+/// 先匹配 `raw_os_error()`（errno 比 ErrorKind 信息量大，能把「超时」和
+/// 「被拒绝」分开），再用 `ErrorKind` 兜底，保证各平台都有合理文案。
 pub fn io_error(host: &str, port: u16, err: &io::Error) -> String {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
@@ -84,46 +110,59 @@ pub fn io_error(host: &str, port: u16, err: &io::Error) -> String {
         );
     }
 
-    match (err.raw_os_error(), err.kind()) {
-        // ETIMEDOUT
-        (Some(60), _) | (_, io::ErrorKind::TimedOut) => compose(
+    let code = err.raw_os_error();
+    let kind = err.kind();
+    let is = |codes: &[i32]| code.is_some_and(|c| codes.contains(&c));
+
+    // errno 优先：同一件事在 ErrorKind 里常被归并成 Uncategorized，
+    // 只有原始码能把「超时」和「被拒绝」分开。ErrorKind 作为各平台的兜底。
+    if is(ETIMEDOUT) || kind == io::ErrorKind::TimedOut {
+        return compose(
             &format!(
                 "连接超时：{}:{} 无响应。请检查 IP 是否正确、主机是否开机、\
                  是否在同一网络、防火墙是否放行 {} 端口",
                 host, port, port
             ),
             &msg,
-        ),
-        // ECONNREFUSED
-        (Some(61), _) | (_, io::ErrorKind::ConnectionRefused) => compose(
+        );
+    }
+    if is(ECONNREFUSED) || kind == io::ErrorKind::ConnectionRefused {
+        return compose(
             &format!("连接被拒绝：{}:{} 端口未开放或服务未启动", host, port),
             &msg,
-        ),
-        // ENETUNREACH / EHOSTUNREACH
-        (Some(51), _) | (Some(65), _) => compose(
+        );
+    }
+    if is(EUNREACH) {
+        return compose(
             &format!("网络不可达：{} 不在可达网段内，请检查本机网络与路由", host),
             &msg,
-        ),
-        // EHOSTDOWN
-        (Some(64), _) => compose(&format!("主机已关机：{} 无响应", host), &msg),
-        // ECONNRESET
-        (Some(54), _) | (_, io::ErrorKind::ConnectionReset) => compose(
+        );
+    }
+    if is(EHOSTDOWN) {
+        return compose(&format!("主机已关机：{} 无响应", host), &msg);
+    }
+    if is(ECONNRESET) || kind == io::ErrorKind::ConnectionReset {
+        return compose(
             &format!("连接被重置：{}:{} 主动断开了握手", host, port),
             &msg,
-        ),
-        (_, io::ErrorKind::ConnectionAborted) => compose(
+        );
+    }
+    if kind == io::ErrorKind::ConnectionAborted {
+        return compose(
             &format!("连接被中止：{}:{} 未通过防火墙校验", host, port),
             &msg,
-        ),
-        (_, io::ErrorKind::PermissionDenied) => compose(
+        );
+    }
+    if kind == io::ErrorKind::PermissionDenied {
+        return compose(
             &format!("本机拒绝发起连接：{}:{}，请检查系统防火墙或 VPN", host, port),
             &msg,
-        ),
-        _ => compose(
-            &format!("无法连接到 {}:{}：{}", host, port, kind_label(err.kind())),
-            &msg,
-        ),
+        );
     }
+    compose(
+        &format!("无法连接到 {}:{}：{}", host, port, kind_label(kind)),
+        &msg,
+    )
 }
 
 fn kind_label(kind: io::ErrorKind) -> &'static str {
@@ -171,15 +210,16 @@ mod tests {
         assert_eq!(resolve_timeout(Some(9999)).as_secs(), 600);
     }
 
+    /// 用本平台真实的 errno 断言，顺带锁住「Windows 用 WSAE*」这个事实
     #[test]
     fn errno_maps_to_expected_copy() {
-        let timed_out = io::Error::from_raw_os_error(60);
+        let timed_out = io::Error::from_raw_os_error(errno::TIMEDOUT);
         assert!(io_error("1.2.3.4", 22, &timed_out).starts_with("连接超时"));
 
-        let refused = io::Error::from_raw_os_error(61);
+        let refused = io::Error::from_raw_os_error(errno::CONNREFUSED);
         assert!(io_error("1.2.3.4", 22, &refused).starts_with("连接被拒绝"));
 
-        let unreach = io::Error::from_raw_os_error(51);
+        let unreach = io::Error::from_raw_os_error(errno::NETUNREACH);
         assert!(io_error("1.2.3.4", 22, &unreach).starts_with("网络不可达"));
     }
 }

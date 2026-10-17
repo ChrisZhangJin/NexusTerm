@@ -45,9 +45,9 @@ impl LocalManager {
         // 登录 shell 比非登录 shell 环境变量完整，更接近日常终端体感
         let mut cmd = default_login_shell();
 
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "/".to_string());
+        // Windows 上 $HOME 大多不存在（或为 Git Bash 风格的 /c/Users/xxx），
+        // 交给 keys::home_dir() 按平台解析，否则 PTY 会因 cwd 非法直接启动失败
+        let home = crate::keys::home_dir();
         cmd.cwd(&home);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -156,9 +156,16 @@ impl LocalManager {
 #[cfg(windows)]
 fn default_login_shell() -> CommandBuilder {
     let shell = std::env::var("COMSPEC")
+        .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|_| "cmd.exe".to_string());
-    CommandBuilder::new(shell)
+        .unwrap_or_else(|| "cmd.exe".to_string());
+    let mut cmd = CommandBuilder::new(shell);
+    // ConPTY 下 cmd.exe 按系统 ANSI 代码页输出（简体中文环境是 GBK），
+    // 而 xterm.js 一律按 UTF-8 解码 —— 不切页的话所有中文都是乱码。
+    // `/K` 执行完这条命令后回到交互提示符，输出被重定向掉以免首行出现噪音。
+    // 代价：`chcp 65001` 下少数老式控制台程序（如 ping）的进度重绘会错位。
+    cmd.args(["/K", "chcp 65001 >nul"]);
+    cmd
 }
 
 #[cfg(unix)]
@@ -171,4 +178,56 @@ fn default_login_shell() -> CommandBuilder {
     let mut cmd = CommandBuilder::new(shell);
     cmd.arg("-l");
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 可执行文件在 PATH 里时是裸名字（如 `cmd.exe`），要按平台规则找一遍。
+    fn exists_in_path(exe: &str) -> bool {
+        let p = std::path::Path::new(exe);
+        if p.is_absolute() || exe.contains('/') || exe.contains('\\') {
+            return p.exists();
+        }
+        let exts: &[&str] = if cfg!(windows) {
+            &["", ".exe", ".cmd", ".bat"]
+        } else {
+            &[""]
+        };
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .any(|dir| exts.iter().any(|e| dir.join(format!("{exe}{e}")).exists()))
+    }
+
+    /// 本地终端是启动即开的，shell 路径解析错就是 100% 复现的故障。
+    /// Windows 上曾因 `Result::filter` 编译不过而根本没跑到这一步。
+    #[test]
+    fn default_shell_is_resolvable() {
+        let cmd = default_login_shell();
+        let argv = cmd.get_argv();
+        assert!(!argv.is_empty(), "shell 可执行文件为空");
+        let exe = argv[0].to_string_lossy().to_string();
+        assert!(!exe.is_empty(), "shell 可执行文件为空字符串");
+        assert!(exists_in_path(&exe), "默认 shell 找不到：{}", exe);
+    }
+
+    /// Windows 上必须带上切 UTF-8 的参数，否则本地终端中文全是乱码。
+    #[test]
+    #[cfg(windows)]
+    fn windows_shell_switches_to_utf8() {
+        let cmd = default_login_shell();
+        let joined = cmd
+            .get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("65001"),
+            "缺少 chcp 65001，中文会乱码：{}",
+            joined
+        );
+    }
 }

@@ -14,6 +14,7 @@ import {
   onTermData,
   stringToBytes,
 } from "../api";
+import { isMacOS } from "../lib/platform";
 import { themeToXterm } from "../lib/theme";
 import { attachZmodem } from "../lib/zmodem";
 import type { Theme } from "../types";
@@ -146,6 +147,33 @@ export default function TerminalView({
       send(d).catch(() => {});
     });
 
+    // Windows / Linux 上 Ctrl+C 必须留给中断信号（^C），不能像 macOS 那样
+    // 兼作复制（macOS 有 ⌘C）。补上终端惯例的 Ctrl+Shift+C / Ctrl+Shift+V，
+    // 否则非 macOS 用户根本没有复制入口。
+    if (!isMacOS()) {
+      term.attachCustomKeyEventHandler((e) => {
+        if (e.type !== "keydown" || !(e.ctrlKey || e.metaKey) || !e.shiftKey) {
+          return true;
+        }
+        const k = e.key.toLowerCase();
+        if (k === "c") {
+          const sel = term.getSelection();
+          if (sel) navigator.clipboard?.writeText(sel).catch(() => {});
+          return false;
+        }
+        if (k === "v") {
+          navigator.clipboard
+            ?.readText()
+            .then((t) => {
+              if (t && !zmodem.isActive()) send(t).catch(() => {});
+            })
+            .catch(() => {});
+          return false;
+        }
+        return true;
+      });
+    }
+
     // 二进制粘贴（避免中转会破坏字节）
     const binSub = term.onBinary((d) => {
       if (zmodem.isActive()) return;
@@ -154,6 +182,20 @@ export default function TerminalView({
         () => {}
       );
     });
+
+    // 右键 = 粘贴（Xshell / SecureCRT 的习惯动作）。系统的默认右键菜单
+    // 已在 App 层全局屏蔽，这里接管成对终端更有用的行为。
+    const onCtxMenu = (e: MouseEvent) => {
+      e.preventDefault();
+      if (zmodem.isActive()) return;
+      navigator.clipboard
+        ?.readText()
+        .then((t) => {
+          if (t) send(t).catch(() => {});
+        })
+        .catch(() => {});
+    };
+    host.addEventListener("contextmenu", onCtxMenu);
 
     const doFit = () => {
       // 容器隐藏时 fit 会得到 0 列，必须跳过，否则会把错误的尺寸推给远端
@@ -176,6 +218,7 @@ export default function TerminalView({
 
     return () => {
       disposed = true;
+      host.removeEventListener("contextmenu", onCtxMenu);
       zmodem.dispose();
       ro.disconnect();
       dataSub.dispose();

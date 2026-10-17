@@ -1,3 +1,4 @@
+import { modKeyLabel } from "../lib/platform";
 import IOMenu from "./IOMenu";
 
 interface Props {
@@ -38,12 +39,13 @@ export default function Toolbar({
   onExportSession,
   onExportAll,
 }: Props) {
+  const modKey = modKeyLabel();
   return (
     <div className="toolbar">
       <button
         className={`tb-action ${sidebarVisible ? "active" : ""}`}
         onClick={onToggleSidebar}
-        title={sidebarVisible ? "收起会话侧栏（⌘B）" : "展开会话侧栏（⌘B）"}
+        title={`${sidebarVisible ? "收起" : "展开"}会话侧栏（${modKey}+B）`}
       >
         <span className="tb-glyph">☰</span>
         会话

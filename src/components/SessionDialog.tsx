@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { normalizeTimeout } from "../lib/errors";
+import { credentialServiceName, sshDirLabel } from "../lib/platform";
 import type { DiscoveredKey, NewSession, SessionRecord } from "../types";
 
 interface Props {
@@ -140,7 +141,7 @@ export default function SessionDialog({ editing, onSave, onClose }: Props) {
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              placeholder="保存在 macOS Keychain，不写入数据库"
+              placeholder={`保存在${credentialServiceName()}，不写入数据库`}
             />
           </div>
         )}
@@ -150,7 +151,7 @@ export default function SessionDialog({ editing, onSave, onClose }: Props) {
             <div className="row">
               <label>私钥</label>
               <select value={keyPath} onChange={(e) => setKeyPath(e.target.value)}>
-                <option value="">选择 ~/.ssh 下的密钥…</option>
+                <option value="">选择 {sshDirLabel()} 下的密钥…</option>
                 {keys.map((k) => (
                   <option key={k.path} value={k.path}>
                     {k.name}

@@ -74,10 +74,71 @@ Keychain 的 ACL 靠**代码签名**识别访问者。ad-hoc 签名每次重建�
 
 ---
 
-## Windows / Linux
+## Windows（已实测）
 
-见 [portability.md](./portability.md) 的前置依赖清单。Windows 出 NSIS/MSI，Linux 出
-AppImage/DEB，均无 Gatekeeper 那套限制。
+前置依赖见 [portability.md](./portability.md)。本机实测环境：
+
+| 项 | 版本 |
+|---|---|
+| 目标三元组 | `x86_64-pc-windows-msvc` |
+| rustc / cargo | 1.97.1 |
+| Node | 22 LTS |
+
+```powershell
+npm install
+npm run tauri:build
+```
+
+首次构建约 9 分钟（russh / rusqlite bundled 编译 SQLite、release LTO），
+其中 Tauri 会自行下载 NSIS 与 `nsis_tauri_utils.dll`，多花 1–2 分钟，属正常行为。
+
+产物：
+
+| 文件 | 体积 | 用途 |
+|---|---|---|
+| `src-tauri/target/release/bundle/nsis/NexusTerm_0.1.0_x64-setup.exe` | 约 2.5 MB | 安装包（开始菜单 / 卸载入口） |
+| `src-tauri/target/release/nexus-term.exe` | 约 6.7 MB | **免安装版**，可直接双击运行 |
+
+### 免安装（便携）用法
+
+`nexus-term.exe` 是自包含的 —— 前端资源在构建时已嵌进二进制，不需要同目录的
+`dist/` 或任何 DLL。把它单独拷到任意空目录实测可正常启动（进程树里同样出现
+`cmd.exe` + `conhost.exe`），因此可以直接分发这个单文件，或压成 zip：
+
+```powershell
+Compress-Archive -Path src-tauri\target\release\nexus-term.exe `
+  -DestinationPath NexusTerm-0.1.0-windows-x64-portable.zip
+```
+
+压缩后约 3 MB。两个前提：
+
+- 目标机器要有 **WebView2 Runtime**（Windows 10/11 一般自带；缺失时
+  `winget install Microsoft.EdgeWebView2Runtime`）。
+- 会话库与凭据仍写用户目录（`%APPDATA%\com.nexus-term.app`），不在 exe 旁边，
+  所以放只读目录也能跑，也不需要管理员权限。
+
+### 冒烟验证做了什么
+
+启动 `nexus-term.exe` 后检查三件事，能同时过就说明「后端 + WebView + 本地 PTY」
+这条主链路在 Windows 上是通的：
+
+1. `%APPDATA%\com.nexus-term.app\nexus.db` 被创建 —— SQLite 初始化未 panic；
+2. 进程树里出现 `cmd.exe` 与 `conhost.exe` —— ConPTY 真的拉起了本地 shell；
+3. 日志打印 `nexus-term 后端就绪` —— `setup` 钩子走完。
+
+> 注意：用 CI 或脚本启动时不要在同一次调用里 `&` 后台起进程再退出，
+> 子进程会随 shell 一起被回收，看起来像是应用自己崩了。
+
+### 平台配置
+
+Windows 的差异写在 [`tauri.windows.conf.json`](../src-tauri/tauri.windows.conf.json)
+（Tauri 2 会自动与 `tauri.conf.json` 合并）：关掉系统装饰改由前端自绘标题栏，
+`bundle.targets` 收敛为 `nsis`。这样 macOS 的 `dmg` / `app` 不会在 Windows 上被尝试构建。
+
+## Linux
+
+见 [portability.md](./portability.md) 的前置依赖清单。出 AppImage / DEB，无 Gatekeeper
+那套限制。尚未实机验证。
 
 ## 构建产物体积参考（macOS arm64）
 

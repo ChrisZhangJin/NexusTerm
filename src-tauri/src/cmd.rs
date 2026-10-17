@@ -1,5 +1,3 @@
-use std::os::unix::fs::PermissionsExt;
-
 use tauri::State;
 
 use crate::keys;
@@ -186,24 +184,28 @@ pub fn export_all_xsh(dir: String, state: State<AppState>) -> Result<usize, Stri
             &s.auth_type,
             s.key_path.as_deref(),
         );
+        let base = std::path::Path::new(&dir);
         let safe = sanitize_filename(&s.name);
-        let mut target = format!("{}/{}.xsh", dir.trim_end_matches('/'), safe);
+        let mut target = base.join(format!("{}.xsh", safe));
         let mut n = 1;
-        while std::path::Path::new(&target).exists() {
+        while target.exists() {
             n += 1;
-            target = format!("{}/{} ({}).xsh", dir.trim_end_matches('/'), safe, n);
+            target = base.join(format!("{} ({}).xsh", safe, n));
         }
-        std::fs::write(&target, bytes).map_err(|e| format!("写入 {} 失败：{}", target, e))?;
+        std::fs::write(&target, bytes)
+            .map_err(|e| format!("写入 {} 失败：{}", target.display(), e))?;
         count += 1;
     }
     Ok(count)
 }
 
+/// 会话名 → 合法文件名。Windows 额外保留 `\ * ? " < > |`，
+/// 这些字符在 NTFS 上根本无法落盘，不过滤会让整个导出失败。
 fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| match c {
-            '/' | ':' | '\0' => '-',
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '-',
             c => c,
         })
         .collect();
@@ -231,9 +233,62 @@ pub async fn verify_key(
     Ok("ok".into())
 }
 
+/// Windows 的驱动器列表。只有真正存在的盘才列出（跳过空软驱 A: 等）。
+#[cfg(windows)]
+fn list_drives() -> Result<Vec<RemoteEntry>, String> {
+    let drives = (b'A'..=b'Z')
+        .map(|c| format!("{}:\\", c as char))
+        .filter(|root| std::path::Path::new(root).exists())
+        .map(|root| RemoteEntry {
+            name: root.clone(),
+            path: root,
+            is_dir: true,
+            size: 0,
+            mtime: None,
+            permissions: None,
+        })
+        .collect::<Vec<_>>();
+    if drives.is_empty() {
+        return Err("没有找到可用的磁盘驱动器".into());
+    }
+    Ok(drives)
+}
+
+/// 非 Windows 没有盘符概念，空路径等价于列根目录。
+#[cfg(not(windows))]
+async fn list_drives() -> Result<Vec<RemoteEntry>, String> {
+    list_local_dir("/".to_string()).await
+}
+
+/// 文件权限位。远端走 SFTP 的 POSIX mode，本地面板则由本函数按平台合成。
+#[cfg(unix)]
+fn permission_mode(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode()
+}
+
+/// Windows 没有 POSIX mode。文件管理器只用它做「是否只读」的展示，
+/// 因此按只读位合成一个近似值即可，不必也不能照搬 Unix 语义。
+#[cfg(windows)]
+fn permission_mode(meta: &std::fs::Metadata) -> u32 {
+    let ro = meta.permissions().readonly();
+    match (meta.is_dir(), ro) {
+        (true, true) => 0o555,
+        (true, false) => 0o755,
+        (false, true) => 0o444,
+        (false, false) => 0o666,
+    }
+}
+
 /// 浏览本机目录 —— 文件管理器的本地面板。
+///
+/// 空路径是「列盘符」的约定：Windows 没有单一的 `/`，用户在 C 盘根目录再点
+/// 一次「上级目录」时前端会传空串，此时列出所有可用驱动器供切换。
 #[tauri::command]
 pub async fn list_local_dir(path: String) -> Result<Vec<RemoteEntry>, String> {
+    if path.is_empty() {
+        return list_drives();
+    }
     let expanded = crate::keys::expand_tilde(&path);
     let mut dir = tokio::fs::read_dir(&expanded)
         .await
@@ -251,11 +306,12 @@ pub async fn list_local_dir(path: String) -> Result<Vec<RemoteEntry>, String> {
             Err(_) => continue,
         };
         let is_dir = meta.is_dir();
-        let full = if expanded.ends_with('/') {
-            format!("{}{}", expanded, name)
-        } else {
-            format!("{}/{}", expanded, name)
-        };
+        // 用 PathBuf 而不是手拼分隔符：Windows 本地路径是 `C:\Users\…`，
+        // 硬写 `/` 会让上级目录按钮与双击进入目录都算错。
+        let full = std::path::Path::new(&expanded)
+            .join(&name)
+            .to_string_lossy()
+            .to_string();
         let mtime = meta
             .modified()
             .ok()
@@ -268,7 +324,7 @@ pub async fn list_local_dir(path: String) -> Result<Vec<RemoteEntry>, String> {
             is_dir,
             size: meta.len(),
             mtime,
-            permissions: Some(meta.permissions().mode()),
+            permissions: Some(permission_mode(&meta)),
         });
     }
 
@@ -358,6 +414,48 @@ pub async fn sftp_rename(
 pub async fn sftp_close(id: String, state: State<'_, AppState>) -> Result<(), SftpError> {
     state.sftp.close(&id).await;
     Ok(())
+}
+
+/// 宿主平台信息。前端的标题栏留白、窗口控制按钮、快捷键提示都要按它分支 ——
+/// 用后端常量而不是 UA 嗅探，避免 WebView 版本差异导致误判。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostInfo {
+    /// `windows` | `macos` | `linux`
+    pub platform: String,
+    pub arch: String,
+    pub os_version: String,
+}
+
+#[tauri::command]
+pub fn host_info() -> HostInfo {
+    HostInfo {
+        platform: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        os_version: os_version(),
+    }
+}
+
+#[cfg(windows)]
+fn os_version() -> String {
+    // 只区分「Win10 之前 / 之后」即可：ConPTY 自 Win10 1809 起可用，
+    // 本地终端在老系统上无法工作，值得在界面上说明。
+    std::env::var("OS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Windows".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn os_version() -> String {
+    std::env::var("SYSTEM_VERSION_COMPAT")
+        .ok()
+        .unwrap_or_else(|| "macOS".to_string())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn os_version() -> String {
+    std::env::consts::OS.to_string()
 }
 
 #[tauri::command]

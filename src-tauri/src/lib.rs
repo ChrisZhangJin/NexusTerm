@@ -51,6 +51,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             cmd::health,
+            cmd::host_info,
             cmd::ssh_connect,
             cmd::ssh_write,
             cmd::ssh_resize,

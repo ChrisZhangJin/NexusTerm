@@ -4,7 +4,8 @@ import type { AuthMethod, SessionRecord } from "../types";
 /**
  * 按会话配置解析认证方式。
  *
- * 密码一律从 Keychain 取，不读数据库 —— 这是密码永不落库的落地点。
+ * 密码一律从系统凭据服务取（Keychain / 凭据管理器 / Secret Service），
+ * 不读数据库 —— 这是密码永不落库的落地点。
  * 终端与 SFTP 两条通道共用此函数，避免认证规则两处漂移。
  */
 export async function resolveAuth(

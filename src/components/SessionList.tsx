@@ -10,6 +10,8 @@ interface Props {
   onCreate: () => void;
   onEdit: (s: SessionRecord) => void;
   onDelete: (s: SessionRecord) => void;
+  /** 行内右键：打开会话上下文菜单（新建 / 复制 / 关闭） */
+  onSessionContextMenu: (e: React.MouseEvent, s: SessionRecord) => void;
 }
 
 function groupByFolder(sessions: SessionRecord[]) {
@@ -30,6 +32,7 @@ export default function SessionList({
   onCreate,
   onEdit,
   onDelete,
+  onSessionContextMenu,
 }: Props) {
   const [filter, setFilter] = useState("");
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -86,6 +89,7 @@ export default function SessionList({
                 <div
                   key={s.id}
                   className={`session-row ${s.id === selectedId ? "selected" : ""}`}
+                  onContextMenu={(e) => onSessionContextMenu(e, s)}
                 >
                   <button
                     className="session-main"

@@ -31,6 +31,37 @@ pub async fn load_private_key(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 家目录解析错会让「列出 ~/.ssh 密钥」静默返回空列表 —— 用户看到的是
+    /// 「没有可用私钥」，很难联想到是 HOME / USERPROFILE 取错了，故锁死。
+    #[test]
+    fn home_dir_points_to_existing_directory() {
+        let home = home_dir();
+        assert!(!home.is_empty(), "家目录解析为空");
+        assert!(
+            std::path::Path::new(&home).exists(),
+            "家目录不存在：{}",
+            home
+        );
+    }
+
+    /// `~/.ssh/id_ed25519` 展开后必须用本平台的分隔符，
+    /// Windows 上混用 `/` 虽能打开但路径显示是错的，且拼接逻辑不再可信。
+    #[test]
+    fn expand_tilde_uses_platform_separator() {
+        let p = expand_tilde("~/.ssh/id_ed25519");
+        assert!(p.ends_with("id_ed25519"), "展开结果不正确：{}", p);
+        if cfg!(windows) {
+            assert!(p.contains(".ssh\\id_ed25519"), "Windows 上应为反斜杠：{}", p);
+        } else {
+            assert!(p.contains(".ssh/id_ed25519"), "Unix 上应为正斜杠：{}", p);
+        }
+    }
+}
+
 /// 列出 ~/.ssh/ 下可用的私钥
 pub async fn discover_keys() -> Vec<DiscoveredKey> {
     let dir = dirs_ssh();
@@ -96,17 +127,43 @@ async fn inspect_key(path: &Path) -> Option<DiscoveredKey> {
     })
 }
 
+/// 用户家目录。
+///
+/// Windows 上 `HOME` 通常不存在（只有 Git Bash / Cygwin 才会设，且值是 POSIX 风格
+/// 的 `/c/Users/xxx`），直接拿去拼路径会得到 Rust 打不开的路径。必须以
+/// `USERPROFILE` 为准；反过来 Unix 上没有 `USERPROFILE`，故按平台分支取。
+#[cfg(windows)]
+pub fn home_dir() -> String {
+    std::env::var("USERPROFILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("HOME").ok())
+        .unwrap_or_else(|| "C:\\Users\\Public".to_string())
+}
+
+#[cfg(not(windows))]
+pub fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
+}
+
 fn dirs_ssh() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/unknown".into());
-    format!("{}/.ssh", home)
+    // 用 PathBuf 拼接，分隔符在 Windows 上自动是 `\`
+    std::path::Path::new(&home_dir())
+        .join(".ssh")
+        .to_string_lossy()
+        .to_string()
 }
 
 pub fn expand_tilde(p: &str) -> String {
     if let Some(rest) = p.strip_prefix("~/") {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{}/{}", home, rest)
+        // 用户填的路径分隔符可能是 `/`，逐段拼才能在两端都得到合法路径
+        let mut out = std::path::PathBuf::from(home_dir());
+        for seg in rest.split('/') {
+            out.push(seg);
+        }
+        out.to_string_lossy().to_string()
     } else if p == "~" {
-        std::env::var("HOME").unwrap_or_default()
+        home_dir()
     } else {
         p.to_string()
     }
