@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { CanvasAddon } from "@xterm/addon-canvas";
@@ -31,6 +31,14 @@ interface Props {
   onClosed?: (code: number) => void;
   /** ZMODEM 传输结果等轻提示 */
   onNotify?: (msg: string) => void;
+  /** 断开当前标签页 */
+  onDisconnect?: () => void;
+}
+
+/** 终端区域右键菜单状态 */
+interface TermCtxMenu {
+  x: number;
+  y: number;
 }
 
 function debounce<A extends unknown[]>(fn: (...a: A) => void, ms: number) {
@@ -51,12 +59,14 @@ export default function TerminalView({
   lineHeight,
   onClosed,
   onNotify,
+  onDisconnect,
 }: Props) {
   const isLocal = kind === "local";
   const hostRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const activeRef = useRef(active);
+  const [ctxMenu, setCtxMenu] = useState<TermCtxMenu | null>(null);
 
   activeRef.current = active;
 
@@ -183,17 +193,16 @@ export default function TerminalView({
       );
     });
 
-    // 右键 = 粘贴（Xshell / SecureCRT 的习惯动作）。系统的默认右键菜单
-    // 已在 App 层全局屏蔽，这里接管成对终端更有用的行为。
+    // 右键弹出终端上下文菜单（断开/复制/粘贴/全选/清屏）
     const onCtxMenu = (e: MouseEvent) => {
       e.preventDefault();
       if (zmodem.isActive()) return;
-      navigator.clipboard
-        ?.readText()
-        .then((t) => {
-          if (t) send(t).catch(() => {});
-        })
-        .catch(() => {});
+      const MENU_W = 160;
+      const MENU_H = 200;
+      setCtxMenu({
+        x: Math.min(e.clientX, window.innerWidth - MENU_W - 8),
+        y: Math.min(e.clientY, window.innerHeight - MENU_H - 8),
+      });
     };
     host.addEventListener("contextmenu", onCtxMenu);
 
@@ -269,11 +278,95 @@ export default function TerminalView({
     return () => window.clearTimeout(id);
   }, [active, tabId]);
 
+  // 菜单动作
+  const doCopy = useCallback(() => {
+    const sel = termRef.current?.getSelection();
+    if (sel) navigator.clipboard?.writeText(sel).catch(() => {});
+    setCtxMenu(null);
+  }, []);
+
+  const doPaste = useCallback(() => {
+    setCtxMenu(null);
+    navigator.clipboard
+      ?.readText()
+      .then((t) => {
+        if (t) {
+          (isLocal
+            ? api.localWrite(tabId, stringToBytes(t))
+            : api.sshWrite(tabId, stringToBytes(t))
+          ).catch(() => {});
+        }
+      })
+      .catch(() => {});
+  }, [isLocal, tabId]);
+
+  const doSelectAll = useCallback(() => {
+    termRef.current?.selectAll();
+    setCtxMenu(null);
+  }, []);
+
+  const doClearScreen = useCallback(() => {
+    termRef.current?.clear();
+    setCtxMenu(null);
+  }, []);
+
+  const doDisconnect = useCallback(() => {
+    setCtxMenu(null);
+    onDisconnect?.();
+  }, [onDisconnect]);
+
+  // 点击任意位置收菜单
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const hide = () => setCtxMenu(null);
+    // 延一帧避免当次 contextmenu 事件又立即关掉
+    const id = requestAnimationFrame(() => {
+      document.addEventListener("mousedown", hide);
+    });
+    return () => {
+      cancelAnimationFrame(id);
+      document.removeEventListener("mousedown", hide);
+    };
+  }, [ctxMenu]);
+
   return (
-    <div
-      ref={hostRef}
-      className="term-host"
-      style={{ display: active ? "block" : "none" }}
-    />
+    <>
+      <div
+        ref={hostRef}
+        className="term-host"
+        style={{ display: active ? "block" : "none" }}
+      />
+      {ctxMenu && active && (
+        <>
+          <div
+            className="ctx-backdrop"
+            onClick={() => setCtxMenu(null)}
+            onContextMenu={(e) => { e.preventDefault(); setCtxMenu(null); }}
+          />
+          <div className="ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
+            <button className="ctx-item" onClick={doDisconnect}>
+              断开
+              <span className="ctx-shortcut">Alt+C</span>
+            </button>
+            <div className="ctx-sep" />
+            <button className="ctx-item" onClick={doCopy}>
+              复制
+              <span className="ctx-shortcut">Ctrl+Shift+C</span>
+            </button>
+            <button className="ctx-item" onClick={doPaste}>
+              粘贴
+              <span className="ctx-shortcut">Ctrl+Shift+V</span>
+            </button>
+            <div className="ctx-sep" />
+            <button className="ctx-item" onClick={doSelectAll}>
+              全选
+            </button>
+            <button className="ctx-item" onClick={doClearScreen}>
+              清屏
+            </button>
+          </div>
+        </>
+      )}
+    </>
   );
 }

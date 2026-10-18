@@ -128,28 +128,40 @@ pub fn load_password(id: String) -> Option<String> {
 // ——— Xshell .xsh 导入 / 导出 ———
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ImportedFile {
     pub label: String,
     pub ok: bool,
     pub error: Option<String>,
+    /// 是否成功解密并导入了密码
+    pub password_imported: bool,
 }
 
-/// 批量导入 .xsh。密码无法从加密串还原，导入后需用户重填。
+/// 批量导入 .xsh。在同一台 Windows 机器上可自动解密密码并存入系统凭据服务。
 #[tauri::command]
 pub fn import_xsh(paths: Vec<String>, state: State<AppState>) -> Result<Vec<ImportedFile>, String> {
     let mut out = Vec::new();
     for parsed in crate::xsh::parse_files(&paths) {
-        let (ok, error) = match &parsed.result {
+        let (ok, error, password_imported) = match &parsed.result {
             Ok(new) => match state.store.create(new.clone()) {
-                Ok(_) => (true, None),
-                Err(e) => (false, Some(format!("入库失败：{}", e))),
+                Ok(created) => {
+                    // 如果密码解密成功，自动存入系统凭据服务
+                    let pw_ok = if let Some(ref pw) = parsed.password {
+                        store::secrets::save(&created.id, pw).is_ok()
+                    } else {
+                        false
+                    };
+                    (true, None, pw_ok)
+                }
+                Err(e) => (false, Some(format!("入库失败：{}", e)), false),
             },
-            Err(e) => (false, Some(e.clone())),
+            Err(e) => (false, Some(e.clone()), false),
         };
         out.push(ImportedFile {
             label: parsed.label,
             ok,
             error,
+            password_imported,
         });
     }
     Ok(out)

@@ -1,150 +1,164 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { SessionRecord } from "../types";
 
 interface Props {
   sessions: SessionRecord[];
-  /** 当前选中项。工具栏的「连接 / SFTP」按钮作用于它 */
-  selectedId: string | null;
-  onSelect: (s: SessionRecord) => void;
   onConnect: (s: SessionRecord) => void;
   onCreate: () => void;
   onEdit: (s: SessionRecord) => void;
   onDelete: (s: SessionRecord) => void;
-  /** 行内右键：打开会话上下文菜单（新建 / 复制 / 关闭） */
-  onSessionContextMenu: (e: React.MouseEvent, s: SessionRecord) => void;
+  onClose: () => void;
 }
 
-function groupByFolder(sessions: SessionRecord[]) {
-  const map = new Map<string, SessionRecord[]>();
+/** 按 host+username 去重，保留最新的那条（updatedAt 最大）。 */
+function dedupe(sessions: SessionRecord[]): SessionRecord[] {
+  const map = new Map<string, SessionRecord>();
   for (const s of sessions) {
-    const key = s.folder || "/";
-    if (!map.has(key)) map.set(key, []);
-    map.get(key)!.push(s);
+    const key = `${s.host}\0${s.username}`;
+    const existing = map.get(key);
+    if (!existing || s.updatedAt > existing.updatedAt) {
+      map.set(key, s);
+    }
   }
-  return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  return [...map.values()];
 }
 
+/** 显示名：有名字用名字，没有名字用 IP。 */
+function displayName(s: SessionRecord): string {
+  // 名字非空且不等于 host 时用名字
+  if (s.name && s.name !== s.host) return s.name;
+  return s.host;
+}
+
+/**
+ * 弹出式连接选择器 —— 类似 Xshell 的「打开」按钮。
+ * 按 host+username 去重，按名字排序（无名字用 IP），不分文件夹。
+ */
 export default function SessionList({
   sessions,
-  selectedId,
-  onSelect,
   onConnect,
   onCreate,
   onEdit,
   onDelete,
-  onSessionContextMenu,
+  onClose,
 }: Props) {
   const [filter, setFilter] = useState("");
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const panelRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
+  // 打开时自动聚焦搜索框
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  // 点击面板外部关闭
+  useEffect(() => {
+    const onClick = (e: MouseEvent) => {
+      if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
+        onClose();
+      }
+    };
+    requestAnimationFrame(() => document.addEventListener("mousedown", onClick));
+    return () => document.removeEventListener("mousedown", onClick);
+  }, [onClose]);
+
+  // ESC 关闭
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  // 去重 + 搜索 + 排序
+  const unique = dedupe(sessions);
   const q = filter.trim().toLowerCase();
   const filtered = q
-    ? sessions.filter(
+    ? unique.filter(
         (s) =>
-          s.name.toLowerCase().includes(q) ||
+          displayName(s).toLowerCase().includes(q) ||
           s.host.toLowerCase().includes(q) ||
           s.username.toLowerCase().includes(q)
       )
-    : sessions;
-
-  const toggle = (f: string) => {
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      next.has(f) ? next.delete(f) : next.add(f);
-      return next;
-    });
-  };
+    : unique;
+  const sorted = [...filtered].sort((a, b) =>
+    displayName(a).localeCompare(displayName(b))
+  );
 
   return (
-    <aside className="sidebar">
-      <div className="sidebar-head">
+    <div className="session-popup" ref={panelRef}>
+      <div className="sp-head">
         <input
+          ref={inputRef}
           className="filter"
-          placeholder="搜索会话…"
+          placeholder="搜索连接…"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
         />
-        <button className="btn-icon" onClick={onCreate} title="新建会话">
+        <button className="btn-icon" onClick={onCreate} title="新建连接">
           +
         </button>
       </div>
 
-      <div className="session-tree">
-        {groupByFolder(filtered).map(([folder, items]) => (
-          <div key={folder} className="folder-group">
+      <div className="sp-list">
+        {sorted.map((s) => (
+          <div key={s.id} className="session-row">
             <button
-              className="folder-row"
-              onClick={() => toggle(folder)}
-              title={folder}
+              className="session-main"
+              onDoubleClick={() => {
+                onConnect(s);
+                onClose();
+              }}
+              title={`${s.username}@${s.host}:${s.port}  双击连接`}
             >
-              <span className="caret">{collapsed.has(folder) ? "▸" : "▾"}</span>
-              <span className="folder-name">
-                {folder === "/" ? "全部会话" : folder.replace(/^\//, "")}
+              <span className="dot" />
+              <span className="s-name">{displayName(s)}</span>
+              <span className="s-host">
+                {s.username ? `${s.username}@` : ""}
+                {s.host}
               </span>
-              <span className="count">{items.length}</span>
             </button>
-
-            {!collapsed.has(folder) &&
-              items.map((s) => (
-                <div
-                  key={s.id}
-                  className={`session-row ${s.id === selectedId ? "selected" : ""}`}
-                  onContextMenu={(e) => onSessionContextMenu(e, s)}
-                >
-                  <button
-                    className="session-main"
-                    onDoubleClick={() => onConnect(s)}
-                    onClick={() => onSelect(s)}
-                    title={`${s.username}@${s.host}:${s.port}`}
-                  >
-                    <span className="dot" />
-                    <span className="s-name">{s.name}</span>
-                    <span className="s-host">
-                      {s.username ? `${s.username}@` : ""}
-                      {s.host}
-                    </span>
-                  </button>
-                  <button
-                    className="btn-row"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onConnect(s);
-                    }}
-                    title="连接"
-                  >
-                    ↵
-                  </button>
-                  <button
-                    className="btn-row"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onEdit(s);
-                    }}
-                    title="编辑"
-                  >
-                    ✎
-                  </button>
-                  <button
-                    className="btn-row danger"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onDelete(s);
-                    }}
-                    title="删除"
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
+            <button
+              className="btn-row"
+              onClick={() => {
+                onConnect(s);
+                onClose();
+              }}
+              title="连接"
+            >
+              ↵
+            </button>
+            <button
+              className="btn-row"
+              onClick={(e) => {
+                e.stopPropagation();
+                onEdit(s);
+                onClose();
+              }}
+              title="编辑"
+            >
+              ✎
+            </button>
+            <button
+              className="btn-row danger"
+              onClick={(e) => {
+                e.stopPropagation();
+                onDelete(s);
+              }}
+              title="删除"
+            >
+              ×
+            </button>
           </div>
         ))}
 
-        {filtered.length === 0 && (
+        {sorted.length === 0 && (
           <p className="empty">
-            {sessions.length === 0 ? "还没有会话，点 + 新建" : "没有匹配的会话"}
+            {sessions.length === 0 ? "还没有连接，点 + 新建" : "没有匹配的连接"}
           </p>
         )}
       </div>
-    </aside>
+    </div>
   );
 }

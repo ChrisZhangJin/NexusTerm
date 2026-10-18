@@ -30,6 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
+sha2 = "0.10"
 parking_lot = "0.12"
 
 # 凭据存储后端随平台切换。keyring 的通用 API 三端一致，

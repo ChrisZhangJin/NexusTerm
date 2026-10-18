@@ -31,7 +31,7 @@ export const api = {
   loadPassword: (id: string) => invoke<string | null>("load_password", { id }),
 
   importXsh: (paths: string[]) =>
-    invoke<{ label: string; ok: boolean; error: string | null }[]>(
+    invoke<{ label: string; ok: boolean; error: string | null; passwordImported: boolean }[]>(
       "import_xsh",
       { paths }
     ),

@@ -12,7 +12,7 @@ import { resolveAuth } from "./lib/auth";
 import { normalizeTimeout, toFriendlyError } from "./lib/errors";
 import { BUILTIN_THEMES, DEFAULT_THEME, FONT_FAMILIES } from "./lib/theme";
 import { applyChromeVars } from "./lib/chrome";
-import { isMacOS, modKeyLabel } from "./lib/platform";
+import { isMacOS } from "./lib/platform";
 import type {
   AuthMethod,
   NewSession,
@@ -29,7 +29,6 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeTab, setActiveTab] = useState<string | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<SessionRecord | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -40,38 +39,13 @@ export default function App() {
   const [fontFamily, setFontFamily] = useState(FONT_FAMILIES[0].value);
   const [fontSize, setFontSize] = useState(13);
   const [lineHeight, setLineHeight] = useState(1.2);
-  // 侧边栏可收起，把宽度全部让给终端
-  const [sidebarVisible, setSidebarVisible] = useState(true);
+
+  // 弹出式会话列表（Xshell「打开」按钮风格）
+  const [sessionPopupOpen, setSessionPopupOpen] = useState(false);
 
   const passphraseRef = useRef<Map<string, string>>(new Map());
-  // 右键菜单始终作用于「打开那一刻」的会话与标签页集合，用 ref 拿到最新快照
-  const tabsRef = useRef(tabs);
-  tabsRef.current = tabs;
-
-  // 会话列表右键菜单：屏幕坐标 + 目标会话
-  const [ctxMenu, setCtxMenu] = useState<{
-    x: number;
-    y: number;
-    session: SessionRecord;
-  } | null>(null);
-
-  const openCtxMenu = useCallback((e: React.MouseEvent, s: SessionRecord) => {
-    e.preventDefault();
-    e.stopPropagation();
-    // 简单防溢出：贴着窗口右/下边缘时往回收
-    const MENU_W = 160;
-    const MENU_H = 110;
-    setCtxMenu({
-      x: Math.min(e.clientX, window.innerWidth - MENU_W - 8),
-      y: Math.min(e.clientY, window.innerHeight - MENU_H - 8),
-      session: s,
-    });
-  }, []);
-
-  const closeCtxMenu = useCallback(() => setCtxMenu(null), []);
 
   // —— 轻量提示条（导入/导出/复制会话等结果） ——
-  // 放在组件上部：duplicateSession 等回调要引用 showToast，晚定义会 TDZ
   const [toast, setToast] = useState<string | null>(null);
   const toastTimer = useRef<number | undefined>(undefined);
   const showToast = useCallback((msg: string) => {
@@ -86,18 +60,6 @@ export default function App() {
   useEffect(() => {
     applyChromeVars(theme);
   }, [theme]);
-
-  // ⌘B 收起 / 展开侧边栏
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b") {
-        e.preventDefault();
-        setSidebarVisible((v) => !v);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
 
   // 屏蔽 WebView2 的默认右键菜单（就是那个「返回 / 刷新 / 打印」系统菜单）。
   // 输入类控件保留原生菜单 —— 那里的复制粘贴是有用的；终端区域的右键由
@@ -198,49 +160,10 @@ export default function App() {
       // 密码存在各平台的系统凭据服务里（Keychain / 凭据管理器 / Secret Service）
       if (!confirm(`删除会话「${s.name}」？此操作同时清除系统凭据服务中的密码。`)) return;
       await api.deleteSession(s.id);
-      if (selectedId === s.id) setSelectedId(null);
       await refresh();
     },
-    [refresh, selectedId]
+    [refresh]
   );
-
-  /** 复制会话：以该会话为模板立即创建一条新记录。密码存于系统凭据服务、
-   *  与会话 id 绑定，因此无法随复制迁移，需用户编辑补填。 */
-  const duplicateSession = useCallback(
-    async (s: SessionRecord) => {
-      try {
-        await api.createSession({
-          name: `${s.name} - 副本`,
-          folder: s.folder || undefined,
-          host: s.host,
-          port: s.port,
-          username: s.username,
-          authType: s.authType,
-          keyPath: s.keyPath ?? undefined,
-          startupCmd: s.startupCmd ?? undefined,
-          theme: s.theme ?? undefined,
-          connectTimeout: s.connectTimeout,
-        });
-        await refresh();
-        showToast(`已复制「${s.name}」。密码不会随会话复制，需要时请编辑补填。`);
-      } catch (e) {
-        showToast(`复制失败：${String(e)}`);
-      }
-    },
-    [refresh, showToast]
-  );
-
-  /** 关闭该会话打开的所有标签页（右键菜单的「关闭会话」）。 */
-  const closeSessionTabs = useCallback((s: SessionRecord) => {
-    const closing = tabsRef.current.filter((t) => t.sessionId === s.id);
-    if (closing.length === 0) return;
-    closing.forEach((t) => api.sshClose(t.id).catch(() => {}));
-    const next = tabsRef.current.filter((t) => t.sessionId !== s.id);
-    setTabs(next);
-    setActiveTab((cur) =>
-      closing.some((t) => t.id === cur) ? (next[next.length - 1]?.id ?? null) : cur
-    );
-  }, []);
 
   const cycleTheme = useCallback(() => {
     setThemeName((cur) => {
@@ -284,9 +207,14 @@ export default function App() {
       const results = await api.importXsh(paths);
       const ok = results.filter((r) => r.ok);
       const bad = results.filter((r) => !r.ok);
+      const pwOk = results.filter((r) => r.passwordImported);
       await refresh();
       const parts: string[] = [];
-      parts.push(`成功导入 ${ok.length} 个会话（导入后请补填密码）`);
+      if (pwOk.length > 0) {
+        parts.push(`成功导入 ${ok.length} 个会话（${pwOk.length} 个已自动导入密码）`);
+      } else {
+        parts.push(`成功导入 ${ok.length} 个会话`);
+      }
       if (bad.length > 0) {
         parts.push(`失败 ${bad.length} 个：${bad.map((b) => `${b.label}（${b.error}）`).join("；")}`);
       }
@@ -297,7 +225,9 @@ export default function App() {
   }, [refresh, showToast]);
 
   const exportSessionXsh = useCallback(async () => {
-    const s = sessions.find((x) => x.id === selectedId);
+    // 导出当前激活标签对应的会话
+    const sid = tabs.find((t) => t.id === activeTab)?.sessionId;
+    const s = sessions.find((x) => x.id === sid);
     if (!s) return;
     const { save } = await import("@tauri-apps/plugin-dialog");
     const target = await save({
@@ -312,7 +242,7 @@ export default function App() {
     } catch (e) {
       showToast(`导出失败：${String(e)}`);
     }
-  }, [sessions, selectedId, showToast]);
+  }, [sessions, activeTab, tabs, showToast]);
 
   const exportAllXsh = useCallback(async () => {
     const { open } = await import("@tauri-apps/plugin-dialog");
@@ -338,7 +268,6 @@ export default function App() {
   const activeSession = activeTabState?.sessionId
     ? sessions.find((s) => s.id === activeTabState.sessionId) ?? null
     : null;
-  const selectedSession = sessions.find((s) => s.id === selectedId) ?? null;
 
   const appTitle = activeSession
     ? `${activeSession.name} — ${activeSession.username}@${activeSession.host}`
@@ -357,6 +286,9 @@ export default function App() {
     ? `${activeSession.username}@${activeSession.host}:${activeSession.port}`
     : null;
 
+  // 当前激活标签是否有对应会话（用于导出按钮状态）
+  const canExportActive = !!activeSession;
+
   return (
     <div className="app" data-theme={themeName}>
       <TitleBar
@@ -368,22 +300,22 @@ export default function App() {
       />
 
       <Toolbar
-        canConnect={!!selectedSession}
+        canConnect={false}
         canDisconnect={!!activeTabState}
         canSftp={activeTabState?.status === "connected"}
         sftpOpen={!!fmSession}
         settingsOpen={settingsOpen}
+        sessionPopupOpen={sessionPopupOpen}
         onCreate={() => {
           setEditing(null);
           setDialogOpen(true);
         }}
-        onConnect={() => selectedSession && connect(selectedSession)}
+        onConnect={() => {}}
         onDisconnect={() => activeTabState && closeTab(activeTabState.id)}
         onToggleSftp={toggleSftp}
         onToggleSettings={() => setSettingsOpen((v) => !v)}
-        sidebarVisible={sidebarVisible}
-        onToggleSidebar={() => setSidebarVisible((v) => !v)}
-        canExportSession={!!selectedId}
+        onToggleSessionPopup={() => setSessionPopupOpen((v) => !v)}
+        canExportSession={canExportActive}
         onImport={importXsh}
         onExportSession={exportSessionXsh}
         onExportAll={exportAllXsh}
@@ -397,25 +329,6 @@ export default function App() {
       />
 
       <div className="workspace">
-        {sidebarVisible && (
-          <SessionList
-            sessions={sessions}
-            selectedId={selectedId}
-            onSelect={(s) => setSelectedId(s.id)}
-            onConnect={connect}
-            onCreate={() => {
-              setEditing(null);
-              setDialogOpen(true);
-            }}
-            onEdit={(s) => {
-              setEditing(s);
-              setDialogOpen(true);
-            }}
-            onDelete={removeSession}
-            onSessionContextMenu={openCtxMenu}
-          />
-        )}
-
         <main className="main">
           <div className="term-area">
             {tabs.map((t) => (
@@ -429,6 +342,7 @@ export default function App() {
                 fontFamily={fontFamily}
                 fontSize={fontSize}
                 lineHeight={lineHeight}
+                onDisconnect={() => closeTab(t.id)}
                 onClosed={() => {
                   setTabs((prev) =>
                     prev.map((x) =>
@@ -453,13 +367,13 @@ export default function App() {
                 <h1>NexusTerm</h1>
                 <p>跨平台 SSH / SFTP 客户端 · Rust + TypeScript</p>
                 <ul>
-                  <li>双击左侧会话即可连接</li>
+                  <li>点击工具栏「连接」打开连接列表，双击即可连接</li>
                   <li>工具栏「SFTP」在终端与文件管理器之间切换</li>
                   <li>点右上角 ⚙ 或工具栏「外观」调整配色与字体</li>
                   <li>
                     {isMacOS()
-                      ? "⌘C 复制 · Ctrl+C 发送中断信号 · ⌘B 收起侧栏"
-                      : `Ctrl+Shift+C 复制 · Ctrl+Shift+V 粘贴 · Ctrl+C 发送中断信号 · ${modKeyLabel()}+B 收起侧栏`}
+                      ? "⌘C 复制 · Ctrl+C 发送中断信号"
+                      : `Ctrl+Shift+C 复制 · Ctrl+Shift+V 粘贴 · Ctrl+C 发送中断信号`}
                   </li>
                 </ul>
               </div>
@@ -560,56 +474,24 @@ export default function App() {
 
       {toast && <div className="toast">{toast}</div>}
 
-      {ctxMenu && (
-        <>
-          {/* 全屏透明层：点 anywhere 收菜单，再点一次右键也收 */}
-          <div
-            className="ctx-backdrop"
-            onClick={closeCtxMenu}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              closeCtxMenu();
-            }}
-          />
-          <div className="ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
-            <button
-              className="ctx-item"
-              onClick={() => {
-                closeCtxMenu();
-                setEditing(null);
-                setDialogOpen(true);
-              }}
-            >
-              新建会话
-            </button>
-            <button
-              className="ctx-item"
-              onClick={() => {
-                closeCtxMenu();
-                duplicateSession(ctxMenu.session);
-              }}
-            >
-              复制会话
-            </button>
-            <button
-              className="ctx-item"
-              disabled={
-                !tabsRef.current.some((t) => t.sessionId === ctxMenu.session.id)
-              }
-              title={
-                tabsRef.current.some((t) => t.sessionId === ctxMenu.session.id)
-                  ? undefined
-                  : "该会话没有已打开的标签页"
-              }
-              onClick={() => {
-                closeCtxMenu();
-                closeSessionTabs(ctxMenu.session);
-              }}
-            >
-              关闭会话
-            </button>
-          </div>
-        </>
+      {/* 弹出式会话列表 —— 从工具栏「☰ 会话」按钮下方弹出 */}
+      {sessionPopupOpen && (
+        <SessionList
+          sessions={sessions}
+          onConnect={connect}
+          onCreate={() => {
+            setSessionPopupOpen(false);
+            setEditing(null);
+            setDialogOpen(true);
+          }}
+          onEdit={(s) => {
+            setSessionPopupOpen(false);
+            setEditing(s);
+            setDialogOpen(true);
+          }}
+          onDelete={removeSession}
+          onClose={() => setSessionPopupOpen(false)}
+        />
       )}
     </div>
   );

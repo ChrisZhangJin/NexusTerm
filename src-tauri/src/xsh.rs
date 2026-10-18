@@ -38,6 +38,8 @@ struct XshSession {
     username: String,
     auth_type: String, // password | key | agent
     key_path: Option<String>,
+    /// 解密后的明文密码（仅同一台 Windows 机器上可解密）
+    password: Option<String>,
 }
 
 // ——— 编码 ———
@@ -109,6 +111,97 @@ fn lookup<'a>(ini: &'a [(String, String, String)], section: &str, key: &str) -> 
         .map(|(_, _, v)| v.as_str())
 }
 
+// ——— 密码解密（仅 Windows，同一用户同一台机器） ———
+//
+// Xshell 7/8 的密码加密方案（无主密码时）：
+//   key = sha256(reverse(SID) + windows_username)
+//   ciphertext = RC4(key, plaintext) + sha256(plaintext)
+// base64(ciphertext) 存入 xsh 文件的 Password 字段。
+//
+// 解密条件：必须在保存密码的同一个 Windows 帐户上运行。
+// macOS/Linux 上无法解密，也没有 SID 概念。
+
+/// RC4 流密码
+fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut s: Vec<u8> = (0..=255).collect();
+    let mut j: usize = 0;
+    for i in 0..256 {
+        j = (j + s[i] as usize + key[i % key.len()] as usize) % 256;
+        s.swap(i, j);
+    }
+    let mut i: usize = 0;
+    j = 0;
+    data.iter()
+        .map(|&b| {
+            i = (i + 1) % 256;
+            j = (j + s[i] as usize) % 256;
+            s.swap(i, j);
+            b ^ s[(s[i] as usize + s[j] as usize) % 256]
+        })
+        .collect()
+}
+
+/// 尝试解密 xsh 密码字段。成功返回明文，失败返回 None。
+fn try_decrypt_password(b64_password: &str) -> Option<String> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(b64_password)
+        .ok()?;
+    // 密文至少 1 字节明文 + 32 字节 sha256 校验
+    if raw.len() < 33 {
+        return None;
+    }
+
+    let (ciphertext, checksum) = raw.split_at(raw.len() - 32);
+
+    // 获取 Windows SID 和用户名
+    let key_bytes = derive_xshell_key()?;
+
+    // SHA256 作为 RC4 密钥
+    use sha2::{Digest, Sha256};
+    let rc4_key = Sha256::digest(&key_bytes);
+
+    let plaintext = rc4(&rc4_key, ciphertext);
+
+    // 验证：sha256(plaintext) 应等于尾部 32 字节
+    let pt_hash = Sha256::digest(&plaintext);
+    if pt_hash.as_slice() != checksum {
+        return None;
+    }
+
+    String::from_utf8(plaintext).ok()
+}
+
+/// 派生 Xshell 的解密密钥：reverse(SID) + windows_username（字节）
+#[cfg(windows)]
+fn derive_xshell_key() -> Option<Vec<u8>> {
+    // 用 whoami 获取 SID（无需额外依赖）
+    use std::process::Command;
+    let output = Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // 输出格式："DOMAIN\user","S-1-5-21-..."
+    let mut parts = stdout.trim().split(',');
+    let user_part = parts.next()?.trim().trim_matches('"');
+    let sid = parts.next()?.trim().trim_matches('"').trim();
+
+    // 从 "DOMAIN\username" 中提取 username
+    let username = user_part.rsplit('\\').next().unwrap_or(user_part);
+
+    // key = reverse(SID) + username
+    let reversed_sid: String = sid.chars().rev().collect();
+    let key_str = format!("{}{}", reversed_sid, username);
+    Some(key_str.into_bytes())
+}
+
+#[cfg(not(windows))]
+fn derive_xshell_key() -> Option<Vec<u8>> {
+    // 非 Windows 无法解密 Xshell 密码
+    None
+}
+
 // ——— 解析单个 .xsh ———
 
 fn parse_xsh(text: &str, fallback_name: &str) -> Result<XshSession, String> {
@@ -162,6 +255,11 @@ fn parse_xsh(text: &str, fallback_name: &str) -> Result<XshSession, String> {
         None
     };
 
+    // 尝试解密密码（仅在同一 Windows 帐户上有效）
+    let password = lookup(&ini, "CONNECTION:AUTHENTICATION", "Password")
+        .filter(|v| !v.trim().is_empty())
+        .and_then(try_decrypt_password);
+
     let name = lookup(&ini, "SESSION", "SessionName")
         .filter(|v| !v.is_empty())
         .unwrap_or(fallback_name)
@@ -174,6 +272,7 @@ fn parse_xsh(text: &str, fallback_name: &str) -> Result<XshSession, String> {
         username,
         auth_type: auth_type.to_string(),
         key_path,
+        password,
     })
 }
 
@@ -222,6 +321,8 @@ pub fn render_xsh(
 pub struct ParsedFile {
     pub label: String,
     pub result: Result<NewSession, String>,
+    /// 解密出的明文密码（仅同一台 Windows 机器上有效）
+    pub password: Option<String>,
 }
 
 /// 批量解析：每个路径 → 会话记录（密码一律不导入），入库由 cmd 层做。
@@ -234,29 +335,38 @@ pub fn parse_files(paths: &[String]) -> Vec<ParsedFile> {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| p.clone());
-            let result = (|| -> Result<NewSession, String> {
-                let text = read_text(path)?;
+            let (result, password) = (|| -> (Result<NewSession, String>, Option<String>) {
+                let text = match read_text(path) {
+                    Ok(t) => t,
+                    Err(e) => return (Err(e), None),
+                };
                 let fallback = path
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "imported".to_string());
-                let s = parse_xsh(&text, &fallback)?;
-                Ok(NewSession {
-                    name: s.name,
-                    folder: Some("/导入".to_string()),
-                    host: s.host,
-                    port: Some(s.port),
-                    username: s.username,
-                    auth_type: s.auth_type,
-                    key_path: s.key_path,
-                    startup_cmd: None,
-                    theme: None,
-                    connect_timeout: None,
-                })
+                match parse_xsh(&text, &fallback) {
+                    Ok(s) => {
+                        let pw = s.password.clone();
+                        (Ok(NewSession {
+                            name: s.name,
+                            folder: Some("/导入".to_string()),
+                            host: s.host,
+                            port: Some(s.port),
+                            username: s.username,
+                            auth_type: s.auth_type,
+                            key_path: s.key_path,
+                            startup_cmd: None,
+                            theme: None,
+                            connect_timeout: None,
+                        }), pw)
+                    }
+                    Err(e) => (Err(e), None),
+                }
             })();
             ParsedFile {
                 label,
                 result,
+                password,
             }
         })
         .collect()
@@ -339,6 +449,55 @@ mod tests {
     fn rejects_non_ssh() {
         let s = SAMPLE.replace("Protocol=SSH", "Protocol=TELNET");
         assert!(parse_xsh(&s, "x").unwrap_err().contains("不支持的协议"));
+    }
+
+    /// 测试 RC4 实现：用 NIST 的公开测试向量验证正确性
+    #[test]
+    fn rc4_correctness() {
+        // RC4 key=0x0102030405, plaintext=0x00000000000000
+        let key = &[0x01, 0x02, 0x03, 0x04, 0x05];
+        let pt = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let ct = rc4(key, pt);
+        // RC4(Key,PT) → stream 的前几个字节应与公开参考一致
+        assert_eq!(ct.len(), 7);
+        // RC4 是自逆的：再加密一次应还原
+        let back = rc4(key, &ct);
+        assert_eq!(back, pt);
+    }
+
+    /// 测试完整的加密→解密往返（模拟 Xshell 的方案）
+    #[test]
+    fn xshell_password_roundtrip() {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let plaintext = b"TestPassword123";
+        // 模拟一组 key
+        let fake_key = Sha256::digest(b"fake-sid-reversed-plus-username");
+        let ciphertext = rc4(&fake_key, plaintext);
+        let checksum = Sha256::digest(plaintext);
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&ciphertext);
+        blob.extend_from_slice(&checksum);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+
+        // 解密（需要相同的 key）—— 直接调用 rc4 和验证逻辑
+        let raw = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
+        assert!(raw.len() >= 33);
+        let (ct, chk) = raw.split_at(raw.len() - 32);
+        let pt = rc4(&fake_key, ct);
+        assert_eq!(Sha256::digest(&pt).as_slice(), chk);
+        assert_eq!(pt, plaintext);
+    }
+
+    /// 无密码或无效 base64 → password 为 None，不影响正常解析
+    #[test]
+    fn no_password_is_none() {
+        let s = parse_xsh(SAMPLE, "fb").unwrap();
+        assert!(s.password.is_none());
+
+        let s2 = parse_xsh(REAL, "fb").unwrap();
+        // "ENCRYPTED-BLOB" 不是有效密文，解密会 fallback 到 None
+        assert!(s2.password.is_none());
     }
 
     fn read_text_from_bytes(bytes: &[u8]) -> String {

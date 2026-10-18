@@ -1,4 +1,3 @@
-import { modKeyLabel } from "../lib/platform";
 import IOMenu from "./IOMenu";
 
 interface Props {
@@ -7,14 +6,14 @@ interface Props {
   canSftp: boolean;
   sftpOpen: boolean;
   settingsOpen: boolean;
-  sidebarVisible: boolean;
+  sessionPopupOpen: boolean;
   canExportSession: boolean;
   onCreate: () => void;
   onConnect: () => void;
   onDisconnect: () => void;
   onToggleSftp: () => void;
   onToggleSettings: () => void;
-  onToggleSidebar: () => void;
+  onToggleSessionPopup: () => void;
   onImport: () => void;
   onExportSession: () => void;
   onExportAll: () => void;
@@ -27,28 +26,27 @@ export default function Toolbar({
   canSftp,
   sftpOpen,
   settingsOpen,
-  sidebarVisible,
+  sessionPopupOpen,
   canExportSession,
   onCreate,
   onConnect,
   onDisconnect,
   onToggleSftp,
   onToggleSettings,
-  onToggleSidebar,
+  onToggleSessionPopup,
   onImport,
   onExportSession,
   onExportAll,
 }: Props) {
-  const modKey = modKeyLabel();
   return (
     <div className="toolbar">
       <button
-        className={`tb-action ${sidebarVisible ? "active" : ""}`}
-        onClick={onToggleSidebar}
-        title={`${sidebarVisible ? "收起" : "展开"}会话侧栏（${modKey}+B）`}
+        className={`tb-action ${sessionPopupOpen ? "active" : ""}`}
+        onClick={onToggleSessionPopup}
+        title="打开连接列表"
       >
         <span className="tb-glyph">☰</span>
-        会话
+        连接
       </button>
 
       <span className="tb-sep" />
@@ -64,7 +62,7 @@ export default function Toolbar({
         className="tb-action"
         onClick={onConnect}
         disabled={!canConnect}
-        title="连接左侧选中的会话"
+        title="连接选中的会话"
       >
         <span className="tb-glyph">⌁</span>
         连接
