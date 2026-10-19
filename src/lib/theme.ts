@@ -78,10 +78,32 @@ export const BUILTIN_THEMES: Record<string, Theme> = {
 };
 
 export const FONT_FAMILIES = [
-  { label: "SF Mono", value: "SF Mono, Menlo, monospace" },
-  { label: "Menlo", value: "Menlo, monospace" },
-  { label: "JetBrains Mono", value: "JetBrains Mono, Menlo, monospace" },
-  { label: "Fira Code", value: "Fira Code, Menlo, monospace" },
+  // 跨平台等宽字体。各项都带足回退链，确保在 Windows / macOS / Linux 上
+  // 至少命中一款真实存在的字体 —— 否则切换「看不出变化」。
+  {
+    label: "Cascadia Code",
+    value: "Cascadia Code, Cascadia Mono, Consolas, Menlo, monospace",
+  },
+  {
+    label: "Consolas",
+    value: "Consolas, Menlo, monospace",
+  },
+  {
+    label: "JetBrains Mono",
+    value: "JetBrains Mono, Consolas, Menlo, monospace",
+  },
+  {
+    label: "Fira Code",
+    value: "Fira Code, Consolas, Menlo, monospace",
+  },
+  {
+    label: "Courier New",
+    value: "Courier New, Courier, monospace",
+  },
+  {
+    label: "SF Mono / Menlo",
+    value: "SF Mono, Menlo, Consolas, monospace",
+  },
 ];
 
 export const DEFAULT_THEME = "Nexus Dark";

@@ -59,10 +59,36 @@ export interface TerminalTab {
   id: string;
   title: string;
   sessionId: string | null;
-  status: "connecting" | "connected" | "closed" | "error";
+  status: "connecting" | "connected" | "reconnecting" | "closed" | "error";
   error?: string;
   /** true = 本机 PTY（本地 shell），false = 远端 SSH 会话 */
   local?: boolean;
+  /** 用户手动改的标签名；有值时优先于 title 显示 */
+  customTitle?: string;
+  /** 自动重连：当前第几次 / 总次数 */
+  reconnectAttempt?: number;
+  reconnectMax?: number;
+  /** 下一次重连的时间戳（ms），用于倒计时 */
+  reconnectAt?: number;
+  /** 断开时刻（ms），用于横幅显示 */
+  closedAt?: number;
+  /** 最近一次探测到的远端上下文（cwd / tmux / docker），断线后仍保留用于恢复 */
+  ctx?: import("./lib/context").TermContext;
+  /** 最近一次上下文恢复的说明卡片（终端里不回显命令，改由卡片告知） */
+  notice?: {
+    mode: "reconnect" | "duplicate";
+    rows: [string, string][];
+    /** false = 没等到提示符或写入失败，未执行恢复 */
+    ok: boolean;
+    at: number;
+  };
+}
+
+/** 会话结束原因（后端 ClosedInfo 的镜像） */
+export interface ClosedInfo {
+  code: number;
+  /** exit = shell 正常退出；eof = 远端关闭；lost = 连接丢失；user = 本地主动关闭 */
+  reason: "exit" | "eof" | "lost" | "user";
 }
 
 /** 远端/本地统一的目录项。后端 `RemoteEntry` 的镜像。 */

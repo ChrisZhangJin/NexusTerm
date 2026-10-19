@@ -82,6 +82,33 @@ pub fn ssh_close(id: String, state: State<'_, AppState>) {
     state.sessions.close(&id);
 }
 
+/// 探测标签当前的工作目录 / 前台进程 / tmux 会话（用于复制会话、断线恢复）
+#[tauri::command]
+pub async fn ssh_probe(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<crate::ssh::session::ProbeInfo, SessionError> {
+    state.sessions.probe(&id).await
+}
+
+// ——— 系统剪贴板 ———
+// WebView2 里 navigator.clipboard.readText 会被权限策略拦截（静默失败），
+// 统一走后端读写系统剪贴板。
+
+#[tauri::command]
+pub fn clipboard_read() -> Result<String, String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.get_text())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn clipboard_write(text: String) -> Result<(), String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(text))
+        .map_err(|e| e.to_string())
+}
+
 // ——— 会话持久化 ———
 
 #[tauri::command]
@@ -108,21 +135,30 @@ pub fn update_session(
 
 #[tauri::command]
 pub fn delete_session(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    state.store.delete(&id)?;
-    store::secrets::delete(&id);
-    Ok(())
+    // 密码随 sessions 行一起删除，无需单独清理
+    state.store.delete(&id)
 }
 
-// ——— 凭据（Keychain，不入库）———
+/// 拖拽后批量持久化排序与分组归属。
+/// items: [(id, sortOrder, folder), ...]
+#[tauri::command]
+pub fn reorder_sessions(
+    items: Vec<(String, i32, String)>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.store.reorder(&items)
+}
+
+// ——— 凭据（明文随 db 保存，便于跨机器迁移）———
 
 #[tauri::command]
-pub fn save_password(id: String, password: String) -> Result<(), String> {
-    store::secrets::save(&id, &password)
+pub fn save_password(id: String, password: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.store.set_password(&id, &password)
 }
 
 #[tauri::command]
-pub fn load_password(id: String) -> Option<String> {
-    store::secrets::load(&id)
+pub fn load_password(id: String, state: State<'_, AppState>) -> Option<String> {
+    state.store.get_password(&id)
 }
 
 // ——— Xshell .xsh 导入 / 导出 ———
@@ -145,9 +181,9 @@ pub fn import_xsh(paths: Vec<String>, state: State<AppState>) -> Result<Vec<Impo
         let (ok, error, password_imported) = match &parsed.result {
             Ok(new) => match state.store.create(new.clone()) {
                 Ok(created) => {
-                    // 如果密码解密成功，自动存入系统凭据服务
+                    // 如果密码解密成功，自动写入 db 明文密码列
                     let pw_ok = if let Some(ref pw) = parsed.password {
-                        store::secrets::save(&created.id, pw).is_ok()
+                        state.store.set_password(&created.id, pw).is_ok()
                     } else {
                         false
                     };
@@ -180,6 +216,40 @@ pub fn export_xsh(id: String, path: String, state: State<AppState>) -> Result<()
         s.key_path.as_deref(),
     );
     std::fs::write(&path, bytes).map_err(|e| format!("写入失败：{}", e))
+}
+
+/// 导出指定 id 列表的会话到目录（分组导出用）。
+#[tauri::command]
+pub fn export_sessions_xsh(
+    ids: Vec<String>,
+    dir: String,
+    state: State<AppState>,
+) -> Result<usize, String> {
+    let all = state.store.list()?;
+    let selected: Vec<_> = all.into_iter().filter(|s| ids.contains(&s.id)).collect();
+    let mut count = 0usize;
+    for s in &selected {
+        let bytes = crate::xsh::encode_xsh(
+            &s.name,
+            &s.host,
+            s.port,
+            &s.username,
+            &s.auth_type,
+            s.key_path.as_deref(),
+        );
+        let base = std::path::Path::new(&dir);
+        let safe = sanitize_filename(&s.name);
+        let mut target = base.join(format!("{}.xsh", safe));
+        let mut n = 1;
+        while target.exists() {
+            n += 1;
+            target = base.join(format!("{} ({}).xsh", safe, n));
+        }
+        std::fs::write(&target, bytes)
+            .map_err(|e| format!("写入 {} 失败：{}", target.display(), e))?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// 导出全部会话到目录（每个会话一个 .xsh，重名自动加序号）。

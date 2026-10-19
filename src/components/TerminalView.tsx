@@ -4,7 +4,10 @@ import { FitAddon } from "@xterm/addon-fit";
 import { CanvasAddon } from "@xterm/addon-canvas";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
+import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
+import { markOutput, registerTerm } from "../lib/termRegistry";
+import { Highlighter, MARK_COLORS, bufferText, type MarkRule } from "../lib/highlight";
 
 import {
   api,
@@ -17,7 +20,14 @@ import {
 import { isMacOS } from "../lib/platform";
 import { themeToXterm } from "../lib/theme";
 import { attachZmodem } from "../lib/zmodem";
-import type { Theme } from "../types";
+import type { ClosedInfo, TerminalTab, Theme } from "../types";
+
+/** HH:MM:SS，本地时区 */
+export function clock(ts: number): string {
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
 
 interface Props {
   tabId: string;
@@ -28,7 +38,13 @@ interface Props {
   fontFamily: string;
   fontSize: number;
   lineHeight: number;
-  onClosed?: (code: number) => void;
+  onClosed?: (info: ClosedInfo) => void;
+  /** 远端主机地址（断开提示用），本地终端为空 */
+  peerHost?: string;
+  /** 标签状态 —— 用于在终端里打印重连进度 */
+  status?: TerminalTab["status"];
+  reconnectAttempt?: number;
+  reconnectMax?: number;
   /** ZMODEM 传输结果等轻提示 */
   onNotify?: (msg: string) => void;
   /** 断开当前标签页 */
@@ -60,13 +76,28 @@ export default function TerminalView({
   onClosed,
   onNotify,
   onDisconnect,
+  peerHost,
+  status,
+  reconnectAttempt,
+  reconnectMax,
 }: Props) {
+  // 事件回调在 mount 时注册一次，用 ref 拿最新的 props
+  const onClosedRef = useRef(onClosed);
+  onClosedRef.current = onClosed;
+  const peerHostRef = useRef(peerHost);
+  peerHostRef.current = peerHost;
   const isLocal = kind === "local";
   const hostRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const activeRef = useRef(active);
   const [ctxMenu, setCtxMenu] = useState<TermCtxMenu | null>(null);
+  const searchRef = useRef<SearchAddon | null>(null);
+  const hlRef = useRef<Highlighter | null>(null);
+  const [findOpen, setFindOpen] = useState(false);
+  const [markOpen, setMarkOpen] = useState(false);
+  /** 当前生效的标记规则数（右上角徽标用） */
+  const [markCount, setMarkCount] = useState(0);
 
   activeRef.current = active;
 
@@ -108,13 +139,31 @@ export default function TerminalView({
     term.loadAddon(unicode);
     term.unicode.activeVersion = "11"; // 中文 / emoji 宽度必须启用
     term.loadAddon(new WebLinksAddon());
+    const search = new SearchAddon({ highlightLimit: 2000 });
+    term.loadAddon(search);
+    searchRef.current = search;
 
     term.open(host);
     termRef.current = term;
     fitRef.current = fit;
+    const hl = new Highlighter(term);
+    hlRef.current = hl;
 
     let disposed = false;
-    const cleanups: Array<() => void> = [];
+    const cleanups: Array<() => void> = [registerTerm(tabId, term)];
+    // 新输出写完后：记录活跃时间（还原命令等提示符用），并重扫标记高亮
+    const parsedSub = term.onWriteParsed(() => {
+      markOutput(tabId);
+      hl.refresh();
+    });
+    const resizeSub = term.onResize(() => hl.refresh());
+    const bufSub = term.buffer.onBufferChange(() => hl.refresh());
+    cleanups.push(
+      () => parsedSub.dispose(),
+      () => resizeSub.dispose(),
+      () => bufSub.dispose(),
+      () => hl.dispose()
+    );
 
     // —— ZMODEM（lrzsz）：远端 rz/sz 的字节流先过 Sentry 嗅探 ——
     const zmodem = attachZmodem({
@@ -130,21 +179,34 @@ export default function TerminalView({
 
     // 输出 → 终端（SSH 与本地 PTY 协议一致，只是事件名前缀不同）
     const dataFeed = isLocal ? onLocalData : onTermData;
-    const closedFeed = isLocal ? onLocalClosed : onTermClosed;
     dataFeed(tabId, (bytes) => {
       if (!disposed) zmodem.consume(bytes);
     }).then((u) => cleanups.push(u));
 
-    closedFeed(tabId, (code) => {
-      if (disposed) return;
-      term.writeln("");
-      term.writeln(
-        isLocal
-          ? `\x1b[90m[Shell 已退出，退出码 ${code}]\x1b[0m`
-          : `\x1b[90m[会话已关闭，退出码 ${code}]\x1b[0m`
-      );
-      onClosed?.(code);
-    }).then((u) => cleanups.push(u));
+    if (isLocal) {
+      onLocalClosed(tabId, (code) => {
+        if (disposed) return;
+        term.write(`\r\n\x1b[90m[Shell 已退出，退出码 ${code}]\x1b[0m\r\n`);
+        onClosedRef.current?.({ code, reason: "exit" });
+      }).then((u) => cleanups.push(u));
+    } else {
+      onTermClosed(tabId, (info) => {
+        if (disposed || info.reason === "user") return;
+        // Xshell 风格：先说明原因，再给出带时间的断开行，方便事后判断何时掉线
+        const host = peerHostRef.current ?? "remote host";
+        const why =
+          info.reason === "lost"
+            ? "Connection lost (network unreachable or keepalive timeout)."
+            : info.reason === "exit"
+              ? `Connection closed. (exit status ${info.code})`
+              : "Connection closed by foreign host.";
+        term.write(
+          `\r\n\r\n\x1b[33m${why}\x1b[0m\r\n\r\n` +
+            `\x1b[1;33mDisconnected from remote host(${host}) at ${clock(Date.now())}.\x1b[0m\r\n`
+        );
+        onClosedRef.current?.(info);
+      }).then((u) => cleanups.push(u));
+    }
 
     // 键盘输入 → 远端 / 本地 PTY（ZMODEM 会话进行中时忽略，出站被协议帧占用）
     const send = (d: string) =>
@@ -166,16 +228,20 @@ export default function TerminalView({
           return true;
         }
         const k = e.key.toLowerCase();
+        if (k === "f") {
+          setFindOpen(true);
+          return false;
+        }
         if (k === "c") {
           const sel = term.getSelection();
-          if (sel) navigator.clipboard?.writeText(sel).catch(() => {});
+          if (sel) api.clipboardWrite(sel).catch(() => {});
           return false;
         }
         if (k === "v") {
-          navigator.clipboard
-            ?.readText()
+          api
+            .clipboardRead()
             .then((t) => {
-              if (t && !zmodem.isActive()) send(t).catch(() => {});
+              if (t && !zmodem.isActive()) term.paste(t);
             })
             .catch(() => {});
           return false;
@@ -197,8 +263,8 @@ export default function TerminalView({
     const onCtxMenu = (e: MouseEvent) => {
       e.preventDefault();
       if (zmodem.isActive()) return;
-      const MENU_W = 160;
-      const MENU_H = 200;
+      const MENU_W = 190;
+      const MENU_H = 300;
       setCtxMenu({
         x: Math.min(e.clientX, window.innerWidth - MENU_W - 8),
         y: Math.min(e.clientY, window.innerHeight - MENU_H - 8),
@@ -240,6 +306,47 @@ export default function TerminalView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId]);
 
+  // —— 会话一建立就重新对齐尺寸 ——
+  // 挂载时的 fit/resize 发生在 sshConnect 完成之前，后端尚无此会话会静默丢弃；
+  // 若之后容器尺寸没变，ResizeObserver 也不会再触发，远端 PTY 会停留在初始尺寸。
+  useEffect(() => {
+    if (status !== "connected") return;
+    const run = () => {
+      const host = hostRef.current;
+      if (!host || host.clientWidth === 0) return;
+      try {
+        fitRef.current?.fit();
+      } catch {
+        /* noop */
+      }
+      syncSizeRef.current();
+    };
+    run();
+    // 再补一次：标签刚切到前台时布局可能还没稳定
+    const id = window.setTimeout(run, 300);
+    return () => window.clearTimeout(id);
+  }, [status]);
+
+  // —— 重连进度写进终端（留痕，方便回看什么时候断/什么时候恢复） ——
+  const prevStatus = useRef(status);
+  useEffect(() => {
+    const term = termRef.current;
+    const prev = prevStatus.current;
+    prevStatus.current = status;
+    if (!term || isLocal) return;
+    const now = clock(Date.now());
+    if (status === "reconnecting" && reconnectAttempt) {
+      term.write(
+        `\x1b[90mReconnecting to ${peerHost ?? "remote host"} ` +
+          `(attempt ${reconnectAttempt}/${reconnectMax ?? reconnectAttempt}) at ${now}...\x1b[0m\r\n`
+      );
+    } else if (status === "connected" && prev === "reconnecting") {
+      term.write(`\x1b[32mReconnected to ${peerHost ?? "remote host"} at ${now}.\x1b[0m\r\n\r\n`);
+    } else if (status === "closed" && prev === "reconnecting") {
+      term.write(`\x1b[31mReconnect failed at ${now}. 右键标签页可「重新连接」。\x1b[0m\r\n`);
+    }
+  }, [status, reconnectAttempt, reconnectMax, peerHost, isLocal]);
+
   // —— 主题变更 ——
   useEffect(() => {
     const term = termRef.current;
@@ -278,27 +385,26 @@ export default function TerminalView({
     return () => window.clearTimeout(id);
   }, [active, tabId]);
 
-  // 菜单动作
+  // 菜单动作。剪贴板走后端（arboard）：WebView2 下 navigator.clipboard 会被静默拒绝
   const doCopy = useCallback(() => {
     const sel = termRef.current?.getSelection();
-    if (sel) navigator.clipboard?.writeText(sel).catch(() => {});
     setCtxMenu(null);
-  }, []);
+    if (sel) api.clipboardWrite(sel).catch((e) => onNotify?.(`复制失败：${String(e)}`));
+    termRef.current?.focus();
+  }, [onNotify]);
 
   const doPaste = useCallback(() => {
     setCtxMenu(null);
-    navigator.clipboard
-      ?.readText()
+    api
+      .clipboardRead()
       .then((t) => {
-        if (t) {
-          (isLocal
-            ? api.localWrite(tabId, stringToBytes(t))
-            : api.sshWrite(tabId, stringToBytes(t))
-          ).catch(() => {});
-        }
+        if (!t) return;
+        // 走 xterm.paste：自动处理换行规范化与 bracketed paste，和键盘粘贴行为一致
+        termRef.current?.paste(t);
       })
-      .catch(() => {});
-  }, [isLocal, tabId]);
+      .catch((e) => onNotify?.(`粘贴失败：${String(e)}`));
+    termRef.current?.focus();
+  }, [onNotify]);
 
   const doSelectAll = useCallback(() => {
     termRef.current?.selectAll();
@@ -306,19 +412,84 @@ export default function TerminalView({
   }, []);
 
   const doClearScreen = useCallback(() => {
-    termRef.current?.clear();
     setCtxMenu(null);
-  }, []);
+    const t = termRef.current;
+    if (!t) return;
+    t.clear();
+    // 再让远端 shell 重绘提示符（Ctrl+L），否则清完是一片空白
+    (isLocal ? api.localWrite(tabId, [0x0c]) : api.sshWrite(tabId, [0x0c])).catch(() => {});
+    t.focus();
+  }, [isLocal, tabId]);
 
   const doDisconnect = useCallback(() => {
     setCtxMenu(null);
     onDisconnect?.();
   }, [onDisconnect]);
 
-  // 点击任意位置收菜单
+  const doFind = useCallback(() => {
+    setCtxMenu(null);
+    setFindOpen(true);
+  }, []);
+
+  const doMark = useCallback(() => {
+    setCtxMenu(null);
+    setMarkOpen(true);
+  }, []);
+
+  /** 导出整个缓冲区（含滚动历史）为 UTF-8 文本 */
+  const doExport = useCallback(async () => {
+    setCtxMenu(null);
+    const t = termRef.current;
+    if (!t) return;
+    const text = bufferText(t);
+    const p = (n: number) => String(n).padStart(2, "0");
+    const d = new Date();
+    const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+    const base = (peerHost ?? (isLocal ? "local" : "session")).replace(/[\\/:*?"<>|]/g, "_");
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const path = await save({
+        title: "导出终端输出",
+        defaultPath: `${base}-${stamp}.txt`,
+        filters: [
+          { name: "文本文件", extensions: ["txt", "log"] },
+        ],
+      });
+      if (!path) return;
+      await api.writeFile(path, Array.from(new TextEncoder().encode(text)));
+      const lines = text.split("\n").length - 1;
+      onNotify?.(`已导出 ${lines} 行到 ${path}`);
+    } catch (e) {
+      onNotify?.(`导出失败：${String(e)}`);
+    } finally {
+      termRef.current?.focus();
+    }
+  }, [peerHost, isLocal, onNotify]);
+
+  const applyMarks = useCallback(
+    (rules: MarkRule[], cs: boolean) => {
+      const n = hlRef.current?.apply(rules, cs) ?? 0;
+      setMarkCount(hlRef.current?.active.length ?? 0);
+      if (rules.some((r) => r.text)) onNotify?.(`标记完成：共高亮 ${n} 处`);
+      return n;
+    },
+    [onNotify]
+  );
+
+  const clearMarks = useCallback(() => {
+    hlRef.current?.clear();
+    setMarkCount(0);
+  }, []);
+
+  // 点菜单外收菜单。必须排除菜单自身：否则 mousedown 先把菜单卸载，
+  // click 永远到不了按钮 —— 这正是「右键菜单一个都没作用」的根因
+  const ctxRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!ctxMenu) return;
-    const hide = () => setCtxMenu(null);
+    const hide = (e: MouseEvent) => {
+      if (ctxRef.current?.contains(e.target as Node)) return;
+      setCtxMenu(null);
+    };
     // 延一帧避免当次 contextmenu 事件又立即关掉
     const id = requestAnimationFrame(() => {
       document.addEventListener("mousedown", hide);
@@ -343,7 +514,7 @@ export default function TerminalView({
             onClick={() => setCtxMenu(null)}
             onContextMenu={(e) => { e.preventDefault(); setCtxMenu(null); }}
           />
-          <div className="ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
+          <div ref={ctxRef} className="ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
             <button className="ctx-item" onClick={doDisconnect}>
               断开
               <span className="ctx-shortcut">Alt+C</span>
@@ -364,9 +535,291 @@ export default function TerminalView({
             <button className="ctx-item" onClick={doClearScreen}>
               清屏
             </button>
+            <div className="ctx-sep" />
+            <button className="ctx-item" onClick={doFind}>
+              查找…
+              <span className="ctx-shortcut">Ctrl+Shift+F</span>
+            </button>
+            <button className="ctx-item" onClick={doMark}>
+              标记…
+              {markCount > 0 && <span className="ctx-shortcut">{markCount} 条生效</span>}
+            </button>
+            <button className="ctx-item" onClick={doExport}>
+              导出…
+            </button>
           </div>
         </>
       )}
+      {active && findOpen && searchRef.current && (
+        <FindBar
+          search={searchRef.current}
+          initial={termRef.current?.getSelection() ?? ""}
+          onClose={() => {
+            searchRef.current?.clearDecorations();
+            setFindOpen(false);
+            termRef.current?.focus();
+          }}
+        />
+      )}
+      {active && markOpen && hlRef.current && (
+        <MarkDialog
+          initial={hlRef.current.active}
+          initialCase={hlRef.current.isCaseSensitive}
+          seed={termRef.current?.getSelection() ?? ""}
+          onApply={applyMarks}
+          onClear={clearMarks}
+          onClose={() => {
+            setMarkOpen(false);
+            termRef.current?.focus();
+          }}
+        />
+      )}
     </>
+  );
+}
+
+// ——— 查找条 ———
+
+/** 装饰色必须是 #RRGGBB */
+const FIND_DECO = {
+  matchBackground: "#5a4a10",
+  matchBorder: "#c9a227",
+  matchOverviewRuler: "#c9a227",
+  activeMatchBackground: "#ff9632",
+  activeMatchBorder: "#ffffff",
+  activeMatchColorOverviewRuler: "#ff9632",
+};
+
+function FindBar({
+  search,
+  initial,
+  onClose,
+}: {
+  search: SearchAddon;
+  initial: string;
+  onClose: () => void;
+}) {
+  const [q, setQ] = useState(initial.split("\n")[0] ?? "");
+  const [caseSensitive, setCaseSensitive] = useState(false);
+  const [wholeWord, setWholeWord] = useState(false);
+  const [regex, setRegex] = useState(false);
+  const [result, setResult] = useState<{ index: number; count: number } | null>(null);
+  const [bad, setBad] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+
+  useEffect(() => {
+    const sub = search.onDidChangeResults((r) =>
+      setResult({ index: r.resultIndex, count: r.resultCount })
+    );
+    return () => sub.dispose();
+  }, [search]);
+
+  const opts = useCallback(
+    (incremental: boolean) => ({
+      caseSensitive,
+      wholeWord,
+      regex,
+      incremental,
+      decorations: FIND_DECO,
+    }),
+    [caseSensitive, wholeWord, regex]
+  );
+
+  // 关键字或选项变化：增量查找第一个
+  useEffect(() => {
+    if (!q) {
+      search.clearDecorations();
+      setResult(null);
+      setBad(false);
+      return;
+    }
+    if (regex) {
+      try {
+        new RegExp(q);
+      } catch {
+        setBad(true);
+        return;
+      }
+    }
+    setBad(false);
+    const found = search.findNext(q, opts(true));
+    if (!found) setResult({ index: -1, count: 0 });
+  }, [q, opts, regex, search]);
+
+  const next = () => q && !bad && search.findNext(q, opts(false));
+  const prev = () => q && !bad && search.findPrevious(q, opts(false));
+
+  const status = !q
+    ? ""
+    : bad
+      ? "正则无效"
+      : !result || result.count === 0
+        ? "无结果"
+        : result.index < 0
+          ? `${result.count}+ 处`
+          : `${result.index + 1} / ${result.count}`;
+
+  return (
+    <div className="find-bar" onMouseDown={(e) => e.stopPropagation()}>
+      <div className="find-row">
+        <input
+          ref={inputRef}
+          className={`find-input${bad || (result && result.count === 0 && q) ? " miss" : ""}`}
+          value={q}
+          placeholder="查找关键字"
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              if (e.shiftKey) prev();
+              else next();
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              onClose();
+            }
+          }}
+        />
+        <span className="find-status">{status}</span>
+        <button className="find-btn" onClick={prev} title="上一个 (Shift+Enter)">↑</button>
+        <button className="find-btn" onClick={next} title="下一个 (Enter)">↓</button>
+        <button className="find-btn" onClick={onClose} title="关闭 (Esc)">×</button>
+      </div>
+      <div className="find-opts">
+        <label>
+          <input
+            type="checkbox"
+            checked={caseSensitive}
+            onChange={(e) => setCaseSensitive(e.target.checked)}
+          />
+          大小写敏感
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={wholeWord}
+            onChange={(e) => setWholeWord(e.target.checked)}
+          />
+          全词匹配
+        </label>
+        <label>
+          <input type="checkbox" checked={regex} onChange={(e) => setRegex(e.target.checked)} />
+          正则
+        </label>
+      </div>
+    </div>
+  );
+}
+
+// ——— 标记窗口 ———
+
+function MarkDialog({
+  initial,
+  initialCase,
+  seed,
+  onApply,
+  onClear,
+  onClose,
+}: {
+  initial: MarkRule[];
+  initialCase: boolean;
+  /** 打开时终端里的选中文本：自动填进第一个空位 */
+  seed: string;
+  onApply: (rules: MarkRule[], caseSensitive: boolean) => number;
+  onClear: () => void;
+  onClose: () => void;
+}) {
+  const [texts, setTexts] = useState<string[]>(() => {
+    const t = MARK_COLORS.map((c) => initial.find((r) => r.color === c.color)?.text ?? "");
+    const s = seed.split("\n")[0]?.trim();
+    if (s && !t.includes(s)) {
+      const i = t.findIndex((x) => !x);
+      if (i >= 0) t[i] = s;
+    }
+    return t;
+  });
+  const [cs, setCs] = useState(initialCase);
+  const firstRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    firstRef.current?.focus();
+  }, []);
+
+  const submit = () => {
+    onApply(
+      MARK_COLORS.map((c, i) => ({ color: c.color, text: texts[i] ?? "" })),
+      cs
+    );
+    onClose();
+  };
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <div
+        className="modal mark-modal"
+        onMouseDown={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            onClose();
+          } else if (e.key === "Enter") {
+            e.preventDefault();
+            submit();
+          }
+        }}
+      >
+        <h2>标记关键字</h2>
+        <p className="mark-hint">为每种颜色输入要高亮的文本，留空则不使用。新输出会自动按规则继续高亮。</p>
+        {MARK_COLORS.map((c, i) => (
+          <div key={c.key} className="mark-row">
+            <span className="mark-swatch" style={{ background: c.color }} />
+            <span className="mark-label">{c.label}</span>
+            <input
+              ref={i === 0 ? firstRef : undefined}
+              value={texts[i]}
+              placeholder="要高亮的文本"
+              onChange={(e) =>
+                setTexts((prev) => prev.map((x, j) => (j === i ? e.target.value : x)))
+              }
+            />
+            {texts[i] && (
+              <button
+                className="mark-x"
+                title="清空"
+                onClick={() => setTexts((prev) => prev.map((x, j) => (j === i ? "" : x)))}
+              >
+                ×
+              </button>
+            )}
+          </div>
+        ))}
+        <label className="mark-case">
+          <input type="checkbox" checked={cs} onChange={(e) => setCs(e.target.checked)} />
+          大小写敏感
+        </label>
+        <div className="modal-actions">
+          <button
+            className="btn"
+            style={{ marginRight: "auto" }}
+            onClick={() => {
+              onClear();
+              onClose();
+            }}
+          >
+            清除全部标记
+          </button>
+          <button className="btn" onClick={onClose}>
+            取消
+          </button>
+          <button className="btn primary" onClick={submit}>
+            确定
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }

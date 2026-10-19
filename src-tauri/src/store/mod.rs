@@ -53,6 +53,8 @@ pub struct Store {
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     for (column, ddl) in [
         ("connect_timeout", "ALTER TABLE sessions ADD COLUMN connect_timeout INTEGER"),
+        // 密码明文列：为了跨机器迁移连接配置，密码直接随 db 保存
+        ("password", "ALTER TABLE sessions ADD COLUMN password TEXT"),
     ] {
         let exists: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?1")?
@@ -91,6 +93,7 @@ impl Store {
                 startup_cmd  TEXT,
                 theme        TEXT,
                 connect_timeout INTEGER,
+                password     TEXT,
                 sort_order   INTEGER NOT NULL DEFAULT 0,
                 created_at   INTEGER NOT NULL,
                 updated_at   INTEGER NOT NULL
@@ -209,6 +212,46 @@ impl Store {
         Ok(())
     }
 
+    /// 保存明文密码（随 db 持久化，便于跨机器迁移）。
+    pub fn set_password(&self, id: &str, password: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE sessions SET password = ?2 WHERE id = ?1",
+            params![id, password],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// 读取明文密码。
+    pub fn get_password(&self, id: &str) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+        conn.query_row(
+            "SELECT password FROM sessions WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty())
+    }
+
+    /// 批量更新排序与分组归属（拖拽后持久化）。
+    pub fn reorder(&self, items: &[(String, i32, String)]) -> Result<(), String> {
+        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let now = now_secs();
+        for (id, sort_order, folder) in items {
+            tx.execute(
+                "UPDATE sessions SET sort_order = ?2, folder = ?3, updated_at = ?4 WHERE id = ?1",
+                params![id, sort_order, folder, now],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     // 预留给下一阶段：持久化主题、字体、布局比例等外观设置
     #[allow(dead_code)]
     pub fn set_setting(&self, k: &str, v: &str) -> Result<(), String> {
@@ -258,14 +301,41 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// 密码存储 —— 走 macOS Keychain，绝不落 SQLite。
-pub mod secrets {
-    const SERVICE: &str = "com.nexus-term.sessions";
-
-    pub fn save(session_id: &str, password: &str) -> Result<(), String> {
-        let entry = keyring::Entry::new(SERVICE, session_id).map_err(|e| e.to_string())?;
-        entry.set_password(password).map_err(|e| e.to_string())
+impl Store {
+    /// 一次性迁移：把旧版本存在系统凭据服务里的密码搬进 db 的明文列。
+    /// 只对 db 里 password 为空、但凭据服务里有值的会话执行；搬完即从凭据服务删除。
+    pub fn migrate_legacy_secrets(&self) {
+        let ids: Vec<String> = {
+            let conn = match self.conn.lock() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let mut stmt = match conn.prepare(
+                "SELECT id FROM sessions WHERE password IS NULL OR password = ''",
+            ) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map(|it| it.flatten().collect::<Vec<_>>())
+                .unwrap_or_default();
+            rows
+        };
+        for id in ids {
+            if let Some(pw) = legacy_keyring::load(&id) {
+                if !pw.is_empty() {
+                    let _ = self.set_password(&id, &pw);
+                    legacy_keyring::delete(&id);
+                }
+            }
+        }
     }
+}
+
+/// 旧版密码存储（系统凭据服务）—— 仅用于一次性迁移到明文 db。
+mod legacy_keyring {
+    const SERVICE: &str = "com.nexus-term.sessions";
 
     pub fn load(session_id: &str) -> Option<String> {
         let entry = keyring::Entry::new(SERVICE, session_id).ok()?;

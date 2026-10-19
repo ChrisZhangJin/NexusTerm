@@ -82,11 +82,50 @@ pub enum AuthMethod {
 
 /// 一个 SSH 会话的运行时句柄
 struct SessionRuntime {
-    // 保留 handle 以便优雅断开；目前由读写循环负责生命周期
-    #[allow(dead_code)]
-    handle: Handle<ClientHandler>,
+    /// 连接句柄：用于在同一连接上开旁路 exec 通道（探测 pwd / tmux / docker）
+    handle: Arc<Handle<ClientHandler>>,
     input_tx: mpsc::UnboundedSender<SessionInput>,
 }
+
+/// 探测脚本：在同一 SSH 连接上开 exec 通道执行（stdin 喂给 `sh -s`，不依赖用户登录 shell 类型）。
+///
+/// 原理：同一 TCP 连接上的所有通道共享同一个 `SSH_CONNECTION`（含客户端端口，全局唯一）。
+/// 据此在 /proc 里找出「父进程是 sshd、且 stdin 是 pts」的进程 —— 就是本标签的交互 shell；
+/// 再从其 stat 的 tpgid 拿到前台进程组，读出 cwd / 命令行；tmux 则按 tty 查询所附着的 session。
+/// 只读、不修改远端任何东西；非 Linux（无 /proc）时输出为空，前端按「未知」处理。
+const PROBE_SCRIPT: &str = r#"
+sc="$SSH_CONNECTION"
+[ -n "$sc" ] || exit 0
+[ -d /proc/self ] || exit 0
+shell=""; tty=""
+for p in /proc/[0-9]*; do
+  [ -O "$p" ] || continue
+  pid=${p#/proc/}
+  [ "$pid" = "$$" ] && continue
+  t=$(readlink "$p/fd/0" 2>/dev/null) || continue
+  case "$t" in /dev/pts/*) ;; *) continue ;; esac
+  tr '\0' '\n' < "$p/environ" 2>/dev/null | grep -qxF "SSH_CONNECTION=$sc" || continue
+  pp=$(sed 's/.*) //' "$p/stat" 2>/dev/null | awk '{print $2}')
+  case "$(cat /proc/$pp/comm 2>/dev/null)" in sshd*) shell=$pid; tty=$t; break ;; esac
+done
+[ -n "$shell" ] || exit 0
+echo "TTY=$tty"
+echo "SHELL_CWD=$(readlink /proc/$shell/cwd 2>/dev/null)"
+fg=$(sed 's/.*) //' /proc/$shell/stat 2>/dev/null | awk '{print $6}')
+if [ -n "$fg" ] && [ "$fg" -gt 0 ] 2>/dev/null && [ -r "/proc/$fg/cmdline" ]; then
+  echo "FG_COMM=$(cat /proc/$fg/comm 2>/dev/null)"
+  echo "FG_CWD=$(readlink /proc/$fg/cwd 2>/dev/null)"
+  printf 'FG_ARGS='; tr '\0' '\037' < /proc/$fg/cmdline 2>/dev/null; echo
+fi
+if command -v tmux >/dev/null 2>&1; then
+  # list-clients 按 tty 匹配（display-message -p -c 在 tmux 3.2 不可用）
+  tmux list-clients -F '#{client_tty}	#{session_name}	#{pane_current_path}' 2>/dev/null |
+    awk -F '\t' -v t="$tty" '$1==t { print "TMUX_SESSION=" $2; print "TMUX_PATH=" $3; exit }'
+fi
+"#;
+
+/// 探测结果：KEY=VALUE 原样回传，由前端解释（规则改动不必重编 Rust）
+pub type ProbeInfo = HashMap<String, String>;
 
 /// 全局会话管理器
 pub struct SessionManager {
@@ -132,7 +171,13 @@ impl SessionManager {
             host_key_rejected: host_key_rejected.clone(),
         };
 
-        let config = Arc::new(russh::client::Config::default());
+        // 必须开 keepalive：网线拔掉 / 中间 NAT 丢表时 TCP 不会报错，
+        // 不探活的话会话会无限期「假在线」。10s 探一次，连续 3 次无响应判定断开。
+        let config = Arc::new(russh::client::Config {
+            keepalive_interval: Some(std::time::Duration::from_secs(10)),
+            keepalive_max: 3,
+            ..Default::default()
+        });
 
         // 内核默认的 TCP 超时约 75 秒，用户会以为软件卡死。显式给上限，
         // 超时后立刻返回可读的中文提示，而不是干等。
@@ -192,7 +237,7 @@ impl SessionManager {
         self.inner.lock().insert(
             id.clone(),
             SessionRuntime {
-                handle: session,
+                handle: Arc::new(session),
                 input_tx,
             },
         );
@@ -210,6 +255,53 @@ impl SessionManager {
         rt.input_tx
             .send(SessionInput::Data(data))
             .map_err(|_| SessionError::Channel("输入通道已关闭".into()))
+    }
+
+    /// 探测该标签交互 shell 的工作目录 / 前台进程 / tmux 会话。
+    /// 走旁路 exec 通道，不会往用户终端里写任何东西。
+    pub async fn probe(&self, id: &str) -> Result<ProbeInfo, SessionError> {
+        let handle = {
+            let map = self.inner.lock();
+            map.get(id)
+                .ok_or_else(|| SessionError::NotFound(id.into()))?
+                .handle
+                .clone()
+        };
+        let run = async move {
+            let mut ch = handle
+                .channel_open_session()
+                .await
+                .map_err(|e| SessionError::Channel(e.to_string()))?;
+            ch.exec(true, "sh -s")
+                .await
+                .map_err(|e| SessionError::Channel(e.to_string()))?;
+            ch.data(PROBE_SCRIPT.as_bytes())
+                .await
+                .map_err(|e| SessionError::Channel(e.to_string()))?;
+            ch.eof().await.map_err(|e| SessionError::Channel(e.to_string()))?;
+            let mut out = Vec::new();
+            while let Some(msg) = ch.wait().await {
+                match msg {
+                    ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            Ok::<_, SessionError>(out)
+        };
+        let out = tokio::time::timeout(std::time::Duration::from_secs(8), run)
+            .await
+            .map_err(|_| SessionError::Channel("探测超时".into()))??;
+        let text = String::from_utf8_lossy(&out);
+        let mut info = ProbeInfo::new();
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                if !v.is_empty() {
+                    info.insert(k.trim().to_string(), v.to_string());
+                }
+            }
+        }
+        Ok(info)
     }
 
     pub fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), SessionError> {
@@ -290,6 +382,16 @@ where
     Ok(())
 }
 
+/// 会话结束事件负载：前端据此决定提示文案以及是否自动重连。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosedInfo {
+    pub code: i32,
+    /// exit = 远端 shell 正常退出；eof = 远端主动关闭通道；
+    /// lost = 连接丢失（网络断开 / keepalive 超时 / 写失败）；user = 本地主动关闭
+    pub reason: &'static str,
+}
+
 /// 读写主循环。select! 同时处理「远端数据」与「本地输入」两条流。
 async fn read_loop(
     app: AppHandle,
@@ -297,6 +399,7 @@ async fn read_loop(
     mut channel: russh::Channel<russh::client::Msg>,
     mut input_rx: mpsc::UnboundedReceiver<SessionInput>,
 ) {
+    let mut info = ClosedInfo { code: 0, reason: "lost" };
     loop {
         tokio::select! {
             msg = channel.wait() => {
@@ -309,6 +412,7 @@ async fn read_loop(
                             .emit(&format!("nx://term/data/{}", id), payload)
                             .is_err()
                         {
+                            info.reason = "user"; // 前端已不在，无需提示
                             break;
                         }
                     }
@@ -318,25 +422,39 @@ async fn read_loop(
                         }
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
+                        // 先别 break：ExitStatus 之后通常还跟着 Eof/Close，统一在循环外发一次
                         tracing::info!(session = id, exit_status, "远端 shell 退出");
-                        let _ = app.emit(&format!("nx://term/closed/{}", id), exit_status);
-                        break;
+                        info = ClosedInfo { code: exit_status as i32, reason: "exit" };
                     }
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
-                        let _ = app.emit(&format!("nx://term/closed/{}", id), 0i32);
+                    // OpenSSH 的顺序通常是 Eof → ExitStatus → Close，所以 Eof 不能立刻退出，
+                    // 否则会漏掉退出码；以 Close（或通道流结束）为准
+                    Some(ChannelMsg::Eof) => {
+                        if info.reason != "exit" {
+                            info.reason = "eof";
+                        }
+                    }
+                    Some(ChannelMsg::Close) => {
+                        if info.reason != "exit" {
+                            info.reason = "eof";
+                        }
                         break;
                     }
                     Some(ChannelMsg::Success) | Some(ChannelMsg::Failure) => {}
                     Some(other) => {
                         tracing::trace!(session = id, "未处理的通道消息: {:?}", other);
                     }
+                    // None：底层连接已断（keepalive 超时 / TCP 重置）。若之前收到过
+                    // ExitStatus 则仍算正常退出
                     None => break,
                 }
             }
             Some(input) = input_rx.recv() => {
                 match input {
                     SessionInput::Data(bytes) => {
-                        if channel.data(&bytes[..]).await.is_err() { break; }
+                        if channel.data(&bytes[..]).await.is_err() {
+                            info.reason = "lost";
+                            break;
+                        }
                     }
                     SessionInput::Resize { cols, rows, pix_w, pix_h } => {
                         // 同步远端 COLUMNS/LINES，否则 vim / top 显示会错乱
@@ -346,6 +464,7 @@ async fn read_loop(
                     }
                     SessionInput::Close => {
                         let _ = channel.close().await;
+                        info.reason = "user";
                         break;
                     }
                 }
@@ -353,11 +472,12 @@ async fn read_loop(
             else => break,
         }
     }
-    let _ = app.emit(&format!("nx://term/closed/{}", id), 0i32);
+    tracing::info!(session = id, reason = info.reason, code = info.code, "会话结束");
+    let _ = app.emit(&format!("nx://term/closed/{}", id), info);
 }
 
 #[allow(dead_code)]
-async fn graceful_close(handle: &mut Handle<ClientHandler>) {
+async fn graceful_close(handle: &Handle<ClientHandler>) {
     let _ = handle
         .disconnect(Disconnect::ByApplication, "session closed", "en-US")
         .await;

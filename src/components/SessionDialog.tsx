@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { normalizeTimeout } from "../lib/errors";
-import { credentialServiceName, sshDirLabel } from "../lib/platform";
+import { sshDirLabel } from "../lib/platform";
 import type { DiscoveredKey, NewSession, SessionRecord } from "../types";
 
 interface Props {
@@ -12,7 +12,7 @@ interface Props {
 
 export default function SessionDialog({ editing, onSave, onClose }: Props) {
   const [name, setName] = useState("");
-  const [folder, setFolder] = useState("/");
+  const [folder, setFolder] = useState("");
   const [host, setHost] = useState("");
   const [port, setPort] = useState("22");
   const [username, setUsername] = useState("");
@@ -29,16 +29,23 @@ export default function SessionDialog({ editing, onSave, onClose }: Props) {
     api.listSshKeys().then(setKeys).catch(() => {});
     if (editing) {
       setName(editing.name);
-      setFolder(editing.folder);
+      // 根目录（"/"）在界面上展示为空
+      setFolder(editing.folder === "/" ? "" : editing.folder);
       setHost(editing.host);
       setPort(String(editing.port));
       setUsername(editing.username);
       setAuthType(editing.authType);
       setKeyPath(editing.keyPath ?? "");
       setConnectTimeout(String(normalizeTimeout(editing.connectTimeout)));
+      // 载入已保存的密码，方便查看/修改
+      if (editing.authType === "password") {
+        api.loadPassword(editing.id).then((p) => setPassword(p ?? "")).catch(() => {});
+      } else {
+        setPassword("");
+      }
     } else {
       setName("");
-      setFolder("/");
+      setFolder("");
       setHost("");
       setPort("22");
       setUsername("");
@@ -63,6 +70,7 @@ export default function SessionDialog({ editing, onSave, onClose }: Props) {
       await onSave(
         {
           name: name.trim() || `${username}@${host}`,
+          // 空 = 根目录；多级用 / 分隔，如「生产环境/华东」
           folder: folder.trim() || "/",
           host: host.trim(),
           port: Number(port) || 22,
@@ -92,7 +100,11 @@ export default function SessionDialog({ editing, onSave, onClose }: Props) {
         </div>
         <div className="row">
           <label>分组</label>
-          <input value={folder} onChange={(e) => setFolder(e.target.value)} placeholder="/" />
+          <input
+            value={folder}
+            onChange={(e) => setFolder(e.target.value)}
+            placeholder="留空=根目录，多级用 / 分隔，如 生产环境/华东"
+          />
         </div>
         <div className="row">
           <label>主机</label>
@@ -141,7 +153,7 @@ export default function SessionDialog({ editing, onSave, onClose }: Props) {
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              placeholder={`保存在${credentialServiceName()}，不写入数据库`}
+              placeholder="随连接配置保存，可随数据库迁移到其他机器"
             />
           </div>
         )}

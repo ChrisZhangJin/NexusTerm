@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  ClosedInfo,
   ConnectRequest,
   DiscoveredKey,
   NewSession,
@@ -18,6 +19,10 @@ export const api = {
   sshResize: (id: string, cols: number, rows: number) =>
     invoke<void>("ssh_resize", { id, cols, rows }),
   sshClose: (id: string) => invoke<void>("ssh_close", { id }),
+  /** 探测远端交互 shell 的 cwd / 前台进程 / tmux（KEY→VALUE） */
+  sshProbe: (id: string) => invoke<Record<string, string>>("ssh_probe", { id }),
+  clipboardRead: () => invoke<string>("clipboard_read"),
+  clipboardWrite: (text: string) => invoke<void>("clipboard_write", { text }),
 
   listSessions: () => invoke<SessionRecord[]>("list_sessions"),
   createSession: (session: NewSession) =>
@@ -25,6 +30,9 @@ export const api = {
   updateSession: (id: string, session: NewSession) =>
     invoke<SessionRecord>("update_session", { id, session }),
   deleteSession: (id: string) => invoke<void>("delete_session", { id }),
+  /** 拖拽后批量持久化排序与分组归属：items = [id, sortOrder, folder][] */
+  reorderSessions: (items: [string, number, string][]) =>
+    invoke<void>("reorder_sessions", { items }),
 
   savePassword: (id: string, password: string) =>
     invoke<void>("save_password", { id, password }),
@@ -37,6 +45,8 @@ export const api = {
     ),
   exportXsh: (id: string, path: string) =>
     invoke<void>("export_xsh", { id, path }),
+  exportSessionsXsh: (ids: string[], dir: string) =>
+    invoke<number>("export_sessions_xsh", { ids, dir }),
   exportAllXsh: (dir: string) => invoke<number>("export_all_xsh", { dir }),
 
   listSshKeys: () => invoke<DiscoveredKey[]>("list_ssh_keys"),
@@ -120,7 +130,10 @@ export async function onLocalClosed(
 /** 订阅会话关闭 */
 export async function onTermClosed(
   id: string,
-  handler: (code: number) => void
+  handler: (info: ClosedInfo) => void
 ): Promise<UnlistenFn> {
-  return listen<number>(`nx://term/closed/${id}`, (ev) => handler(ev.payload));
+  return listen<ClosedInfo | number>(`nx://term/closed/${id}`, (ev) => {
+    const p = ev.payload;
+    handler(typeof p === "number" ? { code: p, reason: "eof" } : p);
+  });
 }

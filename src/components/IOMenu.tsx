@@ -56,7 +56,7 @@ export default function IOMenu({
             <span className="io-glyph">⤓</span>
             <span className="io-text">
               导入 Xshell 会话 (.xsh)…
-              <small>支持多选；密码无法迁移，导入后需重填</small>
+              <small>支持多选；同机同用户的密码会自动解密导入</small>
             </span>
           </button>
 

@@ -37,6 +37,8 @@ pub fn run() {
         .setup(|app| {
             let dir = app_data_dir(app.handle());
             let store = Store::open(dir).expect("SQLite 初始化失败");
+            // 把旧版存在系统凭据服务里的密码迁移到 db 明文列
+            store.migrate_legacy_secrets();
             let sessions = SessionManager::new();
             // SFTP 复用同一份主机指纹表，保证 TOFU 策略在两个通道上一致
             let sftp = SftpManager::new(sessions.known_hosts());
@@ -56,14 +58,19 @@ pub fn run() {
             cmd::ssh_write,
             cmd::ssh_resize,
             cmd::ssh_close,
+            cmd::ssh_probe,
+            cmd::clipboard_read,
+            cmd::clipboard_write,
             cmd::list_sessions,
             cmd::create_session,
             cmd::update_session,
             cmd::delete_session,
             cmd::save_password,
             cmd::load_password,
+            cmd::reorder_sessions,
             cmd::import_xsh,
             cmd::export_xsh,
+            cmd::export_sessions_xsh,
             cmd::export_all_xsh,
             cmd::list_ssh_keys,
             cmd::verify_key,
