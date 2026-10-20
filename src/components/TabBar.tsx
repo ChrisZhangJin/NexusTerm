@@ -23,6 +23,9 @@ interface Props {
   /** 最左侧「☰ 连接」按钮（原工具栏唯一按钮，已并入标签栏） */
   sessionPopupOpen: boolean;
   onToggleSessionPopup: () => void;
+  /** 右侧 AI 助手面板开关 */
+  agentOpen: boolean;
+  onToggleAgent: () => void;
 }
 
 const tabLabel = (t: TerminalTab) => t.customTitle || t.title;
@@ -47,6 +50,8 @@ export default function TabBar({
   onMove,
   sessionPopupOpen,
   onToggleSessionPopup,
+  agentOpen,
+  onToggleAgent,
 }: Props) {
   const [ctx, setCtx] = useState<{ x: number; y: number; id: string } | null>(null);
   const ctxRef = useRef<HTMLDivElement>(null);
@@ -224,6 +229,21 @@ export default function TabBar({
           +
         </button>
       </div>
+
+      {/* AI 助手面板开关：靠右，与标签列表分开（.tabs 是 flex:1，把这里顶到最右） */}
+      <button
+        className={`tb-action tabbar-agent ${agentOpen ? "active" : ""}`}
+        onClick={onToggleAgent}
+        title={
+          agentOpen
+            ? "收起 AI 助手面板"
+            : "展开 AI 助手面板（它能看到当前会话的终端输出，用来带上下文回答问题）"
+        }
+        aria-pressed={agentOpen}
+      >
+        <span className="tb-glyph">✦</span>
+        AI
+      </button>
 
       {ctx && ctxTab && (
         <div ref={ctxRef} className="ctx-menu" style={{ left: ctx.x, top: ctx.y }}>

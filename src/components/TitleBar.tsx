@@ -9,7 +9,7 @@ interface Props {
   themeName: string;
   onCycleTheme: () => void;
   /** 打开「设置」下的某个窗口 */
-  onOpenSettings: (which: "appearance" | "shortcuts") => void;
+  onOpenSettings: (which: "appearance" | "shortcuts" | "agent") => void;
   /** 有设置窗口打开时高亮齿轮 */
   settingsOpen: boolean;
 }
@@ -58,7 +58,7 @@ export default function TitleBar({
     };
   }, [menuOpen]);
 
-  const pick = (w: "appearance" | "shortcuts") => {
+  const pick = (w: "appearance" | "shortcuts" | "agent") => {
     setMenuOpen(false);
     onOpenSettings(w);
   };
@@ -119,6 +119,10 @@ export default function TitleBar({
               </button>
               <button className="ctx-item" role="menuitem" onClick={() => pick("shortcuts")}>
                 快捷键…
+              </button>
+              <button className="ctx-item" role="menuitem" onClick={() => pick("agent")}>
+                AI 助手…
+                <span className="ctx-shortcut">把会话输出旁路给模型</span>
               </button>
             </div>
           )}

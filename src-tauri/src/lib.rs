@@ -9,6 +9,7 @@ use ssh::session::SessionManager;
 use store::Store;
 
 pub mod errors;
+mod agent;
 mod cmd;
 mod keys;
 mod local;
@@ -46,12 +47,18 @@ pub fn run() {
             let sessions = SessionManager::new();
             // SFTP 复用同一份主机指纹表，保证 TOFU 策略在两个通道上一致
             let sftp = SftpManager::new(sessions.known_hosts());
+            // AI 旁路：启动时把 db 里的配置灌进内存里的原子开关，
+            // 否则设施齐全但全局默认关闭，feed 会一路短路
+            let agent = agent::AgentManager::new();
+            agent.apply_config(&agent::load_config(&store));
             app.manage(reader::DocStore::default());
             app.manage(AppState {
                 sessions,
                 sftp,
                 store,
                 local: LocalManager::new(),
+                agent,
+                llm: agent::llm::LlmRuntime::new(),
             });
             tracing::info!("nexus-term 后端就绪");
             Ok(())
@@ -102,6 +109,16 @@ pub fn run() {
             reader::reader_open_ssh,
             reader::reader_open_local,
             reader::reader_doc,
+            agent::cmd::agent_get_config,
+            agent::cmd::agent_set_config,
+            agent::cmd::agent_set_session,
+            agent::cmd::agent_get_session,
+            agent::cmd::agent_context,
+            agent::cmd::agent_clear,
+            agent::cmd::agent_stats,
+            agent::cmd::agent_ask,
+            agent::cmd::agent_cancel,
+            agent::cmd::agent_test,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

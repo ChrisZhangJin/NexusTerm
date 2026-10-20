@@ -6,8 +6,14 @@ import FileManager from "./components/FileManager";
 import TitleBar from "./components/TitleBar";
 import TabBar from "./components/TabBar";
 import StatusBar from "./components/StatusBar";
-import { AppearanceDialog, ShortcutsDialog } from "./components/SettingsDialogs";
+import { AgentPanel } from "./components/AgentPanel";
+import {
+  AppearanceDialog,
+  AgentDialog,
+  ShortcutsDialog,
+} from "./components/SettingsDialogs";
 import { api, stringToBytes } from "./api";
+import { loadAgentConfig } from "./lib/agent";
 import {
   parseProbe,
   restoreCommand,
@@ -47,11 +53,19 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<SessionRecord | null>(null);
-  /** 设置窗口：外观 / 快捷键（模态，同一时刻只开一个） */
-  const [settingsWin, setSettingsWin] = useState<"appearance" | "shortcuts" | null>(null);
+  /** 设置窗口：外观 / 快捷键 / AI 助手（模态，同一时刻只开一个） */
+  const [settingsWin, setSettingsWin] = useState<
+    "appearance" | "shortcuts" | "agent" | null
+  >(null);
   const settingsOpen = settingsWin !== null;
   // 非空时展示该会话的 SFTP 文件管理器
   const [fmSession, setFmSession] = useState<SessionRecord | null>(null);
+  /**
+   * AI 助手侧栏是否展开。
+   * 与「面板是否挂载」是两件事：面板始终挂载、只切 visible，
+   * 否则一轮对话的历史会随收起一起丢掉。
+   */
+  const [agentOpen, setAgentOpen] = useState(false);
 
   // 外观持久化到 localStorage（之前每次启动都回到默认）
   const [themeName, setThemeName] = useState(() => {
@@ -160,6 +174,26 @@ export default function App() {
     setActiveTab(tab.id);
   }, []);
 
+  /**
+   * 新会话建立时，把「是否旁路」的默认值下发到后端。
+   *
+   * 后端对「没登记过的会话」本来就回落到全局 autoAttach，所以这条 IPC 严格说
+   * 是冗余的；仍然发一次，是为了让这个会话的开关状态**在还没有任何输出时就
+   * 是确定的** —— 面板打开即可看到它是开是关、也能在采集开始前就关掉它，
+   * 而不是等第一字节输出时被 feed() 顺手建出来、想关也已经采了一截。
+   *
+   * 两条硬约束：
+   * - 总开关关着时什么都不发。未启用 = 零开销，一条 IPC 也不该有。
+   * - 只在**建会话时**发一次。之后用户在面板里的每次开关都由面板直接写后端
+   *   （它是这条状态的唯一写入者），App 不另起一份镜像，避免两处状态打架。
+   */
+  const seedAgentAttach = useCallback((tabId: string) => {
+    void loadAgentConfig().then((cfg) => {
+      if (!cfg.enabled || !cfg.autoAttach) return;
+      api.agentSetSession(tabId, true).catch(() => {});
+    });
+  }, []);
+
   /** 对指定标签发起一次 SSH 拨号（新建与重连共用） */
   const dial = useCallback(async (tabId: string, s: SessionRecord) => {
     const auth: AuthMethod = await resolveAuth(s, passphraseRef.current.get(s.id));
@@ -256,6 +290,8 @@ export default function App() {
         { id: tabId, title: s.name, customTitle: title, sessionId: s.id, status: "connecting" },
         afterId
       );
+      // 旁路开关的默认值只跟会话一起定一次，之后交给面板
+      seedAgentAttach(tabId);
       try {
         const since = Date.now();
         await dial(tabId, s);
@@ -270,7 +306,7 @@ export default function App() {
         patchTab(tabId, { status: "error", error: String(e) });
       }
     },
-    [dial, insertTab, patchTab, applyContext]
+    [dial, insertTab, seedAgentAttach, patchTab, applyContext]
   );
 
   /**
@@ -458,6 +494,25 @@ export default function App() {
     [askConfirm, closeTabNow]
   );
 
+  /**
+   * 把文本写进某个会话的 pty —— AI 面板「插入到终端」的唯一落地路径。
+   *
+   * 调用链上必然已经过了两道人为确认：点建议卡片上的「插入到终端」→ 在确认框里
+   * 点「插入」。除这条链路外，本函数没有任何调用方，也不接受任何自动触发。
+   *
+   * **刻意不追加 \n**：只把命令插进当前输入行，回车执行留给人在终端里自己按。
+   * 替用户按下这个回车，等于替他执行一条可能没读完的命令 —— 那不是便利，是事故。
+   * 后端会把这次写入当成 StreamKind::In 记进上下文，与人手敲进去的命令同等对待。
+   */
+  const sendToTerminal = useCallback(async (tabId: string, text: string) => {
+    if (!text) return;
+    const t = tabsRef.current.find((x) => x.id === tabId);
+    if (!t) return;
+    const bytes = stringToBytes(text);
+    if (t.local) await api.localWrite(tabId, bytes);
+    else await api.sshWrite(tabId, bytes);
+  }, []);
+
   const saveSession = useCallback(
     async (payload: NewSession, password: string) => {
       if (editing) {
@@ -583,12 +638,14 @@ export default function App() {
         { id, title: "本地终端", sessionId: null, status: "connected", local: true },
         afterId
       );
+      // 本地终端也走同一条旁路（后端 local 读线程同样会 feed）
+      seedAgentAttach(id);
       api.localSpawn(id, 120, 32).catch((e) => {
         patchTab(id, { status: "error", error: String(e) });
         showToast(`本地终端启动失败：${String(e)}`);
       });
     },
-    [insertTab, patchTab, showToast]
+    [insertTab, seedAgentAttach, patchTab, showToast]
   );
 
   // —— 启动时开一个本地 shell：没有 SSH 连接时也能当终端用 ——
@@ -742,6 +799,13 @@ export default function App() {
   // 当前激活标签是否有对应会话（用于导出按钮状态）
   const canExportActive = !!activeSession;
 
+  /**
+   * 侧栏真正占位的时机。
+   * 面板本身帮不上忙的两种情况：用户收起、或一个会话都没有（旁路无从谈起）。
+   * 这两种情况下容器宽度直接归零，不留一条空白。
+   */
+  const agentShown = agentOpen && !!activeTab;
+
   return (
     <div className="app" data-theme={themeName}>
       <TitleBar
@@ -767,6 +831,8 @@ export default function App() {
         onDuplicateWithState={(id) => duplicateTab(id, true)}
         onRename={renameTab}
         onMove={moveTab}
+        agentOpen={agentOpen}
+        onToggleAgent={() => setAgentOpen((v) => !v)}
       />
 
       <div className="workspace">
@@ -867,6 +933,30 @@ export default function App() {
               ))}
           </div>
         </main>
+
+        {/*
+          AI 助手侧栏。
+
+          放在 .workspace 里（与 .main 并列）而不是 .term-area 里：.term-area 是
+          position:relative，终端宿主是 inset:0 的绝对定位元素，塞在这里只会盖住
+          终端右边一块；而 .workspace 本来就是 flex 行容器、.main 是 flex:1，
+          于是侧栏占多少、.main 就少多少 —— 终端宽度自然跟着变，
+          TerminalView 现有的 ResizeObserver 会重新 fit 并把新尺寸推给后端。
+          这样既不用改 term-area 的内部结构，也不用新造一套尺寸通知。
+
+          面板**始终挂载**：聊天记录按会话存在组件内部（切会话互不可见），
+          卸载即丢失。收起只是把 visible 置 false（组件自己返回 null、停掉
+          事件订阅与状态轮询），并把容器宽度归零。
+        */}
+        <div className={`agent-side${agentShown ? "" : " collapsed"}`}>
+          <AgentPanel
+            sessionId={activeTab ?? ""}
+            visible={agentShown}
+            onClose={() => setAgentOpen(false)}
+            onSendToTerminal={sendToTerminal}
+            onOpenSettings={() => setSettingsWin("agent")}
+          />
+        </div>
       </div>
 
       {/* 右下角计数 = 当前打开的标签数（与 Xshell「N 会话」一致），不是已保存的连接数 */}
@@ -907,6 +997,7 @@ export default function App() {
         />
       )}
       {settingsWin === "shortcuts" && <ShortcutsDialog onClose={() => setSettingsWin(null)} />}
+      {settingsWin === "agent" && <AgentDialog onClose={() => setSettingsWin(null)} />}
 
       {dialogOpen && (
         <SessionDialog

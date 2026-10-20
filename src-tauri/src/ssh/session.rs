@@ -8,7 +8,7 @@ const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::
 use russh::client::Handle;
 use russh::{ChannelMsg, Disconnect};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
 use super::{ClientHandler, KnownHosts};
@@ -541,6 +541,12 @@ async fn read_loop(
                         {
                             info.reason = "user"; // 前端已不在，无需提示
                             break;
+                        }
+                        // 旁路：主链路已经把数据投到屏幕上了，这里只是顺手复制一份。
+                        // 拿不到状态（AppState 尚未托管）就安静跳过 —— 绝不能因为
+                        // agent 缓冲出错而让终端断连。
+                        if let Some(st) = app.try_state::<crate::cmd::AppState>() {
+                            st.agent.feed(&id, &data, crate::agent::StreamKind::Out);
                         }
                     }
                     Some(ChannelMsg::ExtendedData { data, ext, .. }) => {

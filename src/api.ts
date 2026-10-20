@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AgentBufferStats,
+  AgentConfig,
+  AgentDonePayload,
   ClosedInfo,
   ConnectRequest,
   DiscoveredKey,
@@ -91,6 +94,38 @@ export const api = {
   writeFile: (path: string, data: number[]) =>
     invoke<void>("write_file", { path, data }),
 
+  // ——— AI Agent 旁路（终端输出旁路喂给 LLM） ———
+
+  agentGetConfig: () => invoke<AgentConfig>("agent_get_config"),
+  agentSetConfig: (config: AgentConfig) =>
+    invoke<void>("agent_set_config", { config }),
+  /** 开关某个会话的旁路 */
+  agentSetSession: (sessionId: string, enabled: boolean) =>
+    invoke<void>("agent_set_session", { sessionId, enabled }),
+  agentGetSession: (sessionId: string) =>
+    invoke<boolean>("agent_get_session", { sessionId }),
+  /**
+   * 取该会话最近的上下文。
+   * `maxBytes` 省略（或 0）时后端回落到配置里的 maxContextBytes。
+   * 返回值是**未脱敏**原文 —— 脱敏只在真正出网前做，便于界面如实展示。
+   */
+  agentContext: (sessionId: string, maxBytes?: number) =>
+    invoke<string>("agent_context", { sessionId, maxBytes: maxBytes ?? null }),
+  /** 清空缓冲（让 agent 忘掉刚才的事） */
+  agentClear: (sessionId: string) => invoke<void>("agent_clear", { sessionId }),
+  /** 会话没登记过旁路时返回 null，而不是抛错 */
+  agentStats: (sessionId: string) =>
+    invoke<AgentBufferStats | null>("agent_stats", { sessionId }),
+  /**
+   * 提问。**resolve 只代表流已启动，不代表回答完成** ——
+   * 答案要走 `onAgentToken` / `onAgentDone` / `onAgentError` 事件收。
+   */
+  agentAsk: (sessionId: string, question: string) =>
+    invoke<void>("agent_ask", { sessionId, question }),
+  agentCancel: (sessionId: string) => invoke<void>("agent_cancel", { sessionId }),
+  /** 用「还没保存」的那份配置测连通性（刻意不读库里的值） */
+  agentTest: (config: AgentConfig) => invoke<string>("agent_test", { config }),
+
   // ——— 阅读窗口（.md / .html 渲染查看） ———
   readerOpenSftp: (sftpId: string, path: string, source: string) =>
     invoke<void>("reader_open_sftp", { sftpId, path, source }),
@@ -167,4 +202,34 @@ export async function onTermClosed(
     const p = ev.payload;
     handler(typeof p === "number" ? { code: p, reason: "eof" } : p);
   });
+}
+
+// ——— AI Agent 流式事件 ———
+//
+// 后端契约：error 是终态（其后不再发 done），done 一定会发
+// （流自然结束却没收到结束标记时兜底为 stop）。
+// 所以收尾只认事件，**不要靠超时**。
+
+/** agent 答案的增量文本块 */
+export async function onAgentToken(
+  id: string,
+  handler: (text: string) => void
+): Promise<UnlistenFn> {
+  return listen<string>(`nx://agent/token/${id}`, (ev) => handler(ev.payload));
+}
+
+/** 本次流结束（含 reason：stop / length / cancelled） */
+export async function onAgentDone(
+  id: string,
+  handler: (p: AgentDonePayload) => void
+): Promise<UnlistenFn> {
+  return listen<AgentDonePayload>(`nx://agent/done/${id}`, (ev) => handler(ev.payload));
+}
+
+/** 终态错误，payload 是后端翻译好的中文文案 */
+export async function onAgentError(
+  id: string,
+  handler: (msg: string) => void
+): Promise<UnlistenFn> {
+  return listen<string>(`nx://agent/error/${id}`, (ev) => handler(ev.payload));
 }

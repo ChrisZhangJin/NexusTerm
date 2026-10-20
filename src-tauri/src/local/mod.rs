@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
@@ -101,6 +101,12 @@ impl LocalManager {
                     Ok(n) => {
                         let payload = B64.encode(&buf[..n]);
                         let _ = app_handle.emit(&format!("nx://local/data/{}", session_id), payload);
+                        // 旁路。这里是 std::thread（不是 tokio task），只能同步取状态，
+                        // 故用 try_state 而不是 tauri 的异步 State；取不到就静默跳过。
+                        if let Some(st) = app_handle.try_state::<crate::cmd::AppState>() {
+                            st.agent
+                                .feed(&session_id, &buf[..n], crate::agent::StreamKind::Out);
+                        }
                     }
                     Err(_) => break,
                 }
@@ -139,6 +145,9 @@ impl LocalManager {
     }
 
     /// 关闭：先杀进程，再从表里移除。
+    ///
+    /// 这里只管 PTY 本体：agent 的旁路缓冲拿不到 AppState（本结构体不持有它），
+    /// 清理统一由命令层 `cmd::local_close` 在调用本方法后做。
     pub fn close(&self, id: &str) -> Result<(), String> {
         let mut guard = self.sessions.lock().unwrap();
         let Some(s) = guard.remove(id) else {

@@ -1,5 +1,6 @@
 use tauri::State;
 
+use crate::agent::StreamKind;
 use crate::keys;
 use crate::sftp::{RemoteEntry, SftpError, SftpManager};
 use crate::ssh::session::{ConnectRequest, SessionError, SessionManager};
@@ -10,6 +11,13 @@ pub struct AppState {
     pub sftp: SftpManager,
     pub store: Store,
     pub local: crate::local::LocalManager,
+    /// AI agent 的旁路缓冲。会话数据流在完成一次 emit 之后顺手喂一份给它。
+    pub agent: crate::agent::AgentManager,
+    /// AI agent 的出网层：流式提问与取消。
+    ///
+    /// 与 `agent` 分开持有：缓冲的锁在终端的 hot path 上被高频取用，
+    /// 出网这一侧的簿记（谁在问、要不要取消）不该和它共用一把锁。
+    pub llm: crate::agent::llm::LlmRuntime,
 }
 
 // ——— 本地 shell ———
@@ -34,16 +42,22 @@ pub fn local_spawn(
 
 #[tauri::command]
 pub fn local_write(id: String, data: Vec<u8>, state: State<'_, AppState>) -> Result<(), String> {
-    state.local.write(&id, &data)
+    state.local.write(&id, &data)?;
+    // 写成功才旁路：没真正送进 PTY 的输入不该出现在 agent 的上下文里
+    state.agent.feed(&id, &data, StreamKind::In);
+    Ok(())
 }
 
 #[tauri::command]
 pub fn local_write_b64(id: String, data: String, state: State<'_, AppState>) -> Result<(), String> {
     use base64::Engine as _;
+    // 先解码再喂：缓冲里必须存原始字节，存 base64 的话快照全是乱码
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
         .map_err(|e| format!("base64 解码失败：{}", e))?;
-    state.local.write(&id, &bytes)
+    state.local.write(&id, &bytes)?;
+    state.agent.feed(&id, &bytes, StreamKind::In);
+    Ok(())
 }
 
 #[tauri::command]
@@ -58,7 +72,10 @@ pub fn local_resize(
 
 #[tauri::command]
 pub fn local_close(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    state.local.close(&id)
+    let res = state.local.close(&id);
+    // 无论关闭是否报错（会话可能根本不存在），agent 侧都要清干净
+    state.agent.remove(&id);
+    res
 }
 
 #[tauri::command]
@@ -73,17 +90,29 @@ pub async fn ssh_connect(
 
 #[tauri::command]
 pub fn ssh_write(id: String, data: Vec<u8>, state: State<'_, AppState>) -> Result<(), SessionError> {
-    state.sessions.write(&id, data)
+    // 多一次拷贝换来的是严格的顺序：只有真正发出去的输入才进 agent 上下文。
+    // 写失败（会话已关）时缓冲里不该留下这一段 —— 命令没执行过，却出现在
+    // 「人干过什么」里，比少记一条的误导性大得多。
+    let res = state.sessions.write(&id, data.clone());
+    if res.is_ok() {
+        state.agent.feed(&id, &data, StreamKind::In);
+    }
+    res
 }
 
 /// 大块二进制写入（ZMODEM 上传）：base64 字符串比 JSON 数字数组小 ~3 倍、解析快得多
 #[tauri::command]
 pub fn ssh_write_b64(id: String, data: String, state: State<'_, AppState>) -> Result<(), SessionError> {
     use base64::Engine as _;
+    // 解码后再喂：缓冲里存原始字节，base64 正文对模型毫无意义
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
         .map_err(|e| SessionError::Channel(format!("base64 解码失败：{}", e)))?;
-    state.sessions.write(&id, bytes)
+    let res = state.sessions.write(&id, bytes.clone());
+    if res.is_ok() {
+        state.agent.feed(&id, &bytes, StreamKind::In);
+    }
+    res
 }
 
 #[tauri::command]
@@ -99,6 +128,9 @@ pub fn ssh_resize(
 #[tauri::command]
 pub fn ssh_close(id: String, state: State<'_, AppState>) {
     state.sessions.close(&id);
+    // 会话没了，旁路缓冲也要跟着放掉：AppState 活到应用退出，
+    // 不清理的话每个关掉的标签都会留下最多 256KB 常驻内存
+    state.agent.remove(&id);
 }
 
 /// 探测标签当前的工作目录 / 前台进程 / tmux 会话（用于复制会话、断线恢复）

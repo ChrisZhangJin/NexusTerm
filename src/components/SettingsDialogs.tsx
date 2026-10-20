@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from "react";
+import { api } from "../api";
+import { formatBytes, saveAgentConfig, useAgentConfig } from "../lib/agent";
+import type { AgentConfig, AgentProvider } from "../types";
 import {
   DEFAULT_SHORTCUTS,
   SHORTCUT_LABELS,
@@ -303,6 +306,322 @@ export function ShortcutsDialog({ onClose }: { onClose: () => void }) {
           >
             全部恢复默认
           </button>
+          <button className="btn" onClick={onClose}>
+            取消
+          </button>
+          <button className="btn primary" disabled={!dirty} onClick={save}>
+            保存
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ——— AI 助手 ———
+
+const PROVIDER_ORDER: readonly AgentProvider[] = ["openai", "anthropic", "custom"];
+
+/** 各 provider 的展示名与默认地址。地址值要和后端 endpoint() 的拼接方式对得上：
+ *  OpenAI 系拼 /chat/completions，Anthropic 拼 /messages，所以两家都填「根地址」。 */
+const PROVIDER_META: Record<
+  AgentProvider,
+  { label: string; url: string; urlHint: string; modelHint: string }
+> = {
+  openai: {
+    label: "OpenAI",
+    url: "https://api.openai.com/v1",
+    urlHint: "",
+    modelHint: "例如 gpt-4o-mini",
+  },
+  anthropic: {
+    label: "Anthropic",
+    url: "https://api.anthropic.com",
+    urlHint: "",
+    modelHint: "例如 claude-3-5-sonnet-latest",
+  },
+  custom: {
+    label: "自定义",
+    url: "",
+    urlHint: "填 OpenAI 兼容接口地址（本地代理、网关、自建服务均可），结尾的 / 会自动去掉",
+    modelHint: "按服务商文档填写",
+  },
+};
+
+/**
+ * 上下文上限的档位。
+ * 只给四档而不是自由填数字：后端形参是 u32，且这个值直接决定单次请求的 token 量与花费，
+ * 让用户在几个「有实感」的档位里选，比让他猜 24576 和 32768 差多少要安全。
+ */
+const CONTEXT_CHOICES: readonly { bytes: number; label: string }[] = [
+  { bytes: 16 * 1024, label: "16 KB · 约 5 千汉字 · 最省" },
+  { bytes: 32 * 1024, label: "32 KB · 约 1.1 万汉字 · 默认" },
+  { bytes: 64 * 1024, label: "64 KB · 约 2.2 万汉字" },
+  { bytes: 128 * 1024, label: "128 KB · 约 4.4 万汉字 · 最完整" },
+];
+
+/** 判断「是否改过」的字段清单；按顺序比对，避免对象身份不同就误判 dirty */
+const AGENT_FIELDS: readonly (keyof AgentConfig)[] = [
+  "enabled",
+  "provider",
+  "baseUrl",
+  "model",
+  "apiKey",
+  "maxContextBytes",
+  "systemPrompt",
+  "autoAttach",
+  "redact",
+];
+
+export function AgentDialog({ onClose }: { onClose: () => void }) {
+  const saved = useAgentConfig();
+  const [draft, setDraft] = useState<AgentConfig>(saved);
+  /** API Key 默认密码态 —— 屏幕上可能有人在后头看 */
+  const [showKey, setShowKey] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [saveErr, setSaveErr] = useState<string | null>(null);
+  /** 用户动过表单之后，后端的异步回包就不再覆盖本地草稿 */
+  const editedRef = useRef(false);
+
+  useEsc(onClose);
+
+  // 配置是异步从后端读的：首帧拿到的是默认值，真值随后才到。
+  // 用户还没编辑过就直接跟随 —— 否则界面会一直停在一份「假」配置上，一保存就把真值冲掉。
+  useEffect(() => {
+    if (!editedRef.current) setDraft(saved);
+  }, [saved]);
+
+  const patch = (p: Partial<AgentConfig>) => {
+    editedRef.current = true;
+    setDraft((d) => ({ ...d, ...p }));
+    // 表单一改，上一次的测试结论就作废了，留着会误导
+    setTestMsg(null);
+  };
+
+  const dirty = AGENT_FIELDS.some((k) => draft[k] !== saved[k]);
+
+  // 测试连接只关心「地址 / 模型 / Key」三件套（与后端 validate 的后三项一致）
+  const missing = [
+    !draft.baseUrl.trim() && "接口地址",
+    !draft.model.trim() && "模型",
+    !draft.apiKey.trim() && "API Key",
+  ].filter((x): x is string => typeof x === "string");
+  const canTest = missing.length === 0;
+
+  const runTest = async () => {
+    if (!canTest || testing) return;
+    setTesting(true);
+    setTestMsg(null);
+    try {
+      // 后端 validate() 第一件事就是查 enabled，而「能不能连通」与「要不要启用」是两回事。
+      // 所以这里临时置 true：测的是连通性，不动用户手里那份 draft，也不会写进库。
+      const text = await api.agentTest({ ...draft, enabled: true });
+      setTestMsg({ ok: true, text });
+    } catch (e) {
+      // 后端已把错误翻译成中文，直接展示即可
+      setTestMsg({ ok: false, text: String(e ?? "测试失败") });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const save = async () => {
+    setSaveErr(null);
+    try {
+      // 先写盘、后关窗：saveAgentConfig 保证写成功才更新内存缓存，
+      // 不会出现「界面显示已保存、库里其实没变」
+      await saveAgentConfig(draft);
+      onClose();
+    } catch (e) {
+      setSaveErr(String(e ?? "保存失败"));
+    }
+  };
+
+  // 库里可能存着四档之外的值（手改过 db 或旧版本遗留），补一个自定义选项免得 select 显示空白
+  const contextOptions = CONTEXT_CHOICES.some((c) => c.bytes === draft.maxContextBytes)
+    ? CONTEXT_CHOICES
+    : [
+        { bytes: draft.maxContextBytes, label: `${formatBytes(draft.maxContextBytes)}（自定义）` },
+        ...CONTEXT_CHOICES,
+      ];
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <div className="modal settings-modal ag-modal" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="settings-head">
+          <h2>AI 助手</h2>
+          <button className="settings-x" onClick={onClose} title="关闭（Esc）">
+            ×
+          </button>
+        </div>
+        <p className="mark-hint">
+          会话的输出旁路给模型，AI 因此能带着上下文回答「刚才那条命令为什么报错」。
+          本页改动在点击「保存」后才生效。
+        </p>
+
+        {/* 安全提示刻意放在最上面：这是「把终端内容发给第三方」的开关，必须先看风险再填 Key */}
+        <div className="ag-notice">
+          <div className="ag-notice-title">
+            <span className="ag-notice-icon">!</span>
+            启用前请读一遍
+          </div>
+          <ul>
+            <li>
+              <strong>API Key 明文保存在本机 nexus.db</strong>
+              —— 与已保存的主机密码同一套策略，不是系统钥匙串；备份或迁移数据库文件时它就包含在里面。
+            </li>
+            <li>
+              <strong>开启后，该会话的终端输出会发往第三方模型服务</strong>
+              —— 屏幕上出现过的内容都可能出网。脱敏能降低风险，但无法保证不泄露。
+            </li>
+            <li>
+              <strong>AI 给出的命令不会自动执行</strong>
+              —— 只进建议区，由你确认后才会写入终端。
+            </li>
+          </ul>
+        </div>
+
+        <div className="settings-section">连接</div>
+        <div className="row">
+          <label>服务商</label>
+          <select
+            value={draft.provider}
+            onChange={(e) => {
+              const p = e.target.value as AgentProvider;
+              // 换服务商时顺手把地址换成该家的默认值：留着旧地址几乎必然请求错地方
+              patch({ provider: p, baseUrl: PROVIDER_META[p].url });
+            }}
+          >
+            {PROVIDER_ORDER.map((p) => (
+              <option key={p} value={p}>
+                {PROVIDER_META[p].label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="row">
+          <label>接口地址</label>
+          <input
+            value={draft.baseUrl}
+            onChange={(e) => patch({ baseUrl: e.target.value })}
+            placeholder={PROVIDER_META[draft.provider].url || "https://your-host/v1"}
+            spellCheck={false}
+          />
+        </div>
+        {PROVIDER_META[draft.provider].urlHint && (
+          <p className="ag-hint">{PROVIDER_META[draft.provider].urlHint}</p>
+        )}
+        <div className="row">
+          <label>模型</label>
+          <input
+            value={draft.model}
+            onChange={(e) => patch({ model: e.target.value })}
+            placeholder={PROVIDER_META[draft.provider].modelHint}
+            spellCheck={false}
+          />
+        </div>
+        <div className="row">
+          <label>API Key</label>
+          <input
+            type={showKey ? "text" : "password"}
+            value={draft.apiKey}
+            onChange={(e) => patch({ apiKey: e.target.value })}
+            placeholder="sk-…"
+            autoComplete="off"
+            spellCheck={false}
+          />
+          <button
+            className="ag-eye"
+            onClick={() => setShowKey((v) => !v)}
+            title={showKey ? "隐藏 API Key" : "显示 API Key"}
+          >
+            {showKey ? "隐藏" : "显示"}
+          </button>
+        </div>
+        <div className="ag-test-row">
+          <button className="btn" disabled={!canTest || testing} onClick={runTest}>
+            {testing ? "测试中…" : "测试连接"}
+          </button>
+          {testing && <span className="spinner sm" />}
+          {testMsg ? (
+            <span className={`ag-test-msg ${testMsg.ok ? "ok" : "err"}`}>{testMsg.text}</span>
+          ) : (
+            <span className="ag-hint ag-test-tip">
+              {canTest ? "用当前表单值发一条极短消息验证" : `还需填写：${missing.join("、")}`}
+            </span>
+          )}
+        </div>
+
+        <div className="settings-section">行为</div>
+        <div className="ag-block">
+          <span className="ag-block-label">系统提示词（留空则使用内置默认提示词）</span>
+          <textarea
+            className="ag-ta"
+            value={draft.systemPrompt}
+            onChange={(e) => patch({ systemPrompt: e.target.value })}
+            placeholder="例如：你是资深 SRE，回答请给出可执行命令，并说明风险"
+            spellCheck={false}
+          />
+        </div>
+        <div className="row">
+          <label>上下文上限</label>
+          <select
+            value={String(draft.maxContextBytes)}
+            onChange={(e) => patch({ maxContextBytes: Number(e.target.value) })}
+          >
+            {contextOptions.map((c) => (
+              <option key={c.bytes} value={String(c.bytes)}>
+                {c.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <p className="ag-hint">
+          单次提问最多回看最近 {formatBytes(draft.maxContextBytes)} 的终端输出，更早的部分会被丢弃。
+        </p>
+        <label className="settings-check">
+          <input
+            type="checkbox"
+            checked={draft.redact}
+            onChange={(e) => patch({ redact: e.target.checked })}
+          />
+          <span>
+            出网前脱敏
+            <em>
+              会话输出发往模型前，抹掉密钥、token、私钥、邮箱、IP 等；关掉则发送原始输出
+            </em>
+          </span>
+        </label>
+
+        <div className="settings-section">总开关</div>
+        <label className="settings-check">
+          <input
+            type="checkbox"
+            checked={draft.enabled}
+            onChange={(e) => patch({ enabled: e.target.checked })}
+          />
+          <span>
+            启用 AI 助手
+            <em>关闭时后端完全不采集旁路，零开销；不启用则本页其余设置都不生效</em>
+          </span>
+        </label>
+        <label className={`settings-check${draft.enabled ? "" : " disabled"}`}>
+          <input
+            type="checkbox"
+            checked={draft.autoAttach}
+            disabled={!draft.enabled}
+            onChange={(e) => patch({ autoAttach: e.target.checked })}
+          />
+          <span>
+            新会话默认开启旁路
+            <em>新建的会话自动开始采集上下文，不用逐个手动打开</em>
+          </span>
+        </label>
+
+        {saveErr && <div className="ag-err">保存失败：{saveErr}</div>}
+
+        <div className="modal-actions">
           <button className="btn" onClick={onClose}>
             取消
           </button>

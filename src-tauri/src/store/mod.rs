@@ -252,8 +252,7 @@ impl Store {
         Ok(())
     }
 
-    // 预留给下一阶段：持久化主题、字体、布局比例等外观设置
-    #[allow(dead_code)]
+    // AI 助手配置、主题、字体、布局比例等外观设置都走这张表
     pub fn set_setting(&self, k: &str, v: &str) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
@@ -265,7 +264,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn get_setting(&self, k: &str) -> Option<String> {
         let conn = self.conn.lock().ok()?;
         conn.query_row("SELECT value FROM settings WHERE key = ?1", params![k], |r| {
