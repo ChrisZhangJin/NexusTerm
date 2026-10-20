@@ -373,7 +373,7 @@ fn list_drives() -> Result<Vec<RemoteEntry>, String> {
 /// 非 Windows 没有盘符概念，空路径等价于列根目录。
 #[cfg(not(windows))]
 async fn list_drives() -> Result<Vec<RemoteEntry>, String> {
-    list_local_dir("/".to_string()).await
+    read_dir_entries("/".to_string()).await
 }
 
 /// 文件权限位。远端走 SFTP 的 POSIX mode，本地面板则由本函数按平台合成。
@@ -403,9 +403,22 @@ fn permission_mode(meta: &std::fs::Metadata) -> u32 {
 #[tauri::command]
 pub async fn list_local_dir(path: String) -> Result<Vec<RemoteEntry>, String> {
     if path.is_empty() {
-        return list_drives();
+        #[cfg(windows)]
+        {
+            return list_drives();
+        }
+        #[cfg(not(windows))]
+        {
+            return list_drives().await;
+        }
     }
     let expanded = crate::keys::expand_tilde(&path);
+    read_dir_entries(expanded).await
+}
+
+/// 读取目录内容。`list_local_dir` 与非 Windows 的 `list_drives` 共用；
+/// 独立成函数是为了避免两者互相调用形成 async 递归环（编译器报 E0733）。
+async fn read_dir_entries(expanded: String) -> Result<Vec<RemoteEntry>, String> {
     let mut dir = tokio::fs::read_dir(&expanded)
         .await
         .map_err(|e| format!("无法读取目录 {}: {}", expanded, e))?;

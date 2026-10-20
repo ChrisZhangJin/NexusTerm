@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.55" y2="1">
+      <stop offset="0" stop-color="#1A2A48"/>
+      <stop offset="1" stop-color="#070B16"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.3" cy="0.18" r="0.68">
+      <stop offset="0" stop-color="#5EEAD4" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#5EEAD4" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.10"/>
+      <stop offset="0.28" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="g0" x1="260.0" y1="344" x2="372.0" y2="680" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#B4C0D0"/>
+    </linearGradient>
+    <linearGradient id="g1" x1="456.0" y1="344" x2="568.0" y2="680" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8CE0FF"/>
+      <stop offset="1" stop-color="#2DD4BF"/>
+    </linearGradient>
+    <linearGradient id="g2" x1="652.0" y1="344" x2="764.0" y2="680" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E2FCA0"/>
+      <stop offset="1" stop-color="#22C55E"/>
+    </linearGradient>
+    <clipPath id="clip"><path d="M 285,100 H 739 A 185,185 0 0 1 924,285 V 739 A 185,185 0 0 1 739,924 H 285 A 185,185 0 0 1 100,739 V 285 A 185,185 0 0 1 285,100 Z"/></clipPath>
+  </defs>
+
+  <path d="M 285,100 H 739 A 185,185 0 0 1 924,285 V 739 A 185,185 0 0 1 739,924 H 285 A 185,185 0 0 1 100,739 V 285 A 185,185 0 0 1 285,100 Z" fill="url(#bg)"/>
+  <g clip-path="url(#clip)">
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#halo)"/>
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#sheen)"/>
+  </g>
+
+  <g stroke-width="58" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M 260.0 344 L 372.0 512 L 260.0 680" stroke="url(#g0)"/>
+    <path d="M 456.0 344 L 568.0 512 L 456.0 680" stroke="url(#g1)"/>
+    <path d="M 652.0 344 L 764.0 512 L 652.0 680" stroke="url(#g2)"/>
+  </g>
+
+  <path d="M 285,100 H 739 A 185,185 0 0 1 924,285 V 739 A 185,185 0 0 1 739,924 H 285 A 185,185 0 0 1 100,739 V 285 A 185,185 0 0 1 285,100 Z" fill="none" stroke="#FFFFFF" stroke-opacity="0.11" stroke-width="2.5"/>
+</svg>

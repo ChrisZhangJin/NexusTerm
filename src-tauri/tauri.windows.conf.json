@@ -3,9 +3,16 @@
   "app": {
     "windows": [
       {
+        "title": "NexusTerm",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 640,
+        "minHeight": 400,
+        "resizable": true,
+        "fullscreen": false,
+        "dragDropEnabled": false,
         "decorations": false,
-        "titleBarStyle": "Visible",
-        "hiddenTitle": false
+        "titleBarStyle": "Visible"
       }
     ]
   },

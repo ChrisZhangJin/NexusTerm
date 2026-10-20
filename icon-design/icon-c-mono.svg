@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.55" y2="1">
+      <stop offset="0" stop-color="#1D2129"/>
+      <stop offset="1" stop-color="#080A0E"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.3" cy="0.18" r="0.68">
+      <stop offset="0" stop-color="#93C5FD" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#93C5FD" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.10"/>
+      <stop offset="0.28" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="320" y1="290" x2="520" y2="734" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#B4C0D0"/>
+    </linearGradient>
+    <clipPath id="clip">
+      <path d="M 285,100 H 739 A 185,185 0 0 1 924,285 V 739 A 185,185 0 0 1 739,924 H 285 A 185,185 0 0 1 100,739 V 285 A 185,185 0 0 1 285,100 Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- 底色：渐变 + 左上柔光 + 顶部高光 -->
+  <path d="M 285,100 H 739 A 185,185 0 0 1 924,285 V 739 A 185,185 0 0 1 739,924 H 285 A 185,185 0 0 1 100,739 V 285 A 185,185 0 0 1 285,100 Z" fill="url(#bg)"/>
+  <g clip-path="url(#clip)">
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#halo)"/>
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#sheen)"/>
+  </g>
+
+  <!-- 提示符 >_ -->
+  <path d="M 320 290 L 520 512 L 320 734" stroke="url(#mark)" stroke-width="92" stroke-linecap="round"
+        stroke-linejoin="round" fill="none"/>
+  <rect x="580" y="666" width="180" height="68" rx="24" fill="#38BDF8"/>
+
+  <!-- 内描边：让图标在浅色桌面上也有边界 -->
+  <path d="M 285,100 H 739 A 185,185 0 0 1 924,285 V 739 A 185,185 0 0 1 739,924 H 285 A 185,185 0 0 1 100,739 V 285 A 185,185 0 0 1 285,100 Z" fill="none" stroke="#FFFFFF" stroke-opacity="0.11" stroke-width="2.5"/>
+</svg>
