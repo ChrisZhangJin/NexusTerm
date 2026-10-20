@@ -4,9 +4,9 @@ import SessionDialog from "./components/SessionDialog";
 import TerminalView, { clock } from "./components/TerminalView";
 import FileManager from "./components/FileManager";
 import TitleBar from "./components/TitleBar";
-import Toolbar from "./components/Toolbar";
 import TabBar from "./components/TabBar";
 import StatusBar from "./components/StatusBar";
+import { AppearanceDialog, ShortcutsDialog } from "./components/SettingsDialogs";
 import { api, stringToBytes } from "./api";
 import {
   parseProbe,
@@ -21,7 +21,7 @@ import { resolveAuth } from "./lib/auth";
 import { normalizeTimeout, toFriendlyError } from "./lib/errors";
 import { BUILTIN_THEMES, DEFAULT_THEME, FONT_FAMILIES } from "./lib/theme";
 import { applyChromeVars } from "./lib/chrome";
-import { isMacOS } from "./lib/platform";
+import { formatCombo, getPrefs, setPrefs, useShortcuts } from "./lib/prefs";
 import type {
   AuthMethod,
   ClosedInfo,
@@ -34,7 +34,10 @@ let tabSeq = 0;
 const nextId = () => `tab-${Date.now()}-${++tabSeq}`;
 
 /** 断线自动重连的等待间隔（ms），数组长度即最大尝试次数 */
-const RECONNECT_DELAYS = [2000, 4000, 8000, 15000, 30000];
+/** 断线自动重连：最多 10 次，间隔从 2 秒起每次翻倍（2s、4s、8s … 1024s，累计约 34 分钟） */
+const RECONNECT_MAX = 10;
+const RECONNECT_BASE = 2000;
+const reconnectDelay = (attempt: number) => RECONNECT_BASE * 2 ** (attempt - 1);
 
 const THEME_NAMES = Object.keys(BUILTIN_THEMES);
 
@@ -44,19 +47,40 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<SessionRecord | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  /** 设置窗口：外观 / 快捷键（模态，同一时刻只开一个） */
+  const [settingsWin, setSettingsWin] = useState<"appearance" | "shortcuts" | null>(null);
+  const settingsOpen = settingsWin !== null;
   // 非空时展示该会话的 SFTP 文件管理器
   const [fmSession, setFmSession] = useState<SessionRecord | null>(null);
 
-  const [themeName, setThemeName] = useState(DEFAULT_THEME);
-  const [fontFamily, setFontFamily] = useState(FONT_FAMILIES[0].value);
-  const [fontSize, setFontSize] = useState(13);
-  const [lineHeight, setLineHeight] = useState(1.2);
+  // 外观持久化到 localStorage（之前每次启动都回到默认）
+  const [themeName, setThemeName] = useState(() => {
+    const v = localStorage.getItem("nx.theme");
+    return v && BUILTIN_THEMES[v] ? v : DEFAULT_THEME;
+  });
+  const [fontFamily, setFontFamily] = useState(
+    () => localStorage.getItem("nx.fontFamily") || FONT_FAMILIES[0].value
+  );
+  const [fontSize, setFontSize] = useState(() => {
+    const n = Number(localStorage.getItem("nx.fontSize"));
+    return n >= 10 && n <= 22 ? n : 13;
+  });
+  const [lineHeight, setLineHeight] = useState(() => {
+    const n = Number(localStorage.getItem("nx.lineHeight"));
+    return n >= 1 && n <= 2 ? n : 1.2;
+  });
+  useEffect(() => {
+    localStorage.setItem("nx.theme", themeName);
+    localStorage.setItem("nx.fontFamily", fontFamily);
+    localStorage.setItem("nx.fontSize", String(fontSize));
+    localStorage.setItem("nx.lineHeight", String(lineHeight));
+  }, [themeName, fontFamily, fontSize, lineHeight]);
 
   // 弹出式会话列表（Xshell「打开」按钮风格）
   const [sessionPopupOpen, setSessionPopupOpen] = useState(false);
 
   const passphraseRef = useRef<Map<string, string>>(new Map());
+  const shortcuts = useShortcuts();
 
   // —— 轻量提示条（导入/导出/复制会话等结果） ——
   const [toast, setToast] = useState<string | null>(null);
@@ -85,6 +109,20 @@ export default function App() {
     };
     document.addEventListener("contextmenu", onCtx);
     return () => document.removeEventListener("contextmenu", onCtx);
+  }, []);
+
+  // 文件拖到终端以外的地方松开时，WebView 默认会「打开」该文件把整个界面替换掉 —— 全局拦下。
+  // 终端区自己处理 drop（rz 上传），这里只兜底默认行为。
+  useEffect(() => {
+    const stop = (e: DragEvent) => {
+      if (Array.from(e.dataTransfer?.types ?? []).includes("Files")) e.preventDefault();
+    };
+    window.addEventListener("dragover", stop);
+    window.addEventListener("drop", stop);
+    return () => {
+      window.removeEventListener("dragover", stop);
+      window.removeEventListener("drop", stop);
+    };
   }, []);
 
   const refresh = useCallback(async () => {
@@ -236,7 +274,7 @@ export default function App() {
   );
 
   /**
-   * 重连。auto=true 为断线自动重连（按退避间隔最多 RECONNECT_DELAYS.length 次），
+   * 重连。auto=true 为断线自动重连（间隔逐次翻倍，最多 RECONNECT_MAX 次），
    * auto=false 为用户手动「重新连接」（立即尝试 1 次）。
    */
   const reconnect = useCallback(
@@ -256,10 +294,10 @@ export default function App() {
       // 清掉后端残留的旧会话条目
       await api.sshClose(tabId).catch(() => {});
 
-      const max = auto ? RECONNECT_DELAYS.length : 1;
+      const max = auto ? RECONNECT_MAX : 1;
       let lastErr = "";
       for (let i = 1; i <= max; i++) {
-        const delay = auto ? RECONNECT_DELAYS[i - 1] : 0;
+        const delay = auto ? reconnectDelay(i) : 0;
         patchTab(tabId, {
           status: "reconnecting",
           reconnectAttempt: i,
@@ -360,6 +398,39 @@ export default function App() {
     });
   }, []);
 
+  /**
+   * 断开会话但保留标签：终端内容留着可回看 / 导出，
+   * 需要时右键「重新连接」，或手动关闭标签。
+   */
+  const disconnectTab = useCallback(
+    (tabId: string) => {
+      const t = tabsRef.current.find((x) => x.id === tabId);
+      if (!t || t.local) return;
+      const ctl = reconnectCtl.current.get(tabId);
+      if (ctl) ctl.cancelled = true;
+      reconnectCtl.current.delete(tabId);
+      const wasLive = t.status === "connected" || t.status === "reconnecting" || t.status === "connecting";
+      api.sshClose(tabId).catch(() => {});
+      patchTab(tabId, {
+        status: "closed",
+        closedAt: Date.now(),
+        error: undefined,
+        notice: undefined,
+        reconnectAttempt: undefined,
+        reconnectAt: undefined,
+      });
+      if (wasLive) {
+        // 后端对主动关闭（reason=user）不再回推提示，这里自己写一行留痕
+        const host = sessionsRef.current.find((x) => x.id === t.sessionId)?.host ?? "remote host";
+        getTerm(tabId)?.write(
+          `\r\n\r\n\x1b[1;33mDisconnected from remote host(${host}) at ${clock(Date.now())}.\x1b[0m\r\n` +
+            `\x1b[90m会话已断开，标签页保留。右键标签可「重新连接」，不需要时手动关闭。\x1b[0m\r\n`
+        );
+      }
+    },
+    [patchTab]
+  );
+
   /** 关闭标签：会话还活着时先确认（可勾选「不再询问」，存 localStorage） */
   const closeTab = useCallback(
     async (tabId: string) => {
@@ -367,7 +438,7 @@ export default function App() {
       if (!t) return;
       const live =
         t.status === "connected" || t.status === "connecting" || t.status === "reconnecting";
-      if (live && localStorage.getItem("nx.confirmCloseTab") !== "off") {
+      if (live && getPrefs().confirmCloseTab) {
         const name = t.customTitle || t.title;
         const { ok, dontAsk } = await askConfirm({
           title: "关闭标签页",
@@ -376,10 +447,11 @@ export default function App() {
             : `关闭「${name}」？SSH 连接会断开，未在 tmux 中运行的前台程序会被终止。`,
           okText: "关闭",
           danger: true,
-          dontAskLabel: "不再询问",
+          dontAskLabel: "不再询问（可在 设置 → 外观 中恢复）",
         });
         if (!ok) return;
-        if (dontAsk) localStorage.setItem("nx.confirmCloseTab", "off");
+        // 可在「⚙ 设置 → 外观 → 终端行为」重新勾选恢复
+        if (dontAsk) setPrefs({ confirmCloseTab: false });
       }
       closeTabNow(tabId);
     },
@@ -527,14 +599,19 @@ export default function App() {
     newLocalTab();
   }, [newLocalTab]);
 
-  /** 复制会话：在右侧再开一个同目标的标签 */
+  /**
+   * 复制会话：在右侧再开一个同目标的标签。
+   * withState=false 只是对同一主机新开一个干净会话；
+   * withState=true 额外恢复当前目录与 tmux（分组会话，窗口共享、视图独立）。
+   */
   const duplicateTab = useCallback(
-    async (tabId: string) => {
+    async (tabId: string, withState: boolean) => {
       const t = tabsRef.current.find((x) => x.id === tabId);
       if (!t) return;
       if (t.local) return newLocalTab(tabId);
       const s = sessionsRef.current.find((x) => x.id === t.sessionId);
       if (!s) return showToast("该连接配置已被删除，无法复制");
+      if (!withState) return connect(s, tabId);
       // 在线就现探一次拿最新目录；已断开则用缓存
       const c = t.status === "connected" ? await probeTab(tabId) : t.ctx;
       connect(s, tabId, c, t.customTitle);
@@ -626,13 +703,17 @@ export default function App() {
     }
   }, [showToast]);
 
-  const toggleSftp = useCallback(() => {
-    setFmSession((cur) => {
-      if (cur) return null;
-      const sid = tabs.find((t) => t.id === activeTab)?.sessionId;
-      return sessions.find((x) => x.id === sid) ?? null;
-    });
-  }, [activeTab, sessions, tabs]);
+  /** 打开某个标签所属连接的 SFTP（标签 / 终端右键菜单） */
+  const openSftp = useCallback(
+    (tabId: string) => {
+      const sid = tabs.find((t) => t.id === tabId)?.sessionId;
+      const s = sessions.find((x) => x.id === sid);
+      if (!s) return;
+      setActiveTab(tabId);
+      setFmSession(s);
+    },
+    [sessions, tabs]
+  );
 
   const activeTabState = tabs.find((t) => t.id === activeTab) ?? null;
   const activeSession = activeTabState?.sessionId
@@ -667,40 +748,23 @@ export default function App() {
         title={appTitle}
         themeName={themeName}
         onCycleTheme={cycleTheme}
-        onToggleSettings={() => setSettingsOpen((v) => !v)}
+        onOpenSettings={setSettingsWin}
         settingsOpen={settingsOpen}
-      />
-
-      <Toolbar
-        canConnect={false}
-        canDisconnect={!!activeTabState}
-        canSftp={activeTabState?.status === "connected"}
-        sftpOpen={!!fmSession}
-        settingsOpen={settingsOpen}
-        sessionPopupOpen={sessionPopupOpen}
-        onCreate={() => {
-          setEditing(null);
-          setDialogOpen(true);
-        }}
-        onConnect={() => {}}
-        onDisconnect={() => activeTabState && closeTab(activeTabState.id)}
-        onToggleSftp={toggleSftp}
-        onToggleSettings={() => setSettingsOpen((v) => !v)}
-        onToggleSessionPopup={() => setSessionPopupOpen((v) => !v)}
-        canExportSession={canExportActive}
-        onImport={importXsh}
-        onExportSession={exportSessionXsh}
-        onExportAll={exportAllXsh}
       />
 
       <TabBar
+        sessionPopupOpen={sessionPopupOpen}
+        onToggleSessionPopup={() => setSessionPopupOpen((v) => !v)}
         tabs={tabs}
         activeTab={activeTab}
         onSelect={setActiveTab}
         onClose={closeTab}
         onNewTab={newLocalTab}
         onReconnect={(id) => reconnect(id, false)}
-        onDuplicate={duplicateTab}
+        onDisconnect={disconnectTab}
+        onOpenSftp={openSftp}
+        onDuplicate={(id) => duplicateTab(id, false)}
+        onDuplicateWithState={(id) => duplicateTab(id, true)}
         onRename={renameTab}
         onMove={moveTab}
       />
@@ -719,7 +783,8 @@ export default function App() {
                 fontFamily={fontFamily}
                 fontSize={fontSize}
                 lineHeight={lineHeight}
-                onDisconnect={() => closeTab(t.id)}
+                onDisconnect={() => (t.local ? closeTab(t.id) : disconnectTab(t.id))}
+                onOpenSftp={() => openSftp(t.id)}
                 peerHost={sessions.find((x) => x.id === t.sessionId)?.host}
                 status={t.status}
                 reconnectAttempt={t.reconnectAttempt}
@@ -750,6 +815,9 @@ export default function App() {
                 <button className="btn-link" onClick={() => reconnect(activeTabState.id, false)}>
                   重新连接
                 </button>
+                <button className="btn-link" onClick={() => closeTab(activeTabState.id)}>
+                  关闭标签
+                </button>
               </div>
             )}
 
@@ -776,13 +844,12 @@ export default function App() {
                 <h1>NexusTerm</h1>
                 <p>跨平台 SSH / SFTP 客户端 · Rust + TypeScript</p>
                 <ul>
-                  <li>点击工具栏「连接」打开连接列表，双击即可连接</li>
-                  <li>工具栏「SFTP」在终端与文件管理器之间切换</li>
-                  <li>点右上角 ⚙ 或工具栏「外观」调整配色与字体</li>
+                  <li>点击标签栏最左侧「☰ 连接」打开连接列表，双击即可连接</li>
+                  <li>右键标签或终端选择「SFTP 文件管理」打开文件管理器</li>
+                  <li>右上角「⚙ 设置」调整外观、自定义快捷键</li>
                   <li>
-                    {isMacOS()
-                      ? "⌘C 复制 · Ctrl+C 发送中断信号"
-                      : `Ctrl+Shift+C 复制 · Ctrl+Shift+V 粘贴 · Ctrl+C 发送中断信号`}
+                    {formatCombo(shortcuts.copy) || "（未设置）"} 复制 ·{" "}
+                    {formatCombo(shortcuts.paste) || "（未设置）"} 粘贴 · Ctrl+C 发送中断信号
                   </li>
                 </ul>
               </div>
@@ -808,73 +875,38 @@ export default function App() {
         peer={peer}
         sessionCount={tabs.length}
         connectedCount={tabs.filter((t) => t.status === "connected").length}
+        statsTarget={
+          !activeTabState
+            ? null
+            : activeTabState.local
+              ? { tabId: activeTabState.id, local: true, hostKey: "local" }
+              : activeTabState.status === "connected"
+                ? {
+                    tabId: activeTabState.id,
+                    local: false,
+                    hostKey: peer ?? activeTabState.id,
+                  }
+                : null
+        }
+        activeTabId={activeTabState?.id ?? null}
       />
 
-      {settingsOpen && (
-        <div className="settings-panel">
-          <h3>外观</h3>
-          <label>
-            配色
-            <select value={themeName} onChange={(e) => setThemeName(e.target.value)}>
-              {THEME_NAMES.map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            字体
-            <select
-              value={fontFamily}
-              onChange={(e) => setFontFamily(e.target.value)}
-            >
-              {FONT_FAMILIES.map((f) => (
-                <option key={f.value} value={f.value}>
-                  {f.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            字号 {fontSize}px
-            <input
-              type="range"
-              min={10}
-              max={22}
-              value={fontSize}
-              onChange={(e) => setFontSize(Number(e.target.value))}
-            />
-          </label>
-          <label>
-            行高 {lineHeight.toFixed(2)}
-            <input
-              type="range"
-              min={1}
-              max={2}
-              step={0.05}
-              value={lineHeight}
-              onChange={(e) => setLineHeight(Number(e.target.value))}
-            />
-          </label>
-          {/* 字体实时预览：调滑块时立刻看到连接后的实际效果 */}
-          <div
-            className="welcome-preview"
-            style={{
-              fontFamily,
-              fontSize,
-              lineHeight: Math.max(1, lineHeight),
-            }}
-          >
-            <span className="wp-dim">chris@server:~$ </span>
-            <span className="wp-cmd">ssh prod-server</span>
-            {"\n"}
-            <span className="wp-dim">
-              {fontSize}px / 行高 {lineHeight.toFixed(2)} · 中文与 emoji 宽度已启用
-            </span>
-          </div>
-        </div>
+      {settingsWin === "appearance" && (
+        <AppearanceDialog
+          themeName={themeName}
+          themeNames={THEME_NAMES}
+          onTheme={setThemeName}
+          fontFamily={fontFamily}
+          fonts={FONT_FAMILIES}
+          onFontFamily={setFontFamily}
+          fontSize={fontSize}
+          onFontSize={setFontSize}
+          lineHeight={lineHeight}
+          onLineHeight={setLineHeight}
+          onClose={() => setSettingsWin(null)}
+        />
       )}
+      {settingsWin === "shortcuts" && <ShortcutsDialog onClose={() => setSettingsWin(null)} />}
 
       {dialogOpen && (
         <SessionDialog
@@ -899,7 +931,7 @@ export default function App() {
         />
       )}
 
-      {/* 弹出式会话列表 —— 从工具栏「☰ 会话」按钮下方弹出 */}
+      {/* 弹出式会话列表 —— 从标签栏最左侧「☰ 连接」按钮下方弹出 */}
       {sessionPopupOpen && (
         <SessionList
           sessions={sessions}
@@ -920,6 +952,22 @@ export default function App() {
           onExport={exportOneXsh}
           onExportFolder={exportFolderXsh}
           onRenameFolder={renameFolder}
+          io={{
+            canExportSession: canExportActive,
+            exportSessionHint: "当前标签不是 SSH 会话",
+            onImport: () => {
+              setSessionPopupOpen(false);
+              importXsh();
+            },
+            onExportSession: () => {
+              setSessionPopupOpen(false);
+              exportSessionXsh();
+            },
+            onExportAll: () => {
+              setSessionPopupOpen(false);
+              exportAllXsh();
+            },
+          }}
         />
       )}
     </div>
@@ -950,7 +998,12 @@ function ReconnectBadge({
     <div className="reconnect-badge">
       <span className="spinner" />
       <span>
-        {left > 0 ? `${left} 秒后` : "正在"}重连 {host}（第 {attempt}/{max} 次）
+        {left > 0
+          ? left >= 60
+            ? `${Math.floor(left / 60)} 分 ${String(left % 60).padStart(2, "0")} 秒后`
+            : `${left} 秒后`
+          : "正在"}
+        重连 {host}（第 {attempt}/{max} 次）
       </span>
       <button className="btn-link" onClick={onCancel}>
         取消

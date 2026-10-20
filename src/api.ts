@@ -16,11 +16,15 @@ export const api = {
     invoke<void>("ssh_connect", { id, req }),
   sshWrite: (id: string, data: number[]) =>
     invoke<void>("ssh_write", { id, data }),
+  /** 二进制大块写入（base64），ZMODEM 上传用 */
+  sshWriteB64: (id: string, data: string) => invoke<void>("ssh_write_b64", { id, data }),
   sshResize: (id: string, cols: number, rows: number) =>
     invoke<void>("ssh_resize", { id, cols, rows }),
   sshClose: (id: string) => invoke<void>("ssh_close", { id }),
   /** 探测远端交互 shell 的 cwd / 前台进程 / tmux（KEY→VALUE） */
   sshProbe: (id: string) => invoke<Record<string, string>>("ssh_probe", { id }),
+  sshStats: (id: string) => invoke<Record<string, string>>("ssh_stats", { id }),
+  localStats: () => invoke<Record<string, string>>("local_stats"),
   clipboardRead: () => invoke<string>("clipboard_read"),
   clipboardWrite: (text: string) => invoke<void>("clipboard_write", { text }),
 
@@ -77,6 +81,8 @@ export const api = {
     invoke<void>("local_spawn", { id, cols, rows }),
   localWrite: (id: string, data: number[]) =>
     invoke<void>("local_write", { id, data }),
+  localWriteB64: (id: string, data: string) =>
+    invoke<void>("local_write_b64", { id, data }),
   localResize: (id: string, cols: number, rows: number) =>
     invoke<void>("local_resize", { id, cols, rows }),
   localClose: (id: string) => invoke<void>("local_close", { id }),
@@ -84,6 +90,18 @@ export const api = {
   /** ZMODEM 下载落盘 */
   writeFile: (path: string, data: number[]) =>
     invoke<void>("write_file", { path, data }),
+
+  // ——— 阅读窗口（.md / .html 渲染查看） ———
+  readerOpenSftp: (sftpId: string, path: string, source: string) =>
+    invoke<void>("reader_open_sftp", { sftpId, path, source }),
+  readerOpenSsh: (id: string, path: string, source: string) =>
+    invoke<void>("reader_open_ssh", { id, path, source }),
+  readerOpenLocal: (path: string) => invoke<void>("reader_open_local", { path }),
+  readerDoc: (id: string) =>
+    invoke<{ name: string; source: string; kind: "markdown" | "html" | "image" | "code"; data: string }>(
+      "reader_doc",
+      { id }
+    ),
 };
 
 /** base64 → Uint8Array。SSH 数据流必须走这条路径，不能 lossy 转字符串。 */
@@ -95,6 +113,19 @@ export function base64ToBytes(b64: string): Uint8Array {
 }
 
 /** 字符串 → 后端的 Vec<u8> */
+/** 字节 → base64（分块 fromCharCode，避免大数组展开爆栈） */
+export function bytesToBase64(bytes: ArrayLike<number>): string {
+  let bin = "";
+  const CH = 0x8000;
+  for (let i = 0; i < bytes.length; i += CH) {
+    const end = Math.min(i + CH, bytes.length);
+    const part: number[] = new Array(end - i);
+    for (let j = i; j < end; j++) part[j - i] = bytes[j];
+    bin += String.fromCharCode.apply(null, part);
+  }
+  return btoa(bin);
+}
+
 export function stringToBytes(s: string): number[] {
   return Array.from(new TextEncoder().encode(s));
 }

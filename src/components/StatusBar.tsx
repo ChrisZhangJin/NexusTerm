@@ -1,3 +1,8 @@
+import { useEffect, useRef, useState } from "react";
+import { api } from "../api";
+import { setPrefs, usePrefs } from "../lib/prefs";
+import { getOutputCount } from "../lib/termRegistry";
+
 interface Props {
   /** 当前激活标签的状态 */
   status: "idle" | "connecting" | "connected" | "reconnecting" | "error";
@@ -7,6 +12,11 @@ interface Props {
   sessionCount: number;
   /** 其中处于已连接状态的数量 */
   connectedCount: number;
+  /** 资源采集目标：已连接的 SSH 标签，或本地终端（采本机）；无则 null。
+   *  hostKey 相同的标签共享一份数据（user@host:port，本机为 "local"） */
+  statsTarget: { tabId: string; local: boolean; hostKey: string } | null;
+  /** 当前激活标签（统计输出字符数） */
+  activeTabId: string | null;
 }
 
 const LABEL: Record<Props["status"], string> = {
@@ -17,19 +27,430 @@ const LABEL: Record<Props["status"], string> = {
   error: "连接失败",
 };
 
-export default function StatusBar({ status, peer, sessionCount, connectedCount }: Props) {
+/** 资源刷新间隔 */
+const STATS_INTERVAL = 5000;
+
+interface Stats {
+  cpus?: number;
+  cpuPct?: number;
+  load?: string;
+  memTotal?: number;
+  memAvail?: number;
+  diskTotal?: number;
+  diskUsed?: number;
+  diskMount?: string;
+}
+
+function parseStats(r: Record<string, string>): Stats {
+  const num = (k: string) => {
+    const v = Number(r[k]);
+    return Number.isFinite(v) && r[k] !== undefined ? v : undefined;
+  };
+  return {
+    cpus: num("CPUS"),
+    cpuPct: num("CPU_PCT"),
+    load: r.LOAD,
+    memTotal: num("MEM_TOTAL"),
+    memAvail: num("MEM_AVAIL"),
+    diskTotal: num("DISK_TOTAL"),
+    diskUsed: num("DISK_USED"),
+    diskMount: r.DISK_MOUNT,
+  };
+}
+
+function fmtBytes(n: number): string {
+  const G = 1024 ** 3;
+  if (n >= 1024 * G) return `${(n / 1024 / G).toFixed(1)}T`;
+  if (n >= G) return `${(n / G).toFixed(1)}G`;
+  return `${(n / 1024 ** 2).toFixed(0)}M`;
+}
+
+/** 占用率分级：<60 正常，<85 偏高，否则告警 —— 决定进度条颜色 */
+const level = (pct: number) => (pct < 60 ? "ok" : pct < 85 ? "warn" : "crit");
+
+/** 数字补间：每次刷新从旧值滚到新值（约 600ms，easeOutCubic） */
+function useTween(target: number | undefined, ms = 600, animate = true): number | undefined {
+  const [v, setV] = useState(target);
+  const fromRef = useRef(target);
+  useEffect(() => {
+    if (target === undefined || !animate) {
+      fromRef.current = target;
+      setV(target);
+      return;
+    }
+    const from = fromRef.current ?? target;
+    const t0 = performance.now();
+    let raf = 0;
+    const step = (now: number) => {
+      const k = Math.min(1, (now - t0) / ms);
+      const e = 1 - Math.pow(1 - k, 3);
+      const cur = from + (target - from) * e;
+      fromRef.current = cur;
+      setV(cur);
+      if (k < 1) raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [target, ms, animate]);
+  return v;
+}
+
+function Meter({
+  label,
+  pct,
+  text,
+  title,
+  pulse,
+  animate,
+}: {
+  label: string;
+  pct: number | undefined;
+  text: string;
+  title: string;
+  pulse: number;
+  animate: boolean;
+}) {
+  const shown = useTween(pct, 600, animate);
+  const p = Math.max(0, Math.min(100, shown ?? 0));
   return (
-    <footer className="statusbar">
+    <span className="sb-meter" title={title}>
+      <span className="sb-meter-label">{label}</span>
+      <span className="sb-bar">
+        <span
+          className={`sb-bar-fill lv-${level(pct ?? 0)}`}
+          // 宽度直接给目标值，过渡交给 CSS；数字由 useTween 逐帧滚动
+          style={{ width: `${pct === undefined ? 0 : Math.max(0, Math.min(100, pct))}%` }}
+        />
+        {/* key 变化即重放一次扫光动画 */}
+        {animate && <span key={pulse} className="sb-bar-sheen" />}
+      </span>
+      <span className="sb-meter-text">
+        {pct === undefined ? "—" : `${p.toFixed(pct < 10 ? 1 : 0)}%`}
+      </span>
+      {text && <span className="sb-meter-sub">{text}</span>}
+    </span>
+  );
+}
+
+/**
+ * 按主机共享的最近一次采集结果（key = user@host:port，本机为 "local"）。
+ * 同一主机的多个标签共用：切回时立刻显示上次数值，不再闪「采集资源…」；
+ * 轮询只由当前激活标签发起，远端负载不随标签数增加。
+ */
+const statsCache = new Map<string, Stats>();
+
+function ResourceMeters({
+  hostKey,
+  tabId,
+  local,
+  live,
+  onContextMenu,
+}: {
+  hostKey: string;
+  tabId: string;
+  local: boolean;
+  live: boolean;
+  onContextMenu: (e: React.MouseEvent) => void;
+}) {
+  const [stats, setStats] = useState<Stats | null>(() => statsCache.get(hostKey) ?? null);
+  const [pulse, setPulse] = useState(0);
+  const [failed, setFailed] = useState(false);
+  // 采集用的标签可能变（同主机的另一个标签被激活），用 ref 取最新值，不重启轮询
+  const tabRef = useRef(tabId);
+  tabRef.current = tabId;
+
+  useEffect(() => {
+    let alive = true;
+    let busy = false;
+    setFailed(false);
+    const tick = async (animate: boolean) => {
+      if (busy) return; // 上一次还没回来（网络慢）就跳过，避免堆积
+      busy = true;
+      try {
+        const r = local ? await api.localStats() : await api.sshStats(tabRef.current);
+        if (!alive) return;
+        const st = parseStats(r);
+        statsCache.set(hostKey, st);
+        setStats(st);
+        setFailed(false);
+        if (animate) setPulse((n) => n + 1);
+      } catch {
+        if (alive) setFailed(true);
+      } finally {
+        busy = false;
+      }
+    };
+    // 关闭实时监控：停止轮询、数值定格在最后一次。
+    // 若这台主机还从没采过（暂停状态下新开的连接），补采一次静态值，避免一直空着
+    if (!live) {
+      if (!statsCache.has(hostKey)) tick(false);
+      return () => {
+        alive = false;
+      };
+    }
+    tick(true);
+    const id = window.setInterval(() => tick(true), STATS_INTERVAL);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [hostKey, local, live]);
+
+  const where = local ? "本机" : "远端";
+
+  if (!stats) {
+    return (
+      <span className="sb-res sb-res-loading" onContextMenu={onContextMenu} title="右键可关闭实时监控">
+        {failed ? "资源信息不可用" : <><span className="spinner sm" /> 采集资源…</>}
+      </span>
+    );
+  }
+
+  const memPct =
+    stats.memTotal && stats.memAvail !== undefined
+      ? ((stats.memTotal - stats.memAvail) / stats.memTotal) * 100
+      : undefined;
+  const diskPct =
+    stats.diskTotal && stats.diskUsed !== undefined
+      ? (stats.diskUsed / stats.diskTotal) * 100
+      : undefined;
+
+  return (
+    <span
+      className={`sb-res${failed ? " stale" : ""}${live ? "" : " paused"}`}
+      onContextMenu={onContextMenu}
+      title={live ? undefined : `${where} · 实时监控已关闭，显示的是最后一次数值（右键开启）`}
+    >
+      {live && (
+        <span
+          key={pulse}
+          className="sb-res-dot"
+          title={`${where} · ${failed ? "最近一次刷新失败" : "每 5 秒刷新"}（右键可关闭实时监控）`}
+        />
+      )}
+      {local && <span className="sb-res-where">本机</span>}
+      <Meter
+        label="CPU"
+        pct={stats.cpuPct}
+        text={stats.cpus ? `${stats.cpus} 核` : ""}
+        title={
+          `CPU：${stats.cpus ?? "?"} 核，当前占用 ${stats.cpuPct?.toFixed(1) ?? "?"}%` +
+          (stats.load ? `\n平均负载（1/5/15 分钟）：${stats.load}` : "")
+        }
+        pulse={pulse}
+        animate={live}
+      />
+      <Meter
+        label="内存"
+        pct={memPct}
+        text={
+          stats.memTotal !== undefined && stats.memAvail !== undefined
+            ? `可用 ${fmtBytes(stats.memAvail)} / ${fmtBytes(stats.memTotal)}`
+            : ""
+        }
+        title={
+          stats.memTotal !== undefined && stats.memAvail !== undefined
+            ? `内存：总量 ${fmtBytes(stats.memTotal)}，可用 ${fmtBytes(stats.memAvail)}，已用 ${fmtBytes(stats.memTotal - stats.memAvail)}`
+            : "内存信息不可用"
+        }
+        pulse={pulse}
+        animate={live}
+      />
+      <Meter
+        label="磁盘"
+        pct={diskPct}
+        text={
+          stats.diskTotal !== undefined && stats.diskUsed !== undefined
+            ? `${fmtBytes(stats.diskUsed)} / ${fmtBytes(stats.diskTotal)}`
+            : ""
+        }
+        title={
+          stats.diskTotal !== undefined && stats.diskUsed !== undefined
+            ? `磁盘（${stats.diskMount ?? "/"}）：总量 ${fmtBytes(stats.diskTotal)}，已用 ${fmtBytes(stats.diskUsed)}`
+            : "磁盘信息不可用"
+        }
+        pulse={pulse}
+        animate={live}
+      />
+    </span>
+  );
+}
+
+/** 1234 → 1,234；≥1 万用 K/M 缩写 */
+function fmtCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
+  if (n >= 10_000) return `${(n / 1000).toFixed(n >= 100_000 ? 0 : 1)}K`;
+  return n.toLocaleString();
+}
+
+function fmtSize(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${n} B`;
+}
+
+/** NumLock / CapsLock：浏览器拿不到初始状态，只能从下一次键盘/鼠标事件里读 */
+function useLockKeys() {
+  const [st, setSt] = useState<{ num: boolean; cap: boolean } | null>(null);
+  useEffect(() => {
+    const read = (e: KeyboardEvent | MouseEvent) => {
+      if (typeof e.getModifierState !== "function") return;
+      const num = e.getModifierState("NumLock");
+      // keydown CapsLock 本身时，状态已经是切换后的值（Chromium 行为）
+      const cap = e.getModifierState("CapsLock");
+      setSt((p) => (p && p.num === num && p.cap === cap ? p : { num, cap }));
+    };
+    // capture：xterm 的 textarea 会吞掉部分键盘事件，必须在捕获阶段读
+    window.addEventListener("keydown", read, true);
+    window.addEventListener("keyup", read, true);
+    window.addEventListener("mousedown", read, true);
+    window.addEventListener("mousemove", read, { capture: true, passive: true });
+    return () => {
+      window.removeEventListener("keydown", read, true);
+      window.removeEventListener("keyup", read, true);
+      window.removeEventListener("mousedown", read, true);
+      window.removeEventListener("mousemove", read, true);
+    };
+  }, []);
+  return st;
+}
+
+/** 当前标签累计输出量；每秒读一次登记表（计数在数据回调里累加，这里只取值） */
+function useOutputCount(tabId: string | null) {
+  const [c, setC] = useState({ chars: 0, bytes: 0 });
+  useEffect(() => {
+    if (!tabId) {
+      setC({ chars: 0, bytes: 0 });
+      return;
+    }
+    const read = () => {
+      const n = getOutputCount(tabId);
+      setC((p) => (p.chars === n.chars && p.bytes === n.bytes ? p : n));
+    };
+    read();
+    const id = window.setInterval(read, 1000);
+    return () => window.clearInterval(id);
+  }, [tabId]);
+  return c;
+}
+
+export default function StatusBar({
+  status,
+  peer,
+  sessionCount,
+  connectedCount,
+  statsTarget,
+  activeTabId,
+}: Props) {
+  const prefs = usePrefs();
+  const locks = useLockKeys();
+  const out = useOutputCount(activeTabId);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+
+  const openMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const W = 180;
+    const H = 72;
+    setMenu({
+      x: Math.min(e.clientX, window.innerWidth - W - 6),
+      y: Math.max(6, Math.min(e.clientY - H, window.innerHeight - H - 6)),
+    });
+  };
+
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && close();
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("blur", close);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("blur", close);
+    };
+  }, [menu]);
+
+  const live = prefs.liveMonitor;
+
+  return (
+    <footer className={`statusbar${live ? "" : " no-anim"}`}>
       <span className={`sb-status sb-${status}`}>
-        {status === "reconnecting" ? <span className="spinner sm" /> : <span className="sb-dot" />}
+        {status === "reconnecting" && live ? <span className="spinner sm" /> : <span className="sb-dot" />}
         {LABEL[status]}
       </span>
       <span className="sb-item">{peer ?? "—"}</span>
+      {prefs.showResources && statsTarget && (
+        <ResourceMeters
+          // 同一主机（含本机）的标签共享组件与数据：切换时不重采、不闪烁
+          key={statsTarget.hostKey}
+          hostKey={statsTarget.hostKey}
+          tabId={statsTarget.tabId}
+          local={statsTarget.local}
+          live={live}
+          onContextMenu={openMenu}
+        />
+      )}
       <span className="sb-spacer" />
+      {activeTabId && (
+        <span
+          className="sb-item sb-count"
+          title={
+            `当前终端累计输出 ${out.chars.toLocaleString()} 个字符（${fmtSize(out.bytes)}）\n` +
+            `导出时仅包含缓冲区内的内容（最多 10000 行滚动历史），实际文件可能更小`
+          }
+        >
+          字符 {fmtCount(out.chars)}
+        </span>
+      )}
+      <span
+        className={`sb-lock${locks?.num ? " on" : ""}`}
+        title={locks ? `NumLock ${locks.num ? "已开启" : "已关闭"}` : "按任意键后显示 NumLock 状态"}
+      >
+        NUM
+      </span>
+      <span
+        className={`sb-lock${locks?.cap ? " on" : ""}`}
+        title={locks ? `CapsLock ${locks.cap ? "已开启（大写）" : "已关闭（小写）"}` : "按任意键后显示 CapsLock 状态"}
+      >
+        CAP
+      </span>
       <span className="sb-item" title={`已打开 ${sessionCount} 个标签，其中 ${connectedCount} 个在线`}>
         {sessionCount} 会话
         {connectedCount !== sessionCount ? `（${connectedCount} 在线）` : ""}
       </span>
+
+      {menu && (
+        <>
+          <div
+            className="ctx-backdrop"
+            onMouseDown={() => setMenu(null)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setMenu(null);
+            }}
+          />
+          <div className="ctx-menu sb-menu" style={{ left: menu.x, top: menu.y }}>
+            <button
+              className="ctx-item"
+              onClick={() => {
+                setPrefs({ liveMonitor: !live });
+                setMenu(null);
+              }}
+            >
+              {live ? "关闭实时监控" : "开启实时监控"}
+            </button>
+            <button
+              className="ctx-item"
+              onClick={() => {
+                setPrefs({ showResources: false });
+                setMenu(null);
+              }}
+            >
+              在底部栏隐藏资源信息
+            </button>
+          </div>
+        </>
+      )}
     </footer>
   );
 }

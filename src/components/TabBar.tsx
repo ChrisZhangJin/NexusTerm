@@ -9,10 +9,20 @@ interface Props {
   /** 新标签页（本地终端），插到 afterId 右侧 */
   onNewTab: (afterId?: string | null) => void;
   onReconnect: (id: string) => void;
+  /** 复制会话：同一主机新开一个干净会话 */
   onDuplicate: (id: string) => void;
+  /** 复制会话并携带状态：恢复当前目录与 tmux */
+  onDuplicateWithState: (id: string) => void;
+  /** 断开 SSH 但保留标签 */
+  onDisconnect: (id: string) => void;
+  /** 打开该标签对应连接的 SFTP 文件管理器 */
+  onOpenSftp: (id: string) => void;
   onRename: (id: string, name: string) => void;
   /** 拖拽换位 */
   onMove: (fromId: string, toId: string, after: boolean) => void;
+  /** 最左侧「☰ 连接」按钮（原工具栏唯一按钮，已并入标签栏） */
+  sessionPopupOpen: boolean;
+  onToggleSessionPopup: () => void;
 }
 
 const tabLabel = (t: TerminalTab) => t.customTitle || t.title;
@@ -30,8 +40,13 @@ export default function TabBar({
   onNewTab,
   onReconnect,
   onDuplicate,
+  onDuplicateWithState,
+  onDisconnect,
+  onOpenSftp,
   onRename,
   onMove,
+  sessionPopupOpen,
+  onToggleSessionPopup,
 }: Props) {
   const [ctx, setCtx] = useState<{ x: number; y: number; id: string } | null>(null);
   const ctxRef = useRef<HTMLDivElement>(null);
@@ -118,6 +133,16 @@ export default function TabBar({
 
   return (
     <div className="tabbar">
+      {/* sp-toggle：连接列表的「点外部关闭」会放行它，避免先关后开 */}
+      <button
+        className={`tb-action tabbar-conn sp-toggle ${sessionPopupOpen ? "active" : ""}`}
+        onClick={onToggleSessionPopup}
+        title="打开连接列表（新建 / 导入 / 导出也在这里）"
+      >
+        <span className="tb-glyph">☰</span>
+        连接
+      </button>
+      <span className="tb-sep" />
       <div className="tabs">
         {tabs.map((t, i) => {
           const isDragging = drag?.id === t.id; // drag 只在越过阈值后才被设置
@@ -210,14 +235,34 @@ export default function TabBar({
             <button className="ctx-item" onClick={run(() => onReconnect(ctxTab.id))}>
               重新连接
             </button>
-          ) : (
-            <button className="ctx-item" onClick={run(() => onClose(ctxTab.id))}>
-              关闭
+          ) : !ctxTab.local ? (
+            <button className="ctx-item" onClick={run(() => onDisconnect(ctxTab.id))}>
+              断开
+            </button>
+          ) : null}
+          {!ctxTab.local && (
+            <button
+              className="ctx-item"
+              disabled={ctxTab.status !== "connected"}
+              title={ctxTab.status === "connected" ? "" : "会话连接后可用"}
+              onClick={run(() => onOpenSftp(ctxTab.id))}
+            >
+              SFTP 文件管理
             </button>
           )}
+          <div className="ctx-sep" />
           <button className="ctx-item" onClick={run(() => onDuplicate(ctxTab.id))}>
             复制会话
           </button>
+          {!ctxTab.local && (
+            <button
+              className="ctx-item"
+              title="新会话会进入当前目录，并以分组会话方式接入同一个 tmux"
+              onClick={run(() => onDuplicateWithState(ctxTab.id))}
+            >
+              复制会话并携带状态
+            </button>
+          )}
           <div className="ctx-sep" />
           <button
             className="ctx-item"
@@ -229,14 +274,10 @@ export default function TabBar({
             重命名
             <span className="ctx-shortcut">双击标签</span>
           </button>
-          {(ctxTab.status === "closed" || ctxTab.status === "error") && !ctxTab.local && (
-            <>
-              <div className="ctx-sep" />
-              <button className="ctx-item danger" onClick={run(() => onClose(ctxTab.id))}>
-                关闭标签
-              </button>
-            </>
-          )}
+          <div className="ctx-sep" />
+          <button className="ctx-item danger" onClick={run(() => onClose(ctxTab.id))}>
+            关闭标签
+          </button>
         </div>
       )}
     </div>

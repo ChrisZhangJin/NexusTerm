@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { SessionRecord } from "../types";
+import IOMenu from "./IOMenu";
 
 interface Props {
   sessions: SessionRecord[];
@@ -16,6 +17,14 @@ interface Props {
   onExportFolder: (sessions: SessionRecord[], folderName: string) => void;
   /** 分组改名：把 oldPath 整体改成以 newName 为末段 */
   onRenameFolder: (oldPath: string, newName: string) => void;
+  /** 导入 / 导出（原工具栏按钮，收编到这里） */
+  io: {
+    canExportSession: boolean;
+    exportSessionHint?: string;
+    onImport: () => void;
+    onExportSession: () => void;
+    onExportAll: () => void;
+  };
 }
 
 /** 规整 folder：去掉首尾斜杠，空/`/` 视为根（""）。 */
@@ -132,6 +141,7 @@ export default function SessionList({
   onExport,
   onExportFolder,
   onRenameFolder,
+  io,
 }: Props) {
   const [filter, setFilter] = useState("");
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -161,7 +171,9 @@ export default function SessionList({
 
   useEffect(() => {
     const onClick = (e: MouseEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
+      const t = e.target as HTMLElement;
+      if (t.closest?.(".sp-toggle")) return; // 开关按钮自己负责切换
+      if (panelRef.current && !panelRef.current.contains(t)) {
         onClose();
       }
     };
@@ -360,6 +372,7 @@ export default function SessionList({
         <button className="btn-icon" onClick={onCreate} title="新建连接">
           +
         </button>
+        <IOMenu {...io} />
       </div>
 
       <div

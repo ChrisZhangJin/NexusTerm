@@ -6,8 +6,17 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
-import { markOutput, registerTerm } from "../lib/termRegistry";
+import { countOutput, markOutput, registerTerm } from "../lib/termRegistry";
+import {
+  formatCombo,
+  getPrefs,
+  matchShortcut,
+  useShortcuts,
+  type ShortcutAction,
+} from "../lib/prefs";
 import { Highlighter, MARK_COLORS, bufferText, type MarkRule } from "../lib/highlight";
+import { parseProbe } from "../lib/context";
+import { readableKind } from "../lib/readable";
 
 import {
   api,
@@ -15,11 +24,11 @@ import {
   onLocalData,
   onTermClosed,
   onTermData,
+  bytesToBase64,
   stringToBytes,
 } from "../api";
-import { isMacOS } from "../lib/platform";
 import { themeToXterm } from "../lib/theme";
-import { attachZmodem } from "../lib/zmodem";
+import { attachZmodem, type ZmodemGate } from "../lib/zmodem";
 import type { ClosedInfo, TerminalTab, Theme } from "../types";
 
 /** HH:MM:SS，本地时区 */
@@ -49,12 +58,25 @@ interface Props {
   onNotify?: (msg: string) => void;
   /** 断开当前标签页 */
   onDisconnect?: () => void;
+  /** 打开 SFTP 文件管理器（仅 SSH） */
+  onOpenSftp?: () => void;
 }
 
 /** 终端区域右键菜单状态 */
 interface TermCtxMenu {
   x: number;
   y: number;
+  /** 右键时的选区（菜单打开后选区可能被改，先存下来） */
+  sel: string;
+}
+
+/** 选区 → 可阅读的文件路径（md / html / 图片 / 配置文件）；否则返回 null */
+function readablePath(sel: string): string | null {
+  let s = sel.trim();
+  if (!s || s.includes("\n")) return null;
+  s = s.replace(/^['"`]+|['"`,;:]+$/g, ""); // 去掉 ls / 日志里常见的引号与尾随标点
+  s = s.replace(/^file:\/\//i, "");
+  return readableKind(s) ? s : null;
 }
 
 function debounce<A extends unknown[]>(fn: (...a: A) => void, ms: number) {
@@ -76,6 +98,7 @@ export default function TerminalView({
   onClosed,
   onNotify,
   onDisconnect,
+  onOpenSftp,
   peerHost,
   status,
   reconnectAttempt,
@@ -98,6 +121,12 @@ export default function TerminalView({
   const [markOpen, setMarkOpen] = useState(false);
   /** 当前生效的标记规则数（右上角徽标用） */
   const [markCount, setMarkCount] = useState(0);
+  const zmodemRef = useRef<ZmodemGate | null>(null);
+  /** 外部文件拖入终端时的高亮遮罩 */
+  const [dropHint, setDropHint] = useState(false);
+  const dragDepth = useRef(0);
+  const statusRef = useRef(status);
+  statusRef.current = status;
 
   activeRef.current = active;
 
@@ -156,6 +185,30 @@ export default function TerminalView({
       markOutput(tabId);
       hl.refresh();
     });
+    // 选中即复制：只在「鼠标在本终端按下 → 松开」时触发。
+    // 不用 onSelectionChange：查找跳转、全选快捷键也会改选区，会意外覆盖剪贴板。
+    // mouseup 挂 window：拖选到终端外再松手也要算。
+    let selPressed = false;
+    const onSelDown = (e: MouseEvent) => {
+      selPressed = e.button === 0;
+    };
+    const onSelUp = (e: MouseEvent) => {
+      if (!selPressed || e.button !== 0) return;
+      selPressed = false;
+      if (!getPrefs().copyOnSelect) return;
+      // 等 xterm 自己的 mouseup 处理完、选区定稿
+      setTimeout(() => {
+        if (disposed || !term.hasSelection()) return;
+        const sel = term.getSelection();
+        if (sel) api.clipboardWrite(sel).catch(() => {});
+      }, 0);
+    };
+    host.addEventListener("mousedown", onSelDown, true);
+    window.addEventListener("mouseup", onSelUp, true);
+    cleanups.push(() => {
+      host.removeEventListener("mousedown", onSelDown, true);
+      window.removeEventListener("mouseup", onSelUp, true);
+    });
     const resizeSub = term.onResize(() => hl.refresh());
     const bufSub = term.buffer.onBufferChange(() => hl.refresh());
     cleanups.push(
@@ -168,14 +221,17 @@ export default function TerminalView({
     // —— ZMODEM（lrzsz）：远端 rz/sz 的字节流先过 Sentry 嗅探 ——
     const zmodem = attachZmodem({
       termWrite: (s) => term.write(s),
-      termWriteBytes: (b) => term.write(b),
+      termWriteBytes: (b) => {
+        countOutput(tabId, b);
+        term.write(b);
+      },
       send: (bytes) => {
-        (isLocal ? api.localWrite(tabId, bytes) : api.sshWrite(tabId, bytes)).catch(
-          () => {}
-        );
+        const b64 = bytesToBase64(bytes);
+        return isLocal ? api.localWriteB64(tabId, b64) : api.sshWriteB64(tabId, b64);
       },
       notify: onNotify ?? (() => {}),
     });
+    zmodemRef.current = zmodem;
 
     // 输出 → 终端（SSH 与本地 PTY 协议一致，只是事件名前缀不同）
     const dataFeed = isLocal ? onLocalData : onTermData;
@@ -219,36 +275,16 @@ export default function TerminalView({
       send(d).catch(() => {});
     });
 
-    // Windows / Linux 上 Ctrl+C 必须留给中断信号（^C），不能像 macOS 那样
-    // 兼作复制（macOS 有 ⌘C）。补上终端惯例的 Ctrl+Shift+C / Ctrl+Shift+V，
-    // 否则非 macOS 用户根本没有复制入口。
-    if (!isMacOS()) {
-      term.attachCustomKeyEventHandler((e) => {
-        if (e.type !== "keydown" || !(e.ctrlKey || e.metaKey) || !e.shiftKey) {
-          return true;
-        }
-        const k = e.key.toLowerCase();
-        if (k === "f") {
-          setFindOpen(true);
-          return false;
-        }
-        if (k === "c") {
-          const sel = term.getSelection();
-          if (sel) api.clipboardWrite(sel).catch(() => {});
-          return false;
-        }
-        if (k === "v") {
-          api
-            .clipboardRead()
-            .then((t) => {
-              if (t && !zmodem.isActive()) term.paste(t);
-            })
-            .catch(() => {});
-          return false;
-        }
-        return true;
-      });
-    }
+    // 快捷键全部来自「设置 → 快捷键」（lib/prefs），改了立即生效。
+    // 默认 Windows / Linux 用 Ctrl+Shift+C/V/F：Ctrl+C 必须留给中断信号（^C）。
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== "keydown") return true;
+      const action = matchShortcut(e);
+      if (!action) return true;
+      e.preventDefault();
+      shortcutRef.current(action);
+      return false;
+    });
 
     // 二进制粘贴（避免中转会破坏字节）
     const binSub = term.onBinary((d) => {
@@ -264,10 +300,11 @@ export default function TerminalView({
       e.preventDefault();
       if (zmodem.isActive()) return;
       const MENU_W = 190;
-      const MENU_H = 300;
+      const MENU_H = 372;
       setCtxMenu({
         x: Math.min(e.clientX, window.innerWidth - MENU_W - 8),
         y: Math.min(e.clientY, window.innerHeight - MENU_H - 8),
+        sel: term.getSelection(),
       });
     };
     host.addEventListener("contextmenu", onCtxMenu);
@@ -295,6 +332,7 @@ export default function TerminalView({
       disposed = true;
       host.removeEventListener("contextmenu", onCtxMenu);
       zmodem.dispose();
+      zmodemRef.current = null;
       ro.disconnect();
       dataSub.dispose();
       binSub.dispose();
@@ -426,10 +464,49 @@ export default function TerminalView({
     onDisconnect?.();
   }, [onDisconnect]);
 
+  /** 阅读选中的文件：相对路径按 shell 当前目录解析 */
+  const doRead = useCallback(
+    async (raw: string) => {
+      setCtxMenu(null);
+      const p = readablePath(raw);
+      if (!p) return;
+      const name = p.split(/[\\/]/).pop() ?? p;
+      try {
+        if (isLocal) {
+          const abs = /^([A-Za-z]:[\\/]|[\\/]|~)/.test(p);
+          if (!abs) {
+            onNotify?.("本地终端请选中完整路径（如 C:\\docs\\README.md）");
+            return;
+          }
+          await api.readerOpenLocal(p);
+          return;
+        }
+        let full = p;
+        if (!p.startsWith("/") && p !== "~" && !p.startsWith("~/")) {
+          const ctx = parseProbe(await api.sshProbe(tabId).catch(() => ({})));
+          if (!ctx?.cwd) {
+            onNotify?.("无法确定远端当前目录，请选中完整路径（/… 或 ~/…）");
+            return;
+          }
+          full = (ctx.cwd.endsWith("/") ? ctx.cwd : ctx.cwd + "/") + p.replace(/^\.\//, "");
+        }
+        onNotify?.(`正在打开「${name}」…`);
+        const where = peerHostRef.current ? `${peerHostRef.current}:` : "";
+        await api.readerOpenSsh(tabId, full, `${where}${full}`);
+      } catch (e) {
+        onNotify?.(`阅读失败：${String(e)}`);
+      }
+    },
+    [isLocal, tabId, onNotify]
+  );
+
   const doFind = useCallback(() => {
     setCtxMenu(null);
     setFindOpen(true);
   }, []);
+
+  /** 快捷键分发：按键处理在 mount 时注册一次，经 ref 拿最新的动作实现 */
+  const shortcutRef = useRef<(a: ShortcutAction) => void>(() => {});
 
   const doMark = useCallback(() => {
     setCtxMenu(null);
@@ -466,6 +543,94 @@ export default function TerminalView({
     }
   }, [peerHost, isLocal, onNotify]);
 
+  shortcutRef.current = (a) => {
+    if (zmodemRef.current?.isActive() && a !== "copy" && a !== "find") return;
+    switch (a) {
+      case "disconnect":
+        // 本地终端的「断开」= 关闭标签，误触代价大，快捷键只作用于 SSH
+        if (!isLocal) doDisconnect();
+        break;
+      case "copy": {
+        const sel = termRef.current?.getSelection();
+        if (sel) api.clipboardWrite(sel).catch(() => {});
+        break;
+      }
+      case "paste":
+        doPaste();
+        break;
+      case "find":
+        doFind();
+        break;
+      case "selectAll":
+        doSelectAll();
+        break;
+      case "clearScreen":
+        doClearScreen();
+        break;
+      case "exportBuffer":
+        doExport();
+        break;
+    }
+  };
+
+  // —— 外部文件拖入 = 上传（远端执行 rz，ZMODEM 握手后直接发送拖入的文件） ——
+  const hasFiles = (e: React.DragEvent) => Array.from(e.dataTransfer?.types ?? []).includes("Files");
+  const onDragEnter = useCallback((e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth.current++;
+    setDropHint(true);
+  }, []);
+  const onDragOver = useCallback((e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  }, []);
+  const onDragLeave = useCallback((e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDropHint(false);
+  }, []);
+  const onDrop = useCallback(
+    (e: React.DragEvent) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      dragDepth.current = 0;
+      setDropHint(false);
+      const files = Array.from(e.dataTransfer.files ?? []).filter((f) => f.size > 0 || f.type !== "");
+      if (files.length === 0) {
+        onNotify?.("没有可上传的文件（不支持直接拖入文件夹）");
+        return;
+      }
+      if (isLocal) {
+        onNotify?.("本地终端不支持拖拽上传，请在 SSH 会话中使用");
+        return;
+      }
+      if (statusRef.current !== "connected") {
+        onNotify?.("会话未连接，无法上传");
+        return;
+      }
+      const z = zmodemRef.current;
+      if (!z) return;
+      if (z.isActive()) {
+        onNotify?.("已有 ZMODEM 传输在进行中，请稍后再试");
+        return;
+      }
+      z.queueUpload(files);
+      // -E：远端已有同名文件时自动改名，避免覆盖也避免被拒收
+      const cmd = "rz -E\r";
+      (isLocal ? api.localWrite(tabId, stringToBytes(cmd)) : api.sshWrite(tabId, stringToBytes(cmd))).catch(
+        (err) => onNotify?.(`发送 rz 失败：${String(err)}`)
+      );
+      const total = files.reduce((n, f) => n + f.size, 0);
+      onNotify?.(
+        `正在通过 rz 上传 ${files.length} 个文件（${(total / 1024 / 1024).toFixed(1)} MB）到远端当前目录；远端需已安装 lrzsz`
+      );
+      termRef.current?.focus();
+    },
+    [isLocal, tabId, onNotify]
+  );
+
   const applyMarks = useCallback(
     (rules: MarkRule[], cs: boolean) => {
       const n = hlRef.current?.apply(rules, cs) ?? 0;
@@ -484,6 +649,7 @@ export default function TerminalView({
   // 点菜单外收菜单。必须排除菜单自身：否则 mousedown 先把菜单卸载，
   // click 永远到不了按钮 —— 这正是「右键菜单一个都没作用」的根因
   const ctxRef = useRef<HTMLDivElement>(null);
+  const sc = useShortcuts();
   useEffect(() => {
     if (!ctxMenu) return;
     const hide = (e: MouseEvent) => {
@@ -506,7 +672,20 @@ export default function TerminalView({
         ref={hostRef}
         className="term-host"
         style={{ display: active ? "block" : "none" }}
+        onDragEnter={onDragEnter}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
       />
+      {active && dropHint && (
+        <div className="term-drop">
+          <div className="term-drop-box">
+            <div className="term-drop-icon">⇪</div>
+            <div className="term-drop-title">松开以上传到远端当前目录</div>
+            <div className="term-drop-sub">通过 rz（lrzsz / ZMODEM）传输 · 同名文件自动改名</div>
+          </div>
+        </div>
+      )}
       {ctxMenu && active && (
         <>
           <div
@@ -517,28 +696,57 @@ export default function TerminalView({
           <div ref={ctxRef} className="ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
             <button className="ctx-item" onClick={doDisconnect}>
               断开
-              <span className="ctx-shortcut">Alt+C</span>
+              <Kbd combo={sc.disconnect} />
             </button>
+            {!isLocal && (
+              <button
+                className="ctx-item"
+                disabled={status !== "connected"}
+                onClick={() => {
+                  setCtxMenu(null);
+                  onOpenSftp?.();
+                }}
+              >
+                SFTP 文件管理
+              </button>
+            )}
+            <div className="ctx-sep" />
+            {(() => {
+              const p = readablePath(ctxMenu.sel);
+              const name = p?.split(/[\\/]/).pop();
+              return (
+                <button
+                  className="ctx-item"
+                  disabled={!p || (!isLocal && status !== "connected")}
+                  title={p ? "在新窗口中渲染查看" : "先用鼠标选中一个 .md / .html 文件名或路径"}
+                  onClick={() => p && void doRead(ctxMenu.sel)}
+                >
+                  <span className="ctx-ellipsis">{name ? `阅读「${name}」` : "阅读"}</span>
+                </button>
+              );
+            })()}
             <div className="ctx-sep" />
             <button className="ctx-item" onClick={doCopy}>
               复制
-              <span className="ctx-shortcut">Ctrl+Shift+C</span>
+              <Kbd combo={sc.copy} />
             </button>
             <button className="ctx-item" onClick={doPaste}>
               粘贴
-              <span className="ctx-shortcut">Ctrl+Shift+V</span>
+              <Kbd combo={sc.paste} />
             </button>
             <div className="ctx-sep" />
             <button className="ctx-item" onClick={doSelectAll}>
               全选
+              <Kbd combo={sc.selectAll} />
             </button>
             <button className="ctx-item" onClick={doClearScreen}>
               清屏
+              <Kbd combo={sc.clearScreen} />
             </button>
             <div className="ctx-sep" />
             <button className="ctx-item" onClick={doFind}>
               查找…
-              <span className="ctx-shortcut">Ctrl+Shift+F</span>
+              <Kbd combo={sc.find} />
             </button>
             <button className="ctx-item" onClick={doMark}>
               标记…
@@ -546,6 +754,7 @@ export default function TerminalView({
             </button>
             <button className="ctx-item" onClick={doExport}>
               导出…
+              <Kbd combo={sc.exportBuffer} />
             </button>
           </div>
         </>
@@ -576,6 +785,11 @@ export default function TerminalView({
       )}
     </>
   );
+}
+
+/** 菜单项右侧的快捷键提示；未绑定时不显示 */
+function Kbd({ combo }: { combo: string }) {
+  return combo ? <span className="ctx-shortcut">{formatCombo(combo)}</span> : null;
 }
 
 // ——— 查找条 ———

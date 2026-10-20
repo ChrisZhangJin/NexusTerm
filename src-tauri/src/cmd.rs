@@ -38,6 +38,15 @@ pub fn local_write(id: String, data: Vec<u8>, state: State<'_, AppState>) -> Res
 }
 
 #[tauri::command]
+pub fn local_write_b64(id: String, data: String, state: State<'_, AppState>) -> Result<(), String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|e| format!("base64 解码失败：{}", e))?;
+    state.local.write(&id, &bytes)
+}
+
+#[tauri::command]
 pub fn local_resize(
     id: String,
     cols: u16,
@@ -67,6 +76,16 @@ pub fn ssh_write(id: String, data: Vec<u8>, state: State<'_, AppState>) -> Resul
     state.sessions.write(&id, data)
 }
 
+/// 大块二进制写入（ZMODEM 上传）：base64 字符串比 JSON 数字数组小 ~3 倍、解析快得多
+#[tauri::command]
+pub fn ssh_write_b64(id: String, data: String, state: State<'_, AppState>) -> Result<(), SessionError> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|e| SessionError::Channel(format!("base64 解码失败：{}", e)))?;
+    state.sessions.write(&id, bytes)
+}
+
 #[tauri::command]
 pub fn ssh_resize(
     id: String,
@@ -89,6 +108,21 @@ pub async fn ssh_probe(
     state: State<'_, AppState>,
 ) -> Result<crate::ssh::session::ProbeInfo, SessionError> {
     state.sessions.probe(&id).await
+}
+
+/// 远端资源快照（CPU / 内存 / 磁盘），状态栏轮询用
+#[tauri::command]
+pub async fn ssh_stats(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<crate::ssh::session::ProbeInfo, SessionError> {
+    state.sessions.stats(&id).await
+}
+
+/// 本机资源快照（本地终端标签的状态栏用），KEY 与 ssh_stats 一致
+#[tauri::command]
+pub async fn local_stats() -> Result<crate::sysstat::Stats, String> {
+    crate::sysstat::collect().await
 }
 
 // ——— 系统剪贴板 ———

@@ -201,6 +201,44 @@ impl SftpManager {
         Ok(n)
     }
 
+    /// 把远端文件整个读进内存（阅读窗口用），超过 `max` 字节直接拒绝。
+    pub async fn read(&self, id: &str, path: &str, max: usize) -> Result<Vec<u8>, SftpError> {
+        use tokio::io::AsyncReadExt;
+        let mut file = {
+            let map = self.inner.lock().await;
+            let s = map
+                .get(id)
+                .ok_or_else(|| SftpError::NotFound(id.to_string()))?;
+            let meta = s
+                .metadata(path.to_string())
+                .await
+                .map_err(|e| SftpError::Remote(e.to_string()))?;
+            if meta.is_dir() {
+                return Err(SftpError::Remote(format!("「{path}」是目录")));
+            }
+            if meta.size.unwrap_or(0) as usize > max {
+                return Err(SftpError::Remote(format!(
+                    "文件超过 {} MB，不适合阅读",
+                    max / 1024 / 1024
+                )));
+            }
+            s.open(path.to_string())
+                .await
+                .map_err(|e| SftpError::Remote(e.to_string()))?
+        };
+        let mut buf = Vec::new();
+        (&mut file)
+            .take(max as u64 + 1)
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| SftpError::Remote(e.to_string()))?;
+        let _ = file.close().await;
+        if buf.len() > max {
+            return Err(SftpError::Remote("文件过大，不适合阅读".into()));
+        }
+        Ok(buf)
+    }
+
     /// 上传本地文件到远端路径，返回写入字节数。
     pub async fn upload(&self, id: &str, local: &str, remote: &str) -> Result<u64, SftpError> {
         let mut file = {

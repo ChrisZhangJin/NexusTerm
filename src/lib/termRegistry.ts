@@ -15,12 +15,48 @@ export function registerTerm(id: string, term: Terminal): () => void {
     if (registry.get(id) === term) {
       registry.delete(id);
       lastOutput.delete(id);
+      outputCount.delete(id);
     }
   };
 }
 
 export function markOutput(id: string): void {
   lastOutput.set(id, Date.now());
+}
+
+/** 每个标签累计收到的输出量（字符数按 UTF-8 解码后计），状态栏展示、导出前参考大小 */
+interface OutputCount {
+  chars: number;
+  bytes: number;
+  decoder: TextDecoder;
+}
+const outputCount = new Map<string, OutputCount>();
+
+export function countOutput(id: string, bytes: Uint8Array): void {
+  let c = outputCount.get(id);
+  if (!c) {
+    c = { chars: 0, bytes: 0, decoder: new TextDecoder("utf-8") };
+    outputCount.set(id, c);
+  }
+  c.bytes += bytes.length;
+  // stream: true —— 多字节字符被拆在两个包之间时不会算成两个乱码
+  const s = c.decoder.decode(bytes, { stream: true });
+  // 按码点计（emoji 等代理对算 1 个字符）
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const cc = s.charCodeAt(i);
+    if (cc < 0xdc00 || cc > 0xdfff) n++;
+  }
+  c.chars += n;
+}
+
+export function getOutputCount(id: string): { chars: number; bytes: number } {
+  const c = outputCount.get(id);
+  return c ? { chars: c.chars, bytes: c.bytes } : { chars: 0, bytes: 0 };
+}
+
+export function dropOutputCount(id: string): void {
+  outputCount.delete(id);
 }
 
 const PROMPT_TAIL = /[$#%>❯➜»λ]\s?$/;

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { isMacOS } from "../lib/platform";
 import appIcon from "../assets/app-icon.png";
@@ -8,7 +8,9 @@ interface Props {
   title: string;
   themeName: string;
   onCycleTheme: () => void;
-  onToggleSettings: () => void;
+  /** 打开「设置」下的某个窗口 */
+  onOpenSettings: (which: "appearance" | "shortcuts") => void;
+  /** 有设置窗口打开时高亮齿轮 */
   settingsOpen: boolean;
 }
 
@@ -30,11 +32,36 @@ export default function TitleBar({
   title,
   themeName,
   onCycleTheme,
-  onToggleSettings,
+  onOpenSettings,
   settingsOpen,
 }: Props) {
   const mac = isMacOS();
   const [maximized, setMaximized] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // 点菜单外 / Esc / 窗口失焦收起
+  useEffect(() => {
+    if (!menuOpen) return;
+    const down = (e: MouseEvent) => {
+      if (!menuRef.current?.contains(e.target as Node)) setMenuOpen(false);
+    };
+    const key = (e: KeyboardEvent) => e.key === "Escape" && setMenuOpen(false);
+    const blur = () => setMenuOpen(false);
+    document.addEventListener("mousedown", down);
+    window.addEventListener("keydown", key);
+    window.addEventListener("blur", blur);
+    return () => {
+      document.removeEventListener("mousedown", down);
+      window.removeEventListener("keydown", key);
+      window.removeEventListener("blur", blur);
+    };
+  }, [menuOpen]);
+
+  const pick = (w: "appearance" | "shortcuts") => {
+    setMenuOpen(false);
+    onOpenSettings(w);
+  };
 
   // 非 macOS 才有自绘的最大化按钮，因此要跟踪窗口当前是否最大化
   useEffect(() => {
@@ -74,13 +101,28 @@ export default function TitleBar({
         >
           {themeName}
         </button>
-        <button
-          className={`tb-btn ${settingsOpen ? "active" : ""}`}
-          onClick={onToggleSettings}
-          title="外观设置"
-        >
-          ⚙
-        </button>
+        <div className="tb-settings" ref={menuRef}>
+          <button
+            className={`tb-btn ${settingsOpen || menuOpen ? "active" : ""}`}
+            onClick={() => setMenuOpen((v) => !v)}
+            title="设置"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+          >
+            ⚙ 设置
+          </button>
+          {menuOpen && (
+            <div className="ctx-menu tb-settings-menu" role="menu" data-tauri-drag-region="false">
+              <button className="ctx-item" role="menuitem" onClick={() => pick("appearance")}>
+                外观…
+                <span className="ctx-shortcut">配色 · 字体 · 底部栏</span>
+              </button>
+              <button className="ctx-item" role="menuitem" onClick={() => pick("shortcuts")}>
+                快捷键…
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* 非 macOS 平台没有系统标题栏按钮，自绘一套放在最右（Windows 习惯） */}

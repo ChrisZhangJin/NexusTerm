@@ -20,13 +20,30 @@ declare module "zmodem.js" {
     on(event: "input", fn: (octets: number[]) => void): void;
     accept(opts?: { on_progress?: (t: ZTransfer, p: number) => void }): Promise<void>;
     skip(): void;
+    /** 发送端：非末尾分片 */
+    send(bytes: Uint8Array | number[]): void;
+    /** 发送端：末尾分片，远端确认后 resolve */
+    end(bytes?: Uint8Array | number[]): Promise<void>;
+    /** 发送端：远端要求的起始偏移（断点续传时非 0） */
+    get_offset(): number;
+  }
+
+  export interface ZOfferParams {
+    name: string;
+    size: number;
+    mtime?: Date;
+    files_remaining?: number;
+    bytes_remaining?: number;
   }
 
   export interface ZSession {
     type: "send" | "receive";
     start(): void;
-    close(): void;
+    /** 发 ZFIN 结束会话，远端回 ZFIN 后 resolve */
+    close(): Promise<void>;
     abort(): void;
+    /** 发送端：提交文件；远端 ZSKIP（拒收）时 resolve 为 undefined */
+    send_offer(params: ZOfferParams): Promise<ZTransfer | undefined>;
     on(event: "offer", fn: (xfer: ZTransfer) => void): void;
     on(event: "session_end", fn: () => void): void;
     on(event: "garbage", fn: (octets: number[]) => void): void;
@@ -46,15 +63,17 @@ declare module "zmodem.js" {
   }
 
   export const Browser: {
+    /** 注意：files 必须是数组（实现里按 length 倒序遍历），传对象会一个都不发 */
     send_files(
       session: ZSession,
-      files_obj: Record<string, File | Blob>,
+      files: File[],
       opts?: {
-        on_offer_response?: (obj: unknown, xfer: ZTransfer) => void;
-        on_file_response?: (obj: unknown, xfer: ZTransfer) => void;
-        on_progress?: (obj: unknown, xfer: ZTransfer) => void;
+        /** xfer 为 undefined 表示远端 ZSKIP（拒收） */
+        on_offer_response?: (obj: File, xfer: ZTransfer | undefined) => void;
+        on_progress?: (obj: File, xfer: ZTransfer, piece: Uint8Array) => void;
+        on_file_complete?: (obj: File, xfer: ZTransfer) => void;
       }
-    ): Promise<unknown>;
+    ): Promise<void>;
     save_to_disk(payloads: Uint8Array[], name: string): void;
   };
 

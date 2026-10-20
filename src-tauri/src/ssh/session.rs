@@ -124,6 +124,54 @@ if command -v tmux >/dev/null 2>&1; then
 fi
 "#;
 
+/// 资源快照脚本（Linux /proc）。CPU 占用率需两次采样 /proc/stat 做差（间隔 0.5s）；
+/// 内存取 MemAvailable（旧内核没有时用 MemFree+Buffers+Cached 近似）；磁盘取根分区 df -kP。
+/// 只读，输出 KEY=VALUE；非 Linux 时各项缺省，前端显示「—」。
+const STATS_SCRIPT: &str = r#"
+LC_ALL=C; export LC_ALL
+cpu() { awk '/^cpu /{ idle=$5+$6; t=0; for(i=2;i<=NF;i++) t+=$i; print t, idle; exit }' /proc/stat 2>/dev/null; }
+a=$(cpu); sleep 0.5; b=$(cpu)
+if [ -n "$a" ] && [ -n "$b" ]; then
+  echo "$a $b" | awk '{ dt=$3-$1; di=$4-$2; if (dt>0) printf "CPU_PCT=%.1f\n", (dt-di)*100/dt }'
+fi
+n=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+[ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null || n=$(nproc 2>/dev/null)
+echo "CPUS=$n"
+[ -r /proc/loadavg ] && awk '{ print "LOAD=" $1 " " $2 " " $3 }' /proc/loadavg
+awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} /^MemFree:/{f=$2} /^Buffers:/{b=$2} /^Cached:/{c=$2}
+  END { if (t) { if (!a) a=f+b+c; print "MEM_TOTAL=" t*1024; print "MEM_AVAIL=" a*1024 } }' /proc/meminfo 2>/dev/null
+df -kP / 2>/dev/null | awk 'NR==2 { print "DISK_TOTAL=" $2*1024; print "DISK_USED=" $3*1024; print "DISK_MOUNT=" $6 }'
+"#;
+
+/// POSIX 单引号转义
+fn shq(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// `cat` 命令：`~/x` 展开为 "$HOME"/'x'，其余整体单引号包裹，防注入。
+/// 只用 sh / bash / zsh / fish 通用的语法。
+fn cat_command(path: &str) -> String {
+    if path == "~" {
+        return "cat -- \"$HOME\"".into();
+    }
+    match path.strip_prefix("~/") {
+        Some(rest) => format!("cat -- \"$HOME\"/{}", shq(rest)),
+        None => format!("cat -- {}", shq(path)),
+    }
+}
+
+#[cfg(test)]
+mod cat_tests {
+    use super::cat_command;
+    #[test]
+    fn quoting() {
+        assert_eq!(cat_command("/a b/c.md"), "cat -- '/a b/c.md'");
+        assert_eq!(cat_command("/x/it's.md"), "cat -- '/x/it'\\''s.md'");
+        assert_eq!(cat_command("~/d/r.md"), "cat -- \"$HOME\"/'d/r.md'");
+        assert_eq!(cat_command("/x/$(rm -rf).md"), "cat -- '/x/$(rm -rf).md'");
+    }
+}
+
 /// 探测结果：KEY=VALUE 原样回传，由前端解释（规则改动不必重编 Rust）
 pub type ProbeInfo = HashMap<String, String>;
 
@@ -260,6 +308,21 @@ impl SessionManager {
     /// 探测该标签交互 shell 的工作目录 / 前台进程 / tmux 会话。
     /// 走旁路 exec 通道，不会往用户终端里写任何东西。
     pub async fn probe(&self, id: &str) -> Result<ProbeInfo, SessionError> {
+        self.run_kv_script(id, PROBE_SCRIPT, "探测超时").await
+    }
+
+    /// 远端资源快照（CPU / 内存 / 磁盘），供状态栏每 5 秒刷新。同样走旁路 exec 通道。
+    pub async fn stats(&self, id: &str) -> Result<ProbeInfo, SessionError> {
+        self.run_kv_script(id, STATS_SCRIPT, "资源采集超时").await
+    }
+
+    /// 在同一连接上开 exec 通道跑 `sh -s` 脚本，解析 `k=v` 行输出。
+    async fn run_kv_script(
+        &self,
+        id: &str,
+        script: &'static str,
+        timeout_msg: &'static str,
+    ) -> Result<ProbeInfo, SessionError> {
         let handle = {
             let map = self.inner.lock();
             map.get(id)
@@ -275,7 +338,7 @@ impl SessionManager {
             ch.exec(true, "sh -s")
                 .await
                 .map_err(|e| SessionError::Channel(e.to_string()))?;
-            ch.data(PROBE_SCRIPT.as_bytes())
+            ch.data(script.as_bytes())
                 .await
                 .map_err(|e| SessionError::Channel(e.to_string()))?;
             ch.eof().await.map_err(|e| SessionError::Channel(e.to_string()))?;
@@ -291,7 +354,7 @@ impl SessionManager {
         };
         let out = tokio::time::timeout(std::time::Duration::from_secs(8), run)
             .await
-            .map_err(|_| SessionError::Channel("探测超时".into()))??;
+            .map_err(|_| SessionError::Channel(timeout_msg.into()))??;
         let text = String::from_utf8_lossy(&out);
         let mut info = ProbeInfo::new();
         for line in text.lines() {
@@ -302,6 +365,70 @@ impl SessionManager {
             }
         }
         Ok(info)
+    }
+
+    /// 在同一连接上开 exec 通道 `cat` 一个文件（阅读窗口用，不依赖 SFTP 子系统）。
+    /// `path` 为绝对路径或 `~/` 开头；超过 `max` 字节即中止。
+    pub async fn read_file(
+        &self,
+        id: &str,
+        path: &str,
+        max: usize,
+    ) -> Result<Vec<u8>, SessionError> {
+        let handle = {
+            let map = self.inner.lock();
+            map.get(id)
+                .ok_or_else(|| SessionError::NotFound(id.into()))?
+                .handle
+                .clone()
+        };
+        let cmd = cat_command(path);
+        let run = async move {
+            let mut ch = handle
+                .channel_open_session()
+                .await
+                .map_err(|e| SessionError::Channel(e.to_string()))?;
+            ch.exec(true, cmd.as_bytes())
+                .await
+                .map_err(|e| SessionError::Channel(e.to_string()))?;
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let mut code: Option<u32> = None;
+            while let Some(msg) = ch.wait().await {
+                match msg {
+                    ChannelMsg::Data { data } => {
+                        out.extend_from_slice(&data);
+                        if out.len() > max {
+                            let _ = ch.close().await;
+                            return Err(SessionError::Channel(format!(
+                                "文件超过 {} MB，不适合阅读",
+                                max / 1024 / 1024
+                            )));
+                        }
+                    }
+                    ChannelMsg::ExtendedData { data, .. } => {
+                        if err.len() < 4096 {
+                            err.extend_from_slice(&data);
+                        }
+                    }
+                    ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            if code.unwrap_or(0) != 0 {
+                let msg = String::from_utf8_lossy(&err).trim().to_string();
+                return Err(SessionError::Channel(if msg.is_empty() {
+                    format!("读取失败（退出码 {}）", code.unwrap_or(0))
+                } else {
+                    msg
+                }));
+            }
+            Ok::<_, SessionError>(out)
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), run)
+            .await
+            .map_err(|_| SessionError::Channel("读取文件超时".into()))?
     }
 
     pub fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), SessionError> {

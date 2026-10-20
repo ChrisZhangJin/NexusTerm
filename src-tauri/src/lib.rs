@@ -12,9 +12,11 @@ pub mod errors;
 mod cmd;
 mod keys;
 mod local;
+mod reader;
 mod sftp;
 mod ssh;
 mod store;
+mod sysstat;
 mod xsh;
 
 fn app_data_dir(app: &tauri::AppHandle) -> PathBuf {
@@ -34,6 +36,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // 阅读窗口里 HTML iframe 的页面来源（带独立 CSP，默认禁脚本）
+        .register_uri_scheme_protocol("nxdoc", reader::protocol)
         .setup(|app| {
             let dir = app_data_dir(app.handle());
             let store = Store::open(dir).expect("SQLite 初始化失败");
@@ -42,6 +46,7 @@ pub fn run() {
             let sessions = SessionManager::new();
             // SFTP 复用同一份主机指纹表，保证 TOFU 策略在两个通道上一致
             let sftp = SftpManager::new(sessions.known_hosts());
+            app.manage(reader::DocStore::default());
             app.manage(AppState {
                 sessions,
                 sftp,
@@ -59,6 +64,10 @@ pub fn run() {
             cmd::ssh_resize,
             cmd::ssh_close,
             cmd::ssh_probe,
+            cmd::ssh_write_b64,
+            cmd::local_write_b64,
+            cmd::ssh_stats,
+            cmd::local_stats,
             cmd::clipboard_read,
             cmd::clipboard_write,
             cmd::list_sessions,
@@ -89,6 +98,10 @@ pub fn run() {
             cmd::local_write,
             cmd::local_resize,
             cmd::local_close,
+            reader::reader_open_sftp,
+            reader::reader_open_ssh,
+            reader::reader_open_local,
+            reader::reader_doc,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

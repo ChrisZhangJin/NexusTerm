@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type MouseEvent as RMouseEvent, type ReactNode } from "react";
 import { homeDir } from "@tauri-apps/api/path";
 import { api } from "../api";
 import { resolveAuth } from "../lib/auth";
 import { normalizeTimeout, toFriendlyError } from "../lib/errors";
 import { isWindows } from "../lib/platform";
 import type { RemoteEntry, SessionRecord } from "../types";
+import { kindIcon, readableKind } from "../lib/readable";
 
 function formatSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -31,6 +32,17 @@ function parentPath(p: string): string {
   if (trimmed === "") return "/";
   const idx = trimmed.lastIndexOf("/");
   return idx <= 0 ? "/" : trimmed.slice(0, idx);
+}
+
+/** 规范化远端路径：折叠 //、处理 . 与 ..，去掉末尾 / */
+function normalizeRemote(p: string): string {
+  const out: string[] = [];
+  for (const seg of p.split("/")) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") out.pop();
+    else out.push(seg);
+  }
+  return "/" + out.join("/");
 }
 
 /**
@@ -70,7 +82,62 @@ interface PaneProps {
   onSelect: (entry: RemoteEntry) => void;
   onActivate: (entry: RemoteEntry) => void;
   onUp: () => void;
+  /** 路径栏回车跳转；返回 false 表示路径无效（输入框抖动并保留输入） */
+  onNavigate: (p: string) => Promise<boolean>;
+  /** 条目右键 */
+  onEntryContext?: (e: RMouseEvent, entry: RemoteEntry) => void;
   children?: ReactNode;
+}
+
+/** 可编辑路径栏：回车跳转，Esc 还原；外部路径变化（双击进目录 / 上级）时同步显示 */
+function PathInput({
+  path,
+  onNavigate,
+}: {
+  path: string;
+  onNavigate: (p: string) => Promise<boolean>;
+}) {
+  const [value, setValue] = useState(path);
+  const [invalid, setInvalid] = useState(false);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    setValue(path);
+    setInvalid(false);
+  }, [path]);
+  const submit = async () => {
+    const v = value.trim();
+    if (!v || v === path || busy) return;
+    setBusy(true);
+    const ok = await onNavigate(v);
+    setBusy(false);
+    if (!ok) {
+      // 先清再置，保证连续输错也能重放抖动动画
+      setInvalid(false);
+      requestAnimationFrame(() => setInvalid(true));
+    }
+  };
+  return (
+    <input
+      className={`fm-path-input${invalid ? " invalid" : ""}`}
+      value={value}
+      spellCheck={false}
+      title="输入路径后回车跳转，Esc 还原"
+      disabled={busy}
+      onChange={(e) => {
+        setValue(e.target.value);
+        setInvalid(false);
+      }}
+      onFocus={(e) => e.currentTarget.select()}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") void submit();
+        else if (e.key === "Escape") {
+          setValue(path);
+          setInvalid(false);
+          e.currentTarget.blur();
+        }
+      }}
+    />
+  );
 }
 
 function Pane({
@@ -83,13 +150,15 @@ function Pane({
   onSelect,
   onActivate,
   onUp,
+  onNavigate,
+  onEntryContext,
   children,
 }: PaneProps) {
   return (
     <div className="fm-pane">
       <div className="fm-pane-head">
         <strong>{title}</strong>
-        <code className="fm-path">{path}</code>
+        <PathInput path={path} onNavigate={onNavigate} />
         <button className="btn-row" onClick={onUp} title="上级目录">
           ↑
         </button>
@@ -107,8 +176,14 @@ function Pane({
             className={`fm-row ${selected === e.path ? "selected" : ""}`}
             onClick={() => onSelect(e)}
             onDoubleClick={() => onActivate(e)}
+            onContextMenu={(ev) => {
+              if (!onEntryContext) return;
+              ev.preventDefault();
+              onSelect(e);
+              onEntryContext(ev, e);
+            }}
           >
-            <span className="fm-icon">{e.isDir ? "📁" : "📄"}</span>
+            <span className="fm-icon">{e.isDir ? "📁" : kindIcon(readableKind(e.name))}</span>
             <span className="fm-name">{e.name}</span>
             <span className="fm-size">
               {e.isDir ? "" : formatSize(e.size)}
@@ -133,6 +208,7 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
   // SFTP 用独立连接，连接 id 与终端 tab 分开，避免长传输阻塞交互 shell
   const sftpId = `sftp-${session.id}`;
   const readyRef = useRef(false);
+  const homeRef = useRef("/");
 
   const [status, setStatus] = useState<"connecting" | "ready" | "error">(
     "connecting"
@@ -152,6 +228,26 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
   const [remoteSel, setRemoteSel] = useState<string | null>(null);
 
   const [transferMsg, setTransferMsg] = useState<string | null>(null);
+  /** 远端条目右键菜单 */
+  const [ctx, setCtx] = useState<{ x: number; y: number; entry: RemoteEntry } | null>(null);
+  const ctxRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!ctx) return;
+    const hide = (e: MouseEvent) => {
+      if (ctxRef.current?.contains(e.target as Node)) return;
+      setCtx(null);
+    };
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && setCtx(null);
+    const id = requestAnimationFrame(() => {
+      document.addEventListener("mousedown", hide);
+      document.addEventListener("keydown", esc);
+    });
+    return () => {
+      cancelAnimationFrame(id);
+      document.removeEventListener("mousedown", hide);
+      document.removeEventListener("keydown", esc);
+    };
+  }, [ctx]);
 
   const loadLocal = useCallback(async (p: string) => {
     setLocalBusy(true);
@@ -198,6 +294,7 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
         const home = await api.sftpHome(sftpId);
         if (cancelled) return;
         readyRef.current = true;
+        homeRef.current = home;
         setRemotePath(home);
         setStatus("ready");
         await loadRemote(home);
@@ -232,6 +329,41 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
     [sftpId]
   );
 
+  /** 本地路径栏跳转：先试列目录，成功才切换 */
+  const gotoLocal = async (p: string): Promise<boolean> => {
+    try {
+      const list = await api.listLocalDir(p);
+      setLocalSel(null);
+      setLocalEntries(list);
+      setLocalError(null);
+      setLocalPath(p);
+      return true;
+    } catch (e) {
+      setTransferMsg(`无法打开本地路径「${p}」：${e}`);
+      return false;
+    }
+  };
+
+  /** 远端路径栏跳转：支持 ~ / ~/xxx 与相对路径（相对当前目录） */
+  const gotoRemote = async (raw: string): Promise<boolean> => {
+    if (status !== "ready") return false;
+    let p = raw;
+    if (p === "~" || p.startsWith("~/")) p = homeRef.current + p.slice(1);
+    else if (!p.startsWith("/")) p = joinPath(remotePath, p);
+    p = normalizeRemote(p);
+    try {
+      const list = await api.sftpList(sftpId, p);
+      setRemoteSel(null);
+      setRemoteEntries(list);
+      setRemoteError(null);
+      setRemotePath(p);
+      return true;
+    } catch (e) {
+      setTransferMsg(`无法打开远端路径「${p}」：${e}`);
+      return false;
+    }
+  };
+
   const enterLocal = (e: RemoteEntry) => {
     if (e.isDir) {
       setLocalSel(null);
@@ -244,6 +376,9 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
       setRemoteSel(null);
       setRemotePath(e.path);
       loadRemote(e.path);
+    } else if (readableKind(e.name)) {
+      // 双击可阅读文件（md / html / 图片 / 配置文件）直接打开
+      void doRead(e);
     }
   };
 
@@ -280,6 +415,22 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
       await loadLocal(localPath);
     } catch (e) {
       setTransferMsg(`下载失败: ${e}`);
+    }
+  };
+
+  /** 在新窗口中阅读：md / html 渲染，图片查看，配置文件高亮 */
+  const doRead = async (entry: RemoteEntry) => {
+    setCtx(null);
+    setTransferMsg(`正在打开「${entry.name}」…`);
+    try {
+      await api.readerOpenSftp(
+        sftpId,
+        entry.path,
+        `${session.username}@${session.host}:${entry.path}`
+      );
+      setTransferMsg(null);
+    } catch (e) {
+      setTransferMsg(`阅读失败：${e}`);
     }
   };
 
@@ -349,6 +500,7 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
           onSelect={(e) => setLocalSel(e.path)}
           onActivate={enterLocal}
           onUp={() => setLocalPath(parentLocal(localPath))}
+          onNavigate={gotoLocal}
         >
           <button className="btn" onClick={doUpload} disabled={status !== "ready"}>
             上传 →
@@ -369,6 +521,14 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
             setRemotePath(p);
             loadRemote(p);
           }}
+          onNavigate={gotoRemote}
+          onEntryContext={(ev, entry) =>
+            setCtx({
+              x: Math.min(ev.clientX, window.innerWidth - 200),
+              y: Math.min(ev.clientY, window.innerHeight - 190),
+              entry,
+            })
+          }
         >
           <button className="btn" onClick={doDownload} disabled={status !== "ready"}>
             ← 下载
@@ -390,6 +550,66 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
       </div>
 
       {transferMsg && <div className="fm-transfer">{transferMsg}</div>}
+
+      {ctx && (
+        <div ref={ctxRef} className="ctx-menu" style={{ left: ctx.x, top: ctx.y }}>
+          {ctx.entry.isDir ? (
+            <button
+              className="ctx-item"
+              onClick={() => {
+                const e = ctx.entry;
+                setCtx(null);
+                enterRemote(e);
+              }}
+            >
+              打开
+            </button>
+          ) : (
+            <>
+              <button
+                className="ctx-item"
+                disabled={!readableKind(ctx.entry.name)}
+                title={
+                  readableKind(ctx.entry.name)
+                    ? "在新窗口中查看"
+                    : "支持 Markdown、HTML、图片、配置文件（json/yaml/toml/ini/conf/xml…）"
+                }
+                onClick={() => doRead(ctx.entry)}
+              >
+                阅读
+              </button>
+              <button
+                className="ctx-item"
+                onClick={() => {
+                  setCtx(null);
+                  void doDownload();
+                }}
+              >
+                下载到本地
+              </button>
+            </>
+          )}
+          <div className="ctx-sep" />
+          <button
+            className="ctx-item"
+            onClick={() => {
+              setCtx(null);
+              void doRename();
+            }}
+          >
+            重命名
+          </button>
+          <button
+            className="ctx-item danger"
+            onClick={() => {
+              setCtx(null);
+              void doDelete();
+            }}
+          >
+            删除
+          </button>
+        </div>
+      )}
     </div>
   );
 }
