@@ -28,6 +28,7 @@ import {
   stringToBytes,
 } from "../api";
 import { themeToXterm } from "../lib/theme";
+import { isMacOS } from "../lib/platform";
 import { attachZmodem, type ZmodemGate } from "../lib/zmodem";
 import type { ClosedInfo, TerminalTab, Theme } from "../types";
 
@@ -36,6 +37,43 @@ export function clock(ts: number): string {
   const d = new Date(ts);
   const p = (n: number) => String(n).padStart(2, "0");
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/**
+ * 让 macOS 也支持按住 Shift 拖选文本（绕过 tmux 等程序的鼠标捕获）。
+ *
+ * xterm.js 的 `SelectionService.shouldForceSelection()` 是按平台分叉的：
+ *
+ * ```ts
+ * if (Browser.isMac) {
+ *   return event.altKey && options.macOptionClickForcesSelection;
+ * }
+ * return event.shiftKey;
+ * ```
+ *
+ * 于是同一份 `set -g mouse on` 的 tmux 配置下，Windows / Linux 上 Shift+拖选
+ * 能正常选文本，macOS 上 Shift 根本不算绕过键 —— 只有 ⌥ 算，而且还得显式把
+ * macOptionClickForcesSelection 打开（默认 false）。
+ *
+ * 官方没有给 macOS 开 Shift 的选项（旧的 attachCustomMouseEventHandler 在
+ * 5.x 已移除），所以这里对实例上的方法做特性检测式补丁：拿得到就补一条 Shift
+ * 分支，拿不到就静默退回官方行为，绝不影响正常的选区与鼠标上报。
+ */
+function patchShiftSelection(term: Terminal): void {
+  if (!isMacOS()) return;
+  try {
+    type SelSvc = {
+      shouldForceSelection?: (ev: MouseEvent) => boolean;
+    };
+    const core = (term as unknown as { _core?: { _selectionService?: SelSvc } })
+      ._core;
+    const svc = core?._selectionService;
+    if (typeof svc?.shouldForceSelection !== "function") return;
+    const original = svc.shouldForceSelection!.bind(svc);
+    svc.shouldForceSelection = (ev: MouseEvent) => ev.shiftKey || original(ev);
+  } catch {
+    // 内部结构变了就放弃补丁，退回官方行为
+  }
 }
 
 interface Props {
@@ -159,6 +197,9 @@ export default function TerminalView({
       scrollback: 10_000,
       theme: themeToXterm(theme),
       macOptionIsMeta: true,
+      // macOS 官方约定的绕过键是 ⌥（配合 macOptionIsMeta 使用）。
+      // 开启后 ⌥+拖选可用；Shift 由下面的补丁补上，与 Windows 手感对齐。
+      macOptionClickForcesSelection: true,
     });
 
     const fit = new FitAddon();
@@ -173,6 +214,8 @@ export default function TerminalView({
     searchRef.current = search;
 
     term.open(host);
+    // 必须在 open() 之后：SelectionService 是 open() 里才创建的
+    patchShiftSelection(term);
     termRef.current = term;
     fitRef.current = fit;
     const hl = new Highlighter(term);
