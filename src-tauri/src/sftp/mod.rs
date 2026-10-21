@@ -62,46 +62,47 @@ impl SftpManager {
     /// 建立连接并请求 `sftp` 子系统。
     pub async fn connect(&self, id: String, req: ConnectRequest) -> Result<(), SftpError> {
         let port = req.port.unwrap_or(22);
-        let addr = format!("{}:{}", req.host, port);
-
-        let host_key_rejected = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let handler = ClientHandler {
             known_hosts: self.known_hosts.clone(),
             host: req.host.clone(),
             port,
-            host_key_rejected: host_key_rejected.clone(),
+            host_key_rejected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
-        // 与终端通道共用同一套超时策略：连不上就尽早失败，别让用户干等
+        // 与终端通道共用同一套超时与算法协商策略（含老服务器自动降级）。
+        // keepalive 走 None：SFTP 是短交互，探活包反而可能干扰老服务器。
         let timeout = crate::errors::resolve_timeout(req.connect_timeout_secs);
-        let connected = tokio::time::timeout(
-            timeout,
-            russh::client::connect(
-                Arc::new(russh::client::Config::default()),
-                addr,
-                handler,
-            ),
-        )
-        .await;
 
-        let mut session = match connected {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                if host_key_rejected.load(std::sync::atomic::Ordering::SeqCst) {
-                    // 指纹冲突：russh 会直接断开，靠旁路标记还原准确原因
-                    return Err(SftpError::Auth(
-                        "主机公钥指纹不匹配，疑似中间人攻击".into(),
-                    ));
-                }
-                return Err(SftpError::Connect(crate::errors::connect_error(
-                    &req.host, port, &e,
-                )));
-            }
-            Err(_) => {
+        let mut session = match crate::ssh::handshake(
+            &req.host,
+            port,
+            handler,
+            timeout,
+            crate::ssh::LegacyPolicy::from_flag(req.legacy_crypto),
+            None,
+        )
+        .await
+        {
+            Ok(hs) => hs.session,
+            Err(crate::ssh::HandshakeError::Timeout) => {
                 return Err(SftpError::Connect(crate::errors::compose(
                     &crate::errors::timeout_message(&req.host, port, timeout),
                     &format!("等待握手超过 {} 秒", timeout.as_secs()),
+                )));
+            }
+            Err(crate::ssh::HandshakeError::HostKeyMismatch) => {
+                // 指纹冲突：russh 会直接断开，靠旁路标记还原准确原因
+                return Err(SftpError::Auth(
+                    "主机公钥指纹不匹配，疑似中间人攻击".into(),
+                ));
+            }
+            Err(crate::ssh::HandshakeError::Russh { err, legacy_tried }) => {
+                return Err(SftpError::Connect(crate::errors::handshake_error(
+                    &req.host,
+                    port,
+                    &err,
+                    legacy_tried,
                 )));
             }
         };

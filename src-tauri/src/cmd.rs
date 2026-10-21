@@ -2,7 +2,7 @@ use tauri::State;
 
 use crate::keys;
 use crate::sftp::{RemoteEntry, SftpError, SftpManager};
-use crate::ssh::session::{ConnectRequest, SessionError, SessionManager};
+use crate::ssh::session::{ConnectOutcome, ConnectRequest, SessionError, SessionManager};
 use crate::store::{self, Store};
 
 pub struct AppState {
@@ -67,7 +67,7 @@ pub async fn ssh_connect(
     req: ConnectRequest,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<(), SessionError> {
+) -> Result<ConnectOutcome, SessionError> {
     state.sessions.connect(app, id, req).await
 }
 

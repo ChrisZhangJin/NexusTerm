@@ -44,6 +44,18 @@ export interface ConnectRequest {
   rows: number;
   /** TCP 连接超时（秒）。缺省由后端取 10 秒。 */
   connectTimeoutSecs?: number;
+  /**
+   * 旧服务器兼容开关（如 CentOS 6 的 OpenSSH 5.3）。
+   * 不传 = 自动：先按现代算法握手，协商失败再用 SHA-1 的旧 KEX 重试一次；
+   * true = 一开始就带上旧算法；false = 只用现代算法、绝不降级。
+   */
+  legacyCrypto?: boolean;
+}
+
+/** 连接成功后的协商结果。 */
+export interface ConnectOutcome {
+  /** 本次是否用了 SHA-1 系列的旧密钥交换算法 */
+  legacyCrypto: boolean;
 }
 
 export interface DiscoveredKey {
