@@ -63,6 +63,19 @@ pub struct ConnectRequest {
     /// TCP 连接超时（秒）。缺省为 [`errors::DEFAULT_CONNECT_TIMEOUT_SECS`]。
     #[serde(default)]
     pub connect_timeout_secs: Option<u32>,
+    /// 旧服务器兼容开关。`None`（默认）= 自动，先按现代算法握手，
+    /// KEX 协商失败时自动用 SHA-1 系列的旧算法重试一次；`Some(true)` =
+    /// 一开始就带旧算法；`Some(false)` = 只用现代算法、绝不降级。
+    #[serde(default)]
+    pub legacy_crypto: Option<bool>,
+}
+
+/// 连接成功后的协商结果，回给前端以便提示「本次用了旧算法」。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectOutcome {
+    /// 是否协商到了 SHA-1 系列的旧密钥交换算法
+    pub legacy_crypto: bool,
 }
 
 fn default_cols() -> u16 {
@@ -206,54 +219,56 @@ impl SessionManager {
         app: AppHandle,
         id: String,
         req: ConnectRequest,
-    ) -> Result<(), SessionError> {
+    ) -> Result<ConnectOutcome, SessionError> {
         let port = req.port.unwrap_or(22);
-        let addr = format!("{}:{}", req.host, port);
 
-        let host_key_rejected = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
+        // 指纹冲突标记由 handshake 内部判别并映射成 HandshakeError::HostKeyMismatch，
+        // 这里不再需要自己持有。
         let handler = ClientHandler {
             known_hosts: self.known_hosts.clone(),
             host: req.host.clone(),
             port,
-            host_key_rejected: host_key_rejected.clone(),
+            host_key_rejected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-
-        // 必须开 keepalive：网线拔掉 / 中间 NAT 丢表时 TCP 不会报错，
-        // 不探活的话会话会无限期「假在线」。10s 探一次，连续 3 次无响应判定断开。
-        let config = Arc::new(russh::client::Config {
-            keepalive_interval: Some(std::time::Duration::from_secs(10)),
-            keepalive_max: 3,
-            ..Default::default()
-        });
 
         // 内核默认的 TCP 超时约 75 秒，用户会以为软件卡死。显式给上限，
         // 超时后立刻返回可读的中文提示，而不是干等。
         let timeout = errors::resolve_timeout(req.connect_timeout_secs);
-        let connected = tokio::time::timeout(
-            timeout,
-            russh::client::connect(config, addr, handler),
-        )
-        .await;
 
-        let mut session = match connected {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                // 指纹冲突会导致 russh 提前断开，此时把原因精确地识别出来
-                if host_key_rejected.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(SessionError::HostKeyMismatch);
-                }
-                return Err(SessionError::Connect(errors::connect_error(
-                    &req.host, port, &e,
-                )));
-            }
-            Err(_) => {
+        // 握手统一走 ssh::handshake：算法协商（含老服务器自动降级）、
+        // keepalive 配置、超时预算都在那里处理，SFTP 通道复用同一套逻辑。
+        let hs = match super::handshake(
+            &req.host,
+            port,
+            handler,
+            timeout,
+            super::LegacyPolicy::from_flag(req.legacy_crypto),
+            Some(std::time::Duration::from_secs(10)),
+        )
+        .await
+        {
+            Ok(hs) => hs,
+            Err(super::HandshakeError::Timeout) => {
                 return Err(SessionError::Connect(errors::compose(
                     &errors::timeout_message(&req.host, port, timeout),
                     &format!("等待握手超过 {} 秒", timeout.as_secs()),
                 )));
             }
+            Err(super::HandshakeError::HostKeyMismatch) => {
+                return Err(SessionError::HostKeyMismatch);
+            }
+            Err(super::HandshakeError::Russh { err, legacy_tried }) => {
+                return Err(SessionError::Connect(errors::handshake_error(
+                    &req.host,
+                    port,
+                    &err,
+                    legacy_tried,
+                )));
+            }
         };
+
+        let legacy_crypto = hs.legacy;
+        let mut session = hs.session;
 
         authenticate(&mut session, &req.username, &req.auth).await?;
 
@@ -292,7 +307,7 @@ impl SessionManager {
 
         tokio::spawn(read_loop(app, id, channel, input_rx));
 
-        Ok(())
+        Ok(ConnectOutcome { legacy_crypto })
     }
 
     pub fn write(&self, id: &str, data: Vec<u8>) -> Result<(), SessionError> {

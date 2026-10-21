@@ -60,6 +60,62 @@ pub fn connect_error(host: &str, port: u16, err: &russh::Error) -> String {
     }
 }
 
+/// 握手阶段错误 → 中文提示。
+///
+/// 与 [`connect_error`] 的区别：算法协商失败（`NoCommonAlgo`）是**老服务器**
+/// 最典型的症状，单独给一条能直接指向解决方向的文案，而不是甩一句英文。
+/// `legacy_tried` 表示最后一次尝试是否已带上旧算法，避免提示用户去做
+/// 一件客户端其实已经做过的事。
+pub fn handshake_error(host: &str, port: u16, err: &russh::Error, legacy_tried: bool) -> String {
+    if let russh::Error::NoCommonAlgo { kind, .. } = err {
+        return algorithm_mismatch(host, port, kind, legacy_tried);
+    }
+    connect_error(host, port, err)
+}
+
+/// 算法协商失败专属文案。
+fn algorithm_mismatch(
+    host: &str,
+    port: u16,
+    kind: &russh::AlgorithmKind,
+    legacy_tried: bool,
+) -> String {
+    let (what, advice) = match kind {
+        russh::AlgorithmKind::Kex => (
+            "密钥交换算法",
+            if legacy_tried {
+                "客户端已启用兼容模式（含 diffie-hellman-group14-sha1 / group1-sha1）仍然没有交集，\
+                 说明服务器端把这类算法也关掉了，或使用了更古老的 SSH 实现（如 OpenSSH 4.x）。\
+                 建议在服务器端升级 OpenSSH 或放开 KexAlgorithms。"
+            } else {
+                "该服务器只提供已被淘汰的旧算法，请在会话设置中开启「兼容旧版服务器」后重试。"
+            },
+        ),
+        russh::AlgorithmKind::Key => (
+            "主机密钥算法",
+            "服务器可能只提供 ssh-dss 等已废弃的主机密钥，建议在服务器端重新生成 RSA/Ed25519 主机密钥。",
+        ),
+        russh::AlgorithmKind::Cipher => (
+            "加密算法",
+            "服务器只提供 3des-cbc / arcfour 等已废弃的加密算法，建议在服务器端开放 aes-ctr 系列算法。",
+        ),
+        russh::AlgorithmKind::Mac => (
+            "消息认证算法",
+            "服务器只提供 hmac-md5 等已废弃的 MAC 算法，建议在服务器端开放 hmac-sha2 系列算法。",
+        ),
+        russh::AlgorithmKind::Compression => (
+            "压缩算法",
+            "服务器只提供 zlib 之外的压缩算法，建议在服务器端关闭压缩或开放 zlib。",
+        ),
+    };
+
+    // 主文案已经把「哪一种算法 + 怎么办」说清楚了，不再附英文原文
+    format!(
+        "算法协商失败：{}:{} 找不到双方都支持的{}。{}",
+        host, port, what, advice
+    )
+}
+
 /// TCP 错误码。BSD/macOS 与 Linux 用 errno，Windows 用 Winsock 的 `WSAE*` 系列
 /// —— 后者的数值恰好是 errno + 10000。同一份代码要覆盖三端，故两种值都列出。
 const ETIMEDOUT: &[i32] = &[60, 10060];

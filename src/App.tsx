@@ -201,7 +201,7 @@ export default function App() {
     // 早于会话建立（后端还没这个 id，静默失败），之后尺寸不变也就不再推送，
     // 远端就一直停在 120×32 —— 复制会话 / tmux 只占左上角一块的根因。
     const term = getTerm(tabId);
-    await api.sshConnect(tabId, {
+    const outcome = await api.sshConnect(tabId, {
       host: s.host,
       port: s.port,
       username: s.username,
@@ -210,7 +210,12 @@ export default function App() {
       rows: term?.rows || 32,
       connectTimeoutSecs: normalizeTimeout(s.connectTimeout),
     });
-  }, []);
+    // 老服务器（CentOS 6.x 的 OpenSSH 5.3 等）会退到 SHA-1 的 DH 组，安全强度偏低，
+    // 不阻断使用但要明确告知，避免用户以为是正常连接。
+    if (outcome?.legacyCrypto) {
+      showToast(`${s.host} 使用了旧版密钥交换算法（兼容模式），建议升级服务器 OpenSSH`);
+    }
+  }, [showToast]);
 
   /** 探测标签的远端上下文并写回 tab.ctx；失败或无结果返回已缓存的值 */
   const probeTab = useCallback(

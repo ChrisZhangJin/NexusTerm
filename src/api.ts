@@ -5,6 +5,7 @@ import type {
   AgentConfig,
   AgentDonePayload,
   ClosedInfo,
+  ConnectOutcome,
   ConnectRequest,
   DiscoveredKey,
   NewSession,
@@ -16,7 +17,7 @@ export const api = {
   health: () => invoke<string>("health"),
 
   sshConnect: (id: string, req: ConnectRequest) =>
-    invoke<void>("ssh_connect", { id, req }),
+    invoke<ConnectOutcome>("ssh_connect", { id, req }),
   sshWrite: (id: string, data: number[]) =>
     invoke<void>("ssh_write", { id, data }),
   /** 二进制大块写入（base64），ZMODEM 上传用 */
