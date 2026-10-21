@@ -18,6 +18,14 @@ pub struct AppState {
     /// 与 `agent` 分开持有：缓冲的锁在终端的 hot path 上被高频取用，
     /// 出网这一侧的簿记（谁在问、要不要取消）不该和它共用一把锁。
     pub llm: crate::agent::llm::LlmRuntime,
+    /// 二次验证（keyboard-interactive）的问答登记表。
+    /// 与 `sessions` / `sftp` 内部持有的是同一个 Arc。
+    pub auth_prompts: std::sync::Arc<crate::ssh::prompt::AuthPrompts>,
+    /// 用户密钥库目录（`<app_data>/keys`）。私钥文件落在这里，
+    /// 不碰 `~/.ssh` —— 那是 ssh / git 自己的资产。
+    /// 用户密钥库目录（`<app_data>/keys`）。私钥文件落在这里，
+    /// 不碰 `~/.ssh` —— 那是 ssh / git 自己的资产。
+    pub keys_dir: std::path::PathBuf,
 }
 
 // ——— 本地 shell ———
@@ -26,6 +34,45 @@ pub struct AppState {
 #[tauri::command]
 pub fn write_file(path: String, data: Vec<u8>) -> Result<(), String> {
     std::fs::write(&path, &data).map_err(|e| format!("写入失败：{}", e))
+}
+
+/// 大文件落盘（ZMODEM 下载）。前端把字节编成 base64 传来：
+/// 走 `number[]` 时一个 600MB 文件会变成 6 亿个 JSON 数字，内存和解析都撑不住。
+#[tauri::command]
+pub fn write_file_b64(path: String, data: String) -> Result<(), String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|e| format!("base64 解码失败：{}", e))?;
+    std::fs::write(&path, &bytes).map_err(|e| format!("写入失败：{}", e))
+}
+
+/// 追加写（ZMODEM 下载流式落盘）：每来一 MB 就写一次，内存不随文件大小增长。
+///
+/// `truncate = true` 时用 `create`（清空重建），之后一律 `append`。
+/// 每次重新 open 而不长驻句柄：一 MB 一次的系统调用开销可以忽略，换来的是
+/// 进程被强杀时不会留下未 flush 的句柄。
+#[tauri::command]
+pub fn append_file_b64(path: String, data: String, truncate: bool) -> Result<(), String> {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|e| format!("base64 解码失败：{}", e))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    // append 与 truncate 互斥，不能同时设（Windows 上会直接报错）
+    if truncate {
+        opts.truncate(true);
+    } else {
+        opts.append(true);
+    }
+    let mut f = opts
+        .open(&path)
+        .map_err(|e| format!("打开文件失败：{}", e))?;
+    f.write_all(&bytes)
+        .map_err(|e| format!("写入失败：{}", e))?;
+    Ok(())
 }
 
 /// 开一个本地 PTY。id 由前端生成，与标签页一致。
@@ -89,26 +136,37 @@ pub async fn ssh_connect(
 }
 
 #[tauri::command]
-pub fn ssh_write(id: String, data: Vec<u8>, state: State<'_, AppState>) -> Result<(), SessionError> {
+pub async fn ssh_write(
+    id: String,
+    data: Vec<u8>,
+    state: State<'_, AppState>,
+) -> Result<(), SessionError> {
     // 多一次拷贝换来的是严格的顺序：只有真正发出去的输入才进 agent 上下文。
     // 写失败（会话已关）时缓冲里不该留下这一段 —— 命令没执行过，却出现在
     // 「人干过什么」里，比少记一条的误导性大得多。
-    let res = state.sessions.write(&id, data.clone());
+    let res = state.sessions.write(&id, data.clone()).await;
     if res.is_ok() {
         state.agent.feed(&id, &data, StreamKind::In);
     }
     res
 }
 
-/// 大块二进制写入（ZMODEM 上传）：base64 字符串比 JSON 数字数组小 ~3 倍、解析快得多
+/// 大块二进制写入（ZMODEM 上传）：base64 字符串比 JSON 数字数组小 ~3 倍、解析快得多。
+///
+/// **async 是必须的**：它 await 发送队列，队列满时 IPC 才不返回。
+/// 这样前端「读盘 → 编码 → 写」的循环会被网速卡住，而不是把整个文件堆进内存。
 #[tauri::command]
-pub fn ssh_write_b64(id: String, data: String, state: State<'_, AppState>) -> Result<(), SessionError> {
+pub async fn ssh_write_b64(
+    id: String,
+    data: String,
+    state: State<'_, AppState>,
+) -> Result<(), SessionError> {
     use base64::Engine as _;
     // 解码后再喂：缓冲里存原始字节，base64 正文对模型毫无意义
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
         .map_err(|e| SessionError::Channel(format!("base64 解码失败：{}", e)))?;
-    let res = state.sessions.write(&id, bytes.clone());
+    let res = state.sessions.write(&id, bytes.clone()).await;
     if res.is_ok() {
         state.agent.feed(&id, &bytes, StreamKind::In);
     }
@@ -133,6 +191,19 @@ pub fn ssh_close(id: String, state: State<'_, AppState>) {
     state.agent.remove(&id);
 }
 
+/// 回填二次验证（keyboard-interactive）的答案。
+///
+/// `answers` 按问题顺序排列；传 `null` 表示用户取消，后端会立刻中止认证，
+/// 不会傻等到超时。返回 true 表示确实有一个等待中的认证收到了答案。
+#[tauri::command]
+pub fn ssh_auth_respond(
+    id: String,
+    answers: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> bool {
+    state.auth_prompts.respond(&id, answers)
+}
+
 /// 探测标签当前的工作目录 / 前台进程 / tmux 会话（用于复制会话、断线恢复）
 #[tauri::command]
 pub async fn ssh_probe(
@@ -155,6 +226,32 @@ pub async fn ssh_stats(
 #[tauri::command]
 pub async fn local_stats() -> Result<crate::sysstat::Stats, String> {
     crate::sysstat::collect().await
+}
+
+// ——— 会话附加状态（跳板机登录路径 / 兼容模式）———
+
+/// 一次取回所有会话的附加状态。前端启动时缓存，`connect` 时按 configId 查，
+/// 免掉「每次连接多一次 IPC」和在连接流程里插 await。
+#[tauri::command]
+pub fn session_extras(
+    state: State<'_, AppState>,
+) -> std::collections::HashMap<String, store::SessionExtras> {
+    state.store.all_extras()
+}
+
+#[tauri::command]
+pub fn set_session_extras(
+    id: String,
+    extras: store::SessionExtras,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.store.set_extras(&id, &extras)
+}
+
+/// 运行中切换某个标签的旁路通道开关（前端发现堡垒机拒绝并行通道时调用）。
+#[tauri::command]
+pub fn ssh_set_sidecar(id: String, on: bool, state: State<'_, AppState>) {
+    state.sessions.set_sidecar(&id, on);
 }
 
 // ——— 系统剪贴板 ———
@@ -381,6 +478,81 @@ pub async fn verify_key(
     Ok("ok".into())
 }
 
+// ——— 用户密钥库 ———
+
+/// 全部可用密钥：库内的 + `~/.ssh` 里发现的（只读）。
+#[tauri::command]
+pub async fn list_keys(state: State<'_, AppState>) -> Result<Vec<keys::KeyInfo>, String> {
+    Ok(keys::list_all(&state.store, &state.keys_dir).await)
+}
+
+#[tauri::command]
+pub async fn import_key(
+    src: String,
+    name: Option<String>,
+    passphrase: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<keys::KeyInfo, String> {
+    keys::import(&state.store, &state.keys_dir, &src, name, passphrase).await
+}
+
+/// 生成密钥可能要几秒（RSA 4096），前端应显示忙碌态。
+#[tauri::command]
+pub async fn generate_key(
+    opts: keys::GenerateOptions,
+    state: State<'_, AppState>,
+) -> Result<keys::KeyInfo, String> {
+    keys::generate(&state.store, &state.keys_dir, opts).await
+}
+
+#[tauri::command]
+pub async fn delete_key(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    if id.starts_with("file:") {
+        return Err("这是 ~/.ssh 里的密钥，请在系统中管理，本应用不会删除它".into());
+    }
+    keys::delete(&state.store, &id).await
+}
+
+#[tauri::command]
+pub async fn export_key(
+    id: String,
+    dest: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    keys::export(&state.store, &id, &dest).await
+}
+
+#[tauri::command]
+pub fn update_key_meta(
+    id: String,
+    name: Option<String>,
+    comment: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    keys::update_meta(&state.store, &id, name, comment)
+}
+
+#[tauri::command]
+pub async fn key_public(id: String, state: State<'_, AppState>) -> Result<String, String> {
+    keys::public_key_of(&state.store, &id).await
+}
+
+/// 私钥口令（passphrase）与会话一起保存，理由是它只用于解开**本地**私钥文件，
+/// 不是服务器凭据；不存的话每次连接都要重输。
+#[tauri::command]
+pub fn save_passphrase(
+    id: String,
+    passphrase: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.store.set_passphrase(&id, &passphrase)
+}
+
+#[tauri::command]
+pub fn load_passphrase(id: String, state: State<'_, AppState>) -> Option<String> {
+    state.store.get_passphrase(&id)
+}
+
 /// Windows 的驱动器列表。只有真正存在的盘才列出（跳过空软驱 A: 等）。
 #[cfg(windows)]
 fn list_drives() -> Result<Vec<RemoteEntry>, String> {
@@ -504,8 +676,9 @@ pub async fn sftp_connect(
     id: String,
     req: ConnectRequest,
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<(), SftpError> {
-    state.sftp.connect(id, req).await
+    state.sftp.connect(&app, id, req).await
 }
 
 #[tauri::command]

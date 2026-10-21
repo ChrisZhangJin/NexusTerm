@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use russh::client::Handle;
 use russh_sftp::client::SftpSession;
 use serde::Serialize;
 use tokio::io::{self, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use crate::ssh::session::{authenticate, ConnectRequest};
+use crate::ssh::session::{ConnectRequest, SharedConns};
 use crate::ssh::{ClientHandler, KnownHosts};
 
 /// 单个远端目录项。尺寸/时间统一成可空数字，避免前端处理 undefined。
@@ -44,72 +45,173 @@ impl Serialize for SftpError {
 
 /// SFTP 会话池。
 ///
-/// 每个 SFTP 面板开一条独立的 SSH 连接 —— 与 Xshell/Xftp 进程分离同理：
-/// 文件传输是长耗时操作，不应和交互式 shell 争抢同一连接的窗口。
+/// 一个 SFTP 面板优先**复用同配置下已认证的终端连接**：在它上面开一条新通道
+/// 请求 `sftp` 子系统即可。对要求 keyboard-interactive 的服务器（OTP / 堡垒机）
+/// 这一点是决定性 —— 独立连接意味着每打开一次文件面板就要再输一次验证码。
+///
+/// 只有在「该配置当前没有活着的终端连接」时才退回独立连接（要重新认证）。
 pub struct SftpManager {
     inner: Mutex<HashMap<String, SftpSession>>,
     known_hosts: Arc<KnownHosts>,
+    /// 与终端通道共享同一份二次验证登记表（AppState 里拿的是同一个 Arc）
+    auth_prompts: Arc<crate::ssh::prompt::AuthPrompts>,
+    /// 已认证连接登记表（与 `SessionManager` 共享同一个 Arc）
+    shared: SharedConns,
+    /// 复用了主连接的 SFTP 会话 → 把句柄一起攥着保活。
+    ///
+    /// 不复用的情况下这里没有条目。留着它是因为：主标签关掉后 `SessionRuntime`
+    /// 里的 Arc 被释放，若文件面板还开着，连接会连带被回收 —— 传输到一半就断。
+    /// 句柄在这里活到 SFTP 会话自己 close 为止。
+    held: parking_lot::Mutex<HashMap<String, Arc<Handle<ClientHandler>>>>,
+}
+
+/// 复用已认证连接时的两种失败，处理方式完全不同。
+enum ReuseError {
+    /// 那条连接其实已经断了（或刚好断在中间）—— 退回独立连接即可
+    Connection(String),
+    /// 连接好好活着，但开不出 sftp 子系统（服务器禁用了）——
+    /// 独立再连一次也是同样结果，没必要多花一次认证
+    Subsystem(SftpError),
 }
 
 impl SftpManager {
-    pub fn new(known_hosts: Arc<KnownHosts>) -> Self {
+    pub fn new(
+        known_hosts: Arc<KnownHosts>,
+        auth_prompts: Arc<crate::ssh::prompt::AuthPrompts>,
+        shared: SharedConns,
+    ) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
             known_hosts,
+            auth_prompts,
+            shared,
+            held: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
+    /// 在同一条已认证连接上开 sftp 子系统。
+    async fn open_shared(
+        &self,
+        id: &str,
+        handle: Arc<Handle<ClientHandler>>,
+    ) -> Result<(), ReuseError> {
+        // 通道开不出来只可能是连接层面的问题，退回独立连接是对的
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| ReuseError::Connection(e.to_string()))?;
+
+        if let Err(e) = channel.request_subsystem(true, "sftp").await {
+            // 通道已经开了，用不上就还回去，别在服务端留个半开通道
+            let _ = channel.close().await;
+            return Err(ReuseError::Subsystem(SftpError::Subsystem(e.to_string())));
+        }
+
+        let sftp = SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|e| ReuseError::Subsystem(SftpError::Subsystem(e.to_string())))?;
+
+        self.inner.lock().await.insert(id.to_string(), sftp);
+        self.held.lock().insert(id.to_string(), handle);
+        Ok(())
+    }
+
     /// 建立连接并请求 `sftp` 子系统。
-    pub async fn connect(&self, id: String, req: ConnectRequest) -> Result<(), SftpError> {
+    ///
+    /// 先尝试复用同配置下已认证的终端连接；只有那条连接不存在或已断开时，
+    /// 才自己拨一条新连接走完整认证。
+    pub async fn connect(
+        &self,
+        app: &tauri::AppHandle,
+        id: String,
+        req: ConnectRequest,
+    ) -> Result<(), SftpError> {
         let port = req.port.unwrap_or(22);
 
-        let handler = ClientHandler {
-            known_hosts: self.known_hosts.clone(),
-            host: req.host.clone(),
-            port,
-            host_key_rejected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
+        // ① 复用路径：省掉整个握手 + 认证过程。
+        //    对 OTP 服务器尤其重要 —— 否则每次打开文件面板都要再输一次验证码。
+        //    四个条件缺一不可：同一配置、同一主机端口、同一用户、连接还活着。
+        //    少掉主机校验就会出这种事：配置从 A 改成 B 后旧标签仍连着 A，
+        //    文件面板会悄悄列出 A 的目录。
+        if let Some(config_id) = req.config_id.as_deref() {
+            let alive = self
+                .shared
+                .lock()
+                .values()
+                .find(|c| {
+                    c.config_id == config_id
+                        && c.host == req.host
+                        && c.port == port
+                        && c.username == req.username
+                        && !c.handle.is_closed()
+                })
+                .map(|c| c.handle.clone());
 
-        // 与终端通道共用同一套超时与算法协商策略（含老服务器自动降级）。
+            if let Some(handle) = alive {
+                match self.open_shared(&id, handle).await {
+                    Ok(()) => {
+                        tracing::info!(session = %id, config = config_id, "SFTP 复用已认证连接");
+                        return Ok(());
+                    }
+                    // 连接正好断了：当成没复用，老老实实自己连
+                    Err(ReuseError::Connection(e)) => {
+                        tracing::info!(
+                            session = %id,
+                            config = config_id,
+                            "复用连接不可用，回退独立连接：{e}"
+                        );
+                    }
+                    // 服务器不给 sftp 子系统，独立连接也一样，别白跑一次认证
+                    Err(ReuseError::Subsystem(e)) => return Err(e),
+                }
+            }
+        }
+
+        // 与终端通道共用同一套超时、算法协商（含老服务器自动降级）与二次验证策略。
         // keepalive 走 None：SFTP 是短交互，探活包反而可能干扰老服务器。
         let timeout = crate::errors::resolve_timeout(req.connect_timeout_secs);
 
-        let mut session = match crate::ssh::handshake(
+        // 走到这里说明没得复用，必须自己认证一次
+        let auth = req.auth.as_ref().ok_or_else(|| {
+            SftpError::Auth(
+                "没有可复用的已登录连接，且本地没有保存登录凭据。请先打开该主机的终端标签，或编辑会话保存密码。"
+                    .into(),
+            )
+        })?;
+
+        let opened = crate::ssh::open_authenticated(
             &req.host,
             port,
-            handler,
+            self.known_hosts.clone(),
             timeout,
             crate::ssh::LegacyPolicy::from_flag(req.legacy_crypto),
             None,
+            &req.username,
+            auth,
+            &id,
+            crate::ssh::session::AuthContext {
+                app,
+                prompts: &self.auth_prompts,
+            },
         )
         .await
-        {
-            Ok(hs) => hs.session,
-            Err(crate::ssh::HandshakeError::Timeout) => {
-                return Err(SftpError::Connect(crate::errors::compose(
-                    &crate::errors::timeout_message(&req.host, port, timeout),
-                    &format!("等待握手超过 {} 秒", timeout.as_secs()),
-                )));
-            }
-            Err(crate::ssh::HandshakeError::HostKeyMismatch) => {
-                // 指纹冲突：russh 会直接断开，靠旁路标记还原准确原因
-                return Err(SftpError::Auth(
-                    "主机公钥指纹不匹配，疑似中间人攻击".into(),
-                ));
-            }
-            Err(crate::ssh::HandshakeError::Russh { err, legacy_tried }) => {
-                return Err(SftpError::Connect(crate::errors::handshake_error(
-                    &req.host,
-                    port,
-                    &err,
-                    legacy_tried,
-                )));
-            }
-        };
+        .map_err(|e| match e {
+            crate::ssh::OpenError::Timeout => SftpError::Connect(crate::errors::compose(
+                &crate::errors::timeout_message(&req.host, port, timeout),
+                &format!("等待握手超过 {} 秒", timeout.as_secs()),
+            )),
+            // 指纹冲突：russh 会直接断开，靠旁路标记还原准确原因
+            crate::ssh::OpenError::HostKeyMismatch => SftpError::Auth(
+                "主机公钥指纹不匹配，疑似中间人攻击".into(),
+            ),
+            crate::ssh::OpenError::Handshake { err, legacy_tried } => SftpError::Connect(
+                crate::errors::handshake_error(&req.host, port, &err, legacy_tried),
+            ),
+            crate::ssh::OpenError::Auth(msg) => SftpError::Auth(msg),
+        })?;
 
-        authenticate(&mut session, &req.username, &req.auth)
-            .await
-            .map_err(|e| SftpError::Auth(e.to_string()))?;
+        let session = opened.session;
+
 
         let channel = session
             .channel_open_session()
@@ -131,9 +233,14 @@ impl SftpManager {
     }
 
     pub async fn close(&self, id: &str) {
+        // 认证可能正卡在等验证码上，先解除挂起
+        self.auth_prompts.cancel(id);
         if let Some(s) = self.inner.lock().await.remove(id) {
             let _ = s.close().await;
         }
+        // 释放保活引用。复用的那条连接属于终端，是否关闭由它自己决定，
+        // 这里只负责别让文件面板替它续命。
+        self.held.lock().remove(id);
     }
 
     /// 列出远端目录。目录在前、名称升序，符合文件管理器习惯。

@@ -22,6 +22,9 @@ async-trait = "0.1"
 russh = "0.49"
 russh-sftp = "2"
 ssh-key = { version = "0.6", features = ["ed25519", "rsa", "ecdsa", "encryption"] }
+# 生成密钥需要一个密码学安全随机源。必须用 0.6 —— ssh-key 0.6 的
+# `CryptoRngCore` 就是 rand_core 0.6 的 trait，换成 0.9 会 trait 不匹配。
+rand_core = { version = "0.6", features = ["getrandom"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 portable-pty = "0.8"
 
@@ -32,6 +35,19 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 sha2 = "0.10"
+# —— PuTTY .ppk 支持 ——
+# ppk 是完全独立于 OpenSSH 的容器格式，ssh-key 不认识它，只能自己实现。
+# v1/v2 用 SHA-1 计数派生出 AES-256-CBC 的 key（IV 恒为 0），v3 改成 Argon2id
+# 一次性吐出 key||iv||mackey；MAC 也随之从 HMAC-SHA1 换成 HMAC-SHA256。
+aes = "0.8"
+cbc = "0.1"
+hmac = "0.12"
+sha1 = "0.10"
+argon2 = "0.5"
+# 只在解析 PPK 的 ECDSA 私钥时用到：那段字节是 mpint，要用 ssh-key 自己的
+# `Decode` 实现灌进 `EcdsaPrivateKey`。必须和 ssh-key 依赖同一个版本，
+# 否则 trait 不是同一个，编译期会报「未实现」。
+ssh-encoding = "0.2"
 parking_lot = "0.12"
 # 上下文脱敏。已在依赖树里（tracing-subscriber/env-filter 传递依赖），
 # 直接引用不会引入额外的编译单元。
@@ -74,6 +90,15 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["linux-native"] }
+
+# 就地修补 russh 0.49.2，理由见 `vendor/russh/PATCHES.md`：
+# 1. 客户端丢弃 RFC 4252 的 partial-success 位，导致「密码对了但还要验证码」
+#    与「密码错了」在程序里无法区分；
+# 2. 客户端只在首个认证请求是 keyboard-interactive 时才记录 current，
+#    于是「先密码、后验证码」的两因素服务器下发的 INFO_REQUEST 会被静默丢弃，
+#    连接永久挂起 —— 这是一整类企业堡垒机连不上的根因。
+[patch.crates-io]
+russh = { path = "vendor/russh" }
 
 [profile.release]
 codegen-units = 1

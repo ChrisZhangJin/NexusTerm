@@ -15,3 +15,7 @@ src-tauri/**/*.db-*
 .DS_Store
 Thumbs.db
 *.log
+
+# cargo vendor marker
+src-tauri/vendor/**/.cargo-ok
+src-tauri/vendor/**/.cargo_vcs_info.json
