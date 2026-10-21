@@ -6,7 +6,7 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
-import { countOutput, markOutput, registerTerm } from "../lib/termRegistry";
+import { countOutput, emitInput, markOutput, registerTerm } from "../lib/termRegistry";
 import {
   formatCombo,
   getPrefs,
@@ -318,6 +318,8 @@ export default function TerminalView({
 
     const dataSub = term.onData((d) => {
       if (zmodem.isActive()) return;
+      // 旁路监听（跳板机登录路径录制）。发不发送由这里决定，监听方只读
+      emitInput(tabId, d);
       send(d).catch(() => {});
     });
 

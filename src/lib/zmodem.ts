@@ -21,7 +21,7 @@ import Zmodem, {
   type ZTransfer,
 } from "zmodem.js";
 
-import { api } from "../api";
+import { api, bytesToBase64 } from "../api";
 
 export interface ZmodemHooks {
   /** 写终端（用于显示传输提示） */
@@ -47,6 +47,11 @@ export interface ZmodemGate {
 const PENDING_TTL = 15_000;
 /** 上传时每次从磁盘读的分片大小 */
 const READ_SLICE = 256 * 1024;
+/**
+ * 单次等待的上限。远端 rz 掉线 / 网络假死时，不要永远停在 99% ——
+ * 超时报错总比无声挂住好排查。
+ */
+const STALL_MS = 60_000;
 
 const fmtSize = (n: number) =>
   n >= 1024 * 1024 * 1024
@@ -65,6 +70,8 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
   let chunks: Uint8Array[] = [];
   let queued = 0;
   let inflight = false;
+  /** 写失败（连接断了）时记下来，让 drain() 立刻报错而不是等超时 */
+  let sendError: unknown = null;
   const flush = () => {
     if (inflight || queued === 0 || disposed) return;
     let n = 0;
@@ -84,7 +91,12 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
     inflight = true;
     hooks
       .send(out)
-      .catch(() => {})
+      .catch((e) => {
+        // 连接断了：清掉积压并记下错误，后续 drain() 立刻失败而不是等超时
+        sendError = e;
+        chunks = [];
+        queued = 0;
+      })
       .finally(() => {
         inflight = false;
         flush();
@@ -93,17 +105,37 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
   };
   /** 等写队列回落到阈值以下（上传背压） */
   let drainWaiters: Array<() => void> = [];
-  const LOW_WATER = 512 * 1024;
+  const LOW_WATER = 1024 * 1024;
   const drain = () =>
-    queued <= LOW_WATER && !inflight
-      ? Promise.resolve()
-      : new Promise<void>((r) => drainWaiters.push(r));
+    sendError
+      ? Promise.reject(sendError)
+      : queued <= LOW_WATER && !inflight
+        ? Promise.resolve()
+        : new Promise<void>((r) => drainWaiters.push(r));
   const wakeDrain = () => {
     if (queued > LOW_WATER) return;
     const w = drainWaiters;
     drainWaiters = [];
     w.forEach((f) => f());
   };
+  /** 给等待加上限：远端不响应时宁可报错，也不要永远挂在 99% */
+  const deadline = <T,>(p: Promise<T>, ms: number, what: string): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      const t = window.setTimeout(
+        () => reject(new Error(`${what}超时（${Math.round(ms / 1000)} 秒无进展）`)),
+        ms
+      );
+      p.then(
+        (v) => {
+          window.clearTimeout(t);
+          resolve(v);
+        },
+        (e) => {
+          window.clearTimeout(t);
+          reject(e);
+        }
+      );
+    });
   const enqueue = (octets: ArrayLike<number>) => {
     const u = octets instanceof Uint8Array ? octets : Uint8Array.from(octets);
     if (u.length === 0) return;
@@ -125,49 +157,91 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
     );
   };
 
-  /** sz（下载）：accept 收完 → 弹保存框 → write_file 落盘 */
-  const handleOffer = (xfer: ZTransfer) => {
+  /**
+   * sz（下载）：先问保存路径，再 accept，边收边落盘。
+   *
+   * 关键是 `accept({ on_input })` —— 用回调模式后 zmodem.js 不再把整个文件
+   * 堆在 `_payloads` 里，收到的每块直接进「攒够 1MB 就写一次」的队列。
+   * 老写法是「收完 → get_payloads() 拼成一个大 Uint8Array → Array.from 传给后端」，
+   * 600MB 的文件会同时存在三份（spool + 拼接 + 六亿个 JSON 数字），必然崩。
+   *
+   * 顺序也讲究：远端发完 ZFILE 后一直在等我们的 ZRPOS，此时还没开始传数据，
+   * 所以在 accept 之前弹保存框不会丢任何字节，也不会先灌进内存。
+   */
+  const handleOffer = (zsession: ZSession, xfer: ZTransfer) => {
     const { name, size } = xfer.get_details();
     const total = size || 0;
-    hooks.termWrite(`\r\n\x1b[33m[ZMODEM] 接收 ${name}（${fmtSize(total)}）\x1b[0m\r\n`);
     const t0 = performance.now();
     let got = 0;
     let last = 0;
-    xfer.on("input", (octets) => {
-      got += octets.length;
-      const now = performance.now();
-      if (now - last > 200) {
-        last = now;
-        progress(name, got, total, t0);
+
+    // 攒批：zmodem 的数据块很小（几 KB～几十 KB），逐块 IPC 会把主线程打满
+    const WRITE_CHUNK = 1024 * 1024;
+    let parts: Uint8Array[] = [];
+    let partsLen = 0;
+    let first = true;
+    let writeError: unknown = null;
+    let chain: Promise<void> = Promise.resolve();
+    const flushTo = (path: string) => {
+      if (partsLen === 0) return;
+      const buf = new Uint8Array(partsLen);
+      let off = 0;
+      for (const p of parts) {
+        buf.set(p, off);
+        off += p.length;
       }
-    });
-    void xfer
-      .accept()
-      .then(async () => {
-        if (disposed) return;
-        progress(name, total || got, total || got, t0);
-        hooks.termWrite("\r\n");
-        const payloads = xfer.get_payloads();
-        const sum = payloads.reduce((n, p) => n + p.length, 0);
-        const buf = new Uint8Array(sum);
-        let off = 0;
-        for (const p of payloads) {
-          buf.set(p, off);
-          off += p.length;
-        }
-        const { save } = await import("@tauri-apps/plugin-dialog");
-        const path = await save({ defaultPath: name });
-        if (!path) {
-          hooks.termWrite(`\x1b[90m[ZMODEM] 已取消保存 ${name}\x1b[0m\r\n`);
-          return;
-        }
-        await api.writeFile(path, Array.from(buf));
-        hooks.termWrite(`\x1b[32m[ZMODEM] ${name} 已保存到 ${path}\x1b[0m\r\n`);
-        hooks.notify(`${name} 下载完成（${fmtSize(sum)}）`);
-      })
-      .catch((e) => {
-        hooks.termWrite(`\r\n\x1b[31m[ZMODEM] 接收失败：${String(e)}\x1b[0m\r\n`);
+      parts = [];
+      partsLen = 0;
+      const truncate = first;
+      first = false;
+      chain = chain.then(() =>
+        api.appendFileB64(path, bytesToBase64(buf), truncate).catch((e) => {
+          writeError = e;
+          // 落盘失败就别再收了，否则远端会一直灌数据
+          safeAbort(zsession);
+          throw e;
+        })
+      );
+    };
+
+    void (async () => {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const path = await save({ defaultPath: name });
+      if (disposed) return;
+      if (!path) {
+        hooks.termWrite(`\r\n\x1b[90m[ZMODEM] 已取消保存 ${name}\x1b[0m\r\n`);
+        safeAbort(zsession);
+        return;
+      }
+      hooks.termWrite(`\r\n\x1b[33m[ZMODEM] 接收 ${name}（${fmtSize(total)}）\x1b[0m\r\n`);
+
+      await xfer.accept({
+        on_input: (payload: ArrayLike<number>) => {
+          const u = payload instanceof Uint8Array ? payload : Uint8Array.from(payload);
+          parts.push(u);
+          partsLen += u.length;
+          got += u.length;
+          if (partsLen >= WRITE_CHUNK) flushTo(path);
+          const now = performance.now();
+          if (now - last > 200) {
+            last = now;
+            progress(name, got, total, t0);
+          }
+        },
       });
+      // accept 已 resolve，但最后不到 1MB 的尾巴还在队列里
+      flushTo(path);
+      await chain;
+      if (writeError) throw writeError;
+      if (disposed) return;
+      progress(name, total || got, total || got, t0);
+      hooks.termWrite("\r\n");
+      hooks.termWrite(`\x1b[32m[ZMODEM] ${name} 已保存到 ${path}\x1b[0m\r\n`);
+      hooks.notify(`${name} 下载完成（${fmtSize(total || got)}）`);
+    })().catch((e) => {
+      hooks.termWrite(`\r\n\x1b[31m[ZMODEM] 接收失败：${String(e)}\x1b[0m\r\n`);
+      safeAbort(zsession);
+    });
   };
 
   const safeAbort = (z: ZSession) => {
@@ -180,6 +254,8 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
 
   /** rz（上传）：拖拽预置的文件 / 文件框 → send_files → close */
   const handleUpload = async (zsession: ZSession) => {
+    // 上一次传输若因断线失败，错误标记要清掉，否则这一轮会一进来就报错
+    sendError = null;
     let files: File[];
     if (pending && Date.now() - pending.at < PENDING_TTL) {
       files = pending.files;
@@ -220,7 +296,11 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
           continue;
         }
         // 分片读文件、逐片发送；每片之后等写队列回落再读下一片 —— 内存占用恒定，
-        // 不会像 Browser.send_files 那样把整个文件一次性压进队列
+        // 不会像 Browser.send_files 那样把整个文件一次性压进队列。
+        //
+        // 这里的 drain() 是真的背压：后端写命令 await 一个有界队列，队列满时 IPC
+        // 不返回，于是「读盘 → 编码 → 写」被网速卡住。没有它，600MB 文件会一秒内
+        // 全部堆进后端内存，进度条直接冲到 99% 再「卡死」。
         const t0 = performance.now();
         let off = xfer.get_offset() || 0;
         let last = 0;
@@ -228,17 +308,27 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
           const end = Math.min(off + READ_SLICE, f.size);
           const piece = new Uint8Array(await f.slice(off, end).arrayBuffer());
           if (disposed) return;
+          if (end >= f.size) {
+            // 最后一片：先让积压落到低水位，再把 ZEOF 发出去。
+            // 顺序反了的话 ZEOF 会排在几百 MB 数据后面，远端迟迟不确认。
+            off = f.size;
+            await deadline(drain(), STALL_MS, "等待发送队列回落");
+            progress(f.name, off, f.size, t0);
+            await deadline(xfer.end(piece), STALL_MS, "等待远端确认文件结束");
+            break;
+          }
+          xfer.send(piece);
           off = end;
-          if (off < f.size) xfer.send(piece);
-          else await Promise.all([xfer.end(piece), drain()]);
-          await drain();
+          await deadline(drain(), STALL_MS, "等待发送队列回落");
           const now = performance.now();
-          if (now - last > 200 || off >= f.size) {
+          if (now - last > 200) {
             last = now;
             progress(f.name, off, f.size, t0);
           }
         }
-        if (f.size === 0) await xfer.end(new Uint8Array(0));
+        if (f.size === 0) {
+          await deadline(xfer.end(new Uint8Array(0)), STALL_MS, "等待远端确认文件结束");
+        }
         sent++;
         progress(f.name, f.size, f.size, t0);
         hooks.termWrite("\r\n");
@@ -295,7 +385,7 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
       });
       if (zsession.type === "receive") {
         hooks.termWrite(`\r\n\x1b[33m[ZMODEM] 检测到远端发送（sz）\x1b[0m`);
-        zsession.on("offer", handleOffer);
+        zsession.on("offer", (x) => handleOffer(zsession, x));
         zsession.start();
       } else {
         hooks.termWrite(`\r\n\x1b[33m[ZMODEM] 检测到远端接收（rz）\x1b[0m`);

@@ -18,7 +18,18 @@ declare module "zmodem.js" {
     get_details(): ZTransferDetails;
     get_payloads(): Uint8Array[];
     on(event: "input", fn: (octets: number[]) => void): void;
-    accept(opts?: { on_progress?: (t: ZTransfer, p: number) => void }): Promise<void>;
+    /**
+     * 接收端：确认接收。
+     *
+     * `on_input` 传函数后 zmodem.js **不再**把数据攒在 `_payloads` 里，
+     * 而是逐块交给回调 —— 大文件下载必须用这种模式，否则整个文件都在内存里。
+     * 此时 `get_payloads()` 拿不到东西（spool 未被使用）。
+     */
+    accept(opts?: {
+      offset?: number;
+      on_input?: ((payload: number[] | Uint8Array) => void) | "spool_array";
+      on_progress?: (t: ZTransfer, p: number) => void;
+    }): Promise<void>;
     skip(): void;
     /** 发送端：非末尾分片 */
     send(bytes: Uint8Array | number[]): void;

@@ -4,7 +4,8 @@ import { api } from "../api";
 import { resolveAuth } from "../lib/auth";
 import { normalizeTimeout, toFriendlyError } from "../lib/errors";
 import { isWindows } from "../lib/platform";
-import type { RemoteEntry, SessionRecord } from "../types";
+import { getPrefs } from "../lib/prefs";
+import type { AuthMethod, RemoteEntry, SessionRecord } from "../types";
 import { kindIcon, readableKind } from "../lib/readable";
 
 function formatSize(n: number): string {
@@ -280,7 +281,14 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
     let cancelled = false;
     (async () => {
       try {
-        const auth = await resolveAuth(session, passphrase);
+        // 凭据只是「独立连一条」时才需要。拿不到也先往下走：
+        // 只要这台机器的终端标签还连着的，后端会复用它，不必再认证。
+        let auth: AuthMethod | undefined;
+        try {
+          auth = await resolveAuth(session, passphrase);
+        } catch {
+          auth = undefined;
+        }
         await api.sftpConnect(sftpId, {
           host: session.host,
           port: session.port,
@@ -289,6 +297,10 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
           cols: 80,
           rows: 24,
           connectTimeoutSecs: normalizeTimeout(session.connectTimeout),
+          // 有已连着的终端标签时，后端直接在那条连接上开 sftp 子系统，
+          // 不再走一次认证（OTP 服务器就不会再弹验证码）。
+          // 设置里关掉「复用已登录连接」时传 undefined，强制独立拨号。
+          configId: getPrefs().shareSftpConnection ? session.id : undefined,
         });
         if (cancelled) return;
         const home = await api.sftpHome(sftpId);

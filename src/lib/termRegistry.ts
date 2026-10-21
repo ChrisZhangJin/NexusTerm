@@ -16,6 +16,7 @@ export function registerTerm(id: string, term: Terminal): () => void {
       registry.delete(id);
       lastOutput.delete(id);
       outputCount.delete(id);
+      inputTaps.delete(id);
     }
   };
 }
@@ -60,6 +61,40 @@ export function dropOutputCount(id: string): void {
 }
 
 const PROMPT_TAIL = /[$#%>❯➜»λ]\s?$/;
+
+/** 最近一次收到远端输出的时刻（0 = 还没有过） */
+export function lastOutputAt(id: string): number {
+  return lastOutput.get(id) ?? 0;
+}
+
+/**
+ * 用户按键的旁路监听（不影响正常发送）。
+ *
+ * 跳板机登录路径的录制需要知道用户敲了什么，但按键处理在 TerminalView、
+ * 录制逻辑在 App 层 —— 与其把 TerminalView 改成受控组件，不如在这里开一个
+ * 只读的tap：多订阅方互不干扰，xterm 的 onData 本身也支持多监听。
+ */
+type InputTap = (data: string) => void;
+const inputTaps = new Map<string, Set<InputTap>>();
+
+export function onInput(id: string, fn: InputTap): () => void {
+  let set = inputTaps.get(id);
+  if (!set) {
+    set = new Set();
+    inputTaps.set(id, set);
+  }
+  set.add(fn);
+  return () => {
+    set?.delete(fn);
+    if (set && set.size === 0) inputTaps.delete(id);
+  };
+}
+
+export function emitInput(id: string, data: string): void {
+  const set = inputTaps.get(id);
+  if (!set) return;
+  for (const fn of set) fn(data);
+}
 
 /**
  * 等远端 shell 停在提示符上：输出静默 ≥350ms 且光标前文本以常见提示符结尾。

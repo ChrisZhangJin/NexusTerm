@@ -145,6 +145,20 @@ export function AppearanceDialog(p: AppearanceProps) {
             <em>会话仍在连接时，关闭标签先弹窗询问</em>
           </span>
         </label>
+        <label className="settings-check">
+          <input
+            type="checkbox"
+            checked={prefs.shareSftpConnection}
+            onChange={(e) => setPrefs({ shareSftpConnection: e.target.checked })}
+          />
+          <span>
+            文件面板复用已登录连接
+            <em>
+              同一主机开着终端标签时，文件面板直接在那条连接上开 SFTP，
+              不必再输一次密码和验证码。关掉则每次单独连一条。
+            </em>
+          </span>
+        </label>
 
         <div className="settings-section">底部栏</div>
         <label className="settings-check">

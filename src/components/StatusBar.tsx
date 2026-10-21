@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { setPrefs, usePrefs } from "../lib/prefs";
 import { getOutputCount } from "../lib/termRegistry";
+import { getExtras, isSidecarDenied, markCompat } from "../lib/sessionExtras";
 
 interface Props {
   /** 当前激活标签的状态 */
@@ -14,7 +15,13 @@ interface Props {
   connectedCount: number;
   /** 资源采集目标：已连接的 SSH 标签，或本地终端（采本机）；无则 null。
    *  hostKey 相同的标签共享一份数据（user@host:port，本机为 "local"） */
-  statsTarget: { tabId: string; local: boolean; hostKey: string } | null;
+  statsTarget: {
+    tabId: string;
+    local: boolean;
+    hostKey: string;
+    /** 对应的会话配置 id：发现堡垒机拒绝并行通道时要靠它记住兼容模式 */
+    sessionId?: string | null;
+  } | null;
   /** 当前激活标签（统计输出字符数） */
   activeTabId: string | null;
 }
@@ -144,17 +151,24 @@ function ResourceMeters({
   tabId,
   local,
   live,
+  sessionId,
   onContextMenu,
 }: {
   hostKey: string;
   tabId: string;
   local: boolean;
   live: boolean;
+  sessionId?: string | null;
   onContextMenu: (e: React.MouseEvent) => void;
 }) {
   const [stats, setStats] = useState<Stats | null>(() => statsCache.get(hostKey) ?? null);
   const [pulse, setPulse] = useState(0);
   const [failed, setFailed] = useState(false);
+  // 兼容模式（堡垒机）：不再轮询。用 ref 让 tick 立刻看到，不必等重渲染
+  const compat = useRef(getExtras(sessionId).compat);
+  compat.current = getExtras(sessionId).compat;
+  // 只是为了让「兼容模式」这句说明能渲染出来（ref 变化不触发重渲染）
+  const [compatNow, setCompatNow] = useState(compat.current);
   // 采集用的标签可能变（同主机的另一个标签被激活），用 ref 取最新值，不重启轮询
   const tabRef = useRef(tabId);
   tabRef.current = tabId;
@@ -164,7 +178,7 @@ function ResourceMeters({
     let busy = false;
     setFailed(false);
     const tick = async (animate: boolean) => {
-      if (busy) return; // 上一次还没回来（网络慢）就跳过，避免堆积
+      if (busy || compat.current) return; // 上一次还没回来（网络慢）就跳过，避免堆积
       busy = true;
       try {
         const r = local ? await api.localStats() : await api.sshStats(tabRef.current);
@@ -174,7 +188,17 @@ function ResourceMeters({
         setStats(st);
         setFailed(false);
         if (animate) setPulse((n) => n + 1);
-      } catch {
+      } catch (e) {
+        // 堡垒机拒绝第二条通道：这里已经是「第二次被拒」，再轮询只会把连接
+        // 一次次顶掉。切兼容模式，状态栏改成明确的说明而不是反复闪「不可用」。
+        if (!local && isSidecarDenied(e) && markCompat(sessionId, tabRef.current)) {
+          compat.current = true;
+          if (alive) {
+            setFailed(true);
+            setCompatNow(true);
+          }
+          return;
+        }
         if (alive) setFailed(true);
       } finally {
         busy = false;
@@ -194,14 +218,28 @@ function ResourceMeters({
       alive = false;
       window.clearInterval(id);
     };
-  }, [hostKey, local, live]);
+  }, [hostKey, local, live, sessionId]);
 
   const where = local ? "本机" : "远端";
 
   if (!stats) {
     return (
-      <span className="sb-res sb-res-loading" onContextMenu={onContextMenu} title="右键可关闭实时监控">
-        {failed ? "资源信息不可用" : <><span className="spinner sm" /> 采集资源…</>}
+      <span
+        className="sb-res sb-res-loading"
+        onContextMenu={onContextMenu}
+        title={
+          compatNow
+            ? "兼容模式：该服务器只允许一条 SSH 通道（堡垒机），不采集远端资源。可在「编辑连接 → 高级」里关闭"
+            : "右键可关闭实时监控"
+        }
+      >
+        {compatNow ? (
+          "兼容模式 · 不采集资源"
+        ) : failed ? (
+          "资源信息不可用"
+        ) : (
+          <><span className="spinner sm" /> 采集资源…</>
+        )}
       </span>
     );
   }
@@ -386,6 +424,7 @@ export default function StatusBar({
           hostKey={statsTarget.hostKey}
           tabId={statsTarget.tabId}
           local={statsTarget.local}
+          sessionId={statsTarget.sessionId}
           live={live}
           onContextMenu={openMenu}
         />
