@@ -1,7 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
-import { formatBytes, saveAgentConfig, useAgentConfig } from "../lib/agent";
-import type { AgentConfig, AgentProvider } from "../types";
+import {
+  accountLabel,
+  defaultAccount,
+  formatBytes,
+  newAccountId,
+  saveAgentConfig,
+  useAgentConfig,
+} from "../lib/agent";
+import type { AgentAccount, AgentConfig, AgentProvider } from "../types";
 import {
   DEFAULT_SHORTCUTS,
   SHORTCUT_LABELS,
@@ -374,19 +381,6 @@ const CONTEXT_CHOICES: readonly { bytes: number; label: string }[] = [
   { bytes: 128 * 1024, label: "128 KB · 约 4.4 万汉字 · 最完整" },
 ];
 
-/** 判断「是否改过」的字段清单；按顺序比对，避免对象身份不同就误判 dirty */
-const AGENT_FIELDS: readonly (keyof AgentConfig)[] = [
-  "enabled",
-  "provider",
-  "baseUrl",
-  "model",
-  "apiKey",
-  "maxContextBytes",
-  "systemPrompt",
-  "autoAttach",
-  "redact",
-];
-
 export function AgentDialog({ onClose }: { onClose: () => void }) {
   const saved = useAgentConfig();
   const [draft, setDraft] = useState<AgentConfig>(saved);
@@ -406,20 +400,48 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
     if (!editedRef.current) setDraft(saved);
   }, [saved]);
 
+  // 当前正在编辑的账号（activeId 恒有效，由 store.normalize 保证；仍兜底取首个）
+  const current: AgentAccount =
+    draft.accounts.find((a) => a.id === draft.activeId) ?? draft.accounts[0];
+
+  /** 改顶层配置（总开关 / autoAttach / activeId） */
   const patch = (p: Partial<AgentConfig>) => {
     editedRef.current = true;
     setDraft((d) => ({ ...d, ...p }));
-    // 表单一改，上一次的测试结论就作废了，留着会误导
     setTestMsg(null);
   };
 
-  const dirty = AGENT_FIELDS.some((k) => draft[k] !== saved[k]);
+  /** 改当前账号的字段 */
+  const patchAccount = (p: Partial<AgentAccount>) => {
+    editedRef.current = true;
+    setDraft((d) => ({
+      ...d,
+      accounts: d.accounts.map((a) => (a.id === d.activeId ? { ...a, ...p } : a)),
+    }));
+    setTestMsg(null);
+  };
 
-  // 测试连接只关心「地址 / 模型 / Key」三件套（与后端 validate 的后三项一致）
+  /** 新增一个账号并切过去 */
+  const addAccount = () => {
+    const id = newAccountId();
+    const acct = defaultAccount(id, `账号 ${draft.accounts.length + 1}`);
+    patch({ accounts: [...draft.accounts, acct], activeId: id });
+  };
+
+  /** 删除当前账号（至少保留一个） */
+  const removeAccount = () => {
+    if (draft.accounts.length <= 1) return;
+    const rest = draft.accounts.filter((a) => a.id !== draft.activeId);
+    patch({ accounts: rest, activeId: rest[0].id });
+  };
+
+  const dirty = JSON.stringify(draft) !== JSON.stringify(saved);
+
+  // 测试连接只关心当前账号的「地址 / 模型 / Key」三件套（与后端 validate 的后三项一致）
   const missing = [
-    !draft.baseUrl.trim() && "接口地址",
-    !draft.model.trim() && "模型",
-    !draft.apiKey.trim() && "API Key",
+    !current.baseUrl.trim() && "接口地址",
+    !current.model.trim() && "模型",
+    !current.apiKey.trim() && "API Key",
   ].filter((x): x is string => typeof x === "string");
   const canTest = missing.length === 0;
 
@@ -428,9 +450,15 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
     setTesting(true);
     setTestMsg(null);
     try {
-      // 后端 validate() 第一件事就是查 enabled，而「能不能连通」与「要不要启用」是两回事。
-      // 所以这里临时置 true：测的是连通性，不动用户手里那份 draft，也不会写进库。
-      const text = await api.agentTest({ ...draft, enabled: true });
+      // 测的是「当前账号」的连通性：临时启用 + 只带当前这一个账号，不动库、不动其它账号。
+      // 后端 validate 第一件事就是查 enabled，且只看 active_account，故这样构造最干净。
+      const probe: AgentConfig = {
+        ...draft,
+        enabled: true,
+        accounts: [current],
+        activeId: current.id,
+      };
+      const text = await api.agentTest(probe);
       setTestMsg({ ok: true, text });
     } catch (e) {
       // 后端已把错误翻译成中文，直接展示即可
@@ -453,10 +481,10 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
   };
 
   // 库里可能存着四档之外的值（手改过 db 或旧版本遗留），补一个自定义选项免得 select 显示空白
-  const contextOptions = CONTEXT_CHOICES.some((c) => c.bytes === draft.maxContextBytes)
+  const contextOptions = CONTEXT_CHOICES.some((c) => c.bytes === current.maxContextBytes)
     ? CONTEXT_CHOICES
     : [
-        { bytes: draft.maxContextBytes, label: `${formatBytes(draft.maxContextBytes)}（自定义）` },
+        { bytes: current.maxContextBytes, label: `${formatBytes(current.maxContextBytes)}（自定义）` },
         ...CONTEXT_CHOICES,
       ];
 
@@ -464,7 +492,7 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
     <div className="modal-backdrop" onMouseDown={onClose}>
       <div className="modal settings-modal ag-modal" onMouseDown={(e) => e.stopPropagation()}>
         <div className="settings-head">
-          <h2>AI 助手</h2>
+          <h2>Nexus AI Agent</h2>
           <button className="settings-x" onClick={onClose} title="关闭（Esc）">
             ×
           </button>
@@ -496,15 +524,53 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
           </ul>
         </div>
 
+        <div className="settings-section">账号</div>
+        <div className="row">
+          <label>当前账号</label>
+          <select
+            value={draft.activeId}
+            onChange={(e) => patch({ activeId: e.target.value })}
+          >
+            {draft.accounts.map((a) => (
+              <option key={a.id} value={a.id}>
+                {accountLabel(a)}
+              </option>
+            ))}
+          </select>
+          <button className="ag-eye" onClick={addAccount} title="新增一个账号">
+            新增
+          </button>
+          <button
+            className="ag-eye"
+            onClick={removeAccount}
+            disabled={draft.accounts.length <= 1}
+            title={draft.accounts.length <= 1 ? "至少保留一个账号" : "删除当前账号"}
+          >
+            删除
+          </button>
+        </div>
+        <div className="row">
+          <label>账号名称</label>
+          <input
+            value={current.name}
+            onChange={(e) => patchAccount({ name: e.target.value })}
+            placeholder="例如：OpenAI 正式、本地 vLLM"
+            spellCheck={false}
+          />
+        </div>
+        <p className="ag-hint">
+          可配置多个账号（不同服务商 / 模型 / Key），在此下拉切换；Nexus AI Agent 使用当前选中的账号。
+        </p>
+
         <div className="settings-section">连接</div>
         <div className="row">
           <label>服务商</label>
           <select
-            value={draft.provider}
+            value={current.provider}
             onChange={(e) => {
               const p = e.target.value as AgentProvider;
               // 换服务商时顺手把地址换成该家的默认值：留着旧地址几乎必然请求错地方
-              patch({ provider: p, baseUrl: PROVIDER_META[p].url });
+              patchAccount({ provider: p, baseUrl: PROVIDER_META[p].url });
             }}
           >
             {PROVIDER_ORDER.map((p) => (
@@ -517,21 +583,21 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
         <div className="row">
           <label>接口地址</label>
           <input
-            value={draft.baseUrl}
-            onChange={(e) => patch({ baseUrl: e.target.value })}
-            placeholder={PROVIDER_META[draft.provider].url || "https://your-host/v1"}
+            value={current.baseUrl}
+            onChange={(e) => patchAccount({ baseUrl: e.target.value })}
+            placeholder={PROVIDER_META[current.provider].url || "https://your-host/v1"}
             spellCheck={false}
           />
         </div>
-        {PROVIDER_META[draft.provider].urlHint && (
-          <p className="ag-hint">{PROVIDER_META[draft.provider].urlHint}</p>
+        {PROVIDER_META[current.provider].urlHint && (
+          <p className="ag-hint">{PROVIDER_META[current.provider].urlHint}</p>
         )}
         <div className="row">
           <label>模型</label>
           <input
-            value={draft.model}
-            onChange={(e) => patch({ model: e.target.value })}
-            placeholder={PROVIDER_META[draft.provider].modelHint}
+            value={current.model}
+            onChange={(e) => patchAccount({ model: e.target.value })}
+            placeholder={PROVIDER_META[current.provider].modelHint}
             spellCheck={false}
           />
         </div>
@@ -539,8 +605,8 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
           <label>API Key</label>
           <input
             type={showKey ? "text" : "password"}
-            value={draft.apiKey}
-            onChange={(e) => patch({ apiKey: e.target.value })}
+            value={current.apiKey}
+            onChange={(e) => patchAccount({ apiKey: e.target.value })}
             placeholder="sk-…"
             autoComplete="off"
             spellCheck={false}
@@ -562,18 +628,18 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
             <span className={`ag-test-msg ${testMsg.ok ? "ok" : "err"}`}>{testMsg.text}</span>
           ) : (
             <span className="ag-hint ag-test-tip">
-              {canTest ? "用当前表单值发一条极短消息验证" : `还需填写：${missing.join("、")}`}
+              {canTest ? "用当前账号发一条极短消息验证" : `还需填写：${missing.join("、")}`}
             </span>
           )}
         </div>
 
-        <div className="settings-section">行为</div>
+        <div className="settings-section">行为（当前账号）</div>
         <div className="ag-block">
           <span className="ag-block-label">系统提示词（留空则使用内置默认提示词）</span>
           <textarea
             className="ag-ta"
-            value={draft.systemPrompt}
-            onChange={(e) => patch({ systemPrompt: e.target.value })}
+            value={current.systemPrompt}
+            onChange={(e) => patchAccount({ systemPrompt: e.target.value })}
             placeholder="例如：你是资深 SRE，回答请给出可执行命令，并说明风险"
             spellCheck={false}
           />
@@ -581,8 +647,8 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
         <div className="row">
           <label>上下文上限</label>
           <select
-            value={String(draft.maxContextBytes)}
-            onChange={(e) => patch({ maxContextBytes: Number(e.target.value) })}
+            value={String(current.maxContextBytes)}
+            onChange={(e) => patchAccount({ maxContextBytes: Number(e.target.value) })}
           >
             {contextOptions.map((c) => (
               <option key={c.bytes} value={String(c.bytes)}>
@@ -592,13 +658,13 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
           </select>
         </div>
         <p className="ag-hint">
-          单次提问最多回看最近 {formatBytes(draft.maxContextBytes)} 的终端输出，更早的部分会被丢弃。
+          单次提问最多回看最近 {formatBytes(current.maxContextBytes)} 的终端输出，更早的部分会被丢弃。
         </p>
         <label className="settings-check">
           <input
             type="checkbox"
-            checked={draft.redact}
-            onChange={(e) => patch({ redact: e.target.checked })}
+            checked={current.redact}
+            onChange={(e) => patchAccount({ redact: e.target.checked })}
           />
           <span>
             出网前脱敏
@@ -616,7 +682,7 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
             onChange={(e) => patch({ enabled: e.target.checked })}
           />
           <span>
-            启用 AI 助手
+            启用 Nexus AI Agent
             <em>关闭时后端完全不采集旁路，零开销；不启用则本页其余设置都不生效</em>
           </span>
         </label>

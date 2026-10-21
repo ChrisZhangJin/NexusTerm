@@ -15,6 +15,8 @@
 
 pub mod buffer;
 pub mod cmd;
+pub mod danger;
+pub mod executor;
 pub mod llm;
 pub mod redact;
 
@@ -68,12 +70,19 @@ pub enum AgentError {
     Transport(String),
 }
 
-/// AI 助手配置。字段用 camelCase，因为要原样进 JSON 发给前端。
+/// 单个 AI 账号的连接与行为配置。
+///
+/// 多账号设计：用户可以配好几组（例如一组 OpenAI、一组 Anthropic、一组自建网关），
+/// 整组切换。连接字段（provider/base_url/model/api_key）与行为字段
+/// （system_prompt/max_context_bytes/redact）都随账号走，这样换账号时
+/// 系统提示词、脱敏策略也一并切换，不会出现「换了模型却还带着上一家的提示词」。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub struct AgentConfig {
-    /// 全局总开关。关着的时候旁路彻底不动 —— 连一次哈希查找都没有。
-    pub enabled: bool,
+pub struct AgentAccount {
+    /// 账号唯一 id（前端生成的 uuid 或时间戳串）。切换、删除都按它定位。
+    pub id: String,
+    /// 展示名，例如「OpenAI 正式」「本地 vLLM」。空时 UI 退回显示模型名。
+    pub name: String,
     /// `openai` | `anthropic` | `custom`
     pub provider: String,
     pub base_url: String,
@@ -84,25 +93,90 @@ pub struct AgentConfig {
     /// 单次喂给模型的最近字节数（环形窗口内的二次截取）
     pub max_context_bytes: u32,
     pub system_prompt: String,
-    /// 新会话是否默认开启旁路
-    pub auto_attach: bool,
     /// 出网前是否做脱敏。**默认 true**：关掉它意味着把原始输出发给第三方
     pub redact: bool,
 }
 
-impl Default for AgentConfig {
+impl Default for AgentAccount {
     fn default() -> Self {
         Self {
-            enabled: false,
+            id: String::new(),
+            name: String::new(),
             provider: "openai".into(),
             base_url: "https://api.openai.com/v1".into(),
             model: "gpt-4o-mini".into(),
             api_key: String::new(),
             max_context_bytes: DEFAULT_MAX_CONTEXT_BYTES,
             system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
-            auto_attach: false,
             // 默认脱敏：宁可让模型少看到一点，也不能把私钥发出去
             redact: true,
+        }
+    }
+}
+
+/// AI 助手配置。字段用 camelCase，因为要原样进 JSON 发给前端。
+///
+/// 顶层只保留**全局**行为（总开关 enabled、新会话默认旁路 auto_attach），
+/// 连接相关的一切下沉到 `accounts` 里。`active_id` 指向当前生效的账号。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AgentConfig {
+    /// 全局总开关。关着的时候旁路彻底不动 —— 连一次哈希查找都没有。
+    pub enabled: bool,
+    /// 新会话是否默认开启旁路
+    pub auto_attach: bool,
+    /// 所有已配置的账号。至少有一个（反序列化后若为空会补一个默认账号）。
+    pub accounts: Vec<AgentAccount>,
+    /// 当前生效账号的 id。找不到时回落到第一个账号。
+    pub active_id: String,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        let acct = AgentAccount {
+            id: "default".into(),
+            name: "默认".into(),
+            ..Default::default()
+        };
+        Self {
+            enabled: false,
+            auto_attach: false,
+            active_id: acct.id.clone(),
+            accounts: vec![acct],
+        }
+    }
+}
+
+impl AgentConfig {
+    /// 取当前生效账号。accounts 保证非空（见 `load_config` 的规整），
+    /// active_id 失效时回落到第一个。
+    pub fn active_account(&self) -> &AgentAccount {
+        self.accounts
+            .iter()
+            .find(|a| a.id == self.active_id)
+            .or_else(|| self.accounts.first())
+            .expect("accounts 恒非空：load_config 已保证")
+    }
+
+    /// 反序列化后的规整：补齐空账号列表、修正失效的 active_id、给没有 id 的账号补 id。
+    /// 兼容旧版扁平配置（见 `load_config` 的迁移分支，那里已把旧字段塞进一个账号）。
+    fn normalize(&mut self) {
+        if self.accounts.is_empty() {
+            self.accounts.push(AgentAccount {
+                id: "default".into(),
+                name: "默认".into(),
+                ..Default::default()
+            });
+        }
+        // 给没 id 的账号补一个稳定 id（极少见：手改过 db）
+        for (i, a) in self.accounts.iter_mut().enumerate() {
+            if a.id.trim().is_empty() {
+                a.id = format!("acct-{i}");
+            }
+        }
+        // active_id 指向一个不存在的账号时，回落到第一个
+        if !self.accounts.iter().any(|a| a.id == self.active_id) {
+            self.active_id = self.accounts[0].id.clone();
         }
     }
 }
@@ -120,18 +194,81 @@ pub fn load_config(store: &Store) -> AgentConfig {
     let Some(raw) = store.get_setting(CONFIG_KEY) else {
         return AgentConfig::default();
     };
+    // 先按新格式（带 accounts）解析；失败再尝试旧的扁平格式并迁移。
     match serde_json::from_str::<AgentConfig>(&raw) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            tracing::warn!("AI 配置解析失败，回落到默认值：{}", e);
-            AgentConfig::default()
+        Ok(mut cfg) if !cfg.accounts.is_empty() => {
+            cfg.normalize();
+            cfg
         }
+        // 解析成功但 accounts 为空 → 多半是旧扁平配置被 serde(default) 填成了空列表，
+        // 走迁移分支把旧字段捞出来。
+        _ => migrate_legacy_config(&raw),
     }
 }
 
-/// 保存 AI 配置。
+/// 把旧版扁平 AgentConfig（顶层直接是 provider/baseUrl/model/apiKey… 没有 accounts）
+/// 迁移成单账号的新结构。解析不出来就回默认值。
+fn migrate_legacy_config(raw: &str) -> AgentConfig {
+    #[derive(Deserialize)]
+    #[serde(default, rename_all = "camelCase")]
+    struct Legacy {
+        enabled: bool,
+        auto_attach: bool,
+        provider: String,
+        base_url: String,
+        model: String,
+        api_key: String,
+        max_context_bytes: u32,
+        system_prompt: String,
+        redact: bool,
+    }
+    impl Default for Legacy {
+        fn default() -> Self {
+            let a = AgentAccount::default();
+            Self {
+                enabled: false,
+                auto_attach: false,
+                provider: a.provider,
+                base_url: a.base_url,
+                model: a.model,
+                api_key: a.api_key,
+                max_context_bytes: a.max_context_bytes,
+                system_prompt: a.system_prompt,
+                redact: a.redact,
+            }
+        }
+    }
+
+    let Ok(old) = serde_json::from_str::<Legacy>(raw) else {
+        tracing::warn!("AI 配置解析失败（新旧格式均不匹配），回落到默认值");
+        return AgentConfig::default();
+    };
+    tracing::info!("检测到旧版 AI 配置，迁移为多账号结构");
+    let acct = AgentAccount {
+        id: "default".into(),
+        name: "默认".into(),
+        provider: old.provider,
+        base_url: old.base_url,
+        model: old.model,
+        api_key: old.api_key,
+        max_context_bytes: old.max_context_bytes,
+        system_prompt: old.system_prompt,
+        redact: old.redact,
+    };
+    AgentConfig {
+        enabled: old.enabled,
+        auto_attach: old.auto_attach,
+        active_id: acct.id.clone(),
+        accounts: vec![acct],
+    }
+}
+
+/// 保存 AI 配置。保存前规整一遍（补账号、修 active_id），
+/// 避免把一份非法状态写进库，下次读出来又得兜底。
 pub fn save_config(store: &Store, cfg: &AgentConfig) -> Result<(), AgentError> {
-    let json = serde_json::to_string(cfg).map_err(|e| AgentError::Serialize(e.to_string()))?;
+    let mut cfg = cfg.clone();
+    cfg.normalize();
+    let json = serde_json::to_string(&cfg).map_err(|e| AgentError::Serialize(e.to_string()))?;
     store
         .set_setting(CONFIG_KEY, &json)
         .map_err(AgentError::Store)
@@ -408,34 +545,74 @@ mod tests {
     fn config_defaults_match_spec() {
         let c = AgentConfig::default();
         assert!(!c.enabled);
-        assert_eq!(c.provider, "openai");
-        assert_eq!(c.base_url, "https://api.openai.com/v1");
-        assert_eq!(c.model, "gpt-4o-mini");
-        assert_eq!(c.max_context_bytes, 32768);
-        assert!(c.redact, "脱敏默认必须开着");
         assert!(!c.auto_attach);
+        assert_eq!(c.accounts.len(), 1, "默认必须恰有一个账号");
+        let a = c.active_account();
+        assert_eq!(a.provider, "openai");
+        assert_eq!(a.base_url, "https://api.openai.com/v1");
+        assert_eq!(a.model, "gpt-4o-mini");
+        assert_eq!(a.max_context_bytes, 32768);
+        assert!(a.redact, "脱敏默认必须开着");
     }
 
     /// 序列化字段必须是 camelCase —— 前端按这个形状解析
     #[test]
     fn config_serializes_to_camel_case() {
         let json = serde_json::to_value(AgentConfig::default()).expect("序列化应成功");
-        assert!(json.get("apiKey").is_some());
-        assert!(json.get("baseUrl").is_some());
-        assert!(json.get("maxContextBytes").is_some());
-        assert!(json.get("systemPrompt").is_some());
+        assert!(json.get("accounts").is_some());
+        assert!(json.get("activeId").is_some());
         assert!(json.get("autoAttach").is_some());
-        assert!(json.get("api_key").is_none());
+        let acct = &json["accounts"][0];
+        assert!(acct.get("apiKey").is_some());
+        assert!(acct.get("baseUrl").is_some());
+        assert!(acct.get("maxContextBytes").is_some());
+        assert!(acct.get("systemPrompt").is_some());
+        assert!(acct.get("api_key").is_none());
     }
 
-    /// 旧版本 / 残缺的配置必须能读回来而不是崩掉
+    /// 新格式部分字段缺失应走 default 而不是崩
     #[test]
     fn config_partial_json_falls_back_to_defaults() {
-        let cfg: AgentConfig = serde_json::from_str(r#"{"model":"o3-mini"}"#)
-            .expect("字段缺失应走 default 而不是报错");
-        assert_eq!(cfg.model, "o3-mini");
-        assert_eq!(cfg.base_url, AgentConfig::default().base_url);
-        assert!(cfg.redact, "未指定的布尔字段应取默认值 true");
+        let cfg: AgentConfig =
+            serde_json::from_str(r#"{"accounts":[{"id":"x","model":"o3-mini"}],"activeId":"x"}"#)
+                .expect("字段缺失应走 default 而不是报错");
+        let a = cfg.active_account();
+        assert_eq!(a.model, "o3-mini");
+        assert_eq!(a.base_url, AgentAccount::default().base_url);
+        assert!(a.redact, "未指定的布尔字段应取默认值 true");
+    }
+
+    /// 旧版扁平配置必须能迁移成单账号而不是丢数据
+    #[test]
+    fn legacy_flat_config_migrates_to_single_account() {
+        let raw = r#"{"enabled":true,"provider":"anthropic","baseUrl":"https://x/v1","model":"claude-3","apiKey":"sk-legacy","maxContextBytes":65536,"systemPrompt":"hi","autoAttach":true,"redact":false}"#;
+        let cfg = migrate_legacy_config(raw);
+        assert!(cfg.enabled);
+        assert!(cfg.auto_attach);
+        assert_eq!(cfg.accounts.len(), 1);
+        let a = cfg.active_account();
+        assert_eq!(a.provider, "anthropic");
+        assert_eq!(a.base_url, "https://x/v1");
+        assert_eq!(a.model, "claude-3");
+        assert_eq!(a.api_key, "sk-legacy");
+        assert_eq!(a.max_context_bytes, 65536);
+        assert_eq!(a.system_prompt, "hi");
+        assert!(!a.redact);
+    }
+
+    /// active_id 指向不存在的账号时，active_account 回落到第一个
+    #[test]
+    fn active_id_falls_back_to_first() {
+        let mut cfg = AgentConfig {
+            accounts: vec![
+                AgentAccount { id: "a".into(), model: "m-a".into(), ..Default::default() },
+                AgentAccount { id: "b".into(), model: "m-b".into(), ..Default::default() },
+            ],
+            active_id: "ghost".into(),
+            ..Default::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.active_account().model, "m-a");
     }
 
     #[test]

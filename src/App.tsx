@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { emit, listen } from "@tauri-apps/api/event";
 import SessionList from "./components/SessionList";
 import SessionDialog from "./components/SessionDialog";
 import TerminalView, { clock } from "./components/TerminalView";
@@ -63,6 +64,12 @@ const reconnectDelay = (attempt: number) => RECONNECT_BASE * 2 ** (attempt - 1);
 
 const THEME_NAMES = Object.keys(BUILTIN_THEMES);
 
+/** AI 面板宽度边界（px）：下限保证内容不挤压，上限防止把终端拖没 */
+const AGENT_MIN_W = 280;
+const AGENT_MAX_W = 760;
+const clampAgentWidth = (w: number) =>
+  Math.min(AGENT_MAX_W, Math.max(AGENT_MIN_W, Math.round(w)));
+
 export default function App() {
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
@@ -82,6 +89,43 @@ export default function App() {
    * 否则一轮对话的历史会随收起一起丢掉。
    */
   const [agentOpen, setAgentOpen] = useState(false);
+  /**
+   * AI 面板宽度（px），持久化到 localStorage。
+   * 拖动左缘手柄改宽；clamp 在 [AGENT_MIN_W, AGENT_MAX_W]，避免拖没或把终端挤没。
+   */
+  const [agentWidth, setAgentWidth] = useState(() => {
+    const v = Number(localStorage.getItem("nx.agentWidth"));
+    return Number.isFinite(v) && v >= AGENT_MIN_W && v <= AGENT_MAX_W ? v : 340;
+  });
+  useEffect(() => {
+    localStorage.setItem("nx.agentWidth", String(agentWidth));
+  }, [agentWidth]);
+  /** 面板左缘拖拽：按下时记录起点，move 时按反向位移（往左拖=变宽）更新宽度 */
+  const startAgentResize = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startW = agentWidth;
+      const onMove = (ev: MouseEvent) => {
+        const next = clampAgentWidth(startW + (startX - ev.clientX));
+        setAgentWidth(next);
+      };
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      };
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+      // 拖动期间全局锁定光标与选区，否则会连带选中终端文本
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    },
+    [agentWidth],
+  );
+  /** AI 面板是否已浮出为独立窗口。浮出时主窗口内嵌面板收起。 */
+  const [agentFloated, setAgentFloated] = useState(false);
 
   // 外观持久化到 localStorage（之前每次启动都回到默认）
   const [themeName, setThemeName] = useState(() => {
@@ -770,6 +814,42 @@ export default function App() {
     else await api.sshWrite(tabId, bytes);
   }, []);
 
+  /** 把 AI 面板浮出为独立窗口：开窗 + 收起内嵌面板 */
+  const floatAgentOut = useCallback(async () => {
+    if (!activeTab) return;
+    await api.agentOpenWindow(activeTab);
+    setAgentFloated(true);
+    setAgentOpen(false);
+  }, [activeTab]);
+
+  // 浮窗开着时，主窗口切换活动会话要通知浮窗跟随
+  useEffect(() => {
+    if (agentFloated && activeTab) void emit("nx://agent/active-session", activeTab);
+  }, [agentFloated, activeTab]);
+
+  // 监听浮窗回传的事件：写终端、开设置、窗口关闭
+  useEffect(() => {
+    const unSend = listen<{ sessionId: string; text: string }>(
+      "nx://agent/send-to-terminal",
+      (e) => {
+        if (e.payload?.sessionId) void sendToTerminal(e.payload.sessionId, e.payload.text);
+      },
+    );
+    const unSettings = listen("nx://agent/open-settings", () => setSettingsWin("agent"));
+    // 浮窗被关掉 → 恢复「未浮出」状态，让用户能重新内嵌或再次浮出
+    const unClosed = listen("nx://agent/window-closed", () => setAgentFloated(false));
+    return () => {
+      void unSend.then((f) => f());
+      void unSettings.then((f) => f());
+      void unClosed.then((f) => f());
+    };
+  }, [sendToTerminal]);
+
+  // 启动时同步一次浮窗状态（热重载 / 重开主窗口时浮窗可能还在）
+  useEffect(() => {
+    void api.agentWindowOpen().then(setAgentFloated).catch(() => {});
+  }, []);
+
   const saveSession = useCallback(
     async (payload: NewSession, password: string, passphrase: string | null) => {
       let id = editing?.id;
@@ -1221,13 +1301,24 @@ export default function App() {
           卸载即丢失。收起只是把 visible 置 false（组件自己返回 null、停掉
           事件订阅与状态轮询），并把容器宽度归零。
         */}
-        <div className={`agent-side${agentShown ? "" : " collapsed"}`}>
+        <div
+          className={`agent-side${agentShown ? "" : " collapsed"}`}
+          style={agentShown ? { width: agentWidth } : undefined}
+        >
+          {agentShown && (
+            <div
+              className="agent-resize"
+              onMouseDown={startAgentResize}
+              title="拖动调整面板宽度"
+            />
+          )}
           <AgentPanel
             sessionId={activeTab ?? ""}
             visible={agentShown}
             onClose={() => setAgentOpen(false)}
             onSendToTerminal={sendToTerminal}
             onOpenSettings={() => setSettingsWin("agent")}
+            onFloatOut={floatAgentOut}
           />
         </div>
       </div>

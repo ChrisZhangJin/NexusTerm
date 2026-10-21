@@ -163,6 +163,13 @@ export const api = {
   agentCancel: (sessionId: string) => invoke<void>("agent_cancel", { sessionId }),
   /** 用「还没保存」的那份配置测连通性（刻意不读库里的值） */
   agentTest: (config: AgentConfig) => invoke<string>("agent_test", { config }),
+  /** 把 Agent 面板浮出为独立系统窗口（已开则切会话并聚焦） */
+  agentOpenWindow: (sessionId: string) =>
+    invoke<void>("agent_open_window", { sessionId }),
+  /** 关闭浮动 Agent 窗口（幂等） */
+  agentCloseWindow: () => invoke<void>("agent_close_window"),
+  /** 浮动窗口是否已打开 */
+  agentWindowOpen: () => invoke<boolean>("agent_window_open"),
 
   // ——— 阅读窗口（.md / .html 渲染查看） ———
   readerOpenSftp: (sftpId: string, path: string, source: string) =>

@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "NexusTerm 默认权限集",
-  "windows": ["main", "reader-*"],
+  "windows": ["main", "reader-*", "agent-float"],
   "permissions": [
     "core:default",
     "opener:default",

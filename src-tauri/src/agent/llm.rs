@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 use super::redact::redact;
-use super::{AgentConfig, AgentError, AgentManager, DEFAULT_MAX_CONTEXT_BYTES};
+use super::{AgentAccount, AgentConfig, AgentError, AgentManager, DEFAULT_MAX_CONTEXT_BYTES};
 use crate::errors;
 
 /// 连接超时：DNS + TCP + TLS 三步都算在里面。15 秒足够跨洲握手，
@@ -92,8 +92,8 @@ pub enum Provider {
 /// **刻意让未知值落到 OpenAI 兼容分支**：绝大多数自建网关（OneAPI、Ollama、
 /// vLLM、各种中转）都是 OpenAI 形状，用户手打 `custom` 或拼错成 `OpenAI ` 时，
 /// 宁可按兼容协议试一次，也不要直接报「不支持的 provider」。
-pub fn resolve_provider(cfg: &AgentConfig) -> Provider {
-    if cfg.provider.trim().eq_ignore_ascii_case("anthropic") {
+pub fn resolve_provider(acct: &AgentAccount) -> Provider {
+    if acct.provider.trim().eq_ignore_ascii_case("anthropic") {
         Provider::Anthropic
     } else {
         Provider::OpenAI
@@ -105,8 +105,17 @@ pub fn resolve_provider(cfg: &AgentConfig) -> Provider {
 /// 去掉 base_url 的尾斜杠：用户从网页上复制来的地址几乎都带 `/`，
 /// 直接 `{base}/chat/completions` 会拼出 `//chat/completions`，
 /// 部分网关会把它当成另一条路径（404）。
-pub fn endpoint(cfg: &AgentConfig, provider: Provider) -> String {
-    let base = cfg.base_url.trim().trim_end_matches('/');
+pub fn endpoint(acct: &AgentAccount, provider: Provider) -> String {
+    // 先去掉尾斜杠，再去掉用户可能误填的完整终点后缀：界面提示承诺「结尾的
+    // /chat/completions 会自动去掉」，这里把 /chat/completions 与 /messages
+    // 都剥掉，保证无论用户填 base URL 还是完整终点都拼得对、不至于 404。
+    let mut base = acct.base_url.trim().trim_end_matches('/');
+    for suffix in ["/chat/completions", "/messages"] {
+        if let Some(stripped) = base.strip_suffix(suffix) {
+            base = stripped.trim_end_matches('/');
+            break;
+        }
+    }
     let path = match provider {
         Provider::OpenAI => "/chat/completions",
         Provider::Anthropic => "/messages",
@@ -134,8 +143,8 @@ pub const FALLBACK_SYSTEM_PROMPT: &str = concat!(
 );
 
 /// 取实际生效的系统提示词。
-pub fn system_prompt(cfg: &AgentConfig) -> &str {
-    let custom = cfg.system_prompt.trim();
+pub fn system_prompt(acct: &AgentAccount) -> &str {
+    let custom = acct.system_prompt.trim();
     if custom.is_empty() {
         FALLBACK_SYSTEM_PROMPT
     } else {
@@ -166,8 +175,8 @@ pub const CONTEXT_MISSING: &str = concat!(
 ///
 /// `raw` 是 `AgentManager::context` 给出的原文（UI 展示用的那份）。
 /// 配置要求脱敏时，这里是不把它发出去的最后机会。
-pub fn sanitize_context(cfg: &AgentConfig, raw: &str) -> String {
-    if cfg.redact {
+pub fn sanitize_context(acct: &AgentAccount, raw: &str) -> String {
+    if acct.redact {
         redact(raw)
     } else {
         raw.to_string()
@@ -241,23 +250,23 @@ pub struct PreparedRequest {
 ///
 /// `stream = false` 用于「测试连接」：省掉 SSE 解析，只看一次往返通不通。
 pub fn build_request(
-    cfg: &AgentConfig,
+    acct: &AgentAccount,
     provider: Provider,
     system: &str,
     user: &str,
     stream: bool,
 ) -> Result<PreparedRequest, AgentError> {
-    if cfg.base_url.trim().is_empty() {
+    if acct.base_url.trim().is_empty() {
         return Err(AgentError::BadRequest("尚未填写接口地址（Base URL）".into()));
     }
-    let model = cfg.model.trim();
+    let model = acct.model.trim();
     if model.is_empty() {
         return Err(AgentError::MissingModel);
     }
     // trim 而不是直接用：从网页/终端复制 key 时经常带出首尾空白或换行，
     // 带进去的请求头会被 hyper 判为非法字符，报一句和「Key 错了」完全不同的错。
-    let key = cfg.api_key.trim().to_string();
-    let url = endpoint(cfg, provider);
+    let key = acct.api_key.trim().to_string();
+    let url = endpoint(acct, provider);
     let messages = vec![ChatMessage {
         role: "user".into(),
         content: user.to_string(),
@@ -311,13 +320,14 @@ pub fn validate(cfg: &AgentConfig) -> Result<(), AgentError> {
     if !cfg.enabled {
         return Err(AgentError::Disabled);
     }
-    if cfg.api_key.trim().is_empty() {
+    let acct = cfg.active_account();
+    if acct.api_key.trim().is_empty() {
         return Err(AgentError::MissingKey);
     }
-    if cfg.model.trim().is_empty() {
+    if acct.model.trim().is_empty() {
         return Err(AgentError::MissingModel);
     }
-    if cfg.base_url.trim().is_empty() {
+    if acct.base_url.trim().is_empty() {
         return Err(AgentError::BadRequest("尚未填写接口地址（Base URL）".into()));
     }
     Ok(())
@@ -890,10 +900,11 @@ impl LlmRuntime {
         };
 
         // —— 唯一一次碰 AgentManager 的锁，读完立刻释放 ——
-        let max_bytes = if cfg.max_context_bytes == 0 {
+        let acct_max = cfg.active_account().max_context_bytes;
+        let max_bytes = if acct_max == 0 {
             DEFAULT_MAX_CONTEXT_BYTES
         } else {
-            cfg.max_context_bytes
+            acct_max
         } as usize;
         let raw_context = mgr.context(session_id, max_bytes);
 
@@ -1013,11 +1024,12 @@ async fn stream_answer(
     question: String,
     cancel: CancelFlag,
 ) {
-    let provider = resolve_provider(&cfg);
+    let acct = cfg.active_account();
+    let provider = resolve_provider(acct);
     // —— 出网前最后一个闸门 ——
-    let context = raw_context.as_deref().map(|c| sanitize_context(&cfg, c));
+    let context = raw_context.as_deref().map(|c| sanitize_context(acct, c));
     let user = build_user_message(context.as_deref(), &question);
-    let prepared = match build_request(&cfg, provider, system_prompt(&cfg), &user, true) {
+    let prepared = match build_request(acct, provider, system_prompt(acct), &user, true) {
         Ok(p) => p,
         Err(e) => {
             emit_error(&app, &session, &e.to_string());
@@ -1164,8 +1176,9 @@ fn extract_answer_text(provider: Provider, body: &str) -> Option<String> {
 /// 与库里已保存的、以及运行时状态都无关。
 pub async fn test_connection(cfg: &AgentConfig) -> Result<String, AgentError> {
     validate(cfg)?;
-    let provider = resolve_provider(cfg);
-    let prepared = build_request(cfg, provider, system_prompt(cfg), TEST_QUESTION, false)?;
+    let acct = cfg.active_account();
+    let provider = resolve_provider(acct);
+    let prepared = build_request(acct, provider, system_prompt(acct), TEST_QUESTION, false)?;
     let client = http_client()?;
 
     let mut headers = HeaderMap::new();
@@ -1206,12 +1219,12 @@ pub async fn test_connection(cfg: &AgentConfig) -> Result<String, AgentError> {
     match extract_answer_text(provider, &body) {
         Some(text) if !text.trim().is_empty() => Ok(format!(
             "连接成功：模型 {} 已响应，回复「{}」",
-            cfg.model.trim(),
+            acct.model.trim(),
             truncate_chars(text.trim(), 60)
         )),
         _ => Ok(format!(
             "连接成功：模型 {} 已响应，但正文为空（请确认该模型可用于对话接口）",
-            cfg.model.trim()
+            acct.model.trim()
         )),
     }
 }
@@ -1221,11 +1234,23 @@ mod tests {
     use super::*;
     use crate::agent::redact::PLACEHOLDER;
 
+    /// 测试账号：带一个可用的 key，其余取默认。
+    fn acct() -> AgentAccount {
+        AgentAccount {
+            id: "default".into(),
+            name: "默认".into(),
+            api_key: "sk-test-key".into(),
+            ..Default::default()
+        }
+    }
+
+    /// 测试配置：启用 + 单账号（key 已填）。validate 这类按 AgentConfig 的测试用它。
     fn cfg() -> AgentConfig {
         AgentConfig {
             enabled: true,
-            api_key: "sk-test-key".into(),
-            ..Default::default()
+            auto_attach: false,
+            active_id: "default".into(),
+            accounts: vec![acct()],
         }
     }
 
@@ -1507,20 +1532,40 @@ mod tests {
 
     #[test]
     fn endpoint_trims_trailing_slash() {
-        let c = AgentConfig {
+        let a = AgentAccount {
             base_url: "https://api.openai.com/v1/".into(),
-            ..cfg()
+            ..acct()
         };
         assert_eq!(
-            endpoint(&c, Provider::OpenAI),
+            endpoint(&a, Provider::OpenAI),
             "https://api.openai.com/v1/chat/completions"
         );
-        assert_eq!(endpoint(&c, Provider::Anthropic), "https://api.openai.com/v1/messages");
+        assert_eq!(endpoint(&a, Provider::Anthropic), "https://api.openai.com/v1/messages");
+    }
+
+    /// 用户误填完整终点 URL 时，endpoint 要剥掉重复后缀而不是拼两次（曾导致 404）
+    #[test]
+    fn endpoint_strips_duplicate_endpoint_suffix() {
+        let a = AgentAccount {
+            base_url: "http://10.0.3.112/v1/chat/completions".into(),
+            ..acct()
+        };
+        assert_eq!(
+            endpoint(&a, Provider::OpenAI),
+            "http://10.0.3.112/v1/chat/completions",
+            "填了完整终点也应只有一个 /chat/completions"
+        );
+        let a = AgentAccount {
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com/messages".into(),
+            ..acct()
+        };
+        assert_eq!(endpoint(&a, Provider::Anthropic), "https://api.anthropic.com/messages");
     }
 
     #[test]
     fn openai_request_shape() {
-        let req = build_request(&cfg(), Provider::OpenAI, "SYS", "USER", true).expect("应组装成功");
+        let req = build_request(&acct(), Provider::OpenAI, "SYS", "USER", true).expect("应组装成功");
         assert_eq!(req.url, "https://api.openai.com/v1/chat/completions");
         assert!(req
             .headers
@@ -1541,25 +1586,25 @@ mod tests {
     /// 流式要 Accept: text/event-stream，非流式（测试连接）不该带上它
     #[test]
     fn accept_header_only_for_streaming() {
-        let streaming = build_request(&cfg(), Provider::OpenAI, "S", "U", true).expect("应组装成功");
+        let streaming = build_request(&acct(), Provider::OpenAI, "S", "U", true).expect("应组装成功");
         assert!(streaming
             .headers
             .contains(&("Accept".into(), "text/event-stream".into())));
 
-        let one_shot = build_request(&cfg(), Provider::OpenAI, "S", "U", false).expect("应组装成功");
+        let one_shot = build_request(&acct(), Provider::OpenAI, "S", "U", false).expect("应组装成功");
         assert!(!one_shot.headers.iter().any(|(k, _)| k == "Accept"));
         assert_eq!(body_of(&one_shot)["stream"], false);
     }
 
     #[test]
     fn anthropic_request_shape() {
-        let c = AgentConfig {
+        let a = AgentAccount {
             provider: "anthropic".into(),
             base_url: "https://api.anthropic.com".into(),
             model: "claude-3-5-sonnet".into(),
-            ..cfg()
+            ..acct()
         };
-        let req = build_request(&c, Provider::Anthropic, "SYS", "USER", true).expect("应组装成功");
+        let req = build_request(&a, Provider::Anthropic, "SYS", "USER", true).expect("应组装成功");
         assert_eq!(req.url, "https://api.anthropic.com/messages");
         assert!(req.headers.contains(&("x-api-key".into(), "sk-test-key".into())));
         assert!(req
@@ -1578,11 +1623,11 @@ mod tests {
 
     #[test]
     fn api_key_is_trimmed() {
-        let c = AgentConfig {
+        let a = AgentAccount {
             api_key: "  sk-abc\n".into(),
-            ..cfg()
+            ..acct()
         };
-        let req = build_request(&c, Provider::OpenAI, "S", "U", false).expect("应组装成功");
+        let req = build_request(&a, Provider::OpenAI, "S", "U", false).expect("应组装成功");
         assert!(req
             .headers
             .contains(&("Authorization".into(), "Bearer sk-abc".into())));
@@ -1590,35 +1635,35 @@ mod tests {
 
     #[test]
     fn provider_resolution_is_case_insensitive() {
-        let c = AgentConfig {
+        let a = AgentAccount {
             provider: " Anthropic ".into(),
-            ..cfg()
+            ..acct()
         };
-        assert_eq!(resolve_provider(&c), Provider::Anthropic);
+        assert_eq!(resolve_provider(&a), Provider::Anthropic);
         // 未知值落到兼容分支，而不是报错
-        let c = AgentConfig {
+        let a = AgentAccount {
             provider: "custom".into(),
-            ..cfg()
+            ..acct()
         };
-        assert_eq!(resolve_provider(&c), Provider::OpenAI);
+        assert_eq!(resolve_provider(&a), Provider::OpenAI);
     }
 
     #[test]
     fn missing_model_or_url_is_rejected() {
-        let c = AgentConfig {
+        let a = AgentAccount {
             model: "  ".into(),
-            ..cfg()
+            ..acct()
         };
         assert!(matches!(
-            build_request(&c, Provider::OpenAI, "S", "U", true),
+            build_request(&a, Provider::OpenAI, "S", "U", true),
             Err(AgentError::MissingModel)
         ));
-        let c = AgentConfig {
+        let a = AgentAccount {
             base_url: String::new(),
-            ..cfg()
+            ..acct()
         };
         assert!(matches!(
-            build_request(&c, Provider::OpenAI, "S", "U", true),
+            build_request(&a, Provider::OpenAI, "S", "U", true),
             Err(AgentError::BadRequest(_))
         ));
     }
@@ -1627,11 +1672,11 @@ mod tests {
 
     #[test]
     fn blank_system_prompt_falls_back() {
-        let c = AgentConfig {
+        let a = AgentAccount {
             system_prompt: "   ".into(),
-            ..cfg()
+            ..acct()
         };
-        let s = system_prompt(&c);
+        let s = system_prompt(&a);
         assert_eq!(s, FALLBACK_SYSTEM_PROMPT);
         // 四条要点必须在兜底提示词里
         for key in ["终端会话", "不要臆测", "不确定", "风险"] {
@@ -1641,11 +1686,11 @@ mod tests {
 
     #[test]
     fn custom_system_prompt_is_used_verbatim() {
-        let c = AgentConfig {
+        let a = AgentAccount {
             system_prompt: "你是我的助手".into(),
-            ..cfg()
+            ..acct()
         };
-        assert_eq!(system_prompt(&c), "你是我的助手");
+        assert_eq!(system_prompt(&a), "你是我的助手");
     }
 
     // —————————————— 上下文与脱敏 ——————————————
@@ -1654,11 +1699,11 @@ mod tests {
 
     #[test]
     fn redact_on_masks_secrets_before_leaving() {
-        let c = AgentConfig {
+        let a = AgentAccount {
             redact: true,
-            ..cfg()
+            ..acct()
         };
-        let safe = sanitize_context(&c, RAW_CONTEXT);
+        let safe = sanitize_context(&a, RAW_CONTEXT);
         assert!(!safe.contains("sk-abcdefgh12345678"), "原文密钥漏出去了");
         assert!(safe.contains(PLACEHOLDER));
         assert!(safe.starts_with("$ export OPENAI_API_KEY="), "脱敏应保留可读性");
@@ -1666,11 +1711,11 @@ mod tests {
 
     #[test]
     fn redact_off_keeps_original_text() {
-        let c = AgentConfig {
+        let a = AgentAccount {
             redact: false,
-            ..cfg()
+            ..acct()
         };
-        assert_eq!(sanitize_context(&c, RAW_CONTEXT), RAW_CONTEXT);
+        assert_eq!(sanitize_context(&a, RAW_CONTEXT), RAW_CONTEXT);
     }
 
     #[test]
@@ -1780,12 +1825,12 @@ mod tests {
     fn validation_rejects_incomplete_config() {
         assert!(matches!(validate(&AgentConfig::default()), Err(AgentError::Disabled)));
         let c = AgentConfig {
-            api_key: String::new(),
+            accounts: vec![AgentAccount { api_key: String::new(), ..acct() }],
             ..cfg()
         };
         assert!(matches!(validate(&c), Err(AgentError::MissingKey)));
         let c = AgentConfig {
-            base_url: String::new(),
+            accounts: vec![AgentAccount { base_url: String::new(), ..acct() }],
             ..cfg()
         };
         assert!(matches!(validate(&c), Err(AgentError::BadRequest(_))));

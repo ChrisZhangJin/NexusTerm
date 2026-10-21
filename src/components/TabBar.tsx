@@ -236,8 +236,8 @@ export default function TabBar({
         onClick={onToggleAgent}
         title={
           agentOpen
-            ? "收起 AI 助手面板"
-            : "展开 AI 助手面板（它能看到当前会话的终端输出，用来带上下文回答问题）"
+            ? "收起 Nexus AI Agent 面板"
+            : "展开 Nexus AI Agent 面板（它能看到当前会话的终端输出，用来带上下文回答问题）"
         }
         aria-pressed={agentOpen}
       >

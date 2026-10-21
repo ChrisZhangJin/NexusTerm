@@ -10,32 +10,46 @@
 
 import { useSyncExternalStore } from "react";
 import { api } from "../api";
-import type { AgentConfig, AgentProvider } from "../types";
+import type { AgentAccount, AgentConfig, AgentProvider } from "../types";
 
-/** 与后端 `AgentConfig::default()` 对齐。systemPrompt 留空 = 用后端内置提示词。 */
+/** 生成一个账号 id：时间戳 + 随机尾巴，够用且不依赖 crypto.randomUUID 的可用性。 */
+export function newAccountId(): string {
+  return `acct-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** 与后端 `AgentAccount::default()` 对齐。systemPrompt 留空 = 用后端内置提示词。 */
+export function defaultAccount(id = "default", name = "默认"): AgentAccount {
+  return {
+    id,
+    name,
+    provider: "openai",
+    baseUrl: "https://api.openai.com/v1",
+    model: "gpt-4o-mini",
+    apiKey: "",
+    maxContextBytes: 32 * 1024,
+    systemPrompt: "",
+    redact: true,
+  };
+}
+
+/** 与后端 `AgentConfig::default()` 对齐：单个默认账号。 */
 export const DEFAULT_AGENT_CONFIG: AgentConfig = {
   enabled: false,
-  provider: "openai",
-  baseUrl: "https://api.openai.com/v1",
-  model: "gpt-4o-mini",
-  apiKey: "",
-  maxContextBytes: 32 * 1024,
-  systemPrompt: "",
   autoAttach: false,
-  redact: true,
+  accounts: [defaultAccount()],
+  activeId: "default",
 };
 
 const PROVIDERS: readonly AgentProvider[] = ["openai", "anthropic", "custom"];
 
-/**
- * IPC 边界上的兜底：Rust 侧 provider 是 String、u32 是定长整数，
- * JSON 能表达的东西比 Rust 出的值宽得多。这里把未知/越界值收敛回合法域，
- * 保证 UI 拿到的对象一定符合 AgentConfig 的类型不变量。
- */
-function normalize(raw: Partial<AgentConfig> | null | undefined): AgentConfig {
-  const c = { ...DEFAULT_AGENT_CONFIG, ...(raw ?? {}) };
+/** 规整单个账号，把未知/越界值收敛回合法域。 */
+function normalizeAccount(raw: Partial<AgentAccount> | null | undefined, idx: number): AgentAccount {
+  const d = defaultAccount();
+  const c = { ...d, ...(raw ?? {}) };
+  const id = typeof c.id === "string" && c.id.trim() ? c.id : `acct-${idx}`;
   return {
-    enabled: Boolean(c.enabled),
+    id,
+    name: typeof c.name === "string" ? c.name : "",
     provider: PROVIDERS.includes(c.provider) ? c.provider : "openai",
     baseUrl: typeof c.baseUrl === "string" ? c.baseUrl : "",
     model: typeof c.model === "string" ? c.model : "",
@@ -43,15 +57,56 @@ function normalize(raw: Partial<AgentConfig> | null | undefined): AgentConfig {
     // 0 与非法值回落到默认窗口 —— 后端对 max_context_bytes == 0 是同样的处理
     maxContextBytes: clampContextBytes(c.maxContextBytes),
     systemPrompt: typeof c.systemPrompt === "string" ? c.systemPrompt : "",
-    autoAttach: Boolean(c.autoAttach),
     redact: Boolean(c.redact),
   };
+}
+
+/**
+ * IPC 边界上的兜底：把后端来的配置收敛成合法的多账号结构。
+ * 账号列表为空时补一个默认账号；activeId 失效时回落到第一个。
+ * 兼容旧的扁平配置（后端已做迁移，但前端也容错一次，避免读到残缺对象就崩）。
+ */
+function normalize(raw: Partial<AgentConfig> | null | undefined): AgentConfig {
+  const c = { ...(raw ?? {}) } as Partial<AgentConfig> & Partial<AgentAccount>;
+  let accounts: AgentAccount[] = Array.isArray(c.accounts)
+    ? c.accounts.map((a, i) => normalizeAccount(a, i))
+    : [];
+  // 兼容后端万一回了旧扁平结构：把顶层连接字段包成一个账号
+  if (accounts.length === 0) {
+    if (c.baseUrl !== undefined || c.model !== undefined || c.apiKey !== undefined) {
+      accounts = [normalizeAccount({ id: "default", name: "默认", ...c }, 0)];
+    } else {
+      accounts = [defaultAccount()];
+    }
+  }
+  const activeId =
+    typeof c.activeId === "string" && accounts.some((a) => a.id === c.activeId)
+      ? c.activeId
+      : accounts[0].id;
+  return {
+    enabled: Boolean(c.enabled),
+    autoAttach: Boolean(c.autoAttach),
+    accounts,
+    activeId,
+  };
+}
+
+/** 取当前生效账号（accounts 恒非空、activeId 恒有效，由 normalize 保证）。 */
+export function activeAccount(cfg: AgentConfig): AgentAccount {
+  return cfg.accounts.find((a) => a.id === cfg.activeId) ?? cfg.accounts[0];
+}
+
+/** 账号的展示名：优先用 name，空则退回模型名，再空则用 id 前缀。 */
+export function accountLabel(a: AgentAccount): string {
+  if (a.name.trim()) return a.name.trim();
+  if (a.model.trim()) return a.model.trim();
+  return a.id;
 }
 
 /** u32 上限：后端形参是 u32，超过会在反序列化时炸掉整个 IPC 调用 */
 function clampContextBytes(n: unknown): number {
   const v = Math.round(Number(n));
-  if (!Number.isFinite(v) || v <= 0) return DEFAULT_AGENT_CONFIG.maxContextBytes;
+  if (!Number.isFinite(v) || v <= 0) return defaultAccount().maxContextBytes;
   return Math.min(v, 0xffffffff);
 }
 
@@ -128,10 +183,11 @@ export function useAgentConfig(): AgentConfig {
  * 唯一可信的校验就是打一次模型 —— 那件事交给 `agent_test`。
  */
 export function isAgentReady(cfg: AgentConfig): { ok: boolean; reason?: string } {
-  if (!cfg.enabled) return { ok: false, reason: "AI 助手未启用：请先在设置里打开总开关" };
-  if (!cfg.apiKey.trim()) return { ok: false, reason: "尚未填写 API Key：请到设置里填写后再提问" };
-  if (!cfg.model.trim()) return { ok: false, reason: "尚未填写模型名称：请到设置里填写后再提问" };
-  if (!cfg.baseUrl.trim()) return { ok: false, reason: "尚未填写接口地址（Base URL）" };
+  if (!cfg.enabled) return { ok: false, reason: "Nexus AI Agent 未启用：请先在设置里打开总开关" };
+  const a = activeAccount(cfg);
+  if (!a.apiKey.trim()) return { ok: false, reason: "当前账号尚未填写 API Key：请到设置里填写后再提问" };
+  if (!a.model.trim()) return { ok: false, reason: "当前账号尚未填写模型名称：请到设置里填写后再提问" };
+  if (!a.baseUrl.trim()) return { ok: false, reason: "当前账号尚未填写接口地址（Base URL）" };
   return { ok: true };
 }
 

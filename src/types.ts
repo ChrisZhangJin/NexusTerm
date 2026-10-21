@@ -224,14 +224,18 @@ export interface Theme {
 export type AgentProvider = "openai" | "anthropic" | "custom";
 
 /**
- * AI 助手配置。后端持久化在 SQLite settings 表（key=`agent.config`），
- * serde `rename_all = "camelCase"`，故此处的字段名必须与 TS 侧一致。
+ * 单个 AI 账号的连接与行为配置。后端 `AgentAccount` 的镜像（camelCase）。
+ *
+ * 多账号设计：用户可配多组（OpenAI / Anthropic / 自建网关…），整组切换。
+ * 连接字段与行为字段都随账号走，这样换账号时系统提示词、脱敏策略一并切换。
  */
-export interface AgentConfig {
-  /** 全局总开关。关着的时候后端旁路完全不动，连一次哈希查找都没有。 */
-  enabled: boolean;
+export interface AgentAccount {
+  /** 账号唯一 id（前端生成）。切换、删除按它定位。 */
+  id: string;
+  /** 展示名，例如「OpenAI 正式」。空时 UI 退回显示模型名。 */
+  name: string;
   provider: AgentProvider;
-  /** OpenAI 兼容根地址；后端会自行去掉尾斜杠再拼 /chat/completions */
+  /** OpenAI 兼容根地址；后端会去掉尾斜杠与重复的 /chat/completions 再拼。 */
   baseUrl: string;
   model: string;
   /** 明文存在 db 里，db 文件权限已锁 0600 —— 不要让 UI 把它打进日志 */
@@ -240,10 +244,25 @@ export interface AgentConfig {
   maxContextBytes: number;
   /** 留空 = 用后端内置提示词（后端会 trim 后判空） */
   systemPrompt: string;
-  /** 新会话是否默认开启旁路 */
-  autoAttach: boolean;
   /** 出网前是否脱敏。默认 true：关掉意味着把原始终端输出发给第三方 */
   redact: boolean;
+}
+
+/**
+ * AI 助手配置。后端持久化在 SQLite settings 表（key=`agent.config`），
+ * serde `rename_all = "camelCase"`，故此处的字段名必须与 TS 侧一致。
+ *
+ * 顶层只保留全局行为（总开关、新会话默认旁路），连接相关下沉到 accounts。
+ */
+export interface AgentConfig {
+  /** 全局总开关。关着的时候后端旁路完全不动，连一次哈希查找都没有。 */
+  enabled: boolean;
+  /** 新会话是否默认开启旁路 */
+  autoAttach: boolean;
+  /** 所有已配置的账号。至少有一个。 */
+  accounts: AgentAccount[];
+  /** 当前生效账号的 id。找不到时后端回落到第一个。 */
+  activeId: string;
 }
 
 /** 某个会话当前的旁路缓冲状态（后端 `BufferStats` 的镜像） */

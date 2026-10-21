@@ -146,6 +146,9 @@ pub fn run() {
             agent::cmd::agent_ask,
             agent::cmd::agent_cancel,
             agent::cmd::agent_test,
+            agent::cmd::agent_open_window,
+            agent::cmd::agent_close_window,
+            agent::cmd::agent_window_open,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

@@ -435,12 +435,22 @@ html, body, #root {
    本已防抖 120ms 的 fit 还要再晚一拍，终端反而更慢跟上。 */
 .agent-side {
   flex: none; width: 340px;
+  position: relative;
   display: flex; flex-direction: column;
   min-height: 0; overflow: hidden;
 }
 /* 收起时整条归零：容器自身没有边框（边框在 .ap-root 上，那个组件此刻返回 null），
    所以是真的什么都没剩下，不留白边 */
 .agent-side.collapsed { width: 0; }
+/* 左缘拖拽手柄：6px 宽的热区贴在面板最左，盖住 .ap-root 的左边框。
+   hover / 拖动时高亮一条竖线，提示可拖。z-index 抬高以压过面板内容。 */
+.agent-resize {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 6px;
+  cursor: col-resize; z-index: 5;
+  background: transparent;
+}
+.agent-resize:hover,
+.agent-resize:active { background: var(--accent, #4a9eff); opacity: 0.6; }
 .welcome { padding: 48px; color: var(--text-dim); }
 .welcome h1 { color: var(--text); font-weight: 500; font-size: 22px; margin: 0 0 6px; }
 .welcome ul { line-height: 1.9; font-size: 12.5px; }
@@ -1466,3 +1476,12 @@ html, body, #root {
   background: var(--bg); border: 1px solid var(--border);
   font: 11.5px/1.6 ui-monospace, Consolas, monospace;
 }
+
+/* ——— 浮动 Agent 独立窗口 ———
+   窗口里只有一个 AgentPanel，让它铺满整个视口；
+   ap-root 自带左边框在独立窗口里没有意义，去掉免得右侧露一条线。 */
+.agent-window-root {
+  width: 100vw; height: 100vh; display: flex; flex-direction: column;
+  background: var(--bg-panel);
+}
+.agent-window-root .ap-root { flex: 1; min-height: 0; border-left: none; }

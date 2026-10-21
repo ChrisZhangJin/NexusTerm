@@ -125,7 +125,7 @@ export default function TitleBar({
                 <span className="ctx-shortcut">生成 · 导入 · 导出</span>
               </button>
               <button className="ctx-item" role="menuitem" onClick={() => pick("agent")}>
-                AI 助手…
+                Nexus AI Agent…
                 <span className="ctx-shortcut">把会话输出旁路给模型</span>
               </button>
             </div>

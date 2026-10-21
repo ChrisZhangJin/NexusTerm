@@ -16,6 +16,8 @@ export interface AgentPanelProps {
   onSendToTerminal: (sessionId: string, text: string) => Promise<void>;
   /** 打开设置（AI 助手那一项）。未配置时的引导按钮走这里 */
   onOpenSettings: () => void;
+  /** 浮出为独立窗口。独立窗口里不传（没有再浮一次的意义） */
+  onFloatOut?: () => void;
 }
 
 /** 单个会话的对话状态。按 sessionId 分桶，切会话时彼此完全隔离。 */
@@ -126,6 +128,7 @@ export function AgentPanel({
   onClose,
   onSendToTerminal,
   onOpenSettings,
+  onFloatOut,
 }: AgentPanelProps) {
   const cfg = useAgentConfig();
   const ready = isAgentReady(cfg);
@@ -284,7 +287,7 @@ export function AgentPanel({
     if (!q || busy || !sessionId) return;
     if (!ready.ok) {
       // 引导态会盖住输入框，正常到不了这里；真到了就把原因说清楚而不是发一个注定失败的请求
-      patch(sessionId, (c) => withError(c, ready.reason ?? "AI 助手尚未配置完成"));
+      patch(sessionId, (c) => withError(c, ready.reason ?? "Nexus AI Agent 尚未配置完成"));
       return;
     }
     setInput("");
@@ -371,7 +374,12 @@ export function AgentPanel({
   return (
     <div className="ap-root">
       <div className="ap-head">
-        <span className="ap-title">AI 助手</span>
+        <span className="ap-title">Nexus AI Agent</span>
+        {onFloatOut && (
+          <button className="ap-x ap-float" onClick={onFloatOut} title="浮出为独立窗口">
+            ⧉
+          </button>
+        )}
         <button className="ap-x" onClick={onClose} title="关闭面板">
           ✕
         </button>
@@ -492,8 +500,8 @@ export function AgentPanel({
         </>
       ) : (
         <div className="ap-setup">
-          <div className="ap-setup-title">AI 助手还没就绪</div>
-          <p className="ap-setup-text">{ready.reason ?? "请先完成 AI 助手配置。"}</p>
+          <div className="ap-setup-title">Nexus AI Agent 还没就绪</div>
+          <p className="ap-setup-text">{ready.reason ?? "请先完成 Nexus AI Agent 配置。"}</p>
           <p className="ap-setup-text">
             配置好后，本会话的终端输出会旁路复制一份给模型：人继续在终端里干活，
             助手则带着这份上下文回答你的问题。开关与清空都在这个面板里，随时可关。

@@ -3,12 +3,15 @@
 //! 命名必须是 snake_case：Tauri 2 直接拿函数名当 IPC 名字，
 //! 而前端是按 `agent_get_config` 这种形状调用的。
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use super::{load_config, save_config, AgentConfig, AgentError};
 use crate::agent::buffer::BufferStats;
 use crate::agent::llm;
 use crate::cmd::AppState;
+
+/// 浮动 Agent 窗口的固定 label。只开一个：再次调用就聚焦并切会话，不叠窗。
+const AGENT_WINDOW_LABEL: &str = "agent-float";
 
 fn err(e: AgentError) -> String {
     tracing::error!("{}", e);
@@ -30,11 +33,14 @@ pub fn agent_set_config(
     save_config(&state.store, &config).map_err(err)?;
     // 写盘成功才算生效：db 里的值和内存里的原子开关必须保持一致
     state.agent.apply_config(&config);
+    let acct = config.active_account();
     tracing::info!(
-        "AI 配置已更新：enabled={} provider={} model={}",
+        "AI 配置已更新：enabled={} accounts={} active={} provider={} model={}",
         config.enabled,
-        config.provider,
-        config.model
+        config.accounts.len(),
+        config.active_id,
+        acct.provider,
+        acct.model
     );
     Ok(())
 }
@@ -73,7 +79,8 @@ pub fn agent_context(
     // 未指定 / 传 0 时回落到配置里的默认窗口
     let max = max_bytes
         .filter(|v| *v > 0)
-        .unwrap_or_else(|| load_config(&state.store).max_context_bytes) as usize;
+        .unwrap_or_else(|| load_config(&state.store).active_account().max_context_bytes)
+        as usize;
     Ok(state.agent.context(&session_id, max).unwrap_or_default())
 }
 
@@ -141,4 +148,51 @@ pub fn agent_cancel(session_id: String, state: State<'_, AppState>) -> Result<()
 #[tauri::command]
 pub async fn agent_test(config: AgentConfig) -> Result<String, String> {
     llm::test_connection(&config).await.map_err(err)
+}
+
+// ——— 浮动独立窗口 ———
+
+/// 把 Nexus AI Agent 面板浮出为一个独立系统窗口。
+///
+/// 复用同一个 label：窗口已存在时只更新它要跟踪的会话（发事件）并聚焦，
+/// 不会叠出第二个窗。窗口加载的仍是本应用 index.html，
+/// 由注入脚本 `window.__NX_AGENT__ = sessionId` 让前端切到「只渲染 Agent 面板」的界面。
+#[tauri::command]
+pub fn agent_open_window(session_id: String, app: AppHandle) -> Result<(), String> {
+    // 已有窗口：切会话 + 聚焦，不新建
+    if let Some(win) = app.get_webview_window(AGENT_WINDOW_LABEL) {
+        use tauri::Emitter;
+        let _ = win.emit("nx://agent/active-session", session_id);
+        let _ = win.set_focus();
+        let _ = win.show();
+        return Ok(());
+    }
+
+    let init = format!(
+        "window.__NX_AGENT__ = {};",
+        serde_json::to_string(&session_id).unwrap_or_else(|_| "\"\"".into())
+    );
+    WebviewWindowBuilder::new(&app, AGENT_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
+        .title("Nexus AI Agent")
+        .inner_size(420.0, 640.0)
+        .min_inner_size(320.0, 420.0)
+        .initialization_script(&init)
+        .build()
+        .map(|_| ())
+        .map_err(|e| format!("无法打开 Nexus AI Agent 窗口：{e}"))
+}
+
+/// 关闭浮动 Agent 窗口（若存在）。幂等。
+#[tauri::command]
+pub fn agent_close_window(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window(AGENT_WINDOW_LABEL) {
+        let _ = win.close();
+    }
+    Ok(())
+}
+
+/// 浮动窗口是否已打开。主窗口据此决定是收起内嵌面板还是正常显示。
+#[tauri::command]
+pub fn agent_window_open(app: AppHandle) -> bool {
+    app.get_webview_window(AGENT_WINDOW_LABEL).is_some()
 }
