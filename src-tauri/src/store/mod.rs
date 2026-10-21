@@ -2,6 +2,7 @@ use rusqlite::{params, Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +46,22 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// 密钥库里一条密钥的元数据（私钥文件本身在 `<app_data>/keys/<id>`）。
+#[derive(Debug, Clone)]
+pub struct KeyRow {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    /// 归一化后的类型名：RSA / ED25519 / ECDSA
+    pub key_type: String,
+    /// 密钥长度（位）。无法判定时为 0
+    pub bits: u32,
+    pub comment: String,
+    pub fingerprint: String,
+    pub encrypted: bool,
+    pub created_at: i64,
+}
+
 /// 追加列的轻量迁移。
 ///
 /// SQLite 没有 `ADD COLUMN IF NOT EXISTS`，且 `CREATE TABLE IF NOT EXISTS`
@@ -55,6 +72,9 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         ("connect_timeout", "ALTER TABLE sessions ADD COLUMN connect_timeout INTEGER"),
         // 密码明文列：为了跨机器迁移连接配置，密码直接随 db 保存
         ("password", "ALTER TABLE sessions ADD COLUMN password TEXT"),
+        // 私钥口令（passphrase）。与密码同理随 db 保存 —— 它只是「解开本地私钥文件」
+        // 的口令，不是服务器凭据；不存的话每次连接都要重输一遍。
+        ("passphrase", "ALTER TABLE sessions ADD COLUMN passphrase TEXT"),
     ] {
         let exists: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?1")?
@@ -94,6 +114,7 @@ impl Store {
                 theme        TEXT,
                 connect_timeout INTEGER,
                 password     TEXT,
+                passphrase   TEXT,
                 sort_order   INTEGER NOT NULL DEFAULT 0,
                 created_at   INTEGER NOT NULL,
                 updated_at   INTEGER NOT NULL
@@ -103,6 +124,21 @@ impl Store {
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+
+            -- 用户密钥库的元数据。私钥文件本身放在 <app_data>/keys/<id>，
+            -- 这里只记展示信息：名字、类型、长度、注释、指纹。
+            -- path 冗余存一份，会话直接引用它即可，不必再回表。
+            CREATE TABLE IF NOT EXISTS ssh_keys (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                path        TEXT NOT NULL,
+                key_type    TEXT NOT NULL,
+                bits        INTEGER NOT NULL DEFAULT 0,
+                comment     TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL DEFAULT '',
+                encrypted   INTEGER NOT NULL DEFAULT 0,
+                created_at  INTEGER NOT NULL
             );
             "#,
         )
@@ -236,6 +272,123 @@ impl Store {
         .filter(|p| !p.is_empty())
     }
 
+    /// 保存私钥口令。空串视为「清除」——避免把空口令当成有效口令传给解密流程。
+    pub fn set_passphrase(&self, id: &str, passphrase: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE sessions SET passphrase = ?2 WHERE id = ?1",
+            params![id, passphrase],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_passphrase(&self, id: &str) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+        conn.query_row(
+            "SELECT passphrase FROM sessions WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty())
+    }
+
+    // ——— 密钥库 ———
+
+    pub fn list_keys(&self) -> Vec<KeyRow> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, name, path, key_type, bits, comment, fingerprint, encrypted, created_at
+             FROM ssh_keys ORDER BY name COLLATE NOCASE",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map([], |r| {
+            Ok(KeyRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                path: r.get(2)?,
+                key_type: r.get(3)?,
+                bits: r.get::<_, i64>(4)? as u32,
+                comment: r.get(5)?,
+                fingerprint: r.get(6)?,
+                encrypted: r.get::<_, i64>(7)? != 0,
+                created_at: r.get(8)?,
+            })
+        })
+        .map(|it| it.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    pub fn get_key(&self, id: &str) -> Option<KeyRow> {
+        let conn = self.conn.lock().ok()?;
+        conn.query_row(
+            "SELECT id, name, path, key_type, bits, comment, fingerprint, encrypted, created_at
+             FROM ssh_keys WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(KeyRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    path: r.get(2)?,
+                    key_type: r.get(3)?,
+                    bits: r.get::<_, i64>(4)? as u32,
+                    comment: r.get(5)?,
+                    fingerprint: r.get(6)?,
+                    encrypted: r.get::<_, i64>(7)? != 0,
+                    created_at: r.get(8)?,
+                })
+            },
+        )
+        .ok()
+    }
+
+    pub fn insert_key(&self, k: &KeyRow) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO ssh_keys (id, name, path, key_type, bits, comment, fingerprint, encrypted, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                k.id,
+                k.name,
+                k.path,
+                k.key_type,
+                k.bits as i64,
+                k.comment,
+                k.fingerprint,
+                if k.encrypted { 1 } else { 0 },
+                k.created_at
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn delete_key(&self, id: &str) -> Option<KeyRow> {
+        let row = self.get_key(id)?;
+        let conn = self.conn.lock().ok()?;
+        conn.execute("DELETE FROM ssh_keys WHERE id = ?1", params![id])
+            .ok()?;
+        Some(row)
+    }
+
+    pub fn update_key_meta(&self, id: &str, name: Option<&str>, comment: Option<&str>) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        if let Some(n) = name {
+            conn.execute("UPDATE ssh_keys SET name = ?2 WHERE id = ?1", params![id, n])
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(c) = comment {
+            conn.execute("UPDATE ssh_keys SET comment = ?2 WHERE id = ?1", params![id, c])
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     /// 批量更新排序与分组归属（拖拽后持久化）。
     pub fn reorder(&self, items: &[(String, i32, String)]) -> Result<(), String> {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
@@ -273,6 +426,56 @@ impl Store {
         })
         .ok()
     }
+
+    /// 所有会话的附加状态（一次取全，前端启动时缓存，省掉每次连接一次 IPC）。
+    pub fn all_extras(&self) -> HashMap<String, SessionExtras> {
+        let mut out = HashMap::new();
+        let Ok(conn) = self.conn.lock() else {
+            return out;
+        };
+        let Ok(mut stmt) = conn.prepare("SELECT key, value FROM settings WHERE key LIKE 'extras:%'")
+        else {
+            return out;
+        };
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        });
+        let Ok(rows) = rows else { return out };
+        for row in rows.flatten() {
+            let (key, value) = row;
+            let id = key[EXTRAS_PREFIX.len()..].to_string();
+            if let Ok(e) = serde_json::from_str::<SessionExtras>(&value) {
+                out.insert(id, e);
+            }
+        }
+        out
+    }
+
+    pub fn set_extras(&self, id: &str, e: &SessionExtras) -> Result<(), String> {
+        let json = serde_json::to_string(e).map_err(|e| e.to_string())?;
+        self.set_setting(&format!("{EXTRAS_PREFIX}{id}"), &json)
+    }
+}
+
+const EXTRAS_PREFIX: &str = "extras:";
+
+/// 会话配置的附加状态：跳板机登录脚本 + 兼容模式。
+///
+/// 存在 `settings` 表而不是 `sessions` 的列，原因有二：
+/// ① 这类数据是「本机学到的行为」，不该跟着导入导出跑到别人机器上；
+/// ② 省掉一次 session 表列迁移（那条路径要动 4 处 SELECT 语句）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionExtras {
+    /// 登录后自动输入：每行一步（例：`2` / `1`），远端出现菜单时按顺序发送
+    #[serde(default)]
+    pub login_script: String,
+    /// 是否在新连接 / 重连时自动回放上面的脚本
+    #[serde(default)]
+    pub login_script_on: bool,
+    /// 兼容模式：不在该连接上开旁路通道（堡垒机只放行一条通道）
+    #[serde(default)]
+    pub compat: bool,
 }
 
 fn row_to_session(r: &rusqlite::Row) -> SqlResult<SessionRecord> {
