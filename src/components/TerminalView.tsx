@@ -39,6 +39,9 @@ export function clock(ts: number): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+/** xterm.js 原生 Alt+Enter 的字节序列（ESC + CR），软换行沿用它 */
+const SOFT_NEWLINE = "\x1b\r";
+
 /**
  * 让 macOS 也支持按住 Shift 拖选文本（绕过 tmux 等程序的鼠标捕获）。
  *
@@ -502,11 +505,27 @@ export default function TerminalView({
     t.focus();
   }, [isLocal, tabId]);
 
+  /**
+   * 软换行：只换行、不执行。
+   *
+   * xterm.js 对 Enter 只判断 `altKey`（`case 13: altKey ? ESC+CR : CR`），
+   * 也就是说 **Ctrl+Enter 与 Enter 发的是同一个 \r**，想改键必须在应用层拦。
+   *
+   * 这里刻意复用 Alt+Enter 的原生字节序列（ESC + CR），而不是发 "\n"：
+   * 终端里 LF 同样是“提交”，只有 ESC 前缀能让远端 readline / tmux 认出
+   * “这是一个带修饰键的 Enter”。字节一致 ⇒ 行为与改键前完全等价，
+   * 不依赖远端 shell 是否刚好绑了 ^J。
+   */
+  const doSoftNewline = useCallback(() => {
+    if (zmodemRef.current?.isActive()) return;
+    const bytes = stringToBytes(SOFT_NEWLINE);
+    (isLocal ? api.localWrite(tabId, bytes) : api.sshWrite(tabId, bytes)).catch(() => {});
+  }, [isLocal, tabId]);
+
   const doDisconnect = useCallback(() => {
     setCtxMenu(null);
     onDisconnect?.();
   }, [onDisconnect]);
-
   /** 阅读选中的文件：相对路径按 shell 当前目录解析 */
   const doRead = useCallback(
     async (raw: string) => {
@@ -600,6 +619,9 @@ export default function TerminalView({
       }
       case "paste":
         doPaste();
+        break;
+      case "softNewline":
+        doSoftNewline();
         break;
       case "find":
         doFind();

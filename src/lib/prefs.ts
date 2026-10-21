@@ -34,6 +34,7 @@ export type ShortcutAction =
   | "disconnect"
   | "copy"
   | "paste"
+  | "softNewline"
   | "find"
   | "selectAll"
   | "clearScreen"
@@ -43,6 +44,7 @@ export const SHORTCUT_LABELS: Record<ShortcutAction, string> = {
   disconnect: "断开",
   copy: "复制",
   paste: "粘贴",
+  softNewline: "软换行（不执行）",
   find: "查找…",
   selectAll: "全选",
   clearScreen: "清屏",
@@ -53,6 +55,7 @@ export const SHORTCUT_ORDER: ShortcutAction[] = [
   "disconnect",
   "copy",
   "paste",
+  "softNewline",
   "selectAll",
   "clearScreen",
   "find",
@@ -68,6 +71,7 @@ export const DEFAULT_SHORTCUTS: Shortcuts = isMacOS()
       disconnect: "Alt+C",
       copy: "Meta+C",
       paste: "Meta+V",
+      softNewline: "Ctrl+Enter",
       find: "Meta+F",
       selectAll: "",
       clearScreen: "",
@@ -77,6 +81,7 @@ export const DEFAULT_SHORTCUTS: Shortcuts = isMacOS()
       disconnect: "Alt+C",
       copy: "Ctrl+Shift+C",
       paste: "Ctrl+Shift+V",
+      softNewline: "Ctrl+Enter",
       find: "Ctrl+Shift+F",
       selectAll: "",
       clearScreen: "",
