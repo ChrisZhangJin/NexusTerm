@@ -1,0 +1,94 @@
+import { api } from "../api";
+
+/**
+ * 会话配置的「附加状态」：跳板机登录路径 + 兼容模式。
+ *
+ * 为什么放在一个模块级的缓存里，而不是 App 的 state：
+ * ① 连接流程（`dial`）需要**同步**读到 compat 才能决定 `sidecar` 开关，
+ *    走 state 会多一次渲染依赖，还容易读到旧值；
+ * ② 资源轮询在 StatusBar 里，上下文探测在 App 里，两处都可能发现
+ *    「这台机器不接受并行通道」—— 共用一份缓存才不会互相覆盖。
+ *
+ * 写库是异步的、失败的：这些数据丢了只是下次要重学，不该打断任何操作，
+ * 所以 `update` 先改内存、立刻通知 UI，再静默落盘。
+ */
+export interface SessionExtras {
+  /** 登录后自动输入：每行一步，远端出现菜单时按顺序发送 */
+  loginScript: string;
+  /** 是否在新连接 / 重连时自动回放 */
+  loginScriptOn: boolean;
+  /** 兼容模式：不开旁路通道（堡垒机只放行一条通道） */
+  compat: boolean;
+}
+
+const EMPTY: SessionExtras = { loginScript: "", loginScriptOn: true, compat: false };
+
+let cache = new Map<string, SessionExtras>();
+let loaded = false;
+const listeners = new Set<() => void>();
+
+const clone = (e: SessionExtras): SessionExtras => ({ ...e });
+
+function notify() {
+  for (const fn of listeners) fn();
+}
+
+/** 启动时拉一次全量；之后所有读写都走内存 */
+export async function loadExtras(): Promise<void> {
+  if (loaded) return;
+  loaded = true;
+  try {
+    const all = await api.sessionExtras();
+    for (const [id, e] of Object.entries(all ?? {})) {
+      if (e) cache.set(id, { ...EMPTY, ...e });
+    }
+  } catch {
+    // 读不到就用空值：功能退化为「每次都重新学」，不影响连接
+  }
+  notify();
+}
+
+export function getExtras(id: string | null | undefined): SessionExtras {
+  if (!id) return EMPTY;
+  const e = cache.get(id);
+  return e ? clone(e) : clone(EMPTY);
+}
+
+/** 改一项或几项，立刻生效并异步落库 */
+export function updateExtras(id: string, patch: Partial<SessionExtras>): void {
+  const next = { ...getExtras(id), ...patch };
+  cache.set(id, next);
+  notify();
+  api.setSessionExtras(id, next).catch(() => {});
+}
+
+export function subscribeExtras(fn: () => void): () => void {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
+
+/**
+ * 这个错误是不是「服务端拒绝并行通道」。
+ *
+ * 后端在 `channel_open_session` / `exec` 被拒时返回固定文案
+ * （`SIDECAR_DENIED`，见 ssh/session.rs）。只认这一句，不认「网络超时」
+ * 之类 —— 后者是临时故障，误判成兼容模式会让正常服务器永远丢掉状态栏。
+ */
+export function isSidecarDenied(err: unknown): boolean {
+  const text = err instanceof Error ? err.message : String(err ?? "");
+  return text.includes("不支持并行通道");
+}
+
+/** 记录一次「这台机器只让开一条通道」，让后续连接直接跳过旁路通道 */
+export function markCompat(
+  configId: string | null | undefined,
+  tabId?: string | null
+): boolean {
+  // 当前这条连接还在跑：先把它身上的开关关掉，否则下一次 probe 还会再试一次
+  // （多数堡垒机在第二条通道被拒时就把整条连接掀了）
+  if (tabId) api.sshSetSidecar(tabId, false).catch(() => {});
+  if (!configId) return false;
+  if (getExtras(configId).compat) return false;
+  updateExtras(configId, { compat: true });
+  return true;
+}

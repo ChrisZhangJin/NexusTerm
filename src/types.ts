@@ -39,7 +39,11 @@ export interface ConnectRequest {
   host: string;
   port?: number;
   username: string;
-  auth: AuthMethod;
+  /**
+   * 登录凭据。SFTP 面板复用已认证的终端连接时不需要，可以省略 ——
+   * 那种情况下本地没存密码也能打开文件面板。
+   */
+  auth?: AuthMethod;
   cols: number;
   rows: number;
   /** TCP 连接超时（秒）。缺省由后端取 10 秒。 */
@@ -50,6 +54,20 @@ export interface ConnectRequest {
    * true = 一开始就带上旧算法；false = 只用现代算法、绝不降级。
    */
   legacyCrypto?: boolean;
+  /**
+   * 这条连接属于哪个会话配置（侧栏那一项，不是标签 id）。
+   * 后端拿它做已认证连接登记，SFTP 面板据此在同一连接上开子系统，
+   * 避免对 OTP 服务器重复要验证码。
+   */
+  configId?: string;
+  /**
+   * 是否允许在该连接上开旁路通道（cwd/tmux 探测、状态栏资源采集）。
+   *
+   * 默认 true。企业堡垒机常把一条 SSH 连接当成一条终端，收到第二个
+   * `CHANNEL_OPEN` 就直接断开客户端 —— 表现是「连上几秒就掉线」。
+   * 这类会话传 false（会话的「兼容模式」），终端功能不受影响。
+   */
+  sidecar?: boolean;
 }
 
 /** 连接成功后的协商结果。 */
@@ -58,12 +76,73 @@ export interface ConnectOutcome {
   legacyCrypto: boolean;
 }
 
+/** 二次验证（keyboard-interactive）的一条待填字段 */
+export interface AuthPromptField {
+  /** 服务端给的提示语，如 "Verification code:" */
+  prompt: string;
+  /** false = 秘密输入（密码 / 验证码），true = 明文回显 */
+  echo: boolean;
+  /** 后端已带入的默认值（目前只有"密码"类问题会自动填已保存的密码），可改 */
+  prefill: string | null;
+}
+
+/** 后端在认证中途下发的一组问题 —— 二次验证 / OTP / 私钥口令 */
+export interface AuthPrompt {
+  sessionId: string;
+  /**
+   * 提问类型：
+   * - `keyboard-interactive`：服务端下发的验证码 / 密码挑战
+   * - `passphrase`：本地私钥已加密，需要口令
+   */
+  kind: "keyboard-interactive" | "passphrase";
+  host: string;
+  /** 登录用户名（私钥口令这类握手前的问题为空） */
+  username?: string;
+  /** 服务端给的标题，通常为空或 "OTP Code" */
+  name: string;
+  instructions: string;
+  fields: AuthPromptField[];
+  /** 第几轮（1 起），多因素时服务端会连问几轮 */
+  round: number;
+}
+
 export interface DiscoveredKey {
   name: string;
   path: string;
   keyType: string;
   fingerprint: string | null;
   encrypted: boolean;
+}
+
+/** 密钥库里的一条密钥（后端 KeyInfo 的镜像） */
+export interface KeyInfo {
+  /** 库内密钥是 uuid；`~/.ssh` 里的外部密钥是 `file:<路径>` */
+  id: string;
+  name: string;
+  /** vault = 应用密钥库；sshDir = 从 ~/.ssh 扫描到的外部密钥（只读） */
+  source: "vault" | "sshDir";
+  keyType: string;
+  /** 原始算法名，如 ssh-rsa */
+  algorithm: string;
+  /** 位数，0 = 未知 */
+  bits: number;
+  comment: string;
+  fingerprint: string;
+  encrypted: boolean;
+  path: string;
+  /** 公钥单行文本，可直接贴进 authorized_keys */
+  publicKey: string;
+  createdAt: number;
+}
+
+export interface GenerateKeyOptions {
+  /** ed25519 | rsa */
+  algorithm: string;
+  /** 仅 RSA：2048 / 3072 / 4096 */
+  bits?: number;
+  comment?: string;
+  passphrase?: string;
+  name?: string;
 }
 
 /** 一个终端页签：持有 SSH 会话 id 与标题 */

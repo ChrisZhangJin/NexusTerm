@@ -7,7 +7,9 @@ import TitleBar from "./components/TitleBar";
 import TabBar from "./components/TabBar";
 import StatusBar from "./components/StatusBar";
 import { AppearanceDialog, ShortcutsDialog } from "./components/SettingsDialogs";
-import { api, stringToBytes } from "./api";
+import KeyManagerDialog from "./components/KeyManagerDialog";
+import AuthPromptDialog from "./components/AuthPromptDialog";
+import { api, onAuthPrompt, stringToBytes } from "./api";
 import {
   parseProbe,
   restoreCommand,
@@ -15,15 +17,29 @@ import {
   stealthInput,
   type TermContext,
 } from "./lib/context";
-import { cellWidth, getTerm, waitForPrompt } from "./lib/termRegistry";
+import { cellWidth, getTerm, onInput, waitForPrompt } from "./lib/termRegistry";
+import {
+  LoginRecorder,
+  parseSteps,
+  waitForMenu,
+  waitQuiet,
+} from "./lib/loginScript";
 import ConfirmDialog, { type ConfirmOptions } from "./components/ConfirmDialog";
 import { resolveAuth } from "./lib/auth";
+import {
+  getExtras,
+  isSidecarDenied,
+  loadExtras,
+  markCompat,
+  updateExtras,
+} from "./lib/sessionExtras";
 import { normalizeTimeout, toFriendlyError } from "./lib/errors";
 import { BUILTIN_THEMES, DEFAULT_THEME, FONT_FAMILIES } from "./lib/theme";
 import { applyChromeVars } from "./lib/chrome";
 import { formatCombo, getPrefs, setPrefs, useShortcuts } from "./lib/prefs";
 import type {
   AuthMethod,
+  AuthPrompt,
   ClosedInfo,
   NewSession,
   SessionRecord,
@@ -48,7 +64,9 @@ export default function App() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<SessionRecord | null>(null);
   /** 设置窗口：外观 / 快捷键（模态，同一时刻只开一个） */
-  const [settingsWin, setSettingsWin] = useState<"appearance" | "shortcuts" | null>(null);
+  const [settingsWin, setSettingsWin] = useState<
+    "appearance" | "shortcuts" | "keys" | null
+  >(null);
   const settingsOpen = settingsWin !== null;
   // 非空时展示该会话的 SFTP 文件管理器
   const [fmSession, setFmSession] = useState<SessionRecord | null>(null);
@@ -80,6 +98,10 @@ export default function App() {
   const [sessionPopupOpen, setSessionPopupOpen] = useState(false);
 
   const passphraseRef = useRef<Map<string, string>>(new Map());
+  /** 标签 id → 会话配置 id。私钥口令弹窗只知道标签，回写口令要用配置 id */
+  const configByTab = useRef<Map<string, string>>(new Map());
+  /** 标签最后一次连上的时刻。用来判断「是不是刚连上就掉线」（堡垒机特征） */
+  const connectedAt = useRef<Map<string, number>>(new Map());
   const shortcuts = useShortcuts();
 
   // —— 轻量提示条（导入/导出/复制会话等结果） ——
@@ -90,6 +112,68 @@ export default function App() {
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(null), 5000);
   }, []);
+
+  // —— 二次验证（OTP / 堡垒机挑战）——
+  // 后端在认证中途挂起等答案，这里弹框收集。
+  //
+  // 必须用**队列**而不是单个 state：终端标签和 SFTP 面板是两条独立连接，
+  // 打到同一台要 OTP 的机器时会同时各弹一个问题。单槽的话后到的会把先到的
+  // 顶掉，被顶掉的那个连接只能干等到 180 秒超时后失败 —— 表现就是
+  // 「明明输了验证码却连不上」。
+  const [authPrompts, setAuthPrompts] = useState<AuthPrompt[]>([]);
+  /** 本次重连过程中出现过交互式认证（OTP）的标签：自动重试没有意义，交给用户手动点 */
+  const interactiveAuth = useRef(new Set<string>());
+  /** 用户主动取消了验证码的标签：这不是「连接失败」，不该打红色错误 */
+  const authCancelled = useRef(new Set<string>());
+
+  useEffect(() => {
+    let alive = true;
+    let unlisten: (() => void) | undefined;
+    onAuthPrompt((p) => {
+      // 到了这一步说明这条连接必须人工介入，自动重试只会反复弹窗
+      interactiveAuth.current.add(p.sessionId);
+      setAuthPrompts((prev) => {
+        // 同一连接同一轮重复下发（输错重试）时替换，不要把一个连接排两次。
+        // kind 必须参与比较：私钥口令和随后服务端下发的 OTP 都是第 1 轮，
+        // 不区分就会互相顶掉。
+        const rest = prev.filter(
+          (x) =>
+            !(x.sessionId === p.sessionId && x.round === p.round && x.kind === p.kind)
+        );
+        return [...rest, p];
+      });
+    }).then((fn) => {
+      // 订阅是异步的，组件可能已经卸载（开发时 StrictMode 会双跑）
+      if (alive) unlisten = fn;
+      else fn();
+    });
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
+  }, []);
+
+  /** 答完/取消队首那条，后面的自动顶上来 */
+  const resolveAuthPrompt = useCallback(
+    (sessionId: string, answers: string[] | null, remember = false) => {
+      if (answers === null) authCancelled.current.add(sessionId);
+      // 私钥口令要留下来：本次运行内重连直接复用，勾了「记住」再落库。
+      // 不这么做的话后端下次重连仍拿不到口令，又会弹一次窗。
+      if (answers && answers.length > 0) {
+        const prompt = authPrompts.find((p) => p.sessionId === sessionId);
+        if (prompt?.kind === "passphrase") {
+          const configId = configByTab.current.get(sessionId);
+          if (configId) {
+            passphraseRef.current.set(configId, answers[0]);
+            if (remember) api.savePassphrase(configId, answers[0]).catch(() => {});
+          }
+        }
+      }
+      setAuthPrompts((prev) => prev.filter((p) => p.sessionId !== sessionId));
+      api.sshAuthRespond(sessionId, answers).catch(() => {});
+    },
+    [authPrompts]
+  );
 
   const theme = BUILTIN_THEMES[themeName] ?? BUILTIN_THEMES[DEFAULT_THEME];
 
@@ -135,6 +219,9 @@ export default function App() {
 
   useEffect(() => {
     refresh();
+    // 附加状态（登录脚本 / 兼容模式）必须先于任何连接就绪：
+    // dial 里要同步判断 compat，晚到就只能靠默认值，等于这次白连
+    void loadExtras();
     api.health().then((h) => console.log("[nexus-term]", h)).catch(() => {});
   }, [refresh]);
 
@@ -162,7 +249,20 @@ export default function App() {
 
   /** 对指定标签发起一次 SSH 拨号（新建与重连共用） */
   const dial = useCallback(async (tabId: string, s: SessionRecord) => {
-    const auth: AuthMethod = await resolveAuth(s, passphraseRef.current.get(s.id));
+    // 记住「标签 → 会话配置」，私钥口令弹窗答完要回写到对应配置上
+    configByTab.current.set(tabId, s.id);
+
+    // 私钥口令的来源有三处，优先级从快到慢：
+    //   内存缓存（本次运行里输过） → 会话配置（上次勾了「记住口令」） → 弹窗问用户
+    let passphrase = passphraseRef.current.get(s.id);
+    if (passphrase === undefined && s.authType === "key") {
+      const saved = await api.loadPassphrase(s.id).catch(() => null);
+      if (saved) {
+        passphraseRef.current.set(s.id, saved);
+        passphrase = saved;
+      }
+    }
+    const auth: AuthMethod = await resolveAuth(s, passphrase);
     // 用终端当前的真实尺寸申请 PTY。原来写死 120×32：TerminalView 挂载时的 resize
     // 早于会话建立（后端还没这个 id，静默失败），之后尺寸不变也就不再推送，
     // 远端就一直停在 120×32 —— 复制会话 / tmux 只占左上角一块的根因。
@@ -175,6 +275,12 @@ export default function App() {
       cols: term?.cols || 120,
       rows: term?.rows || 32,
       connectTimeoutSecs: normalizeTimeout(s.connectTimeout),
+      // 后端按这个 id 登记「已认证连接」，SFTP 面板复用它开子系统，
+      // 免去再认证一次（OTP 服务器就是免再输一次验证码）
+      configId: s.id,
+      // 兼容模式（堡垒机只放行一条通道）：连上后一个额外通道都不开，
+      // 否则每 3 秒一次的 cwd 探测会把整条连接反复顶掉
+      sidecar: !getExtras(s.id).compat,
     });
     // 老服务器（CentOS 6.x 的 OpenSSH 5.3 等）会退到 SHA-1 的 DH 组，安全强度偏低，
     // 不阻断使用但要明确告知，避免用户以为是正常连接。
@@ -186,16 +292,105 @@ export default function App() {
   /** 探测标签的远端上下文并写回 tab.ctx；失败或无结果返回已缓存的值 */
   const probeTab = useCallback(
     async (tabId: string) => {
+      const tab = tabsRef.current.find((t) => t.id === tabId);
+      // 兼容模式的连接一条额外通道都不开：probe 本身会立刻返回，留着只是空转
+      if (tab?.sessionId && getExtras(tab.sessionId).compat) return tab.ctx;
       try {
         const c = parseProbe(await api.sshProbe(tabId));
         if (c) patchTab(tabId, { ctx: c });
         return c ?? tabsRef.current.find((t) => t.id === tabId)?.ctx;
-      } catch {
-        return tabsRef.current.find((t) => t.id === tabId)?.ctx;
+      } catch (e) {
+        // 服务端明确拒绝并行通道 → 这台机器是堡垒机，永久切兼容模式。
+        // 否则这条连接上每 15 秒还会再试一次，每次都可能把连接掀掉。
+        if (isSidecarDenied(e) && markCompat(tab?.sessionId, tabId)) {
+          showToast(
+            "该服务器（堡垒机）不支持并行通道，已切换为兼容模式：不再采集远端资源，下次连接也不会再开额外通道"
+          );
+        }
+        return tab?.ctx;
       }
     },
-    [patchTab]
+    [patchTab, showToast]
   );
+
+  /**
+   * 跳板机登录路径：录制 + 回放。
+   *
+   * 回放时机是「菜单画完、输出静止」——不靠固定延时，也不要求屏幕像 shell 提示符。
+   * 每发一步都等这一步的输出停下，再判断菜单是否再次出现；菜单不回来就收工，
+   * 不会再往目标机器里瞎敲。
+   */
+  const replayLogin = useCallback(
+    async (tabId: string, configId: string | undefined, since: number) => {
+      if (!configId) return;
+      const { loginScript, loginScriptOn } = getExtras(configId);
+      if (!loginScriptOn) return;
+      const steps = parseSteps(loginScript);
+      if (!steps.length) return;
+
+      let mark = since;
+      let sent = 0;
+      for (const step of steps) {
+        const ok = await waitForMenu(tabId, mark, sent === 0 ? 25_000 : 12_000);
+        if (!ok) break;
+        const tab = tabsRef.current.find((t) => t.id === tabId);
+        if (!tab || tab.status !== "connected") break;
+        mark = Date.now();
+        try {
+          await api.sshWrite(tabId, stringToBytes(`${step}\r`));
+          sent++;
+        } catch {
+          break;
+        }
+        await waitQuiet(tabId, 700, 15_000);
+      }
+      if (sent > 0) {
+        showToast(`已自动选择跳板机路径：${steps.slice(0, sent).join(" → ")}`);
+      }
+    },
+    [showToast]
+  );
+
+  /** 标签 → 登录路径录制器。只在「屏幕是菜单」时记录，普通命令不会误记 */
+  const recorders = useRef(new Map<string, { rec: LoginRecorder; off: () => void }>());
+
+  const stopRecording = useCallback((tabId: string) => {
+    const r = recorders.current.get(tabId);
+    if (!r) return;
+    r.rec.dispose();
+    r.off();
+    recorders.current.delete(tabId);
+  }, []);
+
+  const startRecording = useCallback(
+    (tabId: string, configId: string | undefined) => {
+      if (!configId) return;
+      stopRecording(tabId);
+      const rec = new LoginRecorder(tabId, (script) => {
+        const before = getExtras(configId).loginScript;
+        if (before === script) return;
+        updateExtras(configId, { loginScript: script, loginScriptOn: true });
+        showToast(
+          `已记住登录路径：${parseSteps(script).join(" → ")}（重连时自动选择）`
+        );
+      });
+      recorders.current.set(tabId, { rec, off: onInput(tabId, (d) => rec.handleInput(d)) });
+      rec.start();
+    },
+    [showToast, stopRecording]
+  );
+
+  // 标签关掉 / 掉线后回收录制器，别让定时器一直跑
+  useEffect(() => {
+    for (const [id, entry] of [...recorders.current]) {
+      const tab = tabs.find((t) => t.id === id);
+      if (!tab || tab.status !== "connected") {
+        entry.rec.dispose();
+        entry.off();
+        recorders.current.delete(id);
+      }
+    }
+  }, [tabs]);
 
   /**
    * 新连接就绪后把上下文还原进去（cd / tmux）。
@@ -270,8 +465,19 @@ export default function App() {
           return;
         }
         patchTab(tabId, { status: "connected", ctx: restore });
-        applyContext(tabId, restore, "duplicate", since);
+        connectedAt.current.set(tabId, Date.now());
+        // 顺序很重要：先把跳板机菜单选完（进到目标机器），再注入 cd / tmux 还原命令。
+        // 反过来的话，还原命令会被喂给菜单本身，直接变成一个非法选项。
+        void replayLogin(tabId, s.id, since).then(() =>
+          applyContext(tabId, restore, "duplicate", since)
+        );
+        startRecording(tabId, s.id);
       } catch (e) {
+        // 用户自己关掉了验证码弹窗，不是连接出错，别标成红色错误
+        if (authCancelled.current.delete(tabId)) {
+          patchTab(tabId, { status: "closed", error: "已取消二次验证" });
+          return;
+        }
         patchTab(tabId, { status: "error", error: String(e) });
       }
     },
@@ -296,6 +502,9 @@ export default function App() {
       if (old) old.cancelled = true;
       const ctl = { cancelled: false };
       reconnectCtl.current.set(tabId, ctl);
+      // 新一轮重连重新观察：上一轮留下的标记不该影响这一轮
+      interactiveAuth.current.delete(tabId);
+      authCancelled.current.delete(tabId);
       // 清掉后端残留的旧会话条目
       await api.sshClose(tabId).catch(() => {});
 
@@ -320,6 +529,7 @@ export default function App() {
             return;
           }
           reconnectCtl.current.delete(tabId);
+          connectedAt.current.set(tabId, Date.now());
           patchTab(tabId, {
             status: "connected",
             reconnectAttempt: undefined,
@@ -327,12 +537,24 @@ export default function App() {
             reconnectAt: undefined,
             closedAt: undefined,
           });
-          // 用断线前最后一次探测到的上下文恢复（tmux 直接 attach 回原会话）
-          applyContext(tabId, tab.ctx, "reconnect", since);
+          // 用断线前最后一次探测到的上下文恢复（tmux 直接 attach 回原会话）。
+          // 仍然排在登录路径回放之后：菜单没选完时目标机器还没进去。
+          void replayLogin(tabId, s.id, since).then(() =>
+            applyContext(tabId, tab.ctx, "reconnect", since)
+          );
+          startRecording(tabId, s.id);
           return;
         } catch (e) {
           lastErr = toFriendlyError(String(e)).message;
           if (ctl.cancelled) return;
+          // 这条连接要求验证码（或用户取消了验证码）：重试只会再弹一次窗，
+          // 码还可能是同一个已经失效的 —— 停下来让用户手动决定。
+          if (interactiveAuth.current.has(tabId)) {
+            interactiveAuth.current.delete(tabId);
+            authCancelled.current.delete(tabId);
+            lastErr = `${lastErr}。需要重新输入二次验证码，请点「重新连接」`;
+            break;
+          }
         }
       }
       reconnectCtl.current.delete(tabId);
@@ -351,6 +573,12 @@ export default function App() {
       const ctl = reconnectCtl.current.get(tabId);
       if (ctl) ctl.cancelled = true;
       reconnectCtl.current.delete(tabId);
+      interactiveAuth.current.delete(tabId);
+      // 后端可能正挂在「等用户填验证码」上。光置取消标志只是前端不再重试，
+      // 那条 connect 任务还会继续等到 180 秒超时，弹窗也留在屏幕上。
+      // 关会话会顺带唤醒它（SessionManager::close 里 cancel 了 pending 应答）。
+      api.sshClose(tabId).catch(() => {});
+      setAuthPrompts((prev) => prev.filter((p) => p.sessionId !== tabId));
       patchTab(tabId, {
         status: "closed",
         reconnectAttempt: undefined,
@@ -365,10 +593,29 @@ export default function App() {
     (tabId: string, info: ClosedInfo) => {
       if (info.reason === "user") return; // 本地主动关闭，标签已移除
       patchTab(tabId, { status: "closed", closedAt: Date.now() });
+
+      // 「连上没几秒就掉线」+ 这条连接还开着旁路通道 → 高度怀疑是堡垒机
+      // 因为第二条 CHANNEL_OPEN 把整条连接掐了（有的实现连拒绝包都不发，
+      // 我们那边只能看到 lost，认不出是「被拒」）。这里做兜底学习：
+      // 自动切兼容模式，重连时才不会无限循环「连上→几秒→断开」。
+      const tab = tabsRef.current.find((t) => t.id === tabId);
+      const at = connectedAt.current.get(tabId);
+      if (
+        tab?.sessionId &&
+        info.reason === "lost" &&
+        at &&
+        Date.now() - at < 20_000 &&
+        markCompat(tab.sessionId, tabId)
+      ) {
+        showToast(
+          "连接建立后几秒即断开，已按堡垒机处理：为该会话打开「兼容模式」（不再开旁路通道）。若这是网络问题，可在编辑连接里关掉兼容模式"
+        );
+      }
+
       // 只有「连接丢失」才自动重连；远端 exit / 主动关闭属于正常结束
       if (info.reason === "lost") reconnect(tabId, true);
     },
-    [patchTab, reconnect]
+    [patchTab, reconnect, showToast]
   );
 
   // —— 应用内确认框（window.confirm 在 WebView2 下不可靠） ——
@@ -388,6 +635,11 @@ export default function App() {
     const ctl = reconnectCtl.current.get(tabId);
     if (ctl) ctl.cancelled = true;
     reconnectCtl.current.delete(tabId);
+    interactiveAuth.current.delete(tabId);
+    configByTab.current.delete(tabId);
+    // 标签在等验证码时被关掉：后端 close() 会解除挂起，弹窗也得跟着消失，
+    // 否则它会一直杵在那儿等一个已经不存在的连接。
+    setAuthPrompts((prev) => prev.filter((p) => p.sessionId !== tabId));
     setTabs((prev) => {
       const t = prev.find((x) => x.id === tabId);
       if (t?.local) api.localClose(tabId).catch(() => {});
@@ -414,8 +666,10 @@ export default function App() {
       const ctl = reconnectCtl.current.get(tabId);
       if (ctl) ctl.cancelled = true;
       reconnectCtl.current.delete(tabId);
+      interactiveAuth.current.delete(tabId);
       const wasLive = t.status === "connected" || t.status === "reconnecting" || t.status === "connecting";
       api.sshClose(tabId).catch(() => {});
+      setAuthPrompts((prev) => prev.filter((p) => p.sessionId !== tabId));
       patchTab(tabId, {
         status: "closed",
         closedAt: Date.now(),
@@ -464,13 +718,22 @@ export default function App() {
   );
 
   const saveSession = useCallback(
-    async (payload: NewSession, password: string) => {
+    async (payload: NewSession, password: string, passphrase: string | null) => {
+      let id = editing?.id;
       if (editing) {
         await api.updateSession(editing.id, payload);
-        if (password) await api.savePassword(editing.id, password);
       } else {
         const created = await api.createSession(payload);
-        if (password) await api.savePassword(created.id, password);
+        id = created.id;
+      }
+      if (!id) return;
+      if (password) await api.savePassword(id, password);
+      // passphrase === null：用户没动过这个字段，保持库里的原值
+      if (payload.authType === "key" && passphrase !== null) {
+        const value = passphrase.trim();
+        await api.savePassphrase(id, value);
+        if (value) passphraseRef.current.set(id, value);
+        else passphraseRef.current.delete(id);
       }
       await refresh();
     },
@@ -725,6 +988,13 @@ export default function App() {
     ? sessions.find((s) => s.id === activeTabState.sessionId) ?? null
     : null;
 
+  // 队首那条才是当前要答的：同一连接同一时刻只会有一个问题在等，
+  // 多个连接并发时按到达顺序逐个问。
+  const authPrompt = authPrompts[0] ?? null;
+  const authPromptReconnecting = authPrompt
+    ? tabs.find((t) => t.id === authPrompt.sessionId)?.status === "reconnecting"
+    : false;
+
   const appTitle = activeSession
     ? `${activeSession.name} — ${activeSession.username}@${activeSession.host}`
     : "NexusTerm";
@@ -890,6 +1160,7 @@ export default function App() {
                     tabId: activeTabState.id,
                     local: false,
                     hostKey: peer ?? activeTabState.id,
+                    sessionId: activeTabState.sessionId,
                   }
                 : null
         }
@@ -912,6 +1183,7 @@ export default function App() {
         />
       )}
       {settingsWin === "shortcuts" && <ShortcutsDialog onClose={() => setSettingsWin(null)} />}
+      {settingsWin === "keys" && <KeyManagerDialog onClose={() => setSettingsWin(null)} />}
 
       {dialogOpen && (
         <SessionDialog
@@ -925,6 +1197,22 @@ export default function App() {
       )}
 
       {toast && <div className="toast">{toast}</div>}
+
+      {authPrompt && (
+        <AuthPromptDialog
+          // 服务端可能连问多轮，换轮时必须重建组件（清空上一轮的输入）。
+          // kind 也要进 key：私钥口令与紧随其后的 OTP 轮次都是 1，
+          // 少这一项会让 OTP 框里残留刚才的口令。
+          key={`${authPrompt.sessionId}-${authPrompt.kind}-${authPrompt.round}`}
+          prompt={authPrompt}
+          reconnecting={authPromptReconnecting}
+          queued={authPrompts.length - 1}
+          onSubmit={(answers, remember) =>
+            resolveAuthPrompt(authPrompt.sessionId, answers, remember)
+          }
+          onCancel={() => resolveAuthPrompt(authPrompt.sessionId, null)}
+        />
+      )}
 
       {confirmState && (
         <ConfirmDialog

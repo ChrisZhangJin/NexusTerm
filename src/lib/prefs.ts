@@ -18,6 +18,14 @@ export interface Prefs {
   copyOnSelect: boolean;
   /** 关闭仍在连接的标签前弹确认 */
   confirmCloseTab: boolean;
+  /**
+   * 文件面板复用已登录的终端连接（在同一条连接上开 sftp 子系统）。
+   *
+   * 开着的好处：不用第二次认证 —— 对要 OTP / 堡垒机验证的服务器，等于
+   * 每次打开文件面板省一次验证码。关掉则每次独立拨号（传输大文件时不会
+   * 和交互式 shell 抢同一条 TCP 连接的带宽）。
+   */
+  shareSftpConnection: boolean;
 }
 
 const PREFS_KEY = "nx.prefs";
@@ -26,6 +34,7 @@ const DEFAULT_PREFS: Prefs = {
   liveMonitor: true,
   copyOnSelect: true,
   confirmCloseTab: true,
+  shareSftpConnection: true,
 };
 
 // ——— 快捷键 ———

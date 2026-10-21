@@ -1,10 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AuthPrompt,
   ClosedInfo,
   ConnectOutcome,
   ConnectRequest,
   DiscoveredKey,
+  GenerateKeyOptions,
+  KeyInfo,
   NewSession,
   RemoteEntry,
   SessionRecord,
@@ -22,9 +25,22 @@ export const api = {
   sshResize: (id: string, cols: number, rows: number) =>
     invoke<void>("ssh_resize", { id, cols, rows }),
   sshClose: (id: string) => invoke<void>("ssh_close", { id }),
+  /** 回填二次验证答案；answers = null 表示用户取消（后端立刻中止，不再等超时） */
+  sshAuthRespond: (id: string, answers: string[] | null) =>
+    invoke<boolean>("ssh_auth_respond", { id, answers }),
   /** 探测远端交互 shell 的 cwd / 前台进程 / tmux（KEY→VALUE） */
   sshProbe: (id: string) => invoke<Record<string, string>>("ssh_probe", { id }),
   sshStats: (id: string) => invoke<Record<string, string>>("ssh_stats", { id }),
+  /** 运行中切换旁路通道（发现堡垒机拒绝并行通道时关掉） */
+  sshSetSidecar: (id: string, on: boolean) =>
+    invoke<void>("ssh_set_sidecar", { id, on }),
+  /** 所有会话配置的附加状态（登录脚本 / 兼容模式），启动时拉一次 */
+  sessionExtras: () =>
+    invoke<Record<string, import("./lib/sessionExtras").SessionExtras>>("session_extras"),
+  setSessionExtras: (
+    id: string,
+    extras: import("./lib/sessionExtras").SessionExtras
+  ) => invoke<void>("set_session_extras", { id, extras }),
   localStats: () => invoke<Record<string, string>>("local_stats"),
   clipboardRead: () => invoke<string>("clipboard_read"),
   clipboardWrite: (text: string) => invoke<void>("clipboard_write", { text }),
@@ -57,6 +73,21 @@ export const api = {
   listSshKeys: () => invoke<DiscoveredKey[]>("list_ssh_keys"),
   verifyKey: (path: string, passphrase?: string) =>
     invoke<string>("verify_key", { path, passphrase }),
+
+  /** 密钥库 + ~/.ssh 里发现的外部密钥（source 区分） */
+  listKeys: () => invoke<KeyInfo[]>("list_keys"),
+  importKey: (src: string, name?: string, passphrase?: string) =>
+    invoke<KeyInfo>("import_key", { src, name, passphrase }),
+  generateKey: (opts: GenerateKeyOptions) => invoke<KeyInfo>("generate_key", { opts }),
+  deleteKey: (id: string) => invoke<void>("delete_key", { id }),
+  exportKey: (id: string, dest: string) => invoke<void>("export_key", { id, dest }),
+  updateKeyMeta: (id: string, name?: string, comment?: string) =>
+    invoke<void>("update_key_meta", { id, name, comment }),
+  keyPublic: (id: string) => invoke<string>("key_public", { id }),
+
+  savePassphrase: (id: string, passphrase: string) =>
+    invoke<void>("save_passphrase", { id, passphrase }),
+  loadPassphrase: (id: string) => invoke<string | null>("load_passphrase", { id }),
 
   listLocalDir: (path: string) =>
     invoke<RemoteEntry[]>("list_local_dir", { path }),
@@ -91,6 +122,12 @@ export const api = {
   /** ZMODEM 下载落盘 */
   writeFile: (path: string, data: number[]) =>
     invoke<void>("write_file", { path, data }),
+  /** 大文件落盘：base64 传输，避免 number[] 变成几亿个 JSON 数字 */
+  writeFileB64: (path: string, data: string) =>
+    invoke<void>("write_file_b64", { path, data }),
+  /** 下载流式落盘：每 MB 追加一次，内存不随文件大小增长（truncate 只在第一次） */
+  appendFileB64: (path: string, data: string, truncate: boolean) =>
+    invoke<void>("append_file_b64", { path, data, truncate }),
 
   // ——— 阅读窗口（.md / .html 渲染查看） ———
   readerOpenSftp: (sftpId: string, path: string, source: string) =>
@@ -168,4 +205,17 @@ export async function onTermClosed(
     const p = ev.payload;
     handler(typeof p === "number" ? { code: p, reason: "eof" } : p);
   });
+}
+
+/**
+ * 订阅二次验证问询。
+ *
+ * 用全局单通道而不是按会话分段：认证在「连接中」这一刻发生，此时前端还不知道
+ * 会不会被问，没法提前为每个标签挂监听。同一时刻只可能有一个连接在等认证，
+ * 不会串台。答案由 `sshAuthRespond` 按 `sessionId` 送回。
+ */
+export async function onAuthPrompt(
+  handler: (prompt: AuthPrompt) => void
+): Promise<UnlistenFn> {
+  return listen<AuthPrompt>("nx://auth/prompt", (ev) => handler(ev.payload));
 }
