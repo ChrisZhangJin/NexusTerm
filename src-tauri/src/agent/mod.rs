@@ -356,7 +356,10 @@ impl AgentManager {
     /// 否则 Cargo.toml 里的默认值和 db 里的值会打架。
     pub fn apply_config(&self, cfg: &AgentConfig) {
         self.enabled.store(cfg.enabled, Ordering::Relaxed);
-        self.auto_attach.store(cfg.auto_attach, Ordering::Relaxed);
+        // autoAttach 恒为 true：面板与设置页都已经没有「旁路开关」，
+        // 助手默认就要能看到当前会话。db 里可能还躺着旧版本存下的 false，
+        // 在这里兜住它，避免升级后新建会话「明明启用了却没有上下文」。
+        self.auto_attach.store(true, Ordering::Relaxed);
     }
 
     /// 旁路入口。pty / SSH 的读循环（`ssh/session.rs` 的 `read_loop`、
@@ -489,11 +492,14 @@ mod tests {
     }
 
     #[test]
-    fn auto_attach_off_does_not_allocate() {
+    fn auto_attach_ignores_stale_config() {
+        // 面板与设置页都已经没有「旁路开关」，助手面向全局：会话在哪，哪就是上下文。
+        // db 里可能还躺着旧版本存下的 autoAttach:false —— 那种配置不能再让
+        // 新会话「明明启用了，却一条上下文都没有」。
         let m = mgr(true, false);
         m.feed("s1", b"hello", StreamKind::Out);
-        assert_eq!(m.tracked_sessions(), 0);
-        assert!(!m.is_enabled("s1"));
+        assert_eq!(m.tracked_sessions(), 1);
+        assert!(m.is_enabled("s1"));
     }
 
     #[test]

@@ -324,6 +324,19 @@ export interface AgentRunRequest {
   question: string;
   /** 允许操作的会话。留空时后端退回 [sessionId]。 */
   targets: AgentTarget[];
+  /**
+   * 由前端从 xterm 缓冲区抓的当前屏幕快照（含 scrollback）。
+   *
+   * 旁路缓冲只记「开了之后」的字节，可能缺开头、也可能被容量截断；
+   * 而用户此刻屏幕上看到的东西才是他要问的那件事的完整现场。
+   * 有它时后端优先用它当上下文，旁路缓冲只作兜底。
+   */
+  consoleText?: string;
+  /**
+   * 该会话当前是否停在 alternate buffer（vim / less / top / tmux / docker attach 等）。
+   * 后端据此提示模型：这类程序的输出抓不到，要用 capture-pane / docker logs 之类的 skill。
+   */
+  consoleAlt?: boolean;
 }
 
 /**

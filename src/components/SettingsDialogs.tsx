@@ -478,7 +478,10 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
     try {
       // 先写盘、后关窗：saveAgentConfig 保证写成功才更新内存缓存，
       // 不会出现「界面显示已保存、库里其实没变」
-      await saveAgentConfig(draft);
+      //
+      // autoAttach 恒为 true：面板不再提供「旁路开关」，助手默认就能看到
+      // 当前会话 —— 界面上已经没有能置 false 的入口，这里兜住旧配置里的 false。
+      await saveAgentConfig({ ...draft, autoAttach: true });
       onClose();
     } catch (e) {
       setSaveErr(String(e ?? "保存失败"));
@@ -691,18 +694,8 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
             <em>关闭时后端完全不采集旁路，零开销；不启用则本页其余设置都不生效</em>
           </span>
         </label>
-        <label className={`settings-check${draft.enabled ? "" : " disabled"}`}>
-          <input
-            type="checkbox"
-            checked={draft.autoAttach}
-            disabled={!draft.enabled}
-            onChange={(e) => patch({ autoAttach: e.target.checked })}
-          />
-          <span>
-            新会话默认开启旁路
-            <em>新建的会话自动开始采集上下文，不用逐个手动打开</em>
-          </span>
-        </label>
+        {/* 原本这里还有「新会话默认开启旁路」开关。已去掉：助手面向全局，
+            会话在哪、哪就是上下文，没有「这个会话不采集」的第二种用法。 */}
 
         {/* 与「回答里的命令要不要执行」是同一件事的两面：
             这里决定它在终端里的权力边界，放在总开关区而不是某个账号下面 ——

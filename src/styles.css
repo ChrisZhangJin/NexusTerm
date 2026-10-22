@@ -1350,6 +1350,8 @@ html, body, #root {
 /* 状态栏：旁路开关 / 缓冲体积 / 清空 */
 .ap-status {
   flex: none; display: flex; align-items: center; gap: 8px;
+  /* 只剩「上下文说明 + 清空记忆」两项，按钮推到右边去，别挤在说明后面 */
+  justify-content: space-between;
   padding: 6px 10px; border-bottom: 1px solid var(--border);
   font-size: 11.5px; color: var(--text-dim);
 }

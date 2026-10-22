@@ -24,7 +24,7 @@ import {
   stealthInput,
   type TermContext,
 } from "./lib/context";
-import { cellWidth, getTerm, onInput, waitForPrompt } from "./lib/termRegistry";
+import { cellWidth, getTerm, onInput, snapshotConsole, waitForPrompt } from "./lib/termRegistry";
 import {
   LoginRecorder,
   parseSteps,
@@ -1318,9 +1318,10 @@ export default function App() {
           TerminalView 现有的 ResizeObserver 会重新 fit 并把新尺寸推给后端。
           这样既不用改 term-area 的内部结构，也不用新造一套尺寸通知。
 
-          面板**始终挂载**：聊天记录按会话存在组件内部（切会话互不可见），
-          卸载即丢失。收起只是把 visible 置 false（组件自己返回 null、停掉
-          事件订阅与状态轮询），并把容器宽度归零。
+          面板**始终挂载**：整份对话是全局唯一的（助手面向所有会话，
+          切标签只换「当前上下文」，不换聊天记录），卸载即丢失。
+          收起只是把 visible 置 false（组件自己返回 null、停掉事件订阅），
+          并把容器宽度归零。
         */}
         <div
           className={`agent-side${agentShown ? "" : " collapsed"}`}
@@ -1341,6 +1342,7 @@ export default function App() {
             onOpenSettings={() => setSettingsWin("agent")}
             onFloatOut={floatAgentOut}
             sessions={agentSessions}
+            onGetConsole={snapshotConsole}
           />
         </div>
       </div>

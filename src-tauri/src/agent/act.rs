@@ -92,6 +92,16 @@ pub struct AgentRunRequest {
     /// 允许操作的会话。为空时退回 `[session_id]`。
     #[serde(default)]
     pub targets: Vec<AgentTarget>,
+    /// 前端从 xterm 缓冲区抓的当前屏幕快照（含 scrollback）。
+    ///
+    /// 有它就用它当**当前会话**的上下文：旁路缓冲只记「开旁路之后」的字节，
+    /// 用户刚连上就问问题时它往往是空的，而屏幕上才是完整的现场。
+    #[serde(default)]
+    pub console_text: Option<String>,
+    /// 当前会话是否停在全屏程序（vim / less / tmux / docker attach）里。
+    /// 这类程序自己接管了屏幕，旁路抓不到真实输出，要提示模型改用抓取 skill。
+    #[serde(default)]
+    pub console_alt: bool,
 }
 
 /// 模型下发的一个动作：在哪个会话上跑什么命令。
@@ -285,11 +295,11 @@ pub fn reject_command(cmd: &str) -> Option<&'static str> {
 
 // ——————————————————————————————— 系统提示词 ———————————————————————————————
 
-/// Agentic 模式专用系统提示词。
+/// Nexus AI Agent 的系统提示词。
 ///
-/// 与「只读问答」的兜底提示词最大的不同：这里要求模型**动手**，
-/// 所以必须把协议、边界、以及「什么时候该停」讲得毫不含糊 ——
-/// 说不清楚的话，模型会在「再查一条」上无限打转。
+/// 只有一个 Agent：问答和执行是它自己判断的事，不再由用户先选模式。
+/// 这里必须把协议、边界、「什么时候该停」以及**抓取 skill** 讲得毫不含糊 ——
+/// 说不清楚的话，模型要么在「再查一条」上无限打转，要么隔着全屏程序瞎猜。
 pub const AGENTIC_SYSTEM_PROMPT: &str = concat!(
     "你是 NexusTerm 的终端 Agent，可以直接在用户的终端会话里执行命令。",
     "用户会给出若干个会话及其最近输出记录，其中 `$ ` 开头的是人敲进去的命令，",
@@ -310,18 +320,44 @@ pub const AGENTIC_SYSTEM_PROMPT: &str = concat!(
     "5) 不要执行不可逆操作（rm -rf、mkfs、DROP、chmod -R 777、把未知脚本管道给 shell 等），",
     "除非用户在这一轮对话里明确要求；\n",
     "6) 已经查清楚就不要再查了：直接用中文给出结论，说明依据与必要的后续建议；\n",
-    "7) 记录缺失或被截断就直说看不到，不要臆测终端里发生过什么。"
+    "7) 记录缺失或被截断就直说看不到，不要臆测终端里发生过什么。\n\n",
+    "【输出抓取 skill】当记录看起来被全屏程序接管、看不到真实输出时",
+    "（tmux / screen / docker attach / less / vim 等），不要凭猜测下结论，先用只读命令把内容抓出来：\n",
+    "· tmux：先 `tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}'` 找到 pane，",
+    "再 `tmux capture-pane -p -t <pane> -S -200` 抓最近 200 行；\n",
+    "· docker：先 `docker ps --format '{{.ID}} {{.Names}} {{.Status}}'` 找到容器，",
+    "再 `docker logs --tail 200 <容器>`；\n",
+    "· 被 less / more / man 这类分页器截住：那是**屏幕停在半路**，不是命令没跑完 ——",
+    "让它重跑一遍并落到文件（`<命令> > /tmp/nx.out 2>&1; tail -200 /tmp/nx.out`）比试图翻页可靠。\n",
+    "抓到的真实内容才是判断依据。"
 );
 
 // ——————————————————————————————— 上下文组装 ———————————————————————————————
 
 /// 第一轮 user 消息：把所有目标会话的上下文与问题拼在一起。
-fn plan_message(state: &AppState, req: &AgentRunRequest, targets: &[AgentTarget], max_bytes: usize) -> String {
+fn plan_message(
+    state: &AppState,
+    req: &AgentRunRequest,
+    targets: &[AgentTarget],
+    max_bytes: usize,
+    capture: Option<&str>,
+) -> String {
     let mut msg = String::from(
         "以下是你可以操作的终端会话及其最近输出记录（`$ ` 开头是命令，其余是输出）：\n",
     );
     for t in targets {
-        let raw = state.agent.context(&t.id, max_bytes).unwrap_or_default();
+        // 当前会话优先用前端抓的屏幕快照：它含 scrollback，且不依赖旁路是否开启。
+        // 别的会话前端拿不到屏幕，只能退回旁路缓冲。
+        let screen = req
+            .console_text
+            .as_deref()
+            .filter(|s| !s.trim().is_empty() && t.id == req.session_id);
+        let raw = match screen {
+            // 屏幕快照同样受上下文预算约束：前端按 24KB 抓的，配置里可能更小。
+            // 砍头不砍尾 —— 要问的是「刚才发生了什么」。
+            Some(s) => tail_chars(s, max_bytes),
+            None => state.agent.context(&t.id, max_bytes).unwrap_or_default(),
+        };
         // 擦掉过去几轮的哨兵包装痕迹：那是实现细节，不该占模型的注意力
         let ctx = strip_sentinel_wrappers(&raw);
         msg.push_str(&format!(
@@ -337,11 +373,80 @@ fn plan_message(state: &AppState, req: &AgentRunRequest, targets: &[AgentTarget]
             CONTEXT_END,
         ));
     }
+    // 全屏程序会把真实输出挡在 alternate buffer 里，旁路抓不到；
+    // 明确点出来，模型才会去用上面那套抓取 skill 而不是瞎猜。
+    if req.console_alt {
+        msg.push_str(
+            "\n注意：当前会话正停在全屏程序（alternate buffer）里，上面的记录可能不是真实输出。\n",
+        );
+        match capture {
+            // 已经替它抓好了：直接给内容，省掉一轮「先想命令、再执行、再读」的往返。
+            Some(text) if !text.trim().is_empty() => {
+                msg.push_str("我已通过旁路通道自动抓取了该程序的真实内容（只读，未碰你的屏幕）：\n");
+                msg.push_str(CONTEXT_BEGIN);
+                msg.push('\n');
+                msg.push_str(text);
+                msg.push('\n');
+                msg.push_str(CONTEXT_END);
+                msg.push('\n');
+            }
+            // 没抓到（非 tmux、旁路通道被堡垒机拒绝、超时）：让它自己去抓。
+            _ => msg.push_str("必要时先用「输出抓取 skill」拿到内容再判断。\n"),
+        }
+    }
     msg.push_str(&format!(
         "\n目标：{}\n\n需要执行操作就用 ```nx-exec 代码块，已经查清就直接给结论。",
         req.question.trim()
     ));
     msg
+}
+
+/// 全屏程序（tmux / screen / less / vim …）把自己的画面画在 alternate buffer 上，
+/// 远端的真实输出既不进旁路缓冲，也不在前端抓的屏幕快照里。
+///
+/// 这里用**旁路通道**跑一条只读的抓取命令把内容取回来 —— 用户屏幕上不会多出
+/// 一个字符，也不需要模型先想命令、再执行、再读输出（那要多花一次 LLM 往返）。
+///
+/// 只做 tmux：docker / kubectl 之类要么需要自己找容器名、要么常要 sudo，
+/// 贸然替用户跑一条「猜出来的」命令，代价比省下的那一轮大得多 ——
+/// 那些留给模型按系统提示里的抓取 skill 自己决定。
+///
+/// 任何一步不成立（不是 tmux、旁路通道被堡垒机拒、超时）都只返回 `None`，
+/// 由调用方退化成「让模型自己抓」。
+async fn capture_fullscreen(state: &AppState, session_id: &str) -> Option<String> {
+    // 先定位「用户此刻在看哪个 pane」：
+    //   1) display-message 在没有任何客户端上下文时会失败，但成功时最准；
+    //   2) 退回「第一个 session 里 active window 的 active pane」。
+    // 整条是一条 sh 行，`2>/dev/null` 把「tmux 不存在」的噪声吞掉。
+    const CMD: &str = concat!(
+        "p=$(tmux display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null); ",
+        "[ -n \"$p\" ] || p=$(tmux list-panes -a -F ",
+        "'#{session_name}:#{window_index}.#{pane_index} #{?window_active,1,0} #{?pane_active,1,0}' ",
+        "2>/dev/null | awk '$2==1 && $3==1 {print $1; exit}'); ",
+        "[ -n \"$p\" ] && tmux capture-pane -p -t \"$p\" -S -200"
+    );
+    let raw = state
+        .sessions
+        .run_sidecar(session_id, CMD, None, 4, "抓取全屏程序内容超时")
+        .await
+        .ok()?;
+    let text = strip_sentinel_wrappers(&raw).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    // 200 行 tmux 历史足够判断「刚才发生了什么」，再多只是挤占上下文预算
+    Some(tail_chars(&text, 8 * 1024))
+}
+
+/// 取末尾 `max` 个字符。抓屏内容的价值集中在最近几屏，超长时砍头不砍尾。
+fn tail_chars(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let cut = s.len() - max;
+    // 别切在多字节字符中间
+    let start = (cut..s.len()).find(|i| s.is_char_boundary(*i)).unwrap_or(cut);
+    format!("（前略）\n{}", &s[start..])
 }
 
 /// 把一次执行的原文结果变成喂回模型的反馈。
@@ -657,7 +762,24 @@ pub async fn run(
     } as usize;
 
     let targets = resolve_targets(req);
-    let system = IfAgentic::pick(&acct.system_prompt);    let mut messages = vec![ChatMessage::user(plan_message(state, req, &targets, max_bytes))];
+
+    // 当前会话停在全屏程序里时，屏幕上只剩程序自己画的东西 —— 真实输出在
+    // alternate buffer 里，旁路缓冲和前端快照都拿不到。动手规划之前先补一次
+    // 只读抓取；失败就算了，提示词里会退化成「让模型自己抓」。
+    let capture = if req.console_alt && state.sessions.contains(&req.session_id) {
+        capture_fullscreen(state, &req.session_id).await
+    } else {
+        None
+    };
+
+    let system = IfAgentic::pick(&acct.system_prompt);
+    let mut messages = vec![ChatMessage::user(plan_message(
+        state,
+        req,
+        &targets,
+        max_bytes,
+        capture.as_deref(),
+    ))];
 
     let session = req.session_id.clone();
     let mut step = 0usize;
@@ -1007,7 +1129,13 @@ mod tests {
 
     #[test]
     fn empty_targets_fall_back_to_current_session() {
-        let req = AgentRunRequest { session_id: "cur".into(), question: "q".into(), targets: vec![] };
+        let req = AgentRunRequest {
+            session_id: "cur".into(),
+            question: "q".into(),
+            targets: vec![],
+            console_text: None,
+            console_alt: false,
+        };
         let resolved = resolve_targets(&req);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].id, "cur");

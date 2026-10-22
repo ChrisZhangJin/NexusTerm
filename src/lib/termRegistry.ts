@@ -152,3 +152,32 @@ export function textBeforeCursor(term: Terminal): string {
   const line = buf.getLine(buf.baseY + buf.cursorY);
   return line ? line.translateToString(false, 0, buf.cursorX) : "";
 }
+
+/**
+ * 抓当前屏幕快照：把 xterm 的整个缓冲区（scrollback + 视口）摊平成纯文本。
+ *
+ * 这是 AI 助手「当前会话上下文」的首选来源 —— 旁路缓冲只记开旁路之后的字节，
+ * 用户刚连上就问「这个报错什么意思」时，旁路里往往是空的，而屏幕上写满了他要看的东西。
+ *
+ * @param maxChars 只保留末尾这么多字符（模型上下文有预算，越早的输出价值越低）
+ */
+export function snapshotConsole(
+  id: string,
+  maxChars = 24 * 1024
+): { text: string; alt: boolean } | null {
+  const term = registry.get(id);
+  if (!term) return null;
+  const buf = term.buffer.active;
+  const alt = buf.type !== "normal";
+  // 一个正常终端历史几千行足以覆盖「刚才发生了什么」，再多只是喂垃圾
+  const from = Math.max(0, buf.length - 2000);
+  const lines: string[] = [];
+  for (let y = from; y < buf.length; y++) {
+    const line = buf.getLine(y);
+    if (line) lines.push(line.translateToString(true));
+  }
+  // 连续空行压成一行：命令之间的空隙对模型没有信息量，却会吃掉不少预算
+  let text = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (text.length > maxChars) text = text.slice(text.length - maxChars);
+  return { text, alt };
+}
