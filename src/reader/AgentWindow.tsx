@@ -13,15 +13,35 @@ import { useEffect, useState } from "react";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { AgentPanel } from "../components/AgentPanel";
+import type { AgentTarget } from "../types";
 import "../styles.css";
+
+/** 主窗口推过来的「当前会话 + 可操作会话清单」 */
+interface ActiveSessionPayload {
+  sessionId?: string;
+  sessions?: AgentTarget[];
+}
 
 export default function AgentWindow({ initialSession }: { initialSession: string }) {
   const [sessionId, setSessionId] = useState(initialSession);
+  /**
+   * 可操作会话清单。浮窗里没有标签树，这份清单由主窗口随 `active-session` 一起推来，
+   * 「执行」模式的作用范围选择器全靠它 —— 推不来就退化成「只能操作当前会话」，
+   * 那也是安全的（后端同样只认这一个），不该因为清单没到就挡住整个面板。
+   */
+  const [sessions, setSessions] = useState<AgentTarget[]>([]);
 
   useEffect(() => {
     // 主窗口切活动会话 → 浮窗跟随
-    const un = listen<string>("nx://agent/active-session", (e) => {
-      if (typeof e.payload === "string") setSessionId(e.payload);
+    const un = listen<ActiveSessionPayload | string>("nx://agent/active-session", (e) => {
+      const p = e.payload;
+      // 兼容老形状（纯 sessionId 字符串）：后端在复用已开窗口时也会发一条
+      if (typeof p === "string") {
+        if (p) setSessionId(p);
+        return;
+      }
+      if (p?.sessionId) setSessionId(p.sessionId);
+      if (Array.isArray(p?.sessions)) setSessions(p.sessions);
     });
     // 窗口被关（点红灯 / Cmd+W / 代码 close）时通知主窗口恢复「未浮出」状态
     const unClose = getCurrentWindow().onCloseRequested(() => {
@@ -55,6 +75,7 @@ export default function AgentWindow({ initialSession }: { initialSession: string
         onClose={close}
         onSendToTerminal={sendToTerminal}
         onOpenSettings={openSettings}
+        sessions={sessions}
       />
     </div>
   );

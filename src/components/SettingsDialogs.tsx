@@ -8,7 +8,12 @@ import {
   saveAgentConfig,
   useAgentConfig,
 } from "../lib/agent";
-import type { AgentAccount, AgentConfig, AgentProvider } from "../types";
+import type {
+  AgentAccount,
+  AgentConfig,
+  AgentExecMode,
+  AgentProvider,
+} from "../types";
 import {
   DEFAULT_SHORTCUTS,
   SHORTCUT_LABELS,
@@ -698,6 +703,37 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
             <em>新建的会话自动开始采集上下文，不用逐个手动打开</em>
           </span>
         </label>
+
+        {/* 与「回答里的命令要不要执行」是同一件事的两面：
+            这里决定它在终端里的权力边界，放在总开关区而不是某个账号下面 ——
+            换模型不该悄悄换掉对一个终端 Agent 的授权级别。 */}
+        <div className="settings-section">执行权限</div>
+        <div className="row">
+          <label>执行模式</label>
+          <select
+            value={draft.execMode}
+            disabled={!draft.enabled}
+            onChange={(e) => patch({ execMode: e.target.value as AgentExecMode })}
+          >
+            <option value="approval">人在回路（推荐）</option>
+            <option value="agentic">全自动</option>
+          </select>
+        </div>
+        <p className="ag-hint">
+          {draft.execMode === "agentic" ? (
+            <>
+              <strong>全自动</strong>
+              ：Agent 会直接在终端会话里执行它认为必要的命令，不再逐条询问。
+              只在你完全信任这台机器上的操作对象时选它。
+            </>
+          ) : (
+            <>
+              <strong>人在回路</strong>
+              ：被判定为危险的命令（删除、覆写、改权限、把未知脚本管道给 shell 等）
+              会先弹出卡片等你点头；只读命令照常执行。
+            </>
+          )}
+        </p>
 
         {saveErr && <div className="ag-err">保存失败：{saveErr}</div>}
 

@@ -1445,8 +1445,122 @@ html, body, #root {
 .ap-sug-btn:hover { border-color: var(--accent); color: var(--accent); }
 .ap-sug .ap-code { margin: 0; border: none; border-radius: 0; background: var(--bg-panel); }
 
-/* 输入区 */
-.ap-input { flex: none; padding: 8px 10px 10px; border-top: 1px solid var(--border); }
+/* 输入区。relative 是给 `@` 联想浮层当定位父级的 */
+.ap-input { position: relative; flex: none; padding: 8px 10px 10px; border-top: 1px solid var(--border); }
+
+/* `@会话名` 联想：贴着输入框上沿往上弹出，盖住的是对话区而不是输入框本人 */
+.ap-mention {
+  position: absolute; left: 10px; right: 10px; bottom: 100%;
+  margin-bottom: 5px; max-height: 168px; overflow-y: auto;
+  border-radius: 6px; border: 1px solid var(--border);
+  background: var(--bg-elev); box-shadow: 0 8px 22px rgba(0, 0, 0, .34);
+}
+.ap-mention-item {
+  display: flex; align-items: center; gap: 7px; width: 100%;
+  padding: 5px 9px; background: none; border: none; cursor: pointer;
+  color: var(--text); font-size: 12px; text-align: left;
+}
+.ap-mention-item.on { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.ap-mention-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ap-mention-tag {
+  flex: none; padding: 0 6px; border-radius: 8px;
+  background: var(--bg); border: 1px solid var(--border);
+  color: var(--text-dim); font-size: 10px; line-height: 1.6;
+}
+
+/* ——— 执行模式：扣扳机之前，必须先知道枪口对着哪一台机器 ——— */
+
+/* 模式切换。两个按钮一组，选中的那一个必须一眼看出来：
+   「问答」和「执行」在权力上差着一个数量级，认错的下场是别人替你把命令跑了。 */
+.ap-modes { display: flex; gap: 6px; margin-bottom: 7px; }
+.ap-mode {
+  flex: 1; padding: 5px 8px; border-radius: 6px; cursor: pointer;
+  background: var(--bg); border: 1px solid var(--border); color: var(--text-dim);
+  font-size: 12px; line-height: 1.4;
+}
+.ap-mode em { display: block; font-style: normal; font-size: 10.5px; opacity: .8; }
+.ap-mode:hover:not(:disabled) { color: var(--text); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+/* 「执行」选中态用警示色而不是主题蓝：这不是一个普通的开关 */
+.ap-mode.on {
+  color: var(--accent); font-weight: 600;
+  border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.ap-mode:disabled { opacity: .55; cursor: not-allowed; }
+
+/* 作用范围：勾选了哪些机器，下一次发送前必须看得见 */
+.ap-scope {
+  flex: none; display: flex; align-items: flex-start; gap: 8px;
+  padding: 6px 10px; border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+.ap-scope-label { flex: none; padding-top: 3px; color: var(--text-dim); font-size: 11px; }
+.ap-chips { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 5px; }
+.ap-chip {
+  max-width: 140px; padding: 2px 8px; border-radius: 10px; cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  background: var(--bg); border: 1px dashed var(--border); color: var(--text-dim);
+  font-size: 11px;
+}
+.ap-chip:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.ap-chip.on {
+  border-style: solid; color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.ap-chip:disabled { opacity: .6; cursor: not-allowed; }
+
+/* 过程卡片：一次「下令 + 结果」合成一张 */
+.ap-step {
+  margin: 0 0 8px; border-radius: 6px; overflow: hidden;
+  border: 1px solid var(--border); background: var(--bg-elev);
+}
+.ap-step.pending { border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+.ap-step.bad { border-color: color-mix(in srgb, #e5c07b 45%, transparent); }
+.ap-step.danger { border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+.ap-step-head {
+  display: flex; align-items: center; gap: 7px;
+  padding: 5px 8px; border-bottom: 1px solid var(--border);
+}
+.ap-step-tag { flex: none; font-size: 10.5px; font-weight: 600; color: var(--accent); }
+.ap-step.bad .ap-step-tag { color: #e5c07b; }
+.ap-step.danger .ap-step-tag { color: var(--danger); }
+/* 哪台机器上跑的：多会话模式下这是最有信息量的一栏，不许被压缩掉 */
+.ap-step-where {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-dim); font-size: 11px;
+}
+.ap-step-code {
+  flex: none; padding: 0 6px; border-radius: 9px;
+  color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent);
+  font: 10.5px/1.6 ui-monospace, Consolas, monospace;
+}
+.ap-step-code.bad { color: #e5c07b; background: color-mix(in srgb, #e5c07b 16%, transparent); }
+.ap-step .ap-code { margin: 0; border: none; border-radius: 0; background: var(--bg-panel); }
+.ap-step-why { padding: 4px 9px 6px; color: var(--text-dim); font-size: 11px; line-height: 1.6; }
+.ap-out { padding: 5px 9px 7px; }
+.ap-out summary { color: var(--text-dim); font-size: 11px; cursor: pointer; }
+.ap-out .ap-code { margin-top: 4px; border: 1px solid var(--border); border-radius: 5px; }
+.ap-out-plain { margin-top: 0; border-top: 1px solid var(--border); }
+
+/* 执行中的「在跑」指示。Agentic 没有占位泡，全靠这一行 */
+.ap-running {
+  display: flex; align-items: center; gap: 6px; padding: 5px 9px 7px;
+  color: var(--text-dim); font-size: 11.5px;
+}
+
+/* 待批卡片：命令原文一律不折叠 —— 让人签的字必须看得全 */
+.ap-approve {
+  margin: 0 0 8px; border-radius: 6px; overflow: hidden;
+  border: 1px solid var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+.ap-approve.ok { border-color: color-mix(in srgb, var(--accent) 40%, transparent); background: none; }
+.ap-approve.no { border-color: var(--border); background: none; }
+.ap-approve .ap-step-head { border-bottom-color: color-mix(in srgb, var(--danger) 30%, transparent); }
+.ap-approve .ap-code { margin: 0; border: none; border-radius: 0; background: var(--bg-panel); }
+.ap-approve-row { display: flex; gap: 8px; padding: 7px 9px; }
+.ap-approve-row .btn { padding: 4px 14px; font-size: 12px; }
+.ap-approve-done { padding: 6px 9px 8px; color: var(--text-dim); font-size: 11.5px; }
 .ap-ta {
   width: 100%; min-height: 62px; max-height: 180px; resize: vertical;
   background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
@@ -1475,6 +1589,41 @@ html, body, #root {
   padding: 7px 9px; border-radius: 6px;
   background: var(--bg); border: 1px solid var(--border);
   font: 11.5px/1.6 ui-monospace, Consolas, monospace;
+}
+
+/* ——— Console 补全下拉 ———
+   它盖住的是**正在敲的那一行**，挡住输入比不提示更烦人。
+   所以：单行一条（26px）、高度封顶 7 条、贴着光标、越界自动翻到上方。 */
+.cp-pop {
+  position: fixed; z-index: 60; min-width: 260px; max-width: 460px;
+  overflow: hidden; border-radius: 6px;
+  background: var(--bg-elev); border: 1px solid var(--border);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, .38);
+}
+.cp-list { height: 100%; overflow-y: auto; overscroll-behavior: contain; }
+.cp-item {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; height: 26px; padding: 0 9px;
+  background: none; border: none; cursor: pointer; text-align: left;
+  color: var(--text); font: 12px/1 ui-monospace, Consolas, monospace;
+}
+.cp-item.on { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.cp-kind {
+  flex: none; padding: 0 6px; border-radius: 8px;
+  background: var(--bg); border: 1px solid var(--border);
+  color: var(--text-dim); font-size: 10px; line-height: 1.6;
+}
+.cp-item.on .cp-kind {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.cp-label {
+  flex: none; max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--accent);
+}
+.cp-detail {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-dim); font-size: 11px;
 }
 
 /* ——— 浮动 Agent 独立窗口 ———

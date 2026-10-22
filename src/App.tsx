@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { emit, listen } from "@tauri-apps/api/event";
 import SessionList from "./components/SessionList";
 import SessionDialog from "./components/SessionDialog";
@@ -45,6 +45,7 @@ import { BUILTIN_THEMES, DEFAULT_THEME, FONT_FAMILIES } from "./lib/theme";
 import { applyChromeVars } from "./lib/chrome";
 import { formatCombo, getPrefs, setPrefs, useShortcuts } from "./lib/prefs";
 import type {
+  AgentTarget,
   AuthMethod,
   AuthPrompt,
   ClosedInfo,
@@ -822,10 +823,30 @@ export default function App() {
     setAgentOpen(false);
   }, [activeTab]);
 
-  // 浮窗开着时，主窗口切换活动会话要通知浮窗跟随
+  /**
+   * 交给 Agent 的「可操作会话」清单。
+   *
+   * 只列**还活着**的标签：给模型一个已经断开的会话 id，它会在那边吃到
+   * 一句看不懂的「会话不存在」，而用户完全不知道该去修什么。
+   */
+  const agentSessions: AgentTarget[] = useMemo(
+    () =>
+      tabs
+        .filter((t) => t.status === "connected" || t.status === "reconnecting")
+        .map((t) => ({ id: t.id, label: t.customTitle || t.title || t.id })),
+    [tabs],
+  );
+
+  // 浮窗开着时，主窗口切换活动会话要通知浮窗跟随。
+  // 顺带把「可操作会话」清单一起发过去 —— 浮窗里没有标签树，
+  // 而「执行」模式的作用范围选择器全靠这份清单。
+  const agentSessionKey = agentSessions.map((s) => s.id).join("|");
   useEffect(() => {
-    if (agentFloated && activeTab) void emit("nx://agent/active-session", activeTab);
-  }, [agentFloated, activeTab]);
+    if (!agentFloated || !activeTab) return;
+    void emit("nx://agent/active-session", { sessionId: activeTab, sessions: agentSessions });
+    // agentSessionKey 代替 agentSessions 本身进依赖数组：数组每次渲染都是新引用，
+    // 直接放进去会让这个 effect 每帧都跑一遍。
+  }, [agentFloated, activeTab, agentSessionKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 监听浮窗回传的事件：写终端、开设置、窗口关闭
   useEffect(() => {
@@ -1319,6 +1340,7 @@ export default function App() {
             onSendToTerminal={sendToTerminal}
             onOpenSettings={() => setSettingsWin("agent")}
             onFloatOut={floatAgentOut}
+            sessions={agentSessions}
           />
         </div>
       </div>

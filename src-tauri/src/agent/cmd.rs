@@ -5,6 +5,7 @@
 
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
+use super::act::{self, AgentRunRequest, ExecResult};
 use super::{load_config, save_config, AgentConfig, AgentError};
 use crate::agent::buffer::BufferStats;
 use crate::agent::llm;
@@ -148,6 +149,100 @@ pub fn agent_cancel(session_id: String, state: State<'_, AppState>) -> Result<()
 #[tauri::command]
 pub async fn agent_test(config: AgentConfig) -> Result<String, String> {
     llm::test_connection(&config).await.map_err(err)
+}
+
+// ——— Agentic：让 Agent 真的去终端里执行 ———
+
+/// 发起一轮「会动手」的 Agentic 问答。**会一直等到这一轮跑完才返回**，
+/// 过程中什么都不通过返回值给，全部走事件：
+///
+/// - `nx://agent/step/{session_id}`    → 每一步：下令 / 结果 / 跳过 / 提示 / 结论
+/// - `nx://agent/approve/{session_id}` → 请用户批准一条危险命令（审批模式下才会出现）
+/// - `nx://agent/error/{session_id}`   → 终态错误（其后不再发任何事件）
+///
+/// 与 `agent_ask`（纯问答、流式）的分工：**这一条会真的在终端里跑命令**。
+/// 它不像 `agent_ask` 那样立即返回是有原因的：整个循环必须串着跑完，
+/// 「模型思考 → 写入终端 → 读回输出」构成一条不可打乱的时间线，
+/// 提前返回反而要另起一堆并发状态去同步它。
+///
+/// 同一会话同时只允许一轮。已有轮在跑时返回 `Err`，前端应提示用户先取消。
+#[tauri::command]
+pub async fn agent_run(
+    request: AgentRunRequest,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let config = load_config(&state.store);
+    act::run(&app, &state, &state.act, &config, &request)
+        .await
+        .map_err(err)
+}
+
+/// 取消该会话正在进行的这一轮 Agentic 运行（中止整条连锁操作）。
+///
+/// 幂等：没有在跑时什么都不做 —— 用户连点两次不该弹错误。
+#[tauri::command]
+pub fn agent_run_cancel(session_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    if session_id.trim().is_empty() {
+        return Err(AgentError::NoSession(session_id).to_string());
+    }
+    if state.act.cancel(&session_id) {
+        tracing::info!("Agentic 运行已请求取消：{}", session_id);
+    } else {
+        tracing::debug!("取消请求被忽略，该会话没有进行中的 Agentic 运行：{}", session_id);
+    }
+    Ok(())
+}
+
+/// 答复一次审批请求。`approved = false` 或请求已超时，都按「不执行」处理。
+///
+/// 返回 false 表示**这个请求已经没人接了**（多半是超时或答复晚到了）：
+/// 那不是错误，前端只要把那张卡片置灰即可。
+#[tauri::command]
+pub fn agent_approve(
+    request_id: String,
+    approved: bool,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    Ok(state.act.answer(&request_id, approved))
+}
+
+/// 在指定会话里手动跑一条命令（UI 上的「帮我执行」按钮、结果卡重试）。
+///
+/// 与 `agent_run` 共用同一条哨兵执行链路，但不调用模型：
+/// 用户点哪条就跑哪条，跑完把结果直接返回。
+#[tauri::command]
+pub async fn agent_exec(
+    session_id: String,
+    command: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<ExecResult, String> {
+    let config = load_config(&state.store);
+    if !config.enabled {
+        return Err(AgentError::Disabled.to_string());
+    }
+    let outcome = act::run_one(
+        &state,
+        &app,
+        &session_id,
+        &command,
+        0,
+        "当前会话",
+        &session_id,
+        None,
+        false,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Agent 执行命令失败：{}", e);
+        e
+    })?;
+    Ok(ExecResult {
+        output: outcome.output,
+        exit_code: outcome.exit_code,
+        reason: outcome.reason,
+    })
 }
 
 // ——— 浮动独立窗口 ———

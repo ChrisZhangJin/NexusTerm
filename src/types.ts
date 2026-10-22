@@ -249,10 +249,17 @@ export interface AgentAccount {
 }
 
 /**
+ * Agent 的执行模式。后端 `ExecMode` 的镜像（lowercase）。
+ * - `agentic`：全自动，判定出来的动作直接下发到终端；
+ * - `approval`：人在回路，`danger` 一栏判为危险的命令先弹出来等人点头。
+ */
+export type AgentExecMode = "agentic" | "approval";
+
+/**
  * AI 助手配置。后端持久化在 SQLite settings 表（key=`agent.config`），
  * serde `rename_all = "camelCase"`，故此处的字段名必须与 TS 侧一致。
  *
- * 顶层只保留全局行为（总开关、新会话默认旁路），连接相关下沉到 accounts。
+ * 顶层只保留全局行为（总开关、新会话默认旁路、执行模式），连接相关下沉到 accounts。
  */
 export interface AgentConfig {
   /** 全局总开关。关着的时候后端旁路完全不动，连一次哈希查找都没有。 */
@@ -263,6 +270,8 @@ export interface AgentConfig {
   accounts: AgentAccount[];
   /** 当前生效账号的 id。找不到时后端回落到第一个。 */
   activeId: string;
+  /** 下令方式。后端对未知字符串降级到 approval（最安全的那一种）。 */
+  execMode: AgentExecMode;
 }
 
 /** 某个会话当前的旁路缓冲状态（后端 `BufferStats` 的镜像） */
@@ -292,4 +301,79 @@ export interface AgentMessage {
   streaming?: boolean;
   /** 这条是一次失败的提问（文本是错误文案） */
   error?: boolean;
+  /** Agentic 模式下这一步的过程信息（下令 / 结果 / 被跳过 / 提示） */
+  step?: AgentStep;
+  /** Agentic 审批模式下的待批请求；这张卡片自带「允许 / 拒绝」按钮 */
+  approve?: AgentApproveRequest;
+  /** 审批结果：true 已允许 / false 已拒绝 / undefined 还在等人 */
+  approveResult?: boolean;
+}
+
+// ———————————————————————————— Agentic（会动手的那种） ————————————————————————————
+
+/** 一个可操作目标。label 由前端给：后端只认 uuid，把 uuid 贴在进程边上毫无意义。 */
+export interface AgentTarget {
+  id: string;
+  label: string;
+}
+
+/** `agent_run` 的入参 */
+export interface AgentRunRequest {
+  /** 面板当前绑定的会话，同时是模型省略 target 时的默认目标 */
+  sessionId: string;
+  question: string;
+  /** 允许操作的会话。留空时后端退回 [sessionId]。 */
+  targets: AgentTarget[];
+}
+
+/**
+ * `nx://agent/step/{sessionId}` 的载荷：一轮里发生的每一件事。
+ *
+ * 刻意是「扁平结构 + kind」而不是判别联合：多数字段本就可选，
+ * 扁平结构在 TS 侧写起来更省事，渲染时也不用写一堆类型收窄。
+ */
+export interface AgentStep {
+  /** plan | exec | result | skip | note | answer */
+  kind: string;
+  step: number;
+  target?: string;
+  targetLabel?: string;
+  command?: string;
+  output?: string;
+  exitCode?: number | null;
+  text?: string;
+  reasons?: string[];
+}
+
+/** `nx://agent/approve/{sessionId}` 的载荷：请人点头 */
+export interface AgentApproveRequest {
+  requestId: string;
+  command: string;
+  target: string;
+  targetLabel: string;
+  reasons: string[];
+}
+
+/** `agent_run` 在 UI 上的两种叫法 */
+export type AgentRunMode = "ask" | "act";
+
+/** `agent_exec` 的返回值。reason 是命令结束的方式。 */
+export interface AgentExecResult {
+  output: string;
+  exitCode: number | null;
+  reason: "sentinel" | "silence" | "timeout" | "cancelled";
+}
+
+// ———————————————————————————— Console 自动补全 ————————————————————————————
+
+/**
+ * 一个命令行参数。后端从 `<binary> --help` 的输出里解析出来（`CmdOption` 的镜像）。
+ *
+ * `flags` 里第一个是最短、最常敲的那种写法 —— 补全优先推荐它。
+ */
+export interface CmdOption {
+  flags: string[];
+  summary: string;
+  /** 这个参数是可以带取值的；带方括号或大写占位符的都会标出来 */
+  takesValue: boolean;
 }

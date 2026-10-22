@@ -13,6 +13,7 @@
 //! 3. **不许在持锁时做耗时操作**。锁保护的是毫秒级的数据结构，
 //!    HTTP 请求、磁盘 IO 一律拿到释放之后再发生。
 
+pub mod act;
 pub mod buffer;
 pub mod cmd;
 pub mod danger;
@@ -114,6 +115,53 @@ impl Default for AgentAccount {
     }
 }
 
+/// Agent 的执行模式。
+///
+/// - `Agentic`：**全自动**。判定出来的动作直接下发到终端执行。
+/// - `Approval`：**人在回路**。危险命令（见 `danger::assess`）先弹出来让人点头才执行。
+///
+/// 默认是 `Approval`：Terminal agent 的手是真会删文件的手，
+/// 「默认先看一眼」是这里唯一负责的默认选项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecMode {
+    Agentic,
+    Approval,
+}
+
+impl Default for ExecMode {
+    fn default() -> Self {
+        ExecMode::Approval
+    }
+}
+
+impl ExecMode {
+    /// 宽松解析：认得的名字要大小写不敏感（用户手填 JSON 时很容易写成 `AGENTIC`），
+    /// 认不得的一律落到 `Approval` —— 解析从严、降级从安全侧。
+    fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "agentic" | "auto" | "auto-run" => ExecMode::Agentic,
+            _ => ExecMode::Approval,
+        }
+    }
+
+    pub fn is_approval(self) -> bool {
+        matches!(self, ExecMode::Approval)
+    }
+}
+
+/// 让未知的字符串落在默认模式上，而不是让整份配置反序列化失败。
+///
+/// 没有它，一个手抖写成的 `"execMode": "agent"` 会让 `load_config` 整份回落到默认，
+/// 连 API Key 都丢了 —— 那比「这次按审批模式跑」严重得多。
+fn deserialize_exec_mode<'de, D>(d: D) -> Result<ExecMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(d)?;
+    Ok(ExecMode::parse(&raw))
+}
+
 /// AI 助手配置。字段用 camelCase，因为要原样进 JSON 发给前端。
 ///
 /// 顶层只保留**全局**行为（总开关 enabled、新会话默认旁路 auto_attach），
@@ -129,6 +177,9 @@ pub struct AgentConfig {
     pub accounts: Vec<AgentAccount>,
     /// 当前生效账号的 id。找不到时回落到第一个账号。
     pub active_id: String,
+    /// Agent 的下令方式：`agentic`（全自动）/ `approval`（危险命令先问人）。
+    #[serde(default, deserialize_with = "deserialize_exec_mode")]
+    pub exec_mode: ExecMode,
 }
 
 impl Default for AgentConfig {
@@ -143,6 +194,7 @@ impl Default for AgentConfig {
             auto_attach: false,
             active_id: acct.id.clone(),
             accounts: vec![acct],
+            exec_mode: ExecMode::Approval,
         }
     }
 }
@@ -260,6 +312,8 @@ fn migrate_legacy_config(raw: &str) -> AgentConfig {
         auto_attach: old.auto_attach,
         active_id: acct.id.clone(),
         accounts: vec![acct],
+        // 旧配置没有这一项，按最保守的「人在回路」给
+        exec_mode: ExecMode::Approval,
     }
 }
 
@@ -546,6 +600,8 @@ mod tests {
         let c = AgentConfig::default();
         assert!(!c.enabled);
         assert!(!c.auto_attach);
+        assert!(c.exec_mode.is_approval(), "默认必须是「人在回路」");
+
         assert_eq!(c.accounts.len(), 1, "默认必须恰有一个账号");
         let a = c.active_account();
         assert_eq!(a.provider, "openai");
@@ -553,6 +609,39 @@ mod tests {
         assert_eq!(a.model, "gpt-4o-mini");
         assert_eq!(a.max_context_bytes, 32768);
         assert!(a.redact, "脱敏默认必须开着");
+    }
+
+    #[test]
+    fn exec_mode_round_trips_as_lowercase_string() {
+        let cfg = AgentConfig {
+            exec_mode: ExecMode::Agentic,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&cfg).expect("应能序列化");
+        assert_eq!(json["execMode"], "agentic");
+        let back: AgentConfig = serde_json::from_value(json).expect("应能反序列化");
+        assert_eq!(back.exec_mode, ExecMode::Agentic);
+    }
+
+    /// 认不得的值必须落在「审批」上，而且**不能连累整份配置**
+    #[test]
+    fn unknown_exec_mode_degrades_to_approval() {
+        let raw = r#"{"enabled":true,"execMode":"agent","accounts":[{"id":"x","model":"m","apiKey":"k"}]}"#;
+        let cfg: AgentConfig = serde_json::from_str(raw).expect("不应因一个字段坏了整份配置");
+        assert!(cfg.exec_mode.is_approval(), "未知值必须降级到最安全的模式");
+        assert!(cfg.enabled, "其它字段必须照常生效");
+        assert_eq!(cfg.active_account().api_key, "k");
+        // 大小写与别名都认
+        assert_eq!(ExecMode::parse(" AGENTIC "), ExecMode::Agentic);
+        assert_eq!(ExecMode::parse("auto"), ExecMode::Agentic);
+        assert_eq!(ExecMode::parse("nonsense"), ExecMode::Approval);
+    }
+
+    /// 旧版扁平配置迁移后同样必须是最保守的模式
+    #[test]
+    fn migrated_config_starts_in_approval_mode() {
+        let cfg = migrate_legacy_config(r#"{"enabled":true,"model":"m","apiKey":"k"}"#);
+        assert!(cfg.exec_mode.is_approval());
     }
 
     /// 序列化字段必须是 camelCase —— 前端按这个形状解析

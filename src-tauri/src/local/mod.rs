@@ -122,6 +122,12 @@ impl LocalManager {
         Ok(())
     }
 
+    /// 该本地会话是否存在。**轻量且无副作用**（不取写锁、不碰 pty），
+    /// 供需要按 id 判断「到底是本地 shell 还是 SSH 会话」的调用方使用。
+    pub fn contains(&self, id: &str) -> bool {
+        self.sessions.lock().unwrap().contains_key(id)
+    }
+
     pub fn write(&self, id: &str, data: &[u8]) -> Result<(), String> {
         let mut guard = self.sessions.lock().unwrap();
         let s = guard.get_mut(id).ok_or("本地会话不存在")?;

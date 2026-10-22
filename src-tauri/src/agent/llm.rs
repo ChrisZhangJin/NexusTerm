@@ -197,9 +197,18 @@ pub fn build_user_message(context: Option<&str>, question: &str) -> String {
 
 /// 一条聊天消息。两种方言的形状一致（`role` + `content`），故共用。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl ChatMessage {
+    pub fn user(content: impl Into<String>) -> Self {
+        Self { role: "user".into(), content: content.into() }
+    }
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self { role: "assistant".into(), content: content.into() }
+    }
 }
 
 /// OpenAI 兼容：`POST {base}/chat/completions`
@@ -256,6 +265,21 @@ pub fn build_request(
     user: &str,
     stream: bool,
 ) -> Result<PreparedRequest, AgentError> {
+    let messages = vec![ChatMessage::user(user)];
+    build_messages(acct, provider, system, &messages, stream)
+}
+
+/// 多轮版 [`build_request`]：整段会话历史一起发出去。
+///
+/// Agentic 循环每一轮都要把「已经执行过什么、终端回了什么」续在后面喂回去，
+/// 单条 user 消息的形状不够用。
+pub fn build_messages(
+    acct: &AgentAccount,
+    provider: Provider,
+    system: &str,
+    messages: &[ChatMessage],
+    stream: bool,
+) -> Result<PreparedRequest, AgentError> {
     if acct.base_url.trim().is_empty() {
         return Err(AgentError::BadRequest("尚未填写接口地址（Base URL）".into()));
     }
@@ -267,10 +291,6 @@ pub fn build_request(
     // 带进去的请求头会被 hyper 判为非法字符，报一句和「Key 错了」完全不同的错。
     let key = acct.api_key.trim().to_string();
     let url = endpoint(acct, provider);
-    let messages = vec![ChatMessage {
-        role: "user".into(),
-        content: user.to_string(),
-    }];
 
     let (headers, body) = match provider {
         Provider::OpenAI => {
@@ -281,7 +301,7 @@ pub fn build_request(
             push_accept_sse(&mut headers, stream);
             let req = OpenAiRequest {
                 model: model.to_string(),
-                messages,
+                messages: messages.to_vec(),
                 stream,
             };
             let body = serde_json::to_string(&req).map_err(|e| AgentError::Serialize(e.to_string()))?;
@@ -297,7 +317,7 @@ pub fn build_request(
             let req = AnthropicRequest {
                 model: model.to_string(),
                 system: system.to_string(),
-                messages,
+                messages: messages.to_vec(),
                 max_tokens: ANTHROPIC_MAX_TOKENS,
                 stream,
             };
@@ -313,6 +333,24 @@ pub fn build_request(
         headers,
         body,
     })
+}
+
+/// 把 `Vec<(String, String)>` 装成 reqwest 的 `HeaderMap`。
+///
+/// 抽出来是为了让三条出网路径（流式问答 / 测试连接 / Agentic 循环）共用同一套
+/// 「非法字符 → 中文提示」的判定，不至于在其中一条上漏掉。
+pub(crate) fn header_map(headers: &[(String, String)]) -> Result<HeaderMap, AgentError> {
+    let mut map = HeaderMap::new();
+    for (name, value) in headers {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| AgentError::BadRequest("请求头名非法，请检查配置".into()))?;
+        let value = HeaderValue::from_str(value).map_err(|_| {
+            // 九成是 API Key 被复制时带进了换行
+            AgentError::BadRequest("API Key 含有非法字符（换行等），请重新复制".into())
+        })?;
+        map.append(name, value);
+    }
+    Ok(map)
 }
 
 /// 配置合法性检查。提问与测试连接共用，保证两处的行为一致。
@@ -747,17 +785,25 @@ pub fn transport_error(err: &reqwest::Error) -> String {
     errors::compose("网络请求失败：请检查网络与代理设置", &raw)
 }
 
-/// 读错误响应体，**限长**。
-async fn read_error_body(resp: reqwest::Response) -> String {
+/// 读响应体，**限长**。
+///
+/// 成功响应也走限长：模型可能一口气返回几 MB JSON，而我们只需要其中的正文，
+/// 超了就截断 —— 少几个字好过把内存吃穿。
+async fn read_body_limited(resp: reqwest::Response, max: usize) -> String {
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(Ok(chunk)) = stream.next().await {
         buf.extend_from_slice(&chunk);
-        if buf.len() >= MAX_ERROR_BODY {
+        if buf.len() >= max {
             break;
         }
     }
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// 读错误响应体（比成功体宽松一些：原文里可能藏着有用的那句话）。
+async fn read_error_body(resp: reqwest::Response) -> String {
+    read_body_limited(resp, MAX_ERROR_BODY).await
 }
 
 // ——————————————————————————————— HTTP 客户端 ———————————————————————————————
@@ -785,7 +831,9 @@ fn ensure_crypto_provider() {
 ///
 /// 每个 `Client` 自带连接池：逐次新建意味着每次提问都要重做 TCP + TLS 握手
 /// （几百毫秒），流式首字延迟会明显变差。
-fn http_client() -> Result<Client, AgentError> {
+///
+/// `pub(crate)`：Agentic 循环（`agent/act.rs`）也走它。
+pub(crate) fn http_client() -> Result<Client, AgentError> {
     static CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
@@ -1158,13 +1206,92 @@ async fn stream_answer(
 // ——————————————————————————————— 测试连接 ———————————————————————————————
 
 /// 从一次非流式响应里取出回答正文。
-fn extract_answer_text(provider: Provider, body: &str) -> Option<String> {
+pub fn extract_answer_text(provider: Provider, body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let text = match provider {
         Provider::OpenAI => value.pointer("/choices/0/message/content"),
         Provider::Anthropic => value.pointer("/content/0/text"),
     };
     text.and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// 单次 actor 回应体上限。
+///
+/// 一次完整的 HTTP 响应够用了；超限时会被截断。
+const MAX_COMPLETE_BODY: usize = 512 * 1024;
+
+/// 等到取消标记被置位。
+///
+/// 只轮询布尔量，不做任何 I/O。配合 `tokio::select!` 就能给任意请求安上一个
+/// 「用户点了取消就立刻放弃」的出口 —— 否则一条三十秒的生成在这期间完全无法打断。
+async fn until_cancelled(cancel: &AtomicBool) {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// 非流式取一次完整回复（**Agentic 循环专用**）。
+///
+/// 与流式问答的区别：Agentic 循环必须拿到**完整**回复才能判断「里面有没有动作块」——
+/// 半个代码块是没法解析的。所以这一轮牺牲首字延迟，换取可靠的动作协议。
+///
+/// `messages` 是完整的多轮历史，调用方负责把「执行了什么、终端回了什么」续在后面。
+/// `cancel` 置位时返回 `Err`。
+pub async fn complete(
+    acct: &AgentAccount,
+    system: &str,
+    messages: &[ChatMessage],
+    cancel: Option<&AtomicBool>,
+) -> Result<String, AgentError> {
+    if let Some(flag) = cancel {
+        if flag.load(Ordering::Relaxed) {
+            return Err(AgentError::Transport("已取消".into()));
+        }
+    }
+    let provider = resolve_provider(acct);
+    let prepared = build_messages(acct, provider, system, messages, false)?;
+    let client = http_client()?;
+    let headers = header_map(&prepared.headers)?;
+
+    let request = client
+        .post(&prepared.url)
+        .headers(headers)
+        .body(prepared.body)
+        .send();
+
+    let resp = match cancel {
+        Some(flag) => match tokio::select! {
+            r = request => r,
+            _ = until_cancelled(flag) => return Err(AgentError::Transport("已取消".into())),
+        } {
+            Ok(r) => r,
+            Err(e) => return Err(AgentError::Transport(transport_error(&e))),
+        },
+        None => request
+            .await
+            .map_err(|e| AgentError::Transport(transport_error(&e)))?,
+    };
+
+    let status = resp.status();
+    // 成功响应也可以很大（模型可能一口气吐出几十 KB），统一限长
+    let body = if status.is_success() {
+        read_body_limited(resp, MAX_COMPLETE_BODY).await
+    } else {
+        read_error_body(resp).await
+    };
+    if !status.is_success() {
+        return Err(AgentError::Transport(http_status_message(status, &body)));
+    }
+
+    match extract_answer_text(provider, &body) {
+        Some(text) if !text.trim().is_empty() => Ok(text),
+        _ => Err(AgentError::Transport(
+            "模型返回了空回复：请确认该模型可用于对话接口".into(),
+        )),
+    }
 }
 
 /// 用一条极短消息验证 Key / 地址 / 模型是否可用，供设置界面「测试连接」用。
@@ -1180,22 +1307,7 @@ pub async fn test_connection(cfg: &AgentConfig) -> Result<String, AgentError> {
     let provider = resolve_provider(acct);
     let prepared = build_request(acct, provider, system_prompt(acct), TEST_QUESTION, false)?;
     let client = http_client()?;
-
-    let mut headers = HeaderMap::new();
-    for (name, value) in &prepared.headers {
-        let (name, value) = match (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            (Ok(n), Ok(v)) => (n, v),
-            _ => {
-                return Err(AgentError::BadRequest(
-                    "API Key 或接口地址含有非法字符".into(),
-                ))
-            }
-        };
-        headers.append(name, value);
-    }
+    let headers = header_map(&prepared.headers)?;
 
     let resp = client
         .post(&prepared.url)
@@ -1251,6 +1363,7 @@ mod tests {
             auto_attach: false,
             active_id: "default".into(),
             accounts: vec![acct()],
+            ..Default::default()
         }
     }
 

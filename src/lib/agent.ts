@@ -32,12 +32,13 @@ export function defaultAccount(id = "default", name = "默认"): AgentAccount {
   };
 }
 
-/** 与后端 `AgentConfig::default()` 对齐：单个默认账号。 */
+/** 与后端 `AgentConfig::default()` 对齐：单个默认账号 + 人在回路。 */
 export const DEFAULT_AGENT_CONFIG: AgentConfig = {
   enabled: false,
   autoAttach: false,
   accounts: [defaultAccount()],
   activeId: "default",
+  execMode: "approval",
 };
 
 const PROVIDERS: readonly AgentProvider[] = ["openai", "anthropic", "custom"];
@@ -88,6 +89,9 @@ function normalize(raw: Partial<AgentConfig> | null | undefined): AgentConfig {
     autoAttach: Boolean(c.autoAttach),
     accounts,
     activeId,
+    // 认不得的值一律收敛到 approval —— 与后端 `ExecMode::parse` 的降级方向一致。
+    // 宁可多问一句，也不要默认全自动去动别人的机器。
+    execMode: c.execMode === "agentic" ? "agentic" : "approval",
   };
 }
 

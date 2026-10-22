@@ -14,10 +14,9 @@ pub struct AppState {
     /// AI agent 的旁路缓冲。会话数据流在完成一次 emit 之后顺手喂一份给它。
     pub agent: crate::agent::AgentManager,
     /// AI agent 的出网层：流式提问与取消。
-    ///
-    /// 与 `agent` 分开持有：缓冲的锁在终端的 hot path 上被高频取用，
-    /// 出网这一侧的簿记（谁在问、要不要取消）不该和它共用一把锁。
     pub llm: crate::agent::llm::LlmRuntime,
+    /// AI agent 的动作层运行时：一轮 Agentic 运行的取消标记 + 人工审批登记表。
+    pub act: crate::agent::act::ActRuntime,
     /// 二次验证（keyboard-interactive）的问答登记表。
     /// 与 `sessions` / `sftp` 内部持有的是同一个 Arc。
     pub auth_prompts: std::sync::Arc<crate::ssh::prompt::AuthPrompts>,
@@ -226,6 +225,54 @@ pub async fn ssh_stats(
 #[tauri::command]
 pub async fn local_stats() -> Result<crate::sysstat::Stats, String> {
     crate::sysstat::collect().await
+}
+
+// ——— Console 自动补全 ———
+
+/// 问出某个可执行命令支持哪些参数（给终端里的补全提示用）。
+///
+/// **刻意不在用户那个终端里跑**：那样会把屏幕弄脏、污染 shell 历史，
+/// 而且交互式程序会直接把终端抢走。所以走旁路：
+/// 本地会话 → 子进程；远端会话 → 该连接的旁路 exec 通道。
+///
+/// `command` 只需要程序名；带参数也行，只有第一个 token 会被拿去查。
+/// 查不到（程序不存在 / 它不认 --help / 服务端不允许开旁路通道）时返回空数组，
+/// 不把它当成错误 —— 补全提示本来就是「有则锦上添花，没有也不影响用」。
+#[tauri::command]
+pub async fn console_command_options(
+    session_id: String,
+    command: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::console::CmdOption>, String> {
+    let Some(program) = crate::console::program_of(&command) else {
+        return Ok(Vec::new());
+    };
+    if state.local.contains(&session_id) {
+        Ok(crate::console::local_options(program).await)
+    } else {
+        // 远端：走 sidecar。不容易 —— 堡垒机上这条路常被掐，
+        // 那时返回空数组即可，前端把提示藏起来，不打搅用户。
+        match state
+            .sessions
+            .run_sidecar(&session_id, &help_command(program), None, 5, "查询参数超时")
+            .await
+        {
+            Ok(text) => Ok(crate::console::parse_help(&text)),
+            Err(e) => {
+                tracing::debug!("查询 {} 的参数失败：{}", program, e);
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
+/// 拼 `--help` 命令行。
+///
+/// 各家并不统一：GNU 工具认 `--help`，BSD / Go / 自研工具往往只认 `-h`，
+/// 所以两个都试一遍（`||` 让没输出的那个自然落到下一个）。
+/// `2>&1` 是必须的 —— 不少程序把帮助写到 stderr。
+fn help_command(program: &str) -> String {
+    format!("{program} --help 2>&1 || {program} -h 2>&1")
 }
 
 // ——— 会话附加状态（跳板机登录路径 / 兼容模式）———

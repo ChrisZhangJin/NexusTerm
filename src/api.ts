@@ -1,11 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AgentApproveRequest,
   AgentBufferStats,
   AgentConfig,
   AgentDonePayload,
+  AgentExecResult,
+  AgentRunRequest,
+  AgentStep,
   AuthPrompt,
   ClosedInfo,
+  CmdOption,
   ConnectOutcome,
   ConnectRequest,
   DiscoveredKey,
@@ -163,6 +168,43 @@ export const api = {
   agentCancel: (sessionId: string) => invoke<void>("agent_cancel", { sessionId }),
   /** 用「还没保存」的那份配置测连通性（刻意不读库里的值） */
   agentTest: (config: AgentConfig) => invoke<string>("agent_test", { config }),
+
+  // ——— Agentic：让 Agent 真的去终端里执行 ———
+
+  /**
+   * 发起一轮「会动手」的问答。**resolve 代表这一整轮已经跑完**（含所有执行步骤），
+   * 过程信息全部走 `onAgentStep` / `onAgentApprove` / `onAgentError` 事件。
+   * 与 `agentAsk` 的分工：这条会真在终端里跑命令。
+   */
+  agentRun: (request: AgentRunRequest) => invoke<void>("agent_run", { request }),
+  /** 中止该会话正在进行的一轮。幂等。 */
+  agentRunCancel: (sessionId: string) =>
+    invoke<void>("agent_run_cancel", { sessionId }),
+  /**
+   * 答复一条审批请求。
+   * 返回 false 表示这条请求已经没人接了（超时 / 答复晚到）—— 不是错误。
+   */
+  agentApprove: (requestId: string, approved: boolean) =>
+    invoke<boolean>("agent_approve", { requestId, approved }),
+  /**
+   * 不经模型、直接在会话里跑一条命令并拿回结果。
+   *
+   * 这条会给终端**真的下发输入** —— 只有用户点「执行」时才被调用。
+   * 与 `agent_run` 共用同一条哨兵执行链路（同一套结束判定与脱敏策略）。
+   */
+  agentExec: (sessionId: string, command: string) =>
+    invoke<AgentExecResult>("agent_exec", { sessionId, command }),
+
+  // ——— Console 自动补全 ———
+
+  /**
+   * 问出某个命令支持哪些参数（终端里的参数提示用）。
+   * 走旁路执行（本地子进程 / 远端 sidecar 通道），**不碰用户正在用的那个终端**。
+   * 查不到时返回空数组而不是报错 —— 提示本来可有可无。
+   */
+  consoleCommandOptions: (sessionId: string, command: string) =>
+    invoke<CmdOption[]>("console_command_options", { sessionId, command }),
+
   /** 把 Agent 面板浮出为独立系统窗口（已开则切会话并聚焦） */
   agentOpenWindow: (sessionId: string) =>
     invoke<void>("agent_open_window", { sessionId }),
@@ -277,6 +319,27 @@ export async function onAgentError(
   handler: (msg: string) => void
 ): Promise<UnlistenFn> {
   return listen<string>(`nx://agent/error/${id}`, (ev) => handler(ev.payload));
+}
+
+/**
+ * Agentic 一轮里发生的每一步：下令 / 执行结果 / 被跳过 / 提示 / 最终结论。
+ * 与 token/done 是两条并行的线：这里送过程，那边送说了什么话。
+ */
+export async function onAgentStep(
+  id: string,
+  handler: (step: AgentStep) => void
+): Promise<UnlistenFn> {
+  return listen<AgentStep>(`nx://agent/step/${id}`, (ev) => handler(ev.payload));
+}
+
+/** 请用户批准一条危险命令（只有 approval 模式下才会出现） */
+export async function onAgentApprove(
+  id: string,
+  handler: (req: AgentApproveRequest) => void
+): Promise<UnlistenFn> {
+  return listen<AgentApproveRequest>(`nx://agent/approve/${id}`, (ev) =>
+    handler(ev.payload)
+  );
 }
 
 /**

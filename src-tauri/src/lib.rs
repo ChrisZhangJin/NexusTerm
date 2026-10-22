@@ -11,6 +11,7 @@ use store::Store;
 pub mod errors;
 mod agent;
 mod cmd;
+mod console;
 mod keys;
 mod local;
 mod reader;
@@ -69,6 +70,7 @@ pub fn run() {
                 local: LocalManager::new(),
                 agent,
                 llm: agent::llm::LlmRuntime::new(),
+                act: agent::act::ActRuntime::new(),
                 auth_prompts,
                 keys_dir,
             });
@@ -88,6 +90,7 @@ pub fn run() {
             cmd::local_write_b64,
             cmd::ssh_stats,
             cmd::local_stats,
+            cmd::console_command_options,
             cmd::session_extras,
             cmd::set_session_extras,
             cmd::ssh_set_sidecar,
@@ -146,6 +149,10 @@ pub fn run() {
             agent::cmd::agent_ask,
             agent::cmd::agent_cancel,
             agent::cmd::agent_test,
+            agent::cmd::agent_run,
+            agent::cmd::agent_run_cancel,
+            agent::cmd::agent_approve,
+            agent::cmd::agent_exec,
             agent::cmd::agent_open_window,
             agent::cmd::agent_close_window,
             agent::cmd::agent_window_open,

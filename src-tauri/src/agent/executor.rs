@@ -34,6 +34,9 @@ const MAX_WAIT_MS: u64 = 120_000;
 /// 轮询缓冲的间隔。
 const POLL_MS: u64 = 80;
 
+/// 哨兵的固定前缀。既要拼进命令、又要在事后从会话记录里认出来擦掉。
+pub const SENTINEL_MARK: &str = "__NX_END_";
+
 /// 生成哨兵用的单调递增计数，叠加随机数，进一步降低碰撞概率。
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -72,7 +75,7 @@ impl Sentinel {
         // 用 uuid（已是依赖）取随机部分，避免再引入 rand
         let rand = uuid::Uuid::new_v4().simple().to_string();
         Self {
-            token: format!("__NX_END_{seq:x}_{rand}__"),
+            token: format!("{SENTINEL_MARK}{seq:x}_{rand}__"),
         }
     }
 
@@ -104,6 +107,13 @@ impl Default for Sentinel {
     }
 }
 
+/// 打印出来就是那个一次性 token —— 便于拼接期望文本、也便于日志里对账。
+impl std::fmt::Display for Sentinel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.token)
+    }
+}
+
 /// 截掉命令输出尾部可能残留的哨兵命令回显。
 ///
 /// 有些 shell 会把我们注入的整条命令（含 `printf '…'`）回显出来，落在输出里很难看。
@@ -111,6 +121,45 @@ impl Default for Sentinel {
 fn trim_sentinel_tail(s: &str) -> String {
     s.trim_end().to_string()
 }
+
+/// 把会话记录里**过去的**哨兵包装痕迹擦掉，让它读起来仍像一条人敲的命令。
+///
+/// 为什么要擦：终端会把我们注入的整串 `cmd; printf '\n__NX_END_…__%s\n' "$?"`
+/// 原样回显出来，这些字节和其它输出一起进了旁路缓冲。下次把历史喂给模型时，
+/// 它看到的就是一串看不懂的 printf —— 既浪费 token，也容易被模型当成
+/// 「这条歪命令是我自己提的」而误学。
+///
+/// 只做保守的两步清理：整行丢弃哨兵输出行，命令行截到 `; printf` 之前。
+/// 不做任何可能对正常命令造成损伤的模糊替换。
+pub fn strip_sentinel_wrappers(text: &str) -> String {
+    if !text.contains(SENTINEL_MARK) && !text.contains(SENTINEL_TAIL) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        // ① 命令回显：它同时含 TAIL 与 MARK，必须先按 TAIL 切开再判别的，
+        //    否则整行会被 ② 误丢，原本那条命令就跟着没了。
+        if let Some(i) = line.find(SENTINEL_TAIL) {
+            let head = line[..i].trim_end();
+            if !head.is_empty() {
+                out.push_str(head);
+                if line.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            continue;
+        }
+        // ② 哨兵自己打印出来的那一行（`__NX_END_…__<退出码>`）
+        if line.contains(SENTINEL_MARK) {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// 我们追加到命令尾部的字面片段：`; printf '\n`
+const SENTINEL_TAIL: &str = "; printf '\\n";
 
 /// 等待命令结束的配置（便于测试注入更短的时限）。
 #[derive(Clone, Copy)]
@@ -257,6 +306,51 @@ mod tests {
         let (out, code) = s.scan(&stream).expect("应扫到哨兵");
         assert_eq!(out, "out");
         assert_eq!(code, None);
+    }
+
+    // —————————————— 记录的痕迹擦除 ——————————————
+
+    #[test]
+    fn echo_line_is_trimmed_back_to_plain_command() {
+        let s = Sentinel::new();
+        let wrapped = s.wrap("df -h");
+        let transcript = format!("$ {wrapped}Filesystem\n");
+        let clean = strip_sentinel_wrappers(&transcript);
+        assert_eq!(clean, "$ df -h\nFilesystem\n");
+        assert!(!clean.contains(SENTINEL_MARK), "哨兵不该留在记录里");
+    }
+
+    #[test]
+    fn sentinel_output_line_is_dropped() {
+        let s = Sentinel::new();
+        let transcript = format!("/dev/disk1\n{s}0\n");
+        let clean = strip_sentinel_wrappers(&transcript);
+        assert_eq!(clean, "/dev/disk1\n");
+    }
+
+    #[test]
+    fn plain_text_passes_through_untouched() {
+        let text = "$ ls\nfile.txt\n";
+        assert_eq!(strip_sentinel_wrappers(text), text);
+    }
+
+    /// 一次完整回合：命令回显 + 输出 + 哨兵，全都理顺
+    #[test]
+    fn whole_round_trip_leaves_a_readable_transcript() {
+        let s = Sentinel::new();
+        let wrapped = s.wrap("uptime");
+        // printf 前面那个 \n 保证哨兵一定独占一行 —— 真实回显也是如此
+        let transcript = format!("$ {wrapped} 10:00 up 3 days\n{s}0\n");
+        let clean = strip_sentinel_wrappers(&transcript);
+        assert_eq!(clean, "$ uptime\n 10:00 up 3 days\n");
+        assert!(!clean.contains(SENTINEL_MARK));
+    }
+
+    #[test]
+    fn strip_is_idempotent() {
+        let s = Sentinel::new();
+        let once = strip_sentinel_wrappers(&s.wrap("pwd"));
+        assert_eq!(strip_sentinel_wrappers(&once), once);
     }
 
     fn immediate_sleep(_: Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {

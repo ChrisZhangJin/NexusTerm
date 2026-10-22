@@ -17,6 +17,20 @@ import {
 import { Highlighter, MARK_COLORS, bufferText, type MarkRule } from "../lib/highlight";
 import { parseProbe } from "../lib/context";
 import { readableKind } from "../lib/readable";
+import {
+  buildCompletions,
+  dropCompletion,
+  feedKeys,
+  firstToken,
+  lastToken,
+  newLineState,
+  optionsFor,
+  peekOptions,
+  recordCommand,
+  type CompletionItem,
+} from "../lib/complete";
+import { GhostText, cursorFollowsTyped } from "../lib/ghost";
+import CompletionOverlay from "./CompletionOverlay";
 
 import {
   api,
@@ -171,6 +185,154 @@ export default function TerminalView({
 
   activeRef.current = active;
 
+  // ——— Console 自动补全 ———
+  //
+  // 补全**只负责给建议**，从不自己写 pty。
+  // 真正落到终端的只有两处：用户按 Tab 接受的那一段，以及用户自己敲的每一个键。
+  const lineRef = useRef(newLineState());
+  const ghostRef = useRef(new GhostText());
+  /** 当前候选列表（null = 不显示下拉） */
+  const [hints, setHints] = useState<CompletionItem[] | null>(null);
+  const [hintIndex, setHintIndex] = useState(0);
+  // 键盘处理器只在 mount 时注册一次，闭包里拿不到逐次渲染的 hintIndex，
+  // 用 ref 桥接 —— 否则按 ↑↓ 挑中第 3 条后按 Tab，补进去的还是第 1 条
+  const hintIndexRef = useRef(0);
+  hintIndexRef.current = hintIndex;
+  /** 下拉锚点：光标在视口里的像素坐标 */
+  const [hintPos, setHintPos] = useState({ x: 0, y: 0 });
+  const hintsRef = useRef<CompletionItem[]>([]);
+  /** 与后端请求对账用的序号：慢响应回来时若已过期就丢弃 */
+  const hintSeq = useRef(0);
+
+  // 高亮项变了就把灰字换成它：下拉里选中哪条，光标后面就该提示哪条，
+  // 否则「按 ↑↓ 挑一条再按 Tab」会得到跟选中项不一样的结果。
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term || !hints || term.buffer.active.type !== "normal") return;
+    const item = hints[Math.min(hintIndex, hints.length - 1)];
+    if (!item) return;
+    ghostRef.current.show(term, item.insert, term.cols - term.buffer.active.cursorX - 1);
+  }, [hintIndex, hints]);
+
+  /**
+   * 把候选列表推给界面，并把第一条画成行内灰字。
+   *
+   * 灰字只显示「放得下」的那一段（见 `GhostText.show`）——
+   * 宁可提示得短一点也不让它换行把屏幕顶乱。
+   */
+  const publish = useCallback((items: CompletionItem[]) => {
+    const term = termRef.current;
+    const host = hostRef.current;
+    if (!term || !host) return;
+
+    // vim / less / top 用的是 alternate buffer：那里没有 shell 提示符，
+    // 「当前行 = 人敲的命令」这个前提根本不成立。全屏程序里一律不提示，
+    // 否则灰字会直接画在编辑器内容上。
+    if (term.buffer.active.type !== "normal") {
+      ghostRef.current.clear(term);
+      hintsRef.current = [];
+      setHints(null);
+      setHintIndex(0);
+      return;
+    }
+
+    hintsRef.current = items;
+    setHints(items.length ? items : null);
+    setHintIndex(0);
+
+    const room = term.cols - term.buffer.active.cursorX - 1;
+    const ghost = ghostRef.current.show(term, items.length ? items[0].insert : "", room);
+    if (!ghost) return;
+
+    // 只在灰字真的画出来了才定位下拉：位置按光标格换算，
+    // 与 xterm 的字符网格对齐（cellWidth 已处理 CJK / emoji 占两格的情况）
+    const r = host.getBoundingClientRect();
+    const cw = term.cols > 0 ? r.width / term.cols : 8;
+    const ch = term.rows > 0 ? r.height / term.rows : 16;
+    setHintPos({
+      x: Math.min(r.left + term.buffer.active.cursorX * cw, window.innerWidth - 330),
+      y: r.top + (term.buffer.active.cursorY + 1) * ch,
+    });
+  }, []);
+
+  /** 收起提示：擦掉灰字、清空候选。 */
+  const dismissHints = useCallback(() => {
+    const term = termRef.current;
+    if (term) ghostRef.current.clear(term);
+    hintsRef.current = [];
+    hintSeq.current++; // 让还在路上的 `--help` 请求回来时自己作废
+    setHints(null);
+    setHintIndex(0);
+  }, []);
+
+  /**
+   * 按当前这半行重算候选；需要时向后端问参数。
+   *
+   * 每次调用都会先把序号 +1 —— 于是上一次发起但还没回来的 `--help` 请求
+   * 回来时发现自己已过期，自动放弃。连打十个字符只会留下最后一次的结果。
+   */
+  const refreshHints = useCallback(
+    (line: string) => {
+      const seq = ++hintSeq.current;
+
+      const token = lastToken(line);
+      const program = firstToken(line);
+
+      // 半截 flag → 问这个程序支持哪些参数
+      if (token.startsWith("-") && program && program !== token) {
+        const cached = peekOptions(tabId, program);
+        if (cached) {
+          publish(buildCompletions(tabId, line, cached));
+          return;
+        }
+        void optionsFor(tabId, program).then((opts) => {
+          if (hintSeq.current !== seq) return; // 期间又敲了键 → 这次结果已过期
+          publish(buildCompletions(tabId, line, opts));
+        });
+        return;
+      }
+
+      // 命令名阶段：只用历史
+      publish(buildCompletions(tabId, line, []));
+    },
+    [tabId, publish]
+  );
+
+  /**
+   * 接受当前高亮项：把缺的那一段补进终端。
+   *
+   * 两件事必须同时做：写 pty（让远端 shell 真的收到），
+   * 以及更新本地行状态（否则下一次预测还按补完前的半句算）。
+   */
+  const acceptHintAt = useCallback(
+    (index: number) => {
+      const items = hintsRef.current;
+      const term = termRef.current;
+      if (!term || items.length === 0) return;
+      const item = items[Math.min(index, items.length - 1)];
+      if (!item.insert) {
+        dismissHints();
+        return;
+      }
+      lineRef.current.text += item.insert;
+      // 只把「缺的那一段」写进 pty：已经敲出来的字符已经在 shell 里了，
+      // 再写一遍会重复。这里的写入和敲键盘走的是同一条路。
+      void (isLocal
+        ? api.localWrite(tabId, stringToBytes(item.insert))
+        : api.sshWrite(tabId, stringToBytes(item.insert))
+      ).catch(() => {});
+      // 补完后重算一次：多半会自然消失（后面要打的是新 token），
+      // 但遇到 `--f` → `--follow` 这种还能接着补的，下拉会立刻给出下一批。
+      refreshHints(lineRef.current.text);
+    },
+    [dismissHints, isLocal, refreshHints]
+  );
+
+  /** 键盘 Tab 走当前高亮项；鼠标点击走被点的那一项。 */
+  const acceptHint = useCallback(() => {
+    acceptHintAt(hintIndexRef.current);
+  }, [acceptHintAt]);
+
   /** 把当前行列数同步给后端（SSH 是 window_change，本地是 PTY resize） */
   const syncSize = useCallback(() => {
     const t = termRef.current;
@@ -264,12 +426,47 @@ export default function TerminalView({
       () => hl.dispose()
     );
 
+    /**
+     * 把灰字重新画回光标后面。
+     *
+     * 只在「光标还贴着我们记下的那半行」时才画 —— 见 `cursorFollowsTyped`。
+     * 一旦不成立（真的输出来了、提示符被整行重画了），说明这一轮输入已经结束，
+     * 直接收起提示，别把灰字甩到输出中间。
+     */
+    const redrawGhost = () => {
+      const items = hintsRef.current;
+      const typed = lineRef.current.text;
+      if (!items.length || !typed) return;
+      if (term.buffer.active.type !== "normal" || !cursorFollowsTyped(term, typed)) {
+        hintsRef.current = [];
+        setHints(null);
+        setHintIndex(0);
+        return;
+      }
+      const item = items[Math.min(hintIndexRef.current, items.length - 1)];
+      ghostRef.current.show(term, item.insert, term.cols - term.buffer.active.cursorX - 1);
+    };
+
+    // 灰字画在终端的**显示缓冲**里，不是 pty 里的真实字符。
+    // 只要往屏幕上又写了东西，那段灰字就会变成"真"文本赖在那儿，
+    // 还会把光标推到它后面 —— 于是人接着敲的字全落在灰字之后。
+    // 所以所有「往屏幕上写字」的地方都必须走这一个出口：先擦，写完再补画。
+    //
+    // 「再补画」不是可有可无的润色：shell 会把人敲的每个字符回显回来，
+    // 回显走的就是这里。不补画的话，灰字只在「按键 → 回显到达」这几十毫秒里
+    // 闪一下就没了 —— 本地还好，SSH 上一个来回就是肉眼可见的闪烁。
+    const writeOut = (data: string | Uint8Array) => {
+      ghostRef.current.clear(term);
+      term.write(data);
+      redrawGhost();
+    };
+
     // —— ZMODEM（lrzsz）：远端 rz/sz 的字节流先过 Sentry 嗅探 ——
     const zmodem = attachZmodem({
-      termWrite: (s) => term.write(s),
+      termWrite: writeOut,
       termWriteBytes: (b) => {
         countOutput(tabId, b);
-        term.write(b);
+        writeOut(b);
       },
       send: (bytes) => {
         const b64 = bytesToBase64(bytes);
@@ -288,7 +485,7 @@ export default function TerminalView({
     if (isLocal) {
       onLocalClosed(tabId, (code) => {
         if (disposed) return;
-        term.write(`\r\n\x1b[90m[Shell 已退出，退出码 ${code}]\x1b[0m\r\n`);
+        writeOut(`\r\n\x1b[90m[Shell 已退出，退出码 ${code}]\x1b[0m\r\n`);
         onClosedRef.current?.({ code, reason: "exit" });
       }).then((u) => cleanups.push(u));
     } else {
@@ -302,7 +499,7 @@ export default function TerminalView({
             : info.reason === "exit"
               ? `Connection closed. (exit status ${info.code})`
               : "Connection closed by foreign host.";
-        term.write(
+        writeOut(
           `\r\n\r\n\x1b[33m${why}\x1b[0m\r\n\r\n` +
             `\x1b[1;33mDisconnected from remote host(${host}) at ${clock(Date.now())}.\x1b[0m\r\n`
         );
@@ -321,12 +518,41 @@ export default function TerminalView({
       // 旁路监听（跳板机登录路径录制）。发不发送由这里决定，监听方只读
       emitInput(tabId, d);
       send(d).catch(() => {});
+      // 补全：喂键攒行，再按最新的行刷新提示
+      const committed = feedKeys(lineRef.current, d);
+      if (committed) recordCommand(tabId, committed);
+      refreshHints(lineRef.current.text);
     });
 
     // 快捷键全部来自「设置 → 快捷键」（lib/prefs），改了立即生效。
     // 默认 Windows / Linux 用 Ctrl+Shift+C/V/F：Ctrl+C 必须留给中断信号（^C）。
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
+
+      // 只在**有候选**时才接管 Tab / Esc / ↑↓。
+      // 没有候选时一律放行 —— 那几个键本来属于 shell 自己的补全与历史，
+      // 不能因为我们多了个提示层就把终端原本的能力挤掉。
+      if (hintsRef.current && hintsRef.current.length > 0) {
+        if (e.key === "Tab") {
+          e.preventDefault();
+          acceptHint();
+          return false;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          dismissHints();
+          return false;
+        }
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          setHintIndex((i) => {
+            const n = hintsRef.current?.length ?? 1;
+            return (i + (e.key === "ArrowDown" ? 1 : -1) + n) % n;
+          });
+          return false;
+        }
+      }
+
       const action = matchShortcut(e);
       if (!action) return true;
       e.preventDefault();
@@ -387,6 +613,9 @@ export default function TerminalView({
       cleanups.forEach((f) => f());
       term.dispose();
       termRef.current = null;
+      // 标签关掉后，它攒的命令历史与参数缓存就没用了 ——
+      // 这两个 Map 的生命周期是整个进程，不放掉就是泄漏
+      dropCompletion(tabId);
     };
     // 字体等外观变化通过下面的 effect 单独应用，不重建实例
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -421,15 +650,20 @@ export default function TerminalView({
     prevStatus.current = status;
     if (!term || isLocal) return;
     const now = clock(Date.now());
+    // 同样是往屏幕上写字：先把灰字擦掉，否则它会混进这行提示里
+    const out = (s: string) => {
+      ghostRef.current.clear(term);
+      term.write(s);
+    };
     if (status === "reconnecting" && reconnectAttempt) {
-      term.write(
+      out(
         `\x1b[90mReconnecting to ${peerHost ?? "remote host"} ` +
           `(attempt ${reconnectAttempt}/${reconnectMax ?? reconnectAttempt}) at ${now}...\x1b[0m\r\n`
       );
     } else if (status === "connected" && prev === "reconnecting") {
-      term.write(`\x1b[32mReconnected to ${peerHost ?? "remote host"} at ${now}.\x1b[0m\r\n\r\n`);
+      out(`\x1b[32mReconnected to ${peerHost ?? "remote host"} at ${now}.\x1b[0m\r\n\r\n`);
     } else if (status === "closed" && prev === "reconnecting") {
-      term.write(`\x1b[31mReconnect failed at ${now}. 右键标签页可「重新连接」。\x1b[0m\r\n`);
+      out(`\x1b[31mReconnect failed at ${now}. 右键标签页可「重新连接」。\x1b[0m\r\n`);
     }
   }, [status, reconnectAttempt, reconnectMax, peerHost, isLocal]);
 
@@ -744,6 +978,20 @@ export default function TerminalView({
         onDragLeave={onDragLeave}
         onDrop={onDrop}
       />
+      {active && hints && hints.length > 0 && (
+        <CompletionOverlay
+          items={hints}
+          active={Math.min(hintIndex, hints.length - 1)}
+          x={hintPos.x}
+          y={hintPos.y}
+          viewportHeight={window.innerHeight}
+          onPick={(i) => {
+            setHintIndex(i);
+            acceptHintAt(i);
+          }}
+          onHover={setHintIndex}
+        />
+      )}
       {active && dropHint && (
         <div className="term-drop">
           <div className="term-drop-box">
