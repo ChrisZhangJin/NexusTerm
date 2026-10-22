@@ -866,6 +866,31 @@ export default function App() {
     };
   }, [sendToTerminal]);
 
+  // Agent 自己开的新会话（`nx-exec` 的 open 动作）：后端已经真的 spawn/connect
+  // 好了，这里只需要把它接成一个标签页，不再重复调用 localSpawn / sshConnect。
+  useEffect(() => {
+    const un = listen<{
+      id: string;
+      originSessionId: string;
+      kind: "local" | "ssh";
+      label: string;
+    }>("nx://agent/session-opened", (e) => {
+      const { id, originSessionId, kind, label } = e.payload;
+      insertTab(
+        {
+          id,
+          title: label || (kind === "local" ? "本地终端" : "远端会话"),
+          sessionId: null,
+          status: "connected",
+          local: kind === "local",
+        },
+        originSessionId
+      );
+      seedAgentAttach(id);
+    });
+    return () => void un.then((f) => f());
+  }, [insertTab, seedAgentAttach]);
+
   // 启动时同步一次浮窗状态（热重载 / 重开主窗口时浮窗可能还在）
   useEffect(() => {
     void api.agentWindowOpen().then(setAgentFloated).catch(() => {});

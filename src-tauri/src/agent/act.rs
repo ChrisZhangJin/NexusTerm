@@ -43,6 +43,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
+use super::capture;
 use super::danger::assess;
 use super::executor::{
     strip_sentinel_wrappers, wait_for_end, ExecEnd, ExecOutcome, Sentinel, WaitConfig,
@@ -51,6 +52,8 @@ use super::llm::{self, ChatMessage, CONTEXT_BEGIN, CONTEXT_END};
 use super::{AgentConfig, AgentError};
 use crate::agent::StreamKind;
 use crate::cmd::AppState;
+use crate::ssh::session::{AuthMethod, ConnectRequest};
+use crate::store;
 
 /// 一次 run 最多允许多少轮「思考 → 动作 → 再思考」。
 ///
@@ -104,18 +107,37 @@ pub struct AgentRunRequest {
     pub console_alt: bool,
 }
 
-/// 模型下发的一个动作：在哪个会话上跑什么命令。
+/// 模型下发的一个动作。三选一：
+///
+/// - `Exec`：在某个会话上跑一条命令（原有能力）。
+/// - `Export`：把某个会话迄今为止的全部输出要回来（`agent::capture`）。
+/// - `Open`：开一个新会话（本地或某个已保存的 SSH 主机），可选顺手发一条命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentAction {
-    /// `None` = 默认会话
-    pub target: Option<String>,
-    pub command: String,
+pub enum AgentAction {
+    Exec { target: Option<String>, command: String },
+    Export { target: Option<String>, deep: bool },
+    Open { kind: OpenKind, label: Option<String>, command: Option<String> },
+}
+
+/// `Open` 动作的目标：本地新开一个 shell，还是连到一个已保存的 SSH 主机。
+///
+/// **刻意不接受模型直接给的 host/用户名/密码**：新会话只能指向前端侧栏里
+/// 已经存在的 `SessionRecord`，引用方式是它的 id。这样即便终端输出里被注入了
+/// 恶意指令，模型也没有办法凭空编一个主机把数据连出去 —— 能连的，都是用户自己
+/// 已经配置、已经信任过的目标。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenKind {
+    Local,
+    Ssh { session_record_id: String },
 }
 
 /// 围栏代码块内部那一坨 JSON 的形状。字段全可选，是为了让模型怎么写都能接住。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ExecBlock {
+    /// `exec`（默认，兼容没有这个字段的旧式调用） | `export` | `open`
+    #[serde(default)]
+    action: Option<String>,
     #[serde(default)]
     target: Option<String>,
     #[serde(default)]
@@ -124,6 +146,18 @@ struct ExecBlock {
     command: Option<String>,
     #[serde(default)]
     commands: Vec<String>,
+    /// `export` 专用：是否额外探一遍 tmux / docker 的现状。
+    #[serde(default)]
+    deep: bool,
+    /// `open` 专用：`local`（默认） | `ssh`
+    #[serde(default)]
+    kind: Option<String>,
+    /// `open` + `kind:"ssh"` 专用：引用一个已保存的会话配置 id。
+    #[serde(default)]
+    session_record_id: Option<String>,
+    /// `open` 专用：新标签页的展示名。
+    #[serde(default)]
+    label: Option<String>,
 }
 
 // ——————————————————————————————— 事件载荷 ———————————————————————————————
@@ -241,7 +275,15 @@ fn parse_block(raw: &str) -> Vec<AgentAction> {
     let Ok(block) = serde_json::from_str::<ExecBlock>(raw.trim()) else {
         return Vec::new();
     };
+    match block.action.as_deref().unwrap_or("exec") {
+        "export" => parse_export(block),
+        "open" => parse_open(block).into_iter().collect(),
+        _ => parse_exec(block),
+    }
+}
 
+/// `action:"exec"`（或没写 action，向后兼容旧协议）。
+fn parse_exec(block: ExecBlock) -> Vec<AgentAction> {
     let targets = if block.targets.is_empty() {
         block.target.into_iter().collect::<Vec<_>>()
     } else {
@@ -262,16 +304,43 @@ fn parse_block(raw: &str) -> Vec<AgentAction> {
     let mut out = Vec::new();
     if targets.is_empty() {
         for c in &commands {
-            out.push(AgentAction { target: None, command: c.clone() });
+            out.push(AgentAction::Exec { target: None, command: c.clone() });
         }
     } else {
         for t in &targets {
             for c in &commands {
-                out.push(AgentAction { target: Some(t.clone()), command: c.clone() });
+                out.push(AgentAction::Exec { target: Some(t.clone()), command: c.clone() });
             }
         }
     }
     out
+}
+
+/// `action:"export"`：导出一个（或多个）会话迄今为止的全部输出。
+fn parse_export(block: ExecBlock) -> Vec<AgentAction> {
+    let targets = if block.targets.is_empty() {
+        block.target.into_iter().collect::<Vec<_>>()
+    } else {
+        block.targets
+    };
+    if targets.is_empty() {
+        vec![AgentAction::Export { target: None, deep: block.deep }]
+    } else {
+        targets
+            .into_iter()
+            .map(|t| AgentAction::Export { target: Some(t), deep: block.deep })
+            .collect()
+    }
+}
+
+/// `action:"open"`：开一个新会话。`kind:"ssh"` 必须带 `sessionRecordId`，
+/// 否则宁可什么都不做（也不要凭空连一个模型编出来的主机）。
+fn parse_open(block: ExecBlock) -> Option<AgentAction> {
+    let kind = match block.kind.as_deref() {
+        Some("ssh") => OpenKind::Ssh { session_record_id: block.session_record_id? },
+        _ => OpenKind::Local,
+    };
+    Some(AgentAction::Open { kind, label: block.label, command: block.command })
 }
 
 /// 校验一条命令能不能下发。返回可读的拒绝理由。
@@ -301,16 +370,27 @@ pub fn reject_command(cmd: &str) -> Option<&'static str> {
 /// 这里必须把协议、边界、「什么时候该停」以及**抓取 skill** 讲得毫不含糊 ——
 /// 说不清楚的话，模型要么在「再查一条」上无限打转，要么隔着全屏程序瞎猜。
 pub const AGENTIC_SYSTEM_PROMPT: &str = concat!(
-    "你是 NexusTerm 的终端 Agent，可以直接在用户的终端会话里执行命令。",
+    "你是 NexusTerm 的终端 Agent，可以直接在用户的终端会话里执行命令、",
+    "导出会话的完整记录、甚至开一个新会话。",
     "用户会给出若干个会话及其最近输出记录，其中 `$ ` 开头的是人敲进去的命令，",
     "其余是程序输出（已剥离 ANSI 转义）。\n\n",
-    "【要执行东西时】在回复里写且只写这样一个围栏代码块：\n",
-    "```nx-exec\n{\"target\":\"<会话id>\",\"command\":\"<命令>\"}\n```\n",
+    "【要执行命令时】在回复里写且只写这样一个围栏代码块（不写 action 等同 \"exec\"）：\n",
+    "```nx-exec\n{\"action\":\"exec\",\"target\":\"<会话id>\",\"command\":\"<命令>\"}\n```\n",
     "一次要对多台机器发同一批命令时，用 targets / commands 两个数组：\n",
-    "```nx-exec\n{\"targets\":[\"id1\",\"id2\"],\"commands\":[\"uptime\",\"df -h\"]}\n```\n",
+    "```nx-exec\n{\"action\":\"exec\",\"targets\":[\"id1\",\"id2\"],\"commands\":[\"uptime\",\"df -h\"]}\n```\n",
     "不写 target 表示落到用户当前所在的会话。\n\n",
+    "【要导出一个会话的完整记录时】用 export 动作，而不是自己拼 tmux/docker 命令去凑：\n",
+    "```nx-exec\n{\"action\":\"export\",\"target\":\"<会话id>\",\"deep\":true}\n```\n",
+    "`deep:true` 会额外探一遍该会话里的 tmux pane 与 docker 容器日志，",
+    "`deep:false`（默认）只给旁路缓冲里已经记下的内容，更快但可能够不到更早的历史。\n\n",
+    "【要开一个新会话时】本地 shell：\n",
+    "```nx-exec\n{\"action\":\"open\",\"kind\":\"local\",\"label\":\"排查用\",\"command\":\"uptime\"}\n```\n",
+    "连到一个用户已经保存好的 SSH 主机（必须给出已存在的会话配置 id，",
+    "**不能自己编一个主机/用户名/密码**，你也看不到密码本身）：\n",
+    "```nx-exec\n{\"action\":\"open\",\"kind\":\"ssh\",\"sessionRecordId\":\"<已保存的会话配置id>\",\"label\":\"db-01\"}\n```\n",
+    "`command` 可省略（只开不发），开成功后用户的界面上会真的多出一个标签页。\n\n",
     "【规则】\n",
-    "1) 一个块里的 command 必须是**单条单行**命令，不许用换行或 && 串联互不相关的操作；",
+    "1) exec 的 command 必须是**单条单行**命令，不许用换行或 && 串联互不相关的操作；",
     "需要分几步就分几轮，每轮都会收到上一条的真实输出；\n",
     "2) 一次最多给 12 条动作，够用为止，不要贪多；\n",
     "3) 优先用只读命令（ls / cat / grep / ss / df / ps / journalctl 等）把情况看清楚，",
@@ -318,11 +398,12 @@ pub const AGENTIC_SYSTEM_PROMPT: &str = concat!(
     "4) 命令的输出与退出码会原样回给你，**退出码非 0 不代表流程失败** ——",
     "照着真实输出继续判断，不要假装没看到；\n",
     "5) 不要执行不可逆操作（rm -rf、mkfs、DROP、chmod -R 777、把未知脚本管道给 shell 等），",
-    "除非用户在这一轮对话里明确要求；\n",
+    "除非用户在这一轮对话里明确要求；开新会话同理要有明确理由，不要为了好奇心乱开；\n",
     "6) 已经查清楚就不要再查了：直接用中文给出结论，说明依据与必要的后续建议；\n",
     "7) 记录缺失或被截断就直说看不到，不要臆测终端里发生过什么。\n\n",
-    "【输出抓取 skill】当记录看起来被全屏程序接管、看不到真实输出时",
-    "（tmux / screen / docker attach / less / vim 等），不要凭猜测下结论，先用只读命令把内容抓出来：\n",
+    "【输出抓取 skill（export 工具的退路）】当记录看起来被全屏程序接管、看不到真实输出时",
+    "（tmux / screen / docker attach / less / vim 等），优先用上面的 export + deep:true；",
+    "如果它抓到的 pane 不是你想要的那个，再退回手动只读命令自己定位：\n",
     "· tmux：先 `tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}'` 找到 pane，",
     "再 `tmux capture-pane -p -t <pane> -S -200` 抓最近 200 行；\n",
     "· docker：先 `docker ps --format '{{.ID}} {{.Names}} {{.Status}}'` 找到容器，",
@@ -450,9 +531,9 @@ fn tail_chars(s: &str, max: usize) -> String {
 }
 
 /// 把一次执行的原文结果变成喂回模型的反馈。
-fn feedback_for(action: &AgentAction, label: &str, outcome: &ExecOutcome) -> String {
+fn feedback_for(command: &str, label: &str, outcome: &ExecOutcome) -> String {
     let mut s = String::new();
-    s.push_str(&format!("在会话「{label}」执行：`{}`\n", action.command.trim()));
+    s.push_str(&format!("在会话「{label}」执行：`{}`\n", command.trim()));
     match outcome.reason {
         ExecEnd::Sentinel => s.push_str(&format!(
             "退出码：{}\n",
@@ -471,10 +552,10 @@ fn feedback_for(action: &AgentAction, label: &str, outcome: &ExecOutcome) -> Str
 }
 
 /// 也有可能执行本身就没跑起来（会话关了、拒绝-ID 不存在）。
-fn failure_feedback(action: &AgentAction, label: &str, why: &str) -> String {
+fn failure_feedback(command: &str, label: &str, why: &str) -> String {
     format!(
         "在会话「{label}」执行 `{}` 失败：{}\n请据此调整：换一条命令、换个会话，或直接给结论。\n",
-        action.command.trim(),
+        command.trim(),
         why
     )
 }
@@ -601,6 +682,174 @@ pub async fn run_one(
         );
     }
     Ok(outcome)
+}
+
+// ——————————————————————————————— 开新会话 ———————————————————————————————
+
+/// 一次「开新会话」请求。
+pub struct OpenSpec {
+    pub kind: OpenKind,
+    pub label: String,
+    /// 开好之后顺手跑的第一条命令，可选。
+    pub command: Option<String>,
+}
+
+/// 开新会话的结果：新会话 id，以及（如果带了 `command`）那条命令的执行结果。
+pub struct OpenOutcome {
+    pub session_id: String,
+    pub label: String,
+    pub command_result: Option<Result<ExecOutcome, String>>,
+}
+
+fn default_cols() -> u16 {
+    120
+}
+fn default_rows() -> u16 {
+    32
+}
+
+/// 按 `SessionRecord.authType` 规整出一份 `ConnectRequest` 能用的 `AuthMethod`。
+///
+/// 与前端 `lib/auth.ts::resolveAuth` 是同一套规则 —— 两边都要能从同一份
+/// `SessionRecord` 连上，规则漂移就是「前端能连、agent 连不上」之类的怪异故障。
+fn resolve_auth(state: &AppState, record: &store::SessionRecord) -> Result<AuthMethod, String> {
+    match record.auth_type.as_str() {
+        "password" => {
+            let password = state
+                .store
+                .get_password(&record.id)
+                .ok_or_else(|| "未保存密码，请先在该会话里补填密码".to_string())?;
+            Ok(AuthMethod::Password { password })
+        }
+        "key" => {
+            let path = record
+                .key_path
+                .clone()
+                .ok_or_else(|| "该会话未配置私钥路径".to_string())?;
+            // 口令是「有则用，没有就试试看」：很多私钥本就没加口令，
+            // 真要口令而又没有的话，连接会在握手阶段报出明确的认证错误。
+            let passphrase = state.store.get_passphrase(&record.id);
+            Ok(AuthMethod::PrivateKey { path, passphrase })
+        }
+        _ => Ok(AuthMethod::Agent),
+    }
+}
+
+/// 开一个新会话（本地 shell，或连到一个已保存的 SSH 主机），可选顺手跑一条命令。
+///
+/// 新会话 id 由后端自己铸造（迄今为止所有活会话 id 都来自前端，这是第一个
+/// 反过来的方向），随后用 `nx://agent/session-opened`（**全局**主题，不像
+/// `nx://agent/step/{id}` 那样按会话分流）通知前端把它接成一个真正的标签页 ——
+/// 否则这条会话虽然在后端活着，用户却永远看不到它。全局主题是刻意的：
+/// 这条新会话此刻还没有任何标签页在监听它专属的频道，只有前端的顶层
+/// 标签管理器会长期订阅，按 payload 里的 `originSessionId` 自行关联。
+pub async fn open_session(
+    app: &AppHandle,
+    state: &AppState,
+    origin_session: &str,
+    spec: OpenSpec,
+) -> Result<OpenOutcome, AgentError> {
+    let id = uuid::Uuid::new_v4().to_string();
+
+    match &spec.kind {
+        OpenKind::Local => {
+            state
+                .local
+                .spawn(&id, default_cols(), default_rows(), app)
+                .map_err(AgentError::BadRequest)?;
+        }
+        OpenKind::Ssh { session_record_id } => {
+            let record = state
+                .store
+                .get(session_record_id)
+                .map_err(|_| AgentError::BadRequest(format!("未找到会话配置：{session_record_id}")))?;
+            let auth = resolve_auth(state, &record).map_err(AgentError::BadRequest)?;
+            let req = ConnectRequest {
+                host: record.host.clone(),
+                port: Some(record.port),
+                username: record.username.clone(),
+                auth: Some(auth),
+                cols: default_cols(),
+                rows: default_rows(),
+                connect_timeout_secs: record.connect_timeout,
+                legacy_crypto: None,
+                config_id: Some(record.id.clone()),
+                sidecar: None,
+            };
+            state
+                .sessions
+                .connect(app.clone(), id.clone(), req)
+                .await
+                .map_err(|e| AgentError::BadRequest(e.to_string()))?;
+        }
+    }
+
+    let payload = SessionOpenedPayload {
+        id: id.clone(),
+        origin_session_id: origin_session.to_string(),
+        kind: match spec.kind {
+            OpenKind::Local => "local",
+            OpenKind::Ssh { .. } => "ssh",
+        },
+        label: spec.label.clone(),
+    };
+    let _ = app.emit("nx://agent/session-opened", payload);
+
+    let command_result = match spec.command.as_deref() {
+        Some(cmd) if !cmd.trim().is_empty() => {
+            Some(run_one(state, app, &id, cmd, 0, &spec.label, &id, None, false).await)
+        }
+        _ => None,
+    };
+
+    Ok(OpenOutcome { session_id: id, label: spec.label, command_result })
+}
+
+/// `nx://agent/session-opened` 的载荷：通知前端「有一个后端自己开的
+/// 新会话，请接一个标签页上去」。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionOpenedPayload {
+    pub id: String,
+    /// 发起这次「开新会话」的那个会话 —— 多半是触发 agent 的那个标签。
+    pub origin_session_id: String,
+    /// `local` | `ssh`
+    pub kind: &'static str,
+    pub label: String,
+}
+
+/// 把 `open_session` 的结果变成喂回模型的反馈。
+fn open_feedback(outcome: &OpenOutcome) -> String {
+    let mut s = format!(
+        "已打开新会话「{}」（id：{}），已在前端创建对应标签页。\n",
+        outcome.label, outcome.session_id
+    );
+    match &outcome.command_result {
+        Some(Ok(exec)) => {
+            s.push_str(&feedback_for_open_command(exec));
+        }
+        Some(Err(e)) => {
+            s.push_str(&format!("顺带执行的命令未能跑起来：{e}\n"));
+        }
+        None => {}
+    }
+    s
+}
+
+fn feedback_for_open_command(outcome: &ExecOutcome) -> String {
+    let code = match outcome.reason {
+        ExecEnd::Sentinel => outcome
+            .exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "未知".into()),
+        ExecEnd::Silence => "未知（长时间没有新输出，按执行完毕处理）".into(),
+        ExecEnd::Timeout => "未知（等待超时，命令可能仍在运行）".into(),
+        ExecEnd::Cancelled => return "该命令已被用户取消。\n".into(),
+    };
+    format!(
+        "退出码：{code}\n输出：\n{}\n",
+        head_chars(&outcome.output, MAX_FEEDBACK_CHARS)
+    )
 }
 
 // ——————————————————————————————— 审批 ———————————————————————————————
@@ -834,76 +1083,126 @@ pub async fn run(
                 feedback.push_str("（用户取消了后续动作，请直接给出结论。）\n");
                 break;
             }
-            let (target_id, target_label) = locate(action.target.as_deref(), &targets, &session);
             // 一轮内的多个动作共用同一个 step 号：UI 按 step 折叠，同一步归在一张卡里
+            match action {
+                AgentAction::Exec { target, command } => {
+                    let (target_id, target_label) = locate(target.as_deref(), &targets, &session);
 
-            if let Some(why) = reject_command(&action.command) {
-                feedback.push_str(&failure_feedback(&action, target_label, why));
-                continue;
-            }
+                    if let Some(why) = reject_command(&command) {
+                        feedback.push_str(&failure_feedback(&command, target_label, why));
+                        continue;
+                    }
 
-            let risk = assess(&action.command);
-            if cfg.exec_mode.is_approval() && risk.dangerous {
-                let request_id = uuid::Uuid::new_v4().simple().to_string();
-                let req_payload = ApprovePayload {
-                    request_id: request_id.clone(),
-                    command: action.command.trim().into(),
-                    target: target_id.clone(),
-                    target_label: target_label.into(),
-                    reasons: risk.reasons.clone(),
-                };
-                if !request_approval(app, runtime, &session, &req_payload).await {
+                    let risk = assess(&command);
+                    if cfg.exec_mode.is_approval() && risk.dangerous {
+                        let request_id = uuid::Uuid::new_v4().simple().to_string();
+                        let req_payload = ApprovePayload {
+                            request_id: request_id.clone(),
+                            command: command.trim().into(),
+                            target: target_id.clone(),
+                            target_label: target_label.into(),
+                            reasons: risk.reasons.clone(),
+                        };
+                        if !request_approval(app, runtime, &session, &req_payload).await {
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    target: Some(target_id.clone()),
+                                    target_label: Some(target_label.into()),
+                                    command: Some(command.trim().into()),
+                                    reasons: Some(risk.reasons.clone()),
+                                    ..StepPayload::new("skip", step)
+                                },
+                            );
+                            feedback.push_str(&format!(
+                                "命令 `{}` 未获执行（人没批准 / 等待超时）。这可能正是必要的一步：\
+                                 请要么换个更安全的等价做法，要么在结论里明确告诉用户需要他本人执行这一步。\n",
+                                command.trim()
+                            ));
+                            continue;
+                        }
+                    }
+
+                    match run_one(
+                        state,
+                        app,
+                        &target_id,
+                        &command,
+                        step,
+                        target_label,
+                        &target_id,
+                        Some(&cancel),
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => {
+                            let text = feedback_for(&command, target_label, &outcome);
+                            feedback.push_str(&text);
+                            feedback.push('\n');
+                        }
+                        Err(e) => {
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    target: Some(target_id.clone()),
+                                    target_label: Some(target_label.into()),
+                                    command: Some(command.trim().into()),
+                                    text: Some(e.clone()),
+                                    ..StepPayload::new("note", step)
+                                },
+                            );
+                            feedback.push_str(&failure_feedback(&command, target_label, &e));
+                        }
+                    }
+                }
+
+                AgentAction::Export { target, deep } => {
+                    let (target_id, target_label) = locate(target.as_deref(), &targets, &session);
                     emit_step(
                         app,
                         &session,
                         StepPayload {
                             target: Some(target_id.clone()),
                             target_label: Some(target_label.into()),
-                            command: Some(action.command.trim().into()),
-                            reasons: Some(risk.reasons.clone()),
-                            ..StepPayload::new("skip", step)
+                            command: Some(if deep { "export --deep".into() } else { "export".into() }),
+                            ..StepPayload::new("export", step)
                         },
                     );
-                    feedback.push_str(&format!(
-                        "命令 `{}` 未获执行（人没批准 / 等待超时）。这可能正是必要的一步：\
-                         请要么换个更安全的等价做法，要么在结论里明确告诉用户需要他本人执行这一步。\n",
-                        action.command.trim()
-                    ));
-                    continue;
+                    match capture::export_session(state, &target_id, deep).await {
+                        Some(text) => {
+                            feedback.push_str(&format!(
+                                "已导出会话「{target_label}」迄今为止的全部输出{}：\n{}\n\n",
+                                if deep { "（含 tmux/docker 深度抓取）" } else { "" },
+                                head_chars(&text, MAX_FEEDBACK_CHARS)
+                            ));
+                        }
+                        None => {
+                            feedback.push_str(&format!(
+                                "导出会话「{target_label}」没有拿到任何内容：该会话不存在，\
+                                 或从未开启旁路、也没有可供深度抓取的 tmux/docker 现场。\n"
+                            ));
+                        }
+                    }
                 }
-            }
 
-            match run_one(
-                state,
-                app,
-                &target_id,
-                &action.command,
-                step,
-                target_label,
-                &target_id,
-                Some(&cancel),
-                true,
-            )
-            .await
-            {
-                Ok(outcome) => {
-                    let text = feedback_for(&action, target_label, &outcome);
-                    feedback.push_str(&text);
-                    feedback.push('\n');
-                }
-                Err(e) => {
+                AgentAction::Open { kind, label, command } => {
+                    let label = label.unwrap_or_else(|| "新会话".to_string());
                     emit_step(
                         app,
                         &session,
                         StepPayload {
-                            target: Some(target_id.clone()),
-                            target_label: Some(target_label.into()),
-                            command: Some(action.command.trim().into()),
-                            text: Some(e.clone()),
-                            ..StepPayload::new("note", step)
+                            text: Some(format!("正在打开新会话「{label}」……")),
+                            ..StepPayload::new("open", step)
                         },
                     );
-                    feedback.push_str(&failure_feedback(&action, target_label, &e));
+                    let spec = OpenSpec { kind, label, command };
+                    match open_session(app, state, &session, spec).await {
+                        Ok(outcome) => feedback.push_str(&open_feedback(&outcome)),
+                        Err(e) => feedback.push_str(&format!("打开新会话失败：{e}\n")),
+                    }
                 }
             }
         }
@@ -936,9 +1235,12 @@ impl IfAgentic {
 /// 不能简单返回 custom：那样用户的提示词里没有动作协议，模型就永远只会聊天。
 /// 这里做的是「**用户的提示词 + 必需的协议**」而不是二选一。
 const CUSTOM_APPENDIX: &str = concat!(
-    "\n\n【可执行 mode】你可以直接在终端会话里执行命令：",
-    "在回复里写 ```nx-exec 围栏代码块，内容为 {\"target\":\"<会话id>\",\"command\":\"<单行命令>\"}；",
-    "多目标时用 targets / commands 数组。command 必须是单条单行命令。",
+    "\n\n【可执行 mode】你可以直接在终端会话里执行命令、导出会话完整记录、开新会话：",
+    "在回复里写 ```nx-exec 围栏代码块。执行命令：",
+    "{\"action\":\"exec\",\"target\":\"<会话id>\",\"command\":\"<单行命令>\"}（多目标用 targets / commands 数组，",
+    "不写 action 等同 exec）；导出记录：{\"action\":\"export\",\"target\":\"<会话id>\",\"deep\":true}；",
+    "开新会话：{\"action\":\"open\",\"kind\":\"local\"|\"ssh\",\"sessionRecordId\":\"<已保存配置id，仅 ssh 需要>\",",
+    "\"label\":\"<名字>\",\"command\":\"<可选的首条命令>\"}（kind=ssh 必须引用已存在的配置，不能自己编主机）。",
     "不写 target 表示落到用户当前会话。执行结果会回给你，据此继续。",
     "不可逆操作（rm -rf / mkfs / DROP 等）除非用户明确要求，否则不要执行。",
     "查清了直接给中文结论，不要再追加无谓的探查。"
@@ -980,14 +1282,14 @@ mod tests {
         let acts = extract_actions(&block(r#"{"target":"s1","command":"df -h"}"#));
         assert_eq!(
             acts,
-            vec![AgentAction { target: Some("s1".into()), command: "df -h".into() }]
+            vec![AgentAction::Exec { target: Some("s1".into()), command: "df -h".into() }]
         );
     }
 
     #[test]
     fn missing_target_falls_back_to_current() {
         let acts = extract_actions(&block(r#"{"command":"uptime"}"#));
-        assert_eq!(acts, vec![AgentAction { target: None, command: "uptime".into() }]);
+        assert_eq!(acts, vec![AgentAction::Exec { target: None, command: "uptime".into() }]);
     }
 
     /// 多主机 × 多命令：目标在外层，同一台机器上的命令连着跑
@@ -997,17 +1299,72 @@ mod tests {
             r#"{"targets":["a","b"],"commands":["uptime","whoami"]}"#,
         ));
         assert_eq!(acts.len(), 4);
-        assert_eq!(acts[0], AgentAction { target: Some("a".into()), command: "uptime".into() });
-        assert_eq!(acts[1], AgentAction { target: Some("a".into()), command: "whoami".into() });
-        assert_eq!(acts[2], AgentAction { target: Some("b".into()), command: "uptime".into() });
-        assert_eq!(acts[3], AgentAction { target: Some("b".into()), command: "whoami".into() });
+        assert_eq!(acts[0], AgentAction::Exec { target: Some("a".into()), command: "uptime".into() });
+        assert_eq!(acts[1], AgentAction::Exec { target: Some("a".into()), command: "whoami".into() });
+        assert_eq!(acts[2], AgentAction::Exec { target: Some("b".into()), command: "uptime".into() });
+        assert_eq!(acts[3], AgentAction::Exec { target: Some("b".into()), command: "whoami".into() });
     }
 
     /// 模型爱在围栏语言位写 json —— 不许因此整块失效
     #[test]
     fn fence_language_suffix_is_tolerated() {
         let acts = extract_actions("```nx-exec json\n{\"command\":\"ls\"}\n```\n");
-        assert_eq!(acts, vec![AgentAction { target: None, command: "ls".into() }]);
+        assert_eq!(acts, vec![AgentAction::Exec { target: None, command: "ls".into() }]);
+    }
+
+    // —————————————— export / open 动作 ——————————————
+
+    #[test]
+    fn export_action_is_parsed_with_default_shallow() {
+        let acts = extract_actions(&block(r#"{"action":"export","target":"s1"}"#));
+        assert_eq!(acts, vec![AgentAction::Export { target: Some("s1".into()), deep: false }]);
+    }
+
+    #[test]
+    fn export_action_honors_deep_flag_and_missing_target() {
+        let acts = extract_actions(&block(r#"{"action":"export","deep":true}"#));
+        assert_eq!(acts, vec![AgentAction::Export { target: None, deep: true }]);
+    }
+
+    #[test]
+    fn open_local_action_is_parsed() {
+        let acts = extract_actions(&block(
+            r#"{"action":"open","kind":"local","label":"调试","command":"uptime"}"#,
+        ));
+        assert_eq!(
+            acts,
+            vec![AgentAction::Open {
+                kind: OpenKind::Local,
+                label: Some("调试".into()),
+                command: Some("uptime".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn open_ssh_action_requires_session_record_id() {
+        // 没给 sessionRecordId：宁可什么都不做，也不能凭空连一个主机
+        let acts = extract_actions(&block(r#"{"action":"open","kind":"ssh"}"#));
+        assert!(acts.is_empty());
+
+        let acts = extract_actions(&block(
+            r#"{"action":"open","kind":"ssh","sessionRecordId":"rec-1"}"#,
+        ));
+        assert_eq!(
+            acts,
+            vec![AgentAction::Open {
+                kind: OpenKind::Ssh { session_record_id: "rec-1".into() },
+                label: None,
+                command: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn missing_action_field_defaults_to_exec() {
+        // 老协议（没有 action 字段）必须照旧解析成 Exec —— 不能因为加了新字段就破坏兼容
+        let acts = extract_actions(&block(r#"{"target":"s1","command":"whoami"}"#));
+        assert_eq!(acts, vec![AgentAction::Exec { target: Some("s1".into()), command: "whoami".into() }]);
     }
 
     #[test]
@@ -1025,7 +1382,7 @@ mod tests {
     #[test]
     fn unterminated_fence_is_still_attempted() {
         let acts = extract_actions("```nx-exec\n{\"command\":\"pwd\"}");
-        assert_eq!(acts, vec![AgentAction { target: None, command: "pwd".into() }]);
+        assert_eq!(acts, vec![AgentAction::Exec { target: None, command: "pwd".into() }]);
     }
 
     #[test]
@@ -1087,13 +1444,12 @@ mod tests {
 
     #[test]
     fn feedback_reports_exit_code_and_output() {
-        let act = AgentAction { target: None, command: "false".into() };
         let out = ExecOutcome {
             output: "err\n".into(),
             exit_code: Some(1),
             reason: ExecEnd::Sentinel,
         };
-        let text = feedback_for(&act, "web-01", &out);
+        let text = feedback_for("false", "web-01", &out);
         assert!(text.contains("false"));
         assert!(text.contains("退出码：1"));
         assert!(text.contains("err"));
@@ -1102,16 +1458,14 @@ mod tests {
 
     #[test]
     fn cancellation_feedback_tells_model_not_to_retry() {
-        let act = AgentAction { target: None, command: "sleep 100".into() };
         let out = ExecOutcome { output: String::new(), exit_code: None, reason: ExecEnd::Cancelled };
-        assert!(feedback_for(&act, "x", &out).contains("不要重试"));
+        assert!(feedback_for("sleep 100", "x", &out).contains("不要重试"));
     }
 
     #[test]
     fn unknown_exit_code_is_worded_as_unknown() {
-        let act = AgentAction { target: None, command: "top".into() };
         let out = ExecOutcome { output: "alive".into(), exit_code: None, reason: ExecEnd::Silence };
-        let text = feedback_for(&act, "x", &out);
+        let text = feedback_for("top", "x", &out);
         assert!(text.contains("未知"));
         assert!(text.contains("alive"));
     }

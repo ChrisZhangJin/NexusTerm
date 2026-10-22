@@ -5,8 +5,8 @@
 
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
-use super::act::{self, AgentRunRequest, ExecResult};
-use super::{load_config, save_config, AgentConfig, AgentError};
+use super::act::{self, AgentRunRequest, ExecResult, OpenKind, OpenSpec};
+use super::{capture, load_config, save_config, AgentConfig, AgentError};
 use crate::agent::buffer::BufferStats;
 use crate::agent::llm;
 use crate::cmd::AppState;
@@ -243,6 +243,59 @@ pub async fn agent_exec(
         exit_code: outcome.exit_code,
         reason: outcome.reason,
     })
+}
+
+// ——— 导出 / 开新会话（供前端按钮直接调用，与 agent_run 内部走的是同一套实现） ———
+
+/// 导出一个会话迄今为止的全部输出。
+///
+/// `deep=false`：只给旁路缓冲里已经记下的内容（`AgentManager::snapshot`，
+/// 逐字节复刻，不受 `agent_context` 那个「喂给模型用」的字节上限约束）。
+/// `deep=true`：额外探一遍该会话里的 tmux pane / docker 容器日志并追加在后面
+/// —— 这两步都是只读、尽力而为，探测失败不算错误，只是拿不到那一部分。
+///
+/// 会话不存在、或从未开启过旁路且深度探测也一无所获时返回空字符串，
+/// 而不是报错：「没有可导出的内容」本身就是一个合法答案。
+#[tauri::command]
+pub async fn agent_export_session(
+    session_id: String,
+    deep: bool,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    Ok(capture::export_session(&state, &session_id, deep)
+        .await
+        .unwrap_or_default())
+}
+
+/// 开一个新会话：本地 shell，或连到一个已保存的 SSH 主机，可选顺手跑一条命令。
+///
+/// 新会话 id 由后端铸造，成功后会发出 `nx://agent/session-opened/{origin_session_id}`，
+/// 前端据此为它接一个真正的标签页。`kind="ssh"` 时 `session_record_id` 必须指向
+/// 一个已保存的会话配置 —— 这里不接受调用方直接给主机/用户名/密码。
+#[tauri::command]
+pub async fn agent_open_session(
+    origin_session_id: String,
+    kind: String,
+    session_record_id: Option<String>,
+    label: String,
+    command: Option<String>,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let kind = match kind.as_str() {
+        "ssh" => {
+            let id = session_record_id
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| "kind=ssh 必须提供 session_record_id".to_string())?;
+            OpenKind::Ssh { session_record_id: id }
+        }
+        _ => OpenKind::Local,
+    };
+    let spec = OpenSpec { kind, label, command };
+    let outcome = act::open_session(&app, &state, &origin_session_id, spec)
+        .await
+        .map_err(err)?;
+    Ok(outcome.session_id)
 }
 
 // ——— 浮动独立窗口 ———

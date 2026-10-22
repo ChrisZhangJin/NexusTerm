@@ -15,6 +15,7 @@
 
 pub mod act;
 pub mod buffer;
+pub mod capture;
 pub mod cmd;
 pub mod danger;
 pub mod executor;
@@ -427,10 +428,9 @@ impl AgentManager {
         Some(buf.take_tail(max_bytes))
     }
 
-    /// 完整会话记录。当前没有命令在调用它 —— 保留是因为「查看完整上下文」
-    /// 这个 UI 入口（`AgentManager::context` 只给最近 N 字节）属于后续任务；
-    /// 它已被本模块的 `missing_session_reports_none` 单测覆盖。
-    #[allow(dead_code)]
+    /// 完整会话记录（`AgentManager::context` 只给最近 N 字节用于喂模型）。
+    /// 供 `agent::capture::export_session`（导出工具）与 `act::execute`
+    /// （对比执行前后差量）两处调用。
     pub fn snapshot(&self, session_id: &str) -> Option<String> {
         let guard = self.sessions.lock();
         let buf = guard.get(session_id)?;

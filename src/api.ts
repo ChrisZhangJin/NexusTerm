@@ -194,6 +194,32 @@ export const api = {
    */
   agentExec: (sessionId: string, command: string) =>
     invoke<AgentExecResult>("agent_exec", { sessionId, command }),
+  /**
+   * 导出一个会话迄今为止的全部输出（旁路缓冲的完整记录，不受「喂给模型」那个
+   * 字节上限约束）。`deep=true` 额外探一遍该会话里的 tmux / docker 现状。
+   * 没有可导出的内容时返回空字符串，不算错误。
+   */
+  agentExportSession: (sessionId: string, deep: boolean) =>
+    invoke<string>("agent_export_session", { sessionId, deep }),
+  /**
+   * 开一个新会话：本地 shell，或连到一个已保存的会话配置（`kind:"ssh"` 时必填
+   * `sessionRecordId`），可选顺手跑一条命令。成功后会收到
+   * `nx://agent/session-opened` 事件，前端据此接出一个真正的标签页。
+   */
+  agentOpenSession: (
+    originSessionId: string,
+    kind: "local" | "ssh",
+    sessionRecordId: string | null,
+    label: string,
+    command: string | null
+  ) =>
+    invoke<string>("agent_open_session", {
+      originSessionId,
+      kind,
+      sessionRecordId,
+      label,
+      command,
+    }),
 
   // ——— Console 自动补全 ———
 

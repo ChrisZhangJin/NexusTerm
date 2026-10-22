@@ -153,6 +153,8 @@ pub fn run() {
             agent::cmd::agent_run_cancel,
             agent::cmd::agent_approve,
             agent::cmd::agent_exec,
+            agent::cmd::agent_export_session,
+            agent::cmd::agent_open_session,
             agent::cmd::agent_open_window,
             agent::cmd::agent_close_window,
             agent::cmd::agent_window_open,
