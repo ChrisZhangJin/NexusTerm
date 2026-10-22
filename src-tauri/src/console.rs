@@ -435,6 +435,10 @@ Usage:\n  tool [flags]\n\nFlags:\n\t-v, --verbose\tverbose output\n\t-n, --numbe
     // 这里用一个临时脚本当替身，把整条 spawn 路径真跑一遍。
 
     /// 造一个会打印指定帮助正文的可执行脚本，返回它的路径
+    ///
+    /// 只在 unix 上可用：这里造的替身是 `#!/bin/sh` 脚本，Windows 直接 spawn
+    /// 一个 `.sh` 会失败 —— 那不是被测逻辑的问题，是平台没有这个执行入口。
+    #[cfg(unix)]
     fn write_fake_program(name: &str, body: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join("nx_console_probe");
         std::fs::create_dir_all(&dir).expect("临时目录应可创建");
@@ -449,6 +453,7 @@ Usage:\n  tool [flags]\n\nFlags:\n\t-v, --verbose\tverbose output\n\t-n, --numbe
         path
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn options_come_from_a_real_child_process() {
         let path = write_fake_program(
@@ -462,6 +467,7 @@ Usage:\n  tool [flags]\n\nFlags:\n\t-v, --verbose\tverbose output\n\t-n, --numbe
     }
 
     /// 帮助写在 stderr 里（很多自研工具就这么干）也要收得到
+    #[cfg(unix)]
     #[tokio::test]
     async fn help_written_to_stderr_is_collected() {
         let path = write_fake_program(
@@ -476,6 +482,7 @@ Usage:\n  tool [flags]\n\nFlags:\n\t-v, --verbose\tverbose output\n\t-n, --numbe
     }
 
     /// `--help` 没东西时退到 `-h`
+    #[cfg(unix)]
     #[tokio::test]
     async fn falls_back_to_short_h() {
         let path = write_fake_program(
