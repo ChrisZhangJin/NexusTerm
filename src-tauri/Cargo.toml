@@ -99,6 +99,8 @@ keyring = { version = "3", features = ["linux-native"] }
 #    连接永久挂起 —— 这是一整类企业堡垒机连不上的根因。
 [patch.crates-io]
 russh = { path = "vendor/russh" }
+# 修 lib.rs 里那个「出错不退出」的读循环：详见 vendor/russh-sftp/PATCHES.md
+russh-sftp = { path = "vendor/russh-sftp" }
 
 [profile.release]
 codegen-units = 1
