@@ -11,6 +11,7 @@ import {
 } from "../api";
 import { isAgentReady, useAgentConfig } from "../lib/agent";
 import { toFriendlyError } from "../lib/errors";
+import { enterVerdict, ImeGuard, isImeKey, keyInfoFrom } from "../lib/ime";
 import { matchSessions, scanMention } from "../lib/mention";
 import type {
   AgentApproveRequest,
@@ -246,6 +247,11 @@ export function AgentPanel({
   const [input, setInput] = useState("");
   /** 输入框。`@` 联想要在选中一项之后把光标放回原处，所以得拿得到它 */
   const taRef = useRef<HTMLTextAreaElement>(null);
+  /**
+   * 输入法状态。macOS(WKWebView) 上 `isComposing` 不可信 —— Safari 把
+   * compositionend 派发在确认回车的 keydown 之前，详见 `lib/ime.ts`。
+   */
+  const imeRef = useRef<ImeGuard>(new ImeGuard());
   const [err, setErr] = useState<string | null>(null);
   /**
    * 这一轮实际发起的会话。事件订阅挂在它上面，而**不跟随 sessionId** ——
@@ -730,10 +736,32 @@ export function AgentPanel({
               // 光标被方向键挪动后片段也会变，keyup / select 都要重新扫一次
               onKeyUp={(e) => refreshMention(input, e.currentTarget.selectionStart ?? 0)}
               onClick={(e) => refreshMention(input, e.currentTarget.selectionStart ?? 0)}
-              onBlur={() => setMention(null)}
+              onCompositionStart={() => imeRef.current.begin()}
+              onCompositionEnd={(e) => imeRef.current.finish(e.nativeEvent.timeStamp)}
+              onBlur={() => {
+                // 组合中被切走时 compositionend 不一定来，留着 true 会把之后所有回车都吞掉
+                imeRef.current.reset();
+                setMention(null);
+              }}
               onKeyDown={(e) => {
+                const info = keyInfoFrom(e);
+                const guard = imeRef.current;
+
+                // 输入法正在处理这一个键。注意这里连上下键一起挡：拼音组合中
+                // 上下键是在选候选词，联想列表若同时移动，一次选词就会顺手
+                // 改掉「要发给谁」。回车更不能当成发送。
+                if (isImeKey(info, guard)) return;
+
+                const verdict = enterVerdict(info, guard);
+                if (verdict === "ime-after-commit") {
+                  // 组合刚结束的兜底窗口。这一下若其实是真回车（只是手快），
+                  // 拦掉默认行为至少不会往输入框里多塞一个换行。
+                  e.preventDefault();
+                  return;
+                }
+
                 const m = mention;
-                if (m && !e.nativeEvent.isComposing) {
+                if (m) {
                   if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                     e.preventDefault();
                     setMention({
@@ -757,8 +785,8 @@ export function AgentPanel({
                     return;
                   }
                 }
-                // isComposing：中文输入法选词时的回车不能被当成发送
-                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                // 输入法的确认回车已经在上面的 verdict 里排除了
+                if (verdict === "send") {
                   e.preventDefault();
                   void send();
                 }
@@ -866,6 +894,28 @@ function SuggestionCard({
 function StepCard({ step }: { step: AgentStep }) {
   if (step.kind === "note") {
     return <div className="ap-note">{step.text ?? ""}</div>;
+  }
+  // `open` / `export` 不是「跑了一条命令」，没有 command / output。
+  // 之前它们掉进下面那张执行卡里，就成了一个永远「执行中」的空框 ——
+  // 用户看到的是「卡住了」，而实际上新标签页可能已经开出来了。
+  if (step.kind === "open" || step.kind === "export" || step.kind === "tab") {
+    const isOpen = step.kind === "open";
+    const isTab = step.kind === "tab";
+    return (
+      <div className="ap-step">
+        <div className="ap-step-head">
+          <span className="ap-step-tag">
+            {isTab ? "标签页" : isOpen ? "新会话" : "导记录"}
+          </span>
+          {step.targetLabel ? (
+            <span className="ap-step-where" title={step.target}>
+              {step.targetLabel}
+            </span>
+          ) : null}
+        </div>
+        <div className="ap-step-why">{step.text ?? ""}</div>
+      </div>
+    );
   }
   if (step.kind === "skip") {
     return (

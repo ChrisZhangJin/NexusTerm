@@ -30,6 +30,8 @@ import {
   worthAsking,
 } from "../../src/lib/complete";
 import { matchSessions, scanMention } from "../../src/lib/mention";
+import { shouldResyncKeyDownSeen } from "../../src/lib/macInput";
+import { COMMIT_WINDOW_MS, ImeGuard, enterVerdict, isImeKey, keyInfoFrom, type KeyLike } from "../../src/lib/ime";
 import { GhostText, cursorFollowsTyped } from "../../src/lib/ghost";
 import type { CmdOption } from "../../src/types";
 
@@ -403,9 +405,12 @@ test("cursorFollowsTyped：光标紧贴刚敲的那半行 → 可以重画", () 
   assert.equal(cursorFollowsTyped(t as never, "ta"), true);
 });
 
-test("cursorFollowsTyped：光标还没走到末尾 → 不能重画", () => {
+test("cursorFollowsTyped：回显只到前缀（滞后一字符）→ 仍算同一输入行", () => {
+  // 本地已敲 "ta"，屏幕上只回显到 "t"。这是 SSH 的常态（回显晚一个往返）。
+  // 90bdff8 把判据从「整段结尾匹配」放宽成「前缀匹配」，就是为了让这种滞后
+  // 不被误判成"命令输出已经顶掉输入行"，否则灰字每按一键闪两次。
   const t = mockTerm("user@host:~$ ta", 14);
-  assert.equal(cursorFollowsTyped(t as never, "ta"), false);
+  assert.equal(cursorFollowsTyped(t as never, "ta"), true);
 });
 
 test("cursorFollowsTyped：真的输出来了（命令行已被顶掉）→ 不能重画", () => {
@@ -481,4 +486,218 @@ test("端到端：acceptHint 之后行状态与终端内容一致", () => {
 
   // 整条打完 → 不再提示自己
   assert.deepEqual(buildCompletions(id, "kubectl get pods -A", []), []);
+});
+
+// ——— macOS 丢字修复：beforeinput 复位判定 ———
+//
+// 这段判定如果放得太宽（例如不排除输入法组合），会把中文上屏搅乱；
+// 放得太窄又修不好丢字。所以四个维度各钉一条。
+
+test("mac 丢字：普通字符的 composed insertText 要复位", () => {
+  assert.equal(
+    shouldResyncKeyDownSeen({
+      composed: true,
+      data: "b",
+      inputType: "insertText",
+      isComposing: false,
+    }),
+    true
+  );
+});
+
+test("mac 丢字：输入法组合中的字符绝不能碰", () => {
+  assert.equal(
+    shouldResyncKeyDownSeen({
+      composed: true,
+      data: "中",
+      inputType: "insertText",
+      isComposing: true,
+    }),
+    false
+  );
+});
+
+test("mac 丢字：粘贴（insertFromPaste）不归它管", () => {
+  assert.equal(
+    shouldResyncKeyDownSeen({
+      composed: true,
+      data: "ls -la",
+      inputType: "insertFromPaste",
+      isComposing: false,
+    }),
+    false
+  );
+});
+
+test("mac 丢字：非 composed 事件不碰（那是正常 keydown 路径）", () => {
+  assert.equal(
+    shouldResyncKeyDownSeen({
+      composed: false,
+      data: "a",
+      inputType: "insertText",
+      isComposing: false,
+    }),
+    false
+  );
+});
+
+test("mac 丢字：空 data（删除等）不碰", () => {
+  assert.equal(
+    shouldResyncKeyDownSeen({
+      composed: true,
+      data: null,
+      inputType: "insertText",
+      isComposing: false,
+    }),
+    false
+  );
+  assert.equal(
+    shouldResyncKeyDownSeen({
+      composed: true,
+      data: "",
+      inputType: "insertText",
+      isComposing: false,
+    }),
+    false
+  );
+});
+
+// ——— 输入法确认回车 vs 发送 ———
+// 这一组对应 macOS 上的真实故障：打拼音按回车选词，消息被直接发出去了。
+
+/** 造一个键盘事件；默认是「普通的裸回车」 */
+const key = (over: Partial<KeyLike> = {}): KeyLike => ({
+  key: "Enter",
+  shiftKey: false,
+  isComposing: false,
+  keyCode: 13,
+  timeStamp: 1000,
+  ...over,
+});
+
+test("Safari 顺序：compositionend 先到，确认回车仍不能被当成发送", () => {
+  const g = new ImeGuard();
+  g.begin();
+  g.finish(1000); // Safari 先派发这个
+  // 随后才派发 keydown：此时 isComposing 已被清成 false（这就是原 bug 的成因）
+  const v = enterVerdict(key({ isComposing: false, keyCode: 229, timeStamp: 1000.4 }), g);
+  assert.equal(v, "ime");
+  assert.notEqual(v, "send");
+});
+
+test("Chrome 顺序：keydown 带 isComposing=true", () => {
+  const g = new ImeGuard();
+  g.begin();
+  assert.equal(enterVerdict(key({ isComposing: true, keyCode: 229 }), g), "ime");
+});
+
+test("keydown 先于 compositionend：靠组合状态兜住", () => {
+  const g = new ImeGuard();
+  g.begin(); // 组合已开始，end 还没来
+  assert.equal(enterVerdict(key({ isComposing: false, keyCode: 13 }), g), "ime");
+});
+
+test("个别输入法不给 229：组合刚结束的窗口内也要拦", () => {
+  const g = new ImeGuard();
+  g.begin();
+  g.finish(1000);
+  assert.equal(enterVerdict(key({ keyCode: 13, timeStamp: 1005 }), g), "ime-after-commit");
+});
+
+test("Safari 的时间戳可能倒挂（keydown 早于 compositionend），用绝对值照样能拦", () => {
+  const g = new ImeGuard();
+  g.begin();
+  g.finish(1000);
+  assert.equal(enterVerdict(key({ keyCode: 13, timeStamp: 996 }), g), "ime-after-commit");
+});
+
+test("窗口之外的真回车必须放行，不能永久吞掉回车", () => {
+  const g = new ImeGuard();
+  g.begin();
+  g.finish(1000);
+  assert.equal(enterVerdict(key({ timeStamp: 1000 + COMMIT_WINDOW_MS }), g), "send");
+  assert.equal(enterVerdict(key({ timeStamp: 1000 + COMMIT_WINDOW_MS + 1 }), g), "send");
+});
+
+test("229 只挡那一下：紧接着的真回车仍然能发送", () => {
+  const g = new ImeGuard();
+  g.begin();
+  g.finish(1000);
+  // 确认键
+  assert.equal(enterVerdict(key({ keyCode: 229, timeStamp: 1000.2 }), g), "ime");
+  // 人再按一次回车（隔了一会儿）
+  assert.equal(enterVerdict(key({ timeStamp: 1600 }), g), "send");
+});
+
+test("从来没组合过：回车就是回车", () => {
+  const g = new ImeGuard();
+  assert.equal(enterVerdict(key(), g), "send");
+});
+
+test("Shift+Enter 与其它键一律交给浏览器", () => {
+  const g = new ImeGuard();
+  assert.equal(enterVerdict(key({ shiftKey: true }), g), "pass");
+  assert.equal(enterVerdict(key({ key: "a", keyCode: 65 }), g), "pass");
+  // 组合中按 Shift+Enter 也不该被我们拦成「确认」
+  g.begin();
+  assert.equal(enterVerdict(key({ shiftKey: true, isComposing: true }), g), "pass");
+});
+
+test("失焦 reset 之后不会把之后所有回车都吞掉", () => {
+  const g = new ImeGuard();
+  g.begin(); // 组合中被切走，compositionend 没来
+  g.reset();
+  assert.equal(g.isComposing, false);
+  assert.equal(enterVerdict(key({ timeStamp: 5000 }), g), "send");
+});
+
+test("中文输入全过程模拟：打字 → 空格选词 → 回车发送", () => {
+  const g = new ImeGuard();
+  // 敲 nihao 拼音：组合开始
+  g.begin();
+  // 空格选字：组合结束
+  g.finish(2000);
+  // 人回过神来按回车发送（远超窗口）
+  assert.equal(enterVerdict(key({ timeStamp: 2600 }), g), "send");
+});
+
+test("React 的 keyCode 归一化成 0 时，要从 nativeEvent 里取到 229", () => {
+  const info = keyInfoFrom({
+    key: "Enter",
+    shiftKey: false,
+    keyCode: 0, // React 合成事件在某些版本里就是这样
+    nativeEvent: { isComposing: false, keyCode: 229, timeStamp: 1200 },
+  });
+  assert.equal(info.keyCode, 229);
+  assert.equal(info.timeStamp, 1200, "时间戳必须取 nativeEvent 的，否则窗口算错");
+
+  const g = new ImeGuard();
+  g.begin();
+  g.finish(1200);
+  assert.equal(enterVerdict(info, g), "ime");
+});
+
+test("合成事件没给 keyCode 也能正常发送", () => {
+  const info = keyInfoFrom({
+    key: "Enter",
+    shiftKey: false,
+    nativeEvent: { isComposing: false, keyCode: 13, timeStamp: 9000 },
+  });
+  assert.equal(enterVerdict(info, new ImeGuard()), "send");
+});
+
+test("拼音组合中的上下键是在选候选词，不能连带挪动 @ 联想列表", () => {
+  const g = new ImeGuard();
+  g.begin();
+  // 组合中：任何键都被输入法占用
+  assert.equal(isImeKey(key({ key: "ArrowDown", keyCode: 40 }), g), true);
+  assert.equal(isImeKey(key({ key: "ArrowUp", keyCode: 38 }), g), true);
+  // 组合结束后：方向键交回界面
+  g.finish(1000);
+  assert.equal(isImeKey(key({ key: "ArrowDown", keyCode: 40, timeStamp: 1400 }), g), false);
+});
+
+test("229 也代表输入法占用（不只回车）", () => {
+  const g = new ImeGuard();
+  assert.equal(isImeKey(key({ key: "ArrowDown", keyCode: 229 }), g), true);
 });

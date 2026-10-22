@@ -43,6 +43,7 @@ import {
 } from "../api";
 import { themeToXterm } from "../lib/theme";
 import { isMacOS } from "../lib/platform";
+import { installMacInputGuard } from "../lib/macInput";
 import { attachZmodem, type ZmodemGate } from "../lib/zmodem";
 import type { ClosedInfo, TerminalTab, Theme } from "../types";
 
@@ -439,6 +440,9 @@ export default function TerminalView({
     term.open(host);
     // 必须在 open() 之后：SelectionService 是 open() 里才创建的
     patchShiftSelection(term);
+    // macOS(WKWebView) 上 beforeinput 早于 keydown，xterm 会把真实输入误判为重复
+    // 而丢掉；这里只在 mac 上把那个去重标志复位（详见 lib/macInput）。
+    const unMacInput = installMacInputGuard(term, isMacOS());
     termRef.current = term;
     fitRef.current = fit;
     const hl = new Highlighter(term);
@@ -684,6 +688,7 @@ export default function TerminalView({
       ro.disconnect();
       dataSub.dispose();
       binSub.dispose();
+      unMacInput();
       cleanups.forEach((f) => f());
       term.dispose();
       termRef.current = null;
