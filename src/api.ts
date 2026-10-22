@@ -8,6 +8,8 @@ import type {
   AgentExecResult,
   AgentRunRequest,
   AgentStep,
+  AgentTabInfo,
+  AgentTabRequest,
   AuthPrompt,
   ClosedInfo,
   CmdOption,
@@ -186,6 +188,18 @@ export const api = {
    */
   agentApprove: (requestId: string, approved: boolean) =>
     invoke<boolean>("agent_approve", { requestId, approved }),
+  /**
+   * 回执一次标签页动作。
+   *
+   * 后端在等这句话：不回，它就只能当成「没办成」—— 而那个判断会被喂给模型。
+   * `tabs` 只在 list 时有意义。返回 false 表示请求已超时被丢弃，不是错误。
+   */
+  agentTabAck: (
+    requestId: string,
+    ok: boolean,
+    detail?: string,
+    tabs?: AgentTabInfo[]
+  ) => invoke<boolean>("agent_tab_ack", { requestId, ok, detail, tabs }),
   /**
    * 不经模型、直接在会话里跑一条命令并拿回结果。
    *
@@ -366,6 +380,20 @@ export async function onAgentApprove(
   return listen<AgentApproveRequest>(`nx://agent/approve/${id}`, (ev) =>
     handler(ev.payload)
   );
+}
+
+/**
+ * Agent 要对标签页动手（列出 / 切换 / 关闭 / 改名 / 重连）。
+ *
+ * 这是唯一一类**必须由前端执行**的动作：tab 是 React state，后端不知道它存在。
+ * 处理完务必 `api.agentTabAck(...)`，后端在等回执。
+ *
+ * 全局事件（不分会话）：标签页是整个窗口的东西，不是某个会话的私产。
+ */
+export async function onAgentTab(
+  handler: (req: AgentTabRequest) => void
+): Promise<UnlistenFn> {
+  return listen<AgentTabRequest>("nx://agent/tab", (ev) => handler(ev.payload));
 }
 
 /**

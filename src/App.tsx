@@ -15,7 +15,7 @@ import {
 } from "./components/SettingsDialogs";
 import KeyManagerDialog from "./components/KeyManagerDialog";
 import AuthPromptDialog from "./components/AuthPromptDialog";
-import { api, onAuthPrompt, stringToBytes } from "./api";
+import { api, onAuthPrompt, onAgentTab, stringToBytes } from "./api";
 import { loadAgentConfig } from "./lib/agent";
 import {
   parseProbe,
@@ -45,6 +45,8 @@ import { BUILTIN_THEMES, DEFAULT_THEME, FONT_FAMILIES } from "./lib/theme";
 import { applyChromeVars } from "./lib/chrome";
 import { formatCombo, getPrefs, setPrefs, useShortcuts } from "./lib/prefs";
 import type {
+  AgentTabInfo,
+  AgentTabRequest,
   AgentTarget,
   AuthMethod,
   AuthPrompt,
@@ -285,6 +287,9 @@ export default function App() {
   // 异步流程（重连循环、连接回调）里要读最新值，用 ref 桥接
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
+  /** 同上：Agent 的 tab 动作在下发时才读「哪个标签是当前的」，不能闭包捕获旧值 */
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
   /** 每个标签当前重连循环的取消开关 */
@@ -895,6 +900,97 @@ export default function App() {
   useEffect(() => {
     void api.agentWindowOpen().then(setAgentFloated).catch(() => {});
   }, []);
+
+  /**
+   * Agent 下发的标签页动作（`nx-exec` 的 `tab` 动作）。
+   *
+   * 只能在这里落地：tab 是 React state，后端连「开着几个标签页」都不知道，
+   * 它只负责把动作转过来。后端在等回执（3 秒超时，超时会被记成「未确认」），
+   * 所以**每条分支都必须 ack**，失败也要说清楚为什么 —— 静默就是上次那种
+   * 「它说了要做，然后没有然后」。
+   *
+   * 关闭走的是 `closeTabNow`：用户选了「直接执行，面板留痕」，
+   * 不再弹确认框，但步骤卡里会写明关了哪一个。
+   */
+  const handleAgentTab = useCallback(
+    async (req: AgentTabRequest) => {
+      const ack = (ok: boolean, detail: string, list?: AgentTabInfo[]) =>
+        api.agentTabAck(req.requestId, ok, detail, list).catch(() => false);
+      const now = tabsRef.current;
+      const nameOf = (t: TerminalTab) => t.customTitle || t.title || t.id;
+      const toInfo = (t: TerminalTab): AgentTabInfo => ({
+        id: t.id,
+        title: nameOf(t),
+        kind: t.local ? "local" : "ssh",
+        status: t.status,
+        active: t.id === activeTabRef.current,
+      });
+
+      if (req.op === "list") {
+        const list = now.map(toInfo);
+        await ack(true, `当前共 ${list.length} 个标签页`, list);
+        return;
+      }
+
+      const target = now.find((t) => t.id === req.target);
+      if (!target) {
+        await ack(false, `没有 id 为「${req.target ?? "（空）"}」的标签页`);
+        return;
+      }
+
+      switch (req.op) {
+        case "focus":
+          setActiveTab(target.id);
+          await ack(true, `已切到「${nameOf(target)}」`);
+          return;
+        case "rename": {
+          const name = (req.name ?? "").trim();
+          if (!name) {
+            await ack(false, "新名字为空");
+            return;
+          }
+          const before = nameOf(target);
+          patchTab(target.id, { customTitle: name });
+          await ack(true, `已把「${before}」改名为「${name}」`);
+          return;
+        }
+        case "close": {
+          // 与后端同一条护栏：关掉它等于把 Agent 自己的会话也收了
+          if (target.id === req.sessionId) {
+            await ack(false, "不能关闭 Agent 自己所在的标签页");
+            return;
+          }
+          const name = nameOf(target);
+          closeTabNow(target.id);
+          await ack(true, `已关闭「${name}」及其中的进程`);
+          return;
+        }
+        case "reconnect": {
+          if (target.local) {
+            await ack(false, "本地终端不需要重连，只能关掉重开");
+            return;
+          }
+          if (target.status === "connected" || target.status === "connecting") {
+            await ack(false, `「${nameOf(target)}」当前是 ${target.status}，不需要重连`);
+            return;
+          }
+          void reconnect(target.id, false);
+          await ack(true, `已开始重连「${nameOf(target)}」`);
+          return;
+        }
+        default:
+          await ack(false, `不认识的操作：${req.op}`);
+      }
+    },
+    [closeTabNow, patchTab, reconnect]
+  );
+
+  useEffect(() => {
+    const un = onAgentTab((req) => {
+      void handleAgentTab(req);
+    });
+    return () => void un.then((f) => f());
+  }, [handleAgentTab]);
 
   const saveSession = useCallback(
     async (payload: NewSession, password: string, passphrase: string | null) => {

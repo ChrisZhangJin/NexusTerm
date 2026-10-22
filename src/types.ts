@@ -346,7 +346,7 @@ export interface AgentRunRequest {
  * 扁平结构在 TS 侧写起来更省事，渲染时也不用写一堆类型收窄。
  */
 export interface AgentStep {
-  /** plan | exec | result | skip | note | answer */
+  /** plan | exec | result | skip | note | answer | open | export | tab */
   kind: string;
   step: number;
   target?: string;
@@ -365,6 +365,34 @@ export interface AgentApproveRequest {
   target: string;
   targetLabel: string;
   reasons: string[];
+}
+
+/**
+ * `nx://agent/tab/{sessionId}` 的载荷：请前端动一下标签页。
+ *
+ * 后端没有 tab 这个概念（它只知道 pty / ssh 连接），所以这不是「执行」，
+ * 是「转达」。办完必须回一句 `agentTabAck`，否则后端只能当成没办成。
+ */
+export interface AgentTabRequest {
+  requestId: string;
+  /** 发起这次操作的会话，只为定位来源 */
+  sessionId: string;
+  /** list | focus | close | rename | reconnect */
+  op: string;
+  /** 中文说法，直接可以拿去展示 */
+  opLabel: string;
+  target?: string;
+  name?: string;
+}
+
+/** 一个标签页的对外视图（回执里的清单） */
+export interface AgentTabInfo {
+  id: string;
+  title: string;
+  /** local | ssh */
+  kind: string;
+  status: string;
+  active: boolean;
 }
 
 /** `agent_run` 在 UI 上的两种叫法 */

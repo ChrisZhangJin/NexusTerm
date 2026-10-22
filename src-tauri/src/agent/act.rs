@@ -64,6 +64,10 @@ const MAX_STEPS: usize = 8;
 /// 单一步骤里最多允许多少个动作（防止模型一口气吐出五十条命令）。
 const MAX_ACTIONS: usize = 12;
 
+/// 动作块解析不出来时，最多再让模型改几次。
+/// 一次足够它纠正格式；再多就是拿步数上限当儿戏了。
+const MAX_MISFIRE_RETRY: usize = 1;
+
 /// 人工审批的最长等待。超时按「拒绝」处理。
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -107,16 +111,57 @@ pub struct AgentRunRequest {
     pub console_alt: bool,
 }
 
-/// 模型下发的一个动作。三选一：
+/// 模型下发的一个动作。四选一：
 ///
 /// - `Exec`：在某个会话上跑一条命令（原有能力）。
 /// - `Export`：把某个会话迄今为止的全部输出要回来（`agent::capture`）。
 /// - `Open`：开一个新会话（本地或某个已保存的 SSH 主机），可选顺手发一条命令。
+/// - `Tab`：操作窗口上的标签页（列出 / 切换 / 关闭 / 改名 / 重连）。
+///
+/// `Tab` 与前三者有个本质区别：**它不由后端执行**。tab 是前端 React state，
+/// 后端连「用户开了几个标签页」都不知道；这里只把动作转成一个事件，等前端回执。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentAction {
     Exec { target: Option<String>, command: String },
     Export { target: Option<String>, deep: bool },
     Open { kind: OpenKind, label: Option<String>, command: Option<String> },
+    Tab { op: TabOp, target: Option<String>, name: Option<String> },
+}
+
+/// 对标签页能做些什么。
+///
+/// `List` 是其余几个的前提：模型得先知道有哪些 tab、各自 id 是什么，
+/// 才谈得上「切到那个跑着 vim 的」或「把卡住的那个关掉」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabOp {
+    List,
+    Focus,
+    Close,
+    Rename,
+    Reconnect,
+}
+
+impl TabOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Focus => "focus",
+            Self::Close => "close",
+            Self::Rename => "rename",
+            Self::Reconnect => "reconnect",
+        }
+    }
+
+    /// 给人看的中文说法，出现在步骤卡与喂回模型的反馈里。
+    fn label(self) -> &'static str {
+        match self {
+            Self::List => "列出标签页",
+            Self::Focus => "切换标签页",
+            Self::Close => "关闭标签页",
+            Self::Rename => "重命名标签页",
+            Self::Reconnect => "重连标签页",
+        }
+    }
 }
 
 /// `Open` 动作的目标：本地新开一个 shell，还是连到一个已保存的 SSH 主机。
@@ -157,7 +202,13 @@ struct ExecBlock {
     session_record_id: Option<String>,
     /// `open` 专用：新标签页的展示名。
     #[serde(default)]
-    label: Option<String>,
+    pub label: Option<String>,
+    /// `tab` 专用：`list` | `focus` | `close` | `rename` | `reconnect`
+    #[serde(default)]
+    op: Option<String>,
+    /// `tab` + `op:"rename"` 专用：新名字。
+    #[serde(default)]
+    name: Option<String>,
 }
 
 // ——————————————————————————————— 事件载荷 ———————————————————————————————
@@ -224,6 +275,58 @@ pub struct ExecResult {
     pub reason: ExecEnd,
 }
 
+/// `nx://agent/tab` 的载荷：请前端动一下标签页。
+///
+/// 后端**没有** tab 这个概念，所以这不是「执行」，是「转达」。
+/// `request_id` 是回执的凭据：前端办完（或办不成）都要带着它回一句话，
+/// 否则后端永远分不清「办好了」和「消息丢了」。
+///
+/// 事件名是**全局**的（不带 session 后缀）：标签页属于整个窗口，
+/// 不是某个会话的私产；而 tab 的创建 / 关闭又只发生在前端，
+/// 让每个会话各挂一个监听反而更容易漏。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabRequest {
+    pub request_id: String,
+    /// 发起这次操作的会话（只为定位来源，执行时不看它）
+    pub session_id: String,
+    pub op: &'static str,
+    pub op_label: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// 前端回执。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabReply {
+    pub ok: bool,
+    /// 一句人话：办成了什么 / 为什么没办成。
+    #[serde(default)]
+    pub detail: String,
+    /// 仅 `list` 有意义：当前所有标签页。
+    #[serde(default)]
+    pub tabs: Vec<TabInfo>,
+}
+
+/// 一个标签页的对外视图。给模型看，也给用户看。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabInfo {
+    pub id: String,
+    pub title: String,
+    /// `local` | `ssh`
+    #[serde(default)]
+    pub kind: String,
+    /// `connected` | `connecting` | `closed` | `error` …
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub active: bool,
+}
+
 fn emit_step(app: &AppHandle, session: &str, payload: StepPayload) {
     let _ = app.emit(&format!("nx://agent/step/{session}"), payload);
 }
@@ -270,16 +373,46 @@ pub fn extract_actions(text: &str) -> Vec<AgentAction> {
     out
 }
 
-/// 解析一个块。JSON 坏了就返回空 —— **宁可什么都不做，也不要猜**。
+/// 解析一个块。
+///
+/// 先按约定试 JSON；不是 JSON 就走 shell 兜底（见 `parse_raw_shell`）。
+/// 以前这里 JSON 一失败就返回空，结果是最糟的一种失败：围栏明明写着 `nx-exec`，
+/// 界面上却什么都没发生 —— 用户只看到模型自说自话，以为它卡住了。
 fn parse_block(raw: &str) -> Vec<AgentAction> {
-    let Ok(block) = serde_json::from_str::<ExecBlock>(raw.trim()) else {
-        return Vec::new();
-    };
-    match block.action.as_deref().unwrap_or("exec") {
-        "export" => parse_export(block),
-        "open" => parse_open(block).into_iter().collect(),
-        _ => parse_exec(block),
+    match serde_json::from_str::<ExecBlock>(raw.trim()) {
+        Ok(block) => match block.action.as_deref().unwrap_or("exec") {
+            "export" => parse_export(block),
+            "open" => parse_open(block).into_iter().collect(),
+            "tab" => parse_tab(block).into_iter().collect(),
+            _ => parse_exec(block),
+        },
+        Err(_) => parse_raw_shell(raw),
     }
+}
+
+/// 围栏里直接写了一段 shell —— 模型最常犯的协议错误（终端场景下它的先验就是
+/// 「命令写进代码块」）。
+///
+/// 围栏写成 `nx-exec` 本身就是「请执行」的明确信号，所以照执行；但以 `{` / `[`
+/// 开头说明它是想写 JSON 却写坏了，这时**绝不**退化成 shell：否则
+/// `{"target":"s1","command": "ls` 这半截会被原样敲进终端。
+fn parse_raw_shell(raw: &str) -> Vec<AgentAction> {
+    let head = raw.trim_start();
+    if head.starts_with('{') || head.starts_with('[') {
+        return Vec::new();
+    }
+    raw.lines()
+        .filter_map(|line| {
+            let cmd = line.trim();
+            // 模型常顺手把提示符一起抄进来（`$ uptime`），那不是命令的一部分
+            let cmd = cmd.strip_prefix("$ ").unwrap_or(cmd);
+            // 空行和注释不是动作；注释尤其不能发 —— 敲进终端只是白占一行
+            if cmd.is_empty() || cmd.starts_with('#') {
+                return None;
+            }
+            Some(AgentAction::Exec { target: None, command: cmd.to_string() })
+        })
+        .collect()
 }
 
 /// `action:"exec"`（或没写 action，向后兼容旧协议）。
@@ -343,6 +476,32 @@ fn parse_open(block: ExecBlock) -> Option<AgentAction> {
     Some(AgentAction::Open { kind, label: block.label, command: block.command })
 }
 
+/// `action:"tab"`：操作标签页。
+///
+/// 参数不全就**不产生动作**，而不是产出一个半成品让执行层去兜 ——
+/// 缺 target 的 close 是没法「尽量做」的。丢弃后主循环会因为「有围栏却 0 动作」
+/// 给出一张可见的提示卡，不会静默。
+fn parse_tab(block: ExecBlock) -> Option<AgentAction> {
+    let op = match block.op.as_deref()?.trim() {
+        "list" => TabOp::List,
+        "focus" | "switch" | "switchTo" => TabOp::Focus,
+        "close" => TabOp::Close,
+        "rename" => TabOp::Rename,
+        "reconnect" | "reopen" => TabOp::Reconnect,
+        _ => return None,
+    };
+    let target = block.target.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    // 只有 list 不需要指名道姓
+    if op != TabOp::List && target.is_none() {
+        return None;
+    }
+    let name = block.name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    if op == TabOp::Rename && name.is_none() {
+        return None;
+    }
+    Some(AgentAction::Tab { op, target, name })
+}
+
 /// 校验一条命令能不能下发。返回可读的拒绝理由。
 ///
 /// 拒绝换行是这里最重要的一条：一次注入一串操作会让「逐步审批」彻底失效 ——
@@ -369,16 +528,25 @@ pub fn reject_command(cmd: &str) -> Option<&'static str> {
 /// 只有一个 Agent：问答和执行是它自己判断的事，不再由用户先选模式。
 /// 这里必须把协议、边界、「什么时候该停」以及**抓取 skill** 讲得毫不含糊 ——
 /// 说不清楚的话，模型要么在「再查一条」上无限打转，要么隔着全屏程序瞎猜。
-pub const AGENTIC_SYSTEM_PROMPT: &str = concat!(
+pub const AGENTIC_SYSTEM_PROMPT_INTRO: &str = concat!(
     "你是 NexusTerm 的终端 Agent，可以直接在用户的终端会话里执行命令、",
     "导出会话的完整记录、甚至开一个新会话。",
     "用户会给出若干个会话及其最近输出记录，其中 `$ ` 开头的是人敲进去的命令，",
-    "其余是程序输出（已剥离 ANSI 转义）。\n\n",
+    "其余是程序输出（已剥离 ANSI 转义）。"
+);
+
+/// 动作协议本身。
+///
+/// 刻意抽成独立常量并被**两条路径共用**（内置提示词 / 用户自定义提示词）：
+/// 之前自定义路径用的是压缩版说明，结果用户的提示词里写着「只给结论与必要命令」，
+/// 模型就真把 shell 直接抄进围栏 —— 协议写歪了，界面上什么都不发生。
+pub const ACTION_PROTOCOL: &str = concat!(
     "【要执行命令时】在回复里写且只写这样一个围栏代码块（不写 action 等同 \"exec\"）：\n",
     "```nx-exec\n{\"action\":\"exec\",\"target\":\"<会话id>\",\"command\":\"<命令>\"}\n```\n",
     "一次要对多台机器发同一批命令时，用 targets / commands 两个数组：\n",
     "```nx-exec\n{\"action\":\"exec\",\"targets\":[\"id1\",\"id2\"],\"commands\":[\"uptime\",\"df -h\"]}\n```\n",
-    "不写 target 表示落到用户当前所在的会话。\n\n",
+    "不写 target 表示落到用户当前所在的会话。",
+    "围栏里**只放那一行 JSON**：直接抄一段 shell 虽然也能跑，但 target 就丢了。\n\n",
     "【要导出一个会话的完整记录时】用 export 动作，而不是自己拼 tmux/docker 命令去凑：\n",
     "```nx-exec\n{\"action\":\"export\",\"target\":\"<会话id>\",\"deep\":true}\n```\n",
     "`deep:true` 会额外探一遍该会话里的 tmux pane 与 docker 容器日志，",
@@ -388,7 +556,20 @@ pub const AGENTIC_SYSTEM_PROMPT: &str = concat!(
     "连到一个用户已经保存好的 SSH 主机（必须给出已存在的会话配置 id，",
     "**不能自己编一个主机/用户名/密码**，你也看不到密码本身）：\n",
     "```nx-exec\n{\"action\":\"open\",\"kind\":\"ssh\",\"sessionRecordId\":\"<已保存的会话配置id>\",\"label\":\"db-01\"}\n```\n",
-    "`command` 可省略（只开不发），开成功后用户的界面上会真的多出一个标签页。\n\n",
+    "`command` 可省略（只开不发），开成功后用户的界面上会真的多出一个标签页。\n",
+    "**「开一个窗口」就是指这个 open 动作**：不要用 `open -a Terminal`、`osascript`、",
+    "`gnome-terminal`、`wt` 之类的命令去启动系统终端应用 —— 那会在本应用之外弹出",
+    "一个与 NexusTerm 毫无关系的窗口，用户要的并不是它。open 失败就如实说明原因，",
+    "不要换成系统命令硬绕，也不要在没执行的情况下说「已打开」。\n\n",
+    "【要操作标签页（tab）时】用 tab 动作 —— 标签页是界面上的东西，", 
+    "**没有任何 shell 命令能操作它**，别试着用命令绕：\n",
+    "```nx-exec\n{\"action\":\"tab\",\"op\":\"list\"}\n```\n",
+    "`op` 取值：`list`（列出所有标签页，**先做这个拿到 id**）、`focus`（切过去）、",
+    "`close`（关掉，里面的程序会被结束）、`rename`（配 `name` 改名）、",
+    "`reconnect`（SSH 断线后重连）。后四个都要带 `target`：\n",
+    "```nx-exec\n{\"action\":\"tab\",\"op\":\"focus\",\"target\":\"<标签页id>\"}\n```\n",
+    "```nx-exec\n{\"action\":\"tab\",\"op\":\"rename\",\"target\":\"<标签页id>\",\"name\":\"<新名字>\"}\n```\n",
+    "标签页 id 与 exec 的 target 是同一套会话 id。你**不能**关闭自己所在的那个标签页。\n\n",
     "【规则】\n",
     "1) exec 的 command 必须是**单条单行**命令，不许用换行或 && 串联互不相关的操作；",
     "需要分几步就分几轮，每轮都会收到上一条的真实输出；\n",
@@ -400,7 +581,11 @@ pub const AGENTIC_SYSTEM_PROMPT: &str = concat!(
     "5) 不要执行不可逆操作（rm -rf、mkfs、DROP、chmod -R 777、把未知脚本管道给 shell 等），",
     "除非用户在这一轮对话里明确要求；开新会话同理要有明确理由，不要为了好奇心乱开；\n",
     "6) 已经查清楚就不要再查了：直接用中文给出结论，说明依据与必要的后续建议；\n",
-    "7) 记录缺失或被截断就直说看不到，不要臆测终端里发生过什么。\n\n",
+    "7) 记录缺失或被截断就直说看不到，不要臆测终端里发生过什么。"
+);
+
+/// 全屏程序（tmux / docker / 分页器）里抓真实输出时的退路。
+const OUTPUT_SKILL_TIPS: &str = concat!(
     "【输出抓取 skill（export 工具的退路）】当记录看起来被全屏程序接管、看不到真实输出时",
     "（tmux / screen / docker attach / less / vim 等），优先用上面的 export + deep:true；",
     "如果它抓到的 pane 不是你想要的那个，再退回手动只读命令自己定位：\n",
@@ -412,6 +597,16 @@ pub const AGENTIC_SYSTEM_PROMPT: &str = concat!(
     "让它重跑一遍并落到文件（`<命令> > /tmp/nx.out 2>&1; tail -200 /tmp/nx.out`）比试图翻页可靠。\n",
     "抓到的真实内容才是判断依据。"
 );
+
+/// 内置的 agentic 系统提示词：介绍 + 完整协议 + 抓取技巧。
+///
+/// 用函数而不是 `const`：`concat!` 只吃字面量，拼不进上面两个常量；
+/// 而**共用同一份协议文本**才是这里真正重要的事。
+pub fn agentic_system_prompt() -> String {
+    format!(
+        "{AGENTIC_SYSTEM_PROMPT_INTRO}\n\n{ACTION_PROTOCOL}\n\n{OUTPUT_SKILL_TIPS}"
+    )
+}
 
 // ——————————————————————————————— 上下文组装 ———————————————————————————————
 
@@ -859,6 +1054,8 @@ pub struct ActRuntime {
     inflight: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// request_id → 谁来收「批准 / 拒绝」这个答复
     approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+    /// request_id → 谁来收前端对 tab 动作的回执
+    tab_acks: Mutex<HashMap<String, tokio::sync::oneshot::Sender<TabReply>>>,
 }
 
 impl ActRuntime {
@@ -866,6 +1063,7 @@ impl ActRuntime {
         Self {
             inflight: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
+            tab_acks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -907,6 +1105,26 @@ impl ActRuntime {
         };
         // 接收端已经因为超时被 drop 掉了 → send 会失败，同样是「没人接了」
         tx.send(approved).is_ok()
+    }
+
+    /// 收前端对 tab 动作的回执。返回 false 表示这个请求已经超时、没人接了。
+    pub fn answer_tab(&self, request_id: &str, reply: TabReply) -> bool {
+        let Some(tx) = self.tab_acks.lock().remove(request_id) else {
+            return false;
+        };
+        tx.send(reply).is_ok()
+    }
+
+    /// 挂一个等 tab 回执的接收端。
+    fn register_tab(&self, request_id: &str) -> tokio::sync::oneshot::Receiver<TabReply> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tab_acks.lock().insert(request_id.to_string(), tx);
+        rx
+    }
+
+    /// 超时或提前放弃时把登记清掉，别让 map 随着轮次慢慢涨。
+    fn unregister_tab(&self, request_id: &str) {
+        self.tab_acks.lock().remove(request_id);
     }
 
     /// 挂一个待批请求，返回用来等答复的接收端。
@@ -954,6 +1172,40 @@ async fn request_approval(
     decision
 }
 
+/// tab 动作等前端回执的上限。
+///
+/// 比审批短得多：前端只是改一下 React state，正常几毫秒就回来了。
+/// 3 秒还没动静，基本是「没人挂监听」或「主窗口在忙」——
+/// 那不是再等等能好的事，得如实告诉用户「这次没确认到」。
+const TAB_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 把 tab 动作转给前端，并等它回一句话。
+///
+/// 返回 `None` = 超时或前端没接。**不能把这个当成成功**：
+/// 上一轮「说了却没动静」的毛病就是由「发出去就当做到了」养出来的。
+async fn request_tab(
+    app: &AppHandle,
+    runtime: &ActRuntime,
+    session_id: &str,
+    payload: &TabRequest,
+) -> Option<TabReply> {
+    let rx = runtime.register_tab(&payload.request_id);
+    let _ = app.emit("nx://agent/tab", payload.clone());
+    let got = tokio::time::timeout(TAB_ACK_TIMEOUT, rx).await;
+    runtime.unregister_tab(&payload.request_id);
+    match got {
+        Ok(Ok(reply)) => Some(reply),
+        _ => {
+            tracing::warn!(
+                "标签页动作无人回执（来源会话 {session_id}）：{} {}",
+                payload.request_id,
+                payload.op
+            );
+            None
+        }
+    }
+}
+
 // ——————————————————————————————— Agentic 主循环 ———————————————————————————————
 
 /// 目标列表的兜底：前端一个都没传时，用当前会话。
@@ -982,6 +1234,58 @@ fn locate<'a>(id: Option<&str>, targets: &'a [AgentTarget], fallback: &str) -> (
             .map(|t| (t.id.clone(), t.label.as_str()))
             .unwrap_or_else(|| (fallback.to_string(), "当前会话")),
     }
+}
+
+/// 把前端回执里的标签页清单整理成模型好读的一段。
+///
+/// 带上 id 是关键：模型下一步要拿它当 `target`，光有标题是点不中的。
+fn tab_list_feedback(tabs: &[TabInfo]) -> String {
+    let mut out = String::from(
+        "当前标签页（`*` 是用户正在看的那个；下一步的 target 用第三列那个 id）：\n",
+    );
+    for t in tabs {
+        out.push_str(&format!(
+            "{}「{}」· {} · {} · {}\n",
+            if t.active { "* " } else { "  " },
+            t.title,
+            t.id,
+            if t.kind == "local" { "本地" } else { "SSH" },
+            t.status
+        ));
+    }
+    out
+}
+
+/// 诊断用：把每一轮模型的原始回复落盘。
+///
+/// 只在 `/tmp/nx-agent-trace.on` 存在时才写 —— 这是一个**默认关闭**的开关，
+/// 关着的时候连一次 `exists()` 都算多余，所以放在最前面。
+///
+/// 为什么需要它：模型偶尔「只描述、不下令」，界面上一张卡片都没有，用户只看到
+/// 一句「已执行」。此时有两种可能，光看界面永远分不清：
+///   1. 模型压根没写 ```nx-exec 块（它的锅）；
+///   2. 写了但被解析/执行环节拒掉（我们的锅）。
+/// 把原文和解析出的动作数记下来，这个二分一次就能定案。
+fn trace_round(session: &str, step: usize, reply: &str, actions: usize) {
+    use std::io::Write as _;
+    const SWITCH: &str = "/tmp/nx-agent-trace.on";
+    if !std::path::Path::new(SWITCH).exists() {
+        return;
+    }
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/nx-agent-trace.log")
+    else {
+        return;
+    };
+    let head: String = reply.chars().take(2000).collect();
+    let _ = writeln!(
+        f,
+        "\n===== step {step} · session {session} · actions={actions} · chars={} =====",
+        reply.chars().count()
+    );
+    let _ = writeln!(f, "{head}");
 }
 
 /// 跑完一整轮 Agentic 问答。过程中只发事件，不通过返回值交付内容。
@@ -1033,6 +1337,8 @@ pub async fn run(
     let session = req.session_id.clone();
     let mut step = 0usize;
     let mut feedback = String::new();
+    // 动作块写歪的次数。允许模型改一次，但不许它拿这个把步数刷完。
+    let mut misfires = 0usize;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -1069,7 +1375,29 @@ pub async fn run(
         messages.push(ChatMessage::assistant(reply.clone()));
 
         let actions = extract_actions(&reply);
+        trace_round(&session, step, &reply, actions.len());
         if actions.is_empty() {
+            // 回复里有围栏却抽不出任何动作 = 协议写歪了，不是「模型想收尾」。
+            // 这种情况必须让人看见：以前直接 break，界面上只留下模型那段
+            // 「我需要打开一个新的会话…」，看起来就像它答应了却没动手。
+            if reply.contains(FENCE_OPEN) && misfires < MAX_MISFIRE_RETRY {
+                misfires += 1;
+                emit_step(
+                    app,
+                    &session,
+                    StepPayload {
+                        text: Some(
+                            "这一轮的动作块没能解析成可执行指令（围栏里不是约定的 JSON），已请模型重发。".into(),
+                        ),
+                        ..StepPayload::new("note", step)
+                    },
+                );
+                feedback.push_str(&format!(
+                    "你上一条回复里的 {FENCE_OPEN} 块没有解析出任何动作。围栏里必须只有一行 JSON，\
+                     例如 {{\"action\":\"exec\",\"command\":\"ls\"}}，不要直接写 shell 代码块。请重发。"
+                ));
+                continue;
+            }
             // 没有动作块 = 模型准备收尾了，这段纯文本就是给用户的结论
             let text = strip_action_blocks(&reply);
             if !text.trim().is_empty() {
@@ -1089,6 +1417,19 @@ pub async fn run(
                     let (target_id, target_label) = locate(target.as_deref(), &targets, &session);
 
                     if let Some(why) = reject_command(&command) {
+                        // 静默拒绝是最糟的失败方式：原因只喂回模型，界面上什么都没有，
+                        // 用户看到的就是「它说了要做，然后没有然后」。必须落一张卡片。
+                        emit_step(
+                            app,
+                            &session,
+                            StepPayload {
+                                target: Some(target_id.clone()),
+                                target_label: Some(target_label.into()),
+                                command: Some(command.trim().into()),
+                                reasons: Some(vec![why.to_string()]),
+                                ..StepPayload::new("skip", step)
+                            },
+                        );
                         feedback.push_str(&failure_feedback(&command, target_label, why));
                         continue;
                     }
@@ -1159,6 +1500,127 @@ pub async fn run(
                     }
                 }
 
+                AgentAction::Tab { op, target, name } => {
+                    // 不许关掉 Agent 自己脚下的那块地板：会话没了，面板绑定的东西
+                    // 也跟着没了，用户只会看到「终端自己消失了」。
+                    if op == TabOp::Close && target.as_deref() == Some(session.as_str()) {
+                        let why = "不能关闭 Agent 自己所在的标签页";
+                        emit_step(
+                            app,
+                            &session,
+                            StepPayload {
+                                target: target.clone(),
+                                target_label: Some("当前会话".into()),
+                                command: Some(op.label().into()),
+                                reasons: Some(vec![why.into()]),
+                                ..StepPayload::new("skip", step)
+                            },
+                        );
+                        feedback.push_str(&format!("{why}。要关它请让用户自己点。\n"));
+                        continue;
+                    }
+
+                    let where_ = target
+                        .as_deref()
+                        .map(|id| {
+                            targets
+                                .iter()
+                                .find(|t| t.id == id)
+                                .map(|t| t.label.clone())
+                                .unwrap_or_else(|| id.to_string())
+                        })
+                        .unwrap_or_else(|| "全部标签页".into());
+
+                    emit_step(
+                        app,
+                        &session,
+                        StepPayload {
+                            target: target.clone(),
+                            target_label: Some(where_.clone()),
+                            text: Some(format!("正在{}……", op.label())),
+                            ..StepPayload::new("tab", step)
+                        },
+                    );
+
+                    let payload = TabRequest {
+                        request_id: uuid::Uuid::new_v4().simple().to_string(),
+                        session_id: session.clone(),
+                        op: op.as_str(),
+                        op_label: op.label(),
+                        target: target.clone(),
+                        name: name.clone(),
+                    };
+
+                    match request_tab(app, runtime, &session, &payload).await {
+                        Some(reply) if reply.ok => {
+                            // list 的结果既进卡片也喂回模型 —— 后者才是重点：
+                            // 模型拿到清单才知道下一步该点哪个 id。
+                            let detail = if reply.detail.trim().is_empty() {
+                                format!("{}完成", op.label())
+                            } else {
+                                reply.detail.clone()
+                            };
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    target: target.clone(),
+                                    target_label: Some(where_.clone()),
+                                    text: Some(detail.clone()),
+                                    ..StepPayload::new("tab", step)
+                                },
+                            );
+                            feedback.push_str(&format!("{detail}\n"));
+                            if !reply.tabs.is_empty() {
+                                feedback.push_str(&tab_list_feedback(&reply.tabs));
+                            }
+                        }
+                        Some(reply) => {
+                            let why = if reply.detail.trim().is_empty() {
+                                "前端拒绝了这个操作".to_string()
+                            } else {
+                                reply.detail.clone()
+                            };
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    target: target.clone(),
+                                    target_label: Some(where_.clone()),
+                                    command: Some(op.label().into()),
+                                    reasons: Some(vec![why.clone()]),
+                                    ..StepPayload::new("skip", step)
+                                },
+                            );
+                            feedback.push_str(&format!(
+                                "{}失败：{why}。不要重试同一个目标，要么换个 id，\
+                                 要么如实告诉用户界面上的实际情况。\n",
+                                op.label()
+                            ));
+                        }
+                        None => {
+                            // 前端没接（超时 / 主窗口不在）。说清楚，别装作办成了。
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    target: target.clone(),
+                                    target_label: Some(where_.clone()),
+                                    text: Some(format!(
+                                        "「{}」没有收到界面回执（主窗口可能没开或正忙），未能确认结果。",
+                                        op.label()
+                                    )),
+                                    ..StepPayload::new("note", step)
+                                },
+                            );
+                            feedback.push_str(&format!(
+                                "{}没有收到界面回执，结果未知。不要断言已完成，也不要重复下发。\n",
+                                op.label()
+                            ));
+                        }
+                    }
+                }
+
                 AgentAction::Export { target, deep } => {
                     let (target_id, target_label) = locate(target.as_deref(), &targets, &session);
                     emit_step(
@@ -1200,8 +1662,39 @@ pub async fn run(
                     );
                     let spec = OpenSpec { kind, label, command };
                     match open_session(app, state, &session, spec).await {
-                        Ok(outcome) => feedback.push_str(&open_feedback(&outcome)),
-                        Err(e) => feedback.push_str(&format!("打开新会话失败：{e}\n")),
+                        Ok(outcome) => {
+                            // 成功也要补一条：前端确实会接出标签页，但那张卡片
+                            // 留在「正在打开」上会让人以为它还没完成。
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    target: Some(outcome.session_id.clone()),
+                                    target_label: Some(outcome.label.clone()),
+                                    text: Some(format!(
+                                        "已打开「{}」，标签页已就位（id：{}）",
+                                        outcome.label, outcome.session_id
+                                    )),
+                                    ..StepPayload::new("open", step)
+                                },
+                            );
+                            feedback.push_str(&open_feedback(&outcome));
+                        }
+                        Err(e) => {
+                            // 失败必须在**界面上**说出来，不能只喂回模型：
+                            // 模型收到「打不开」之后很可能改用 open -a Terminal
+                            // 之类的命令绕过去，再宣称成功 —— 用户只会看到
+                            // 应用外面莫名多了个终端窗口，而面板里什么线索都没有。
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    text: Some(format!("打开新会话失败：{e}")),
+                                    ..StepPayload::new("note", step)
+                                },
+                            );
+                            feedback.push_str(&format!("打开新会话失败：{e}\n"));
+                        }
                     }
                 }
             }
@@ -1221,26 +1714,25 @@ struct IfAgentic;
 impl IfAgentic {
     fn pick(custom: &str) -> String {
         if custom.trim().is_empty() {
-            AGENTIC_SYSTEM_PROMPT.to_string()
+            agentic_system_prompt()
         } else {
             // 尊重用户自己的设定 —— 也许他就是要一个不许动手的顾问。
-            // 但协议必须挂上去：否则他在自定义提示词下永远不知道该怎么下令。
-            format!("{}\n{CUSTOM_APPENDIX}", custom.trim_end())
+            // 但协议必须挂上去，而且得是**完整版**：之前这里只是一段压缩说明，
+            // 用户的提示词里若写着「只给结论与必要命令」，模型就退回往代码块里抄
+            // shell，动作块解析不出来，界面上什么都不发生。
+            format!("{}\n\n{ACTION_PROTOCOL}\n\n{CUSTOM_TAIL}", custom.trim_end())
         }
     }
 }
 
-/// 挂在用户自定义提示词后面的协议说明。
+/// 挂在用户自定义提示词后面的补充说明。
 ///
 /// 不能简单返回 custom：那样用户的提示词里没有动作协议，模型就永远只会聊天。
-/// 这里做的是「**用户的提示词 + 必需的协议**」而不是二选一。
-const CUSTOM_APPENDIX: &str = concat!(
-    "\n\n【可执行 mode】你可以直接在终端会话里执行命令、导出会话完整记录、开新会话：",
-    "在回复里写 ```nx-exec 围栏代码块。执行命令：",
-    "{\"action\":\"exec\",\"target\":\"<会话id>\",\"command\":\"<单行命令>\"}（多目标用 targets / commands 数组，",
-    "不写 action 等同 exec）；导出记录：{\"action\":\"export\",\"target\":\"<会话id>\",\"deep\":true}；",
-    "开新会话：{\"action\":\"open\",\"kind\":\"local\"|\"ssh\",\"sessionRecordId\":\"<已保存配置id，仅 ssh 需要>\",",
-    "\"label\":\"<名字>\",\"command\":\"<可选的首条命令>\"}（kind=ssh 必须引用已存在的配置，不能自己编主机）。",
+/// 这里做的是「**用户的提示词 + 必需的协议**」而不是二选一 ——
+/// 并明确告诉模型：协议优先于上文关于输出格式的要求。
+const CUSTOM_TAIL: &str = concat!(
+    "以上动作协议优先于上文关于「输出格式 / 只给结论」的任何要求：",
+    "要真的动手，就必须写成围栏里那一行 JSON，而不是把命令贴在回复正文里。",
     "不写 target 表示落到用户当前会话。执行结果会回给你，据此继续。",
     "不可逆操作（rm -rf / mkfs / DROP 等）除非用户明确要求，否则不要执行。",
     "查清了直接给中文结论，不要再追加无谓的探查。"
@@ -1367,6 +1859,107 @@ mod tests {
         assert_eq!(acts, vec![AgentAction::Exec { target: Some("s1".into()), command: "whoami".into() }]);
     }
 
+    // ——————————————————— tab 动作（后端只转达，由前端执行） ———————————————————
+
+    #[test]
+    fn tab_list_needs_no_target() {
+        let acts = extract_actions(&block(r#"{"action":"tab","op":"list"}"#));
+        assert_eq!(acts, vec![AgentAction::Tab { op: TabOp::List, target: None, name: None }]);
+    }
+
+    #[test]
+    fn tab_focus_close_reconnect_carry_target() {
+        for (op, want) in [
+            ("focus", TabOp::Focus),
+            ("close", TabOp::Close),
+            ("reconnect", TabOp::Reconnect),
+        ] {
+            let acts = extract_actions(&block(&format!(
+                r#"{{"action":"tab","op":"{op}","target":"tab-1"}}"#
+            )));
+            assert_eq!(
+                acts,
+                vec![AgentAction::Tab { op: want, target: Some("tab-1".into()), name: None }],
+                "op={op}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_rename_requires_a_name() {
+        let ok = extract_actions(&block(
+            r#"{"action":"tab","op":"rename","target":"tab-1","name":"日志"}"#,
+        ));
+        assert_eq!(
+            ok,
+            vec![AgentAction::Tab {
+                op: TabOp::Rename,
+                target: Some("tab-1".into()),
+                name: Some("日志".into())
+            }]
+        );
+        // 没名字的改名毫无意义，且执行层没法「尽量做」，直接不产生动作
+        assert!(extract_actions(&block(
+            r#"{"action":"tab","op":"rename","target":"tab-1"}"#
+        ))
+        .is_empty());
+    }
+
+    #[test]
+    fn tab_without_target_is_dropped() {
+        assert!(extract_actions(&block(r#"{"action":"tab","op":"close"}"#)).is_empty());
+        assert!(extract_actions(&block(r#"{"action":"tab"}"#)).is_empty(), "缺 op");
+        // 不认识的 op 不能被当成 exec 去跑
+        assert!(extract_actions(&block(r#"{"action":"tab","op":"explode","target":"t"}"#)).is_empty());
+    }
+
+    /// 回执通道：挂上 → 应答 → 拿到；重复应答第二次应返回 false（已超时/已取走）
+    #[test]
+    fn tab_ack_round_trip() {
+        let rt = ActRuntime::new();
+        let rx = rt.register_tab("rq1");
+        let reply = TabReply {
+            ok: true,
+            detail: "已切到「日志」".into(),
+            tabs: vec![TabInfo {
+                id: "tab-1".into(),
+                title: "日志".into(),
+                kind: "ssh".into(),
+                status: "connected".into(),
+                active: true,
+            }],
+        };
+        assert!(rt.answer_tab("rq1", reply));
+        let got = rx.blocking_recv().expect("应收到回执");
+        assert!(got.ok);
+        assert_eq!(got.tabs.len(), 1);
+        // 取走之后再应答 = 没人接了
+        assert!(!rt.answer_tab("rq1", TabReply::default()));
+    }
+
+    #[test]
+    fn tab_list_feedback_mentions_ids_and_active_mark() {
+        let out = tab_list_feedback(&[
+            TabInfo {
+                id: "tab-1".into(),
+                title: "日志".into(),
+                kind: "ssh".into(),
+                status: "connected".into(),
+                active: true,
+            },
+            TabInfo {
+                id: "tab-2".into(),
+                title: "本地".into(),
+                kind: "local".into(),
+                status: "connected".into(),
+                active: false,
+            },
+        ]);
+        assert!(out.contains("tab-1") && out.contains("tab-2"), "必须带 id，否则模型点不中");
+        assert!(out.contains("* 「日志」"), "当前标签页要标出来");
+        assert!(out.contains("本地"));
+    }
+
     #[test]
     fn plain_code_blocks_are_never_actions() {
         let text = "请先自己试一下：\n```bash\nrm -rf /\n```\n我再去帮你看日志。\n";
@@ -1377,6 +1970,52 @@ mod tests {
     fn broken_json_yields_nothing() {
         assert!(extract_actions(&block("{not json")).is_empty());
         assert!(extract_actions(&block(r#"{"target":"s1"}"#)).is_empty(), "没有 command 就不算动作");
+    }
+
+    // —————————————— 围栏里是裸 shell（现场抓到的真实回复） ——————————————
+
+    /// 用户上报的那次「说要开 session 但什么都没发生」的原始回复：
+    /// 围栏写的是 nx-exec，里面却是裸 shell。以前 JSON 解析失败 → 0 个动作 → 静默，
+    /// 界面上只留下模型那段自说自话。
+    #[test]
+    fn raw_shell_block_is_executed_instead_of_dropped() {
+        let reply = concat!(
+            "我需要打开一个新的终端会话，复制当前的本地终端。\n\n",
+            "```nx-exec\necho \"Opening new session...\"\n```\n\n",
+            "让我在当前会话中确认环境信息：\n\n",
+            "```nx-exec\npwd && whoami\n```\n",
+        );
+        let acts = extract_actions(reply);
+        assert_eq!(acts.len(), 2, "两个裸 shell 块都该被执行，实际：{acts:?}");
+        assert_eq!(
+            acts[0],
+            AgentAction::Exec { target: None, command: "echo \"Opening new session...\"".into() }
+        );
+        assert_eq!(acts[1], AgentAction::Exec { target: None, command: "pwd && whoami".into() });
+    }
+
+    #[test]
+    fn raw_shell_single_line_block_is_executed() {
+        let acts = extract_actions("```nx-exec\nexit\n```\n");
+        assert_eq!(acts, vec![AgentAction::Exec { target: None, command: "exit".into() }]);
+    }
+
+    /// 多行块按行拆：`reject_command` 拒收换行，整块塞进去只会被拒。
+    /// 顺手抄来的 `$ ` 提示符、空行、注释都不是命令。
+    #[test]
+    fn raw_shell_block_splits_lines_and_drops_noise() {
+        let acts = extract_actions("```nx-exec\n# 先看看目录\n$ ls -la\n\nuptime\n```\n");
+        assert_eq!(acts.len(), 2, "只该剩 ls -la 与 uptime，实际：{acts:?}");
+        assert_eq!(acts[0], AgentAction::Exec { target: None, command: "ls -la".into() });
+        assert_eq!(acts[1], AgentAction::Exec { target: None, command: "uptime".into() });
+    }
+
+    /// 想写 JSON 却写坏了（以 `{` 开头）—— 绝不退化成 shell：
+    /// 否则这半截会被原样敲进终端。
+    #[test]
+    fn truncated_json_is_not_echoed_into_the_shell() {
+        let acts = extract_actions(&block(r#"{"target":"s1","command": "ls"#));
+        assert!(acts.is_empty(), "半截 JSON 不能被当成命令执行");
     }
 
     #[test]
@@ -1542,20 +2181,63 @@ mod tests {
     /// agentic 提示词必须把协议与两条硬边界写清楚，否则模型不会动手 / 停不下来
     #[test]
     fn agentic_prompt_states_the_protocol_and_limits() {
-        assert!(AGENTIC_SYSTEM_PROMPT.contains("nx-exec"));
+        let agentic = agentic_system_prompt();
+        assert!(agentic.contains("nx-exec"));
         for key in ["targets", "commands", "单行", "不可逆", "不要再"] {
-            assert!(AGENTIC_SYSTEM_PROMPT.contains(key), "提示词缺少要点：{key}");
+            assert!(agentic.contains(key), "提示词缺少要点：{key}");
         }
-        assert!(CUSTOM_APPENDIX.contains("nx-exec"));
+        assert!(ACTION_PROTOCOL.contains("nx-exec"));
+        // 「开窗口」必须走 open 动作，不许拿系统终端应用充数 ——
+        // 模型曾用 open -a Terminal 交差，用户看到的是应用外多出来的窗口
+        assert!(agentic.contains("open -a Terminal"), "提示词要显式禁掉系统终端命令");
+        assert!(agentic.contains("不要换成系统命令硬绕"));
+        assert!(ACTION_PROTOCOL.contains("open -a Terminal"));
+        assert!(ACTION_PROTOCOL.contains("不能自己编一个主机"));
     }
 
     #[test]
     fn prompt_pick_never_drops_the_protocol() {
         // 用户清空提示词 → 用 agentic 兜底
-        assert_eq!(IfAgentic::pick("   "), AGENTIC_SYSTEM_PROMPT);
+        assert_eq!(IfAgentic::pick("   "), agentic_system_prompt());
         // 用户写了自己的 → 他的话要留着，协议也要挂上
         let picked = IfAgentic::pick("你是我的运维顾问");
         assert!(picked.starts_with("你是我的运维顾问"), "用户的提示词被丢了");
         assert!(picked.contains("nx-exec"), "自定义模式也必须带上协议");
+    }
+
+    /// 用户账号里真实存在的那段自定义提示词（「只给结论与必要命令」）。
+    /// 它把模型往「直接贴命令」上带，之前自定义路径只挂了一段压缩协议，
+    /// 模型于是把 shell 抄进围栏 —— 动作解析不出来，界面上什么都不发生。
+    #[test]
+    fn custom_prompt_still_gets_the_full_protocol() {
+        let custom = concat!(
+            "你是 NexusTerm 的终端助手。用户会把终端会话的最近输出发给你，",
+            "请结合会话上下文用中文简洁回答，只给结论与必要命令，不要复述已给出的输出。"
+        );
+        let picked = IfAgentic::pick(custom);
+        // 三个动作类型都得能照抄
+        for key in ["\"action\":\"exec\"", "\"action\":\"export\"", "\"action\":\"open\""] {
+            assert!(picked.contains(key), "自定义模式缺少动作样例：{key}");
+        }
+        // 围栏里只放 JSON、以及「开窗口别拿系统终端充数」这两条硬边界不能少
+        assert!(picked.contains("只放那一行 JSON"));
+        assert!(picked.contains("open -a Terminal"));
+        // 协议必须压过用户那句「只给结论与必要命令」
+        assert!(picked.contains("优先于上文"), "自定义模式要先声明协议优先级");
+    }
+    /// 模型真实回复（用同一账号跑出来的原文）：开本地会话
+    #[test]
+    fn real_world_reply_open_local_is_extracted() {
+        let reply = "\u{0060}\u{0060}\u{0060}nx-exec\n{\"action\":\"open\",\"kind\":\"local\",\"label\":\"新窗口\"}\n\u{0060}\u{0060}\u{0060}\n\n已为你开一个新的本地终端窗口。";
+        let acts = extract_actions(&reply);
+        assert_eq!(acts.len(), 1, "应当解析出 1 个 open 动作，实际：{acts:?}");
+        match &acts[0] {
+            AgentAction::Open { kind, label, command } => {
+                assert_eq!(*kind, OpenKind::Local);
+                assert_eq!(label.as_deref(), Some("新窗口"));
+                assert!(command.is_none());
+            }
+            other => panic!("应解析成 Open，实际 {other:?}"),
+        }
     }
 }

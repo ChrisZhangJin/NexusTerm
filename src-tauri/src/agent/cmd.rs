@@ -207,6 +207,28 @@ pub fn agent_approve(
     Ok(state.act.answer(&request_id, approved))
 }
 
+/// 前端对一次标签页动作的回执。
+///
+/// 必须回：后端在等它才能把「办成了 / 办砸了 / 没人接」区分开。
+/// 返回 false 表示这个请求已经超时被丢掉了 —— 前端把卡片置灰即可，不是错误。
+#[tauri::command]
+pub fn agent_tab_ack(
+    request_id: String,
+    ok: bool,
+    detail: Option<String>,
+    tabs: Option<Vec<crate::agent::act::TabInfo>>,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    Ok(state.act.answer_tab(
+        &request_id,
+        crate::agent::act::TabReply {
+            ok,
+            detail: detail.unwrap_or_default(),
+            tabs: tabs.unwrap_or_default(),
+        },
+    ))
+}
+
 /// 在指定会话里手动跑一条命令（UI 上的「帮我执行」按钮、结果卡重试）。
 ///
 /// 与 `agent_run` 共用同一条哨兵执行链路，但不调用模型：
