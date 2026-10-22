@@ -200,16 +200,32 @@ export default function TerminalView({
   hintIndexRef.current = hintIndex;
   /** 下拉锚点：光标在视口里的像素坐标 */
   const [hintPos, setHintPos] = useState({ x: 0, y: 0 });
+  /** 上一次推给界面的下拉位置（用来跳过「位置没变」的重复渲染） */
+  const hintPosRef = useRef({ x: 0, y: 0 });
+  /** 上一次推给界面的候选签名（label 拼起来），用来跳过内容没变的重复渲染 */
+  const hintSigRef = useRef("\u0000");
   const hintsRef = useRef<CompletionItem[]>([]);
   /** 与后端请求对账用的序号：慢响应回来时若已过期就丢弃 */
   const hintSeq = useRef(0);
+  /**
+   * 本帧有没有排队的补全重算（rAF 句柄，0 = 没排）。
+   *
+   * 敲键时**不**当场算候选：算候选要读历史、量 DOM（`getBoundingClientRect`）、
+   * 改 React 状态、往终端里写灰字 —— 这些同步塞在 `onData` 里，等于让
+   * 「把字节发给 shell」排在它们后头，连着敲就是一串能感觉到的顿挫。
+   * 改成一帧最多算一次之后，打字这条路上只剩发字节，提示最多晚一帧出现。
+   */
+  const hintRaf = useRef(0);
 
   // 高亮项变了就把灰字换成它：下拉里选中哪条，光标后面就该提示哪条，
   // 否则「按 ↑↓ 挑一条再按 Tab」会得到跟选中项不一样的结果。
   useEffect(() => {
     const term = termRef.current;
-    if (!term || !hints || term.buffer.active.type !== "normal") return;
-    const item = hints[Math.min(hintIndex, hints.length - 1)];
+    // 取 `hintsRef` 而不是 `hints`：状态里的那份可能因为「候选没变就不推送」
+    // 而落后一步（`insert` 是随行内容变的），灰字必须跟真正会被 Tab 补进去的一致。
+    const items = hintsRef.current;
+    if (!term || items.length === 0 || term.buffer.active.type !== "normal") return;
+    const item = items[Math.min(hintIndex, items.length - 1)];
     if (!item) return;
     ghostRef.current.show(term, item.insert, term.cols - term.buffer.active.cursorX - 1);
   }, [hintIndex, hints]);
@@ -231,17 +247,30 @@ export default function TerminalView({
     if (term.buffer.active.type !== "normal") {
       ghostRef.current.clear(term);
       hintsRef.current = [];
+      // 签名也要作废，否则下次算出同一批候选时会因为「签名没变」而不推状态
+      hintSigRef.current = "\u0000";
       setHints(null);
       setHintIndex(0);
       return;
     }
 
     hintsRef.current = items;
-    setHints(items.length ? items : null);
-    setHintIndex(0);
+    // 候选没变就不要再推一次状态：`insert` 是由 `label` 减去已输入前缀算出来的，
+    // 所以 label 一样、补充部分必然一样。行里接着敲字时列表常常是同一批
+    // （历史里就那几条），不比较的话每敲一个字都要重建一遍下拉的 40 个节点。
+    const sig = items.map((i) => i.label).join("\n");
+    if (sig !== hintSigRef.current) {
+      hintSigRef.current = sig;
+      setHints(items.length ? items : null);
+      setHintIndex(0);
+    }
 
     const room = term.cols - term.buffer.active.cursorX - 1;
-    const ghost = ghostRef.current.show(term, items.length ? items[0].insert : "", room);
+    // 画的是「下拉里当前高亮的那条」而不是永远第一条：候选没变时高亮可能已经被
+    // 方向键挪走了（见上面的签名判重），这时灰字必须跟着高亮走，否则按 Tab
+    // 补进去的东西和屏幕上提示的不是同一条。
+    const shownItem = items[Math.min(hintIndexRef.current, items.length - 1)];
+    const ghost = ghostRef.current.show(term, shownItem ? shownItem.insert : "", room);
     if (!ghost) return;
 
     // 只在灰字真的画出来了才定位下拉：位置按光标格换算，
@@ -249,10 +278,16 @@ export default function TerminalView({
     const r = host.getBoundingClientRect();
     const cw = term.cols > 0 ? r.width / term.cols : 8;
     const ch = term.rows > 0 ? r.height / term.rows : 16;
-    setHintPos({
-      x: Math.min(r.left + term.buffer.active.cursorX * cw, window.innerWidth - 330),
-      y: r.top + (term.buffer.active.cursorY + 1) * ch,
-    });
+    const x = Math.round(Math.min(r.left + term.buffer.active.cursorX * cw, window.innerWidth - 330));
+    const y = Math.round(r.top + (term.buffer.active.cursorY + 1) * ch);
+    // 同一个位置就不要再 set 一次：每次都是新对象，React 会当成变化重新渲染 ——
+    // 而「敲一个字、光标挪一格、下拉跟着右移」正是每次按键都发生的事。
+    // 只有真的挪了才推给界面，一行里连着打十个字就只重渲染一次。
+    const last = hintPosRef.current;
+    if (last.x !== x || last.y !== y) {
+      hintPosRef.current = { x, y };
+      setHintPos({ x, y });
+    }
   }, []);
 
   /** 收起提示：擦掉灰字、清空候选。 */
@@ -261,6 +296,7 @@ export default function TerminalView({
     if (term) ghostRef.current.clear(term);
     hintsRef.current = [];
     hintSeq.current++; // 让还在路上的 `--help` 请求回来时自己作废
+    hintSigRef.current = "\u0000";
     setHints(null);
     setHintIndex(0);
   }, []);
@@ -297,6 +333,28 @@ export default function TerminalView({
     },
     [tabId, publish]
   );
+
+  /**
+   * 敲键后的补全刷新：**一帧最多一次**。
+   *
+   * 行状态（`lineRef`）本身就是即时更新的，所以延迟这一帧不会让候选算错 ——
+   * 刷的时候读的是当时的行，早先几帧的中间态直接被跳过，反而更省。
+   */
+  const refreshHintsSoon = useCallback(() => {
+    if (hintRaf.current) return;
+    hintRaf.current = requestAnimationFrame(() => {
+      hintRaf.current = 0;
+      refreshHints(lineRef.current.text);
+    });
+  }, [refreshHints]);
+
+  // 标签页关掉 / 组件卸载时把没跑完的那一帧撤掉，否则回调会碰已 dispose 的终端
+  useEffect(() => {
+    return () => {
+      if (hintRaf.current) cancelAnimationFrame(hintRaf.current);
+      hintRaf.current = 0;
+    };
+  }, []);
 
   /**
    * 接受当前高亮项：把缺的那一段补进终端。
@@ -439,6 +497,7 @@ export default function TerminalView({
       if (!items.length || !typed) return;
       if (term.buffer.active.type !== "normal" || !cursorFollowsTyped(term, typed)) {
         hintsRef.current = [];
+        hintSigRef.current = "\u0000";
         setHints(null);
         setHintIndex(0);
         return;
@@ -455,10 +514,25 @@ export default function TerminalView({
     // 「再补画」不是可有可无的润色：shell 会把人敲的每个字符回显回来，
     // 回显走的就是这里。不补画的话，灰字只在「按键 → 回显到达」这几十毫秒里
     // 闪一下就没了 —— 本地还好，SSH 上一个来回就是肉眼可见的闪烁。
+    //
+    // 补画按帧合并：回显是**一个字节一块**到达的，逐块补画等于每个字符都
+    // 擦一次整行、再画一次整行（两次整行重绘）。一帧里到几块都只补画一次。
+    let paintRaf = 0;
+    const scheduleGhostPaint = () => {
+      if (paintRaf) return;
+      paintRaf = requestAnimationFrame(() => {
+        paintRaf = 0;
+        redrawGhost();
+      });
+    };
+    cleanups.push(() => {
+      if (paintRaf) cancelAnimationFrame(paintRaf);
+    });
+
     const writeOut = (data: string | Uint8Array) => {
       ghostRef.current.clear(term);
       term.write(data);
-      redrawGhost();
+      scheduleGhostPaint();
     };
 
     // —— ZMODEM（lrzsz）：远端 rz/sz 的字节流先过 Sentry 嗅探 ——
@@ -518,10 +592,10 @@ export default function TerminalView({
       // 旁路监听（跳板机登录路径录制）。发不发送由这里决定，监听方只读
       emitInput(tabId, d);
       send(d).catch(() => {});
-      // 补全：喂键攒行，再按最新的行刷新提示
+      // 补全：喂键攒行（同步、纯字符串运算），候选留到下一帧再算
       const committed = feedKeys(lineRef.current, d);
       if (committed) recordCommand(tabId, committed);
-      refreshHints(lineRef.current.text);
+      refreshHintsSoon();
     });
 
     // 快捷键全部来自「设置 → 快捷键」（lib/prefs），改了立即生效。
