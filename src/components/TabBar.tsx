@@ -26,6 +26,11 @@ interface Props {
   /** 右侧 AI 助手面板开关 */
   agentOpen: boolean;
   onToggleAgent: () => void;
+  /** 宏管理器 */
+  onMacros: () => void;
+  macroOpen: boolean;
+  /** 正在录制宏：按钮上打个红点，提醒用户「你现在的操作会被记住」 */
+  recording: boolean;
 }
 
 const tabLabel = (t: TerminalTab) => t.customTitle || t.title;
@@ -52,6 +57,9 @@ export default function TabBar({
   onToggleSessionPopup,
   agentOpen,
   onToggleAgent,
+  onMacros,
+  macroOpen,
+  recording,
 }: Props) {
   const [ctx, setCtx] = useState<{ x: number; y: number; id: string } | null>(null);
   const ctxRef = useRef<HTMLDivElement>(null);
@@ -230,6 +238,23 @@ export default function TabBar({
         </button>
       </div>
 
+      {/* 宏：常驻按钮而不是只放右键菜单 —— 它是个「边试边改」的功能，
+          藏进二级菜单没人找得到；录制中按钮带红点，避免用户忘了还在录 */}
+      <button
+        className={`tb-action tabbar-macro ${macroOpen ? "active" : ""} ${recording ? "rec" : ""}`}
+        onClick={onMacros}
+        title={
+          recording
+            ? "正在录制宏：单击打开宏管理器并停止录制"
+            : "宏：录下一串操作（等什么、发什么），可一键重放或连接后自动执行"
+        }
+        aria-pressed={macroOpen}
+      >
+        <span className="tb-glyph">▤</span>
+        宏
+        {recording && <span className="tb-rec" aria-hidden />}
+      </button>
+
       {/* AI 助手面板开关：靠右，与标签列表分开（.tabs 是 flex:1，把这里顶到最右） */}
       <button
         className={`tb-action tabbar-agent ${agentOpen ? "active" : ""}`}
@@ -260,6 +285,16 @@ export default function TabBar({
               断开
             </button>
           ) : null}
+          {!ctxTab.local && (
+            <button
+              className="ctx-item"
+              disabled={ctxTab.status !== "connected"}
+              title={ctxTab.status === "connected" ? "" : "会话连接后可用"}
+              onClick={run(onMacros)}
+            >
+              宏…
+            </button>
+          )}
           {!ctxTab.local && (
             <button
               className="ctx-item"

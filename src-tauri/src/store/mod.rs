@@ -46,6 +46,47 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// 宏里的一步。
+///
+/// 三种原语刻意做得很少 —— 宏要的是「可预测」，不是编程语言。真正的灵活性
+/// 来自 `Wait` 的三种用法：等某个模式出现、等输出静默（pattern 为空）、
+/// 以及 `Sleep` 的兜底延时。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum MacroStep {
+    /// 发送文本。`enter` 默认 true：绝大多数步骤就是「敲这一行然后回车」。
+    Send {
+        text: String,
+        #[serde(default = "default_true")]
+        enter: bool,
+    },
+    /// 等屏幕出现 `pattern`；`pattern` 为空表示「等输出静默」。
+    Wait {
+        #[serde(default)]
+        pattern: String,
+        /// 超时（毫秒）。0 = 用引擎默认值。
+        #[serde(default, rename = "timeoutMs")]
+        timeout_ms: u32,
+    },
+    /// 无条件等待。用在「服务端不输出任何东西，但必须等它准备好」的场合。
+    Sleep { ms: u32 },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 一条宏。`steps` 在库里是 JSON 文本，进出都走 serde，坏数据在边界上就报错。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacroRecord {
+    pub id: String,
+    pub name: String,
+    pub steps: Vec<MacroStep>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// 密钥库里一条密钥的元数据（私钥文件本身在 `<app_data>/keys/<id>`）。
 #[derive(Debug, Clone)]
 pub struct KeyRow {
@@ -139,6 +180,18 @@ impl Store {
                 fingerprint TEXT NOT NULL DEFAULT '',
                 encrypted   INTEGER NOT NULL DEFAULT 0,
                 created_at  INTEGER NOT NULL
+            );
+
+            -- 宏：一串「等什么、发什么」的操作，可以一键或连接后自动重放。
+            -- steps 存 JSON 数组。之所以不建 steps 子表：单条宏的步骤数很少、
+            -- 从不需要按步骤查询，而步骤结构还会继续演进（以后可能有条件分支），
+            -- 子表会逼着做频繁的列迁移。
+            CREATE TABLE IF NOT EXISTS macros (
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                steps      TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
             );
             "#,
         )
@@ -244,6 +297,81 @@ impl Store {
     pub fn delete(&self, id: &str) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    // ───────────────────────── 宏 ─────────────────────────
+
+    pub fn list_macros(&self) -> Result<Vec<MacroRecord>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT id,name,steps,created_at,updated_at FROM macros ORDER BY created_at")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], row_to_macro)
+            .map_err(|e| e.to_string())?
+            .collect::<SqlResult<Vec<_>>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    pub fn create_macro(&self, name: &str, steps: &[MacroStep]) -> Result<MacroRecord, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("宏名称不能为空".into());
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_secs();
+        let json = serde_json::to_string(steps).map_err(|e| format!("步骤序列化失败: {e}"))?;
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO macros (id,name,steps,created_at,updated_at) VALUES (?1,?2,?3,?4,?5)",
+            params![id, name, json, now, now],
+        )
+        .map_err(|e| e.to_string())?;
+        drop(conn);
+        self.get_macro(&id)
+    }
+
+    pub fn get_macro(&self, id: &str) -> Result<MacroRecord, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT id,name,steps,created_at,updated_at FROM macros WHERE id = ?1",
+            params![id],
+            row_to_macro,
+        )
+        .map_err(|_| format!("宏不存在: {}", id))
+    }
+
+    pub fn update_macro(
+        &self,
+        id: &str,
+        name: &str,
+        steps: &[MacroStep],
+    ) -> Result<MacroRecord, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("宏名称不能为空".into());
+        }
+        let json = serde_json::to_string(steps).map_err(|e| format!("步骤序列化失败: {e}"))?;
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let n = conn
+            .execute(
+                "UPDATE macros SET name=?2, steps=?3, updated_at=?4 WHERE id=?1",
+                params![id, name, json, now_secs()],
+            )
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err(format!("宏不存在: {}", id));
+        }
+        drop(conn);
+        self.get_macro(id)
+    }
+
+    pub fn delete_macro(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM macros WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -457,7 +585,7 @@ impl Store {
 
 const EXTRAS_PREFIX: &str = "extras:";
 
-/// 会话配置的附加状态：跳板机登录脚本 + 兼容模式。
+/// 会话配置的附加状态：连接后自动执行的宏 + 兼容模式。
 ///
 /// 存在 `settings` 表而不是 `sessions` 的列，原因有二：
 /// ① 这类数据是「本机学到的行为」，不该跟着导入导出跑到别人机器上；
@@ -465,12 +593,18 @@ const EXTRAS_PREFIX: &str = "extras:";
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionExtras {
-    /// 登录后自动输入：每行一步（例：`2` / `1`），远端出现菜单时按顺序发送
+    /// **旧版**「登录后自动输入」，只为迁移保留：前端启动时会把它转成一条宏
+    /// 并清空，之后不再读写。
     #[serde(default)]
     pub login_script: String,
-    /// 是否在新连接 / 重连时自动回放上面的脚本
     #[serde(default)]
     pub login_script_on: bool,
+    /// 连接后自动执行的宏 id（空串 = 不执行）。宏本体在 `macros` 表
+    #[serde(default)]
+    pub macro_id: String,
+    /// 是否真的自动执行（关掉但保留选择，方便临时禁用）
+    #[serde(default)]
+    pub macro_on: bool,
     /// 兼容模式：不在该连接上开旁路通道（堡垒机只放行一条通道）
     #[serde(default)]
     pub compat: bool,
@@ -492,6 +626,20 @@ fn row_to_session(r: &rusqlite::Row) -> SqlResult<SessionRecord> {
         sort_order: r.get(11)?,
         created_at: r.get(12)?,
         updated_at: r.get(13)?,
+    })
+}
+
+fn row_to_macro(r: &rusqlite::Row) -> SqlResult<MacroRecord> {
+    // 步骤是 JSON 文本。解析失败说明库被外部改坏了：退化成空步骤而不是
+    // 让整个宏列表加载失败 —— 用户至少还能看到这条宏并改写它。
+    let raw: String = r.get(2)?;
+    let steps: Vec<MacroStep> = serde_json::from_str(&raw).unwrap_or_default();
+    Ok(MacroRecord {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        steps,
+        created_at: r.get(3)?,
+        updated_at: r.get(4)?,
     })
 }
 
@@ -547,5 +695,80 @@ mod legacy_keyring {
         if let Ok(entry) = keyring::Entry::new(SERVICE, session_id) {
             entry.delete_credential().ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_store(tag: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!(
+            "nexus-store-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        Store::open(dir).expect("打开临时库")
+    }
+
+    /// 步骤的 JSON 形状是和前端共用的契约，改字段名必须两边一起改 ——
+    /// 这里把它钉死，避免「Rust 编译通过、前端读不到 timeoutMs」这种静默错位。
+    #[test]
+    fn macro_step_json_shape_is_stable() {
+        let steps = vec![
+            MacroStep::Send { text: "6".into(), enter: true },
+            MacroStep::Wait { pattern: "[Host]>".into(), timeout_ms: 20_000 },
+            MacroStep::Sleep { ms: 300 },
+        ];
+        let json = serde_json::to_value(&steps).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                { "kind": "send", "text": "6", "enter": true },
+                { "kind": "wait", "pattern": "[Host]>", "timeoutMs": 20000 },
+                { "kind": "sleep", "ms": 300 }
+            ])
+        );
+        let back: Vec<MacroStep> = serde_json::from_value(json).unwrap();
+        assert_eq!(back, steps);
+    }
+
+    /// `enter` 缺省为 true：手写的旧数据 / 前端省略该字段时仍然是「发完回车」。
+    #[test]
+    fn send_defaults_to_enter() {
+        let s: Vec<MacroStep> =
+            serde_json::from_str(r#"[{"kind":"send","text":"ls"}]"#).unwrap();
+        assert_eq!(s[0], MacroStep::Send { text: "ls".into(), enter: true });
+    }
+
+    #[test]
+    fn macro_crud_roundtrip() {
+        let store = temp_store("macro");
+        let steps = vec![
+            MacroStep::Wait { pattern: String::new(), timeout_ms: 0 },
+            MacroStep::Send { text: "2".into(), enter: true },
+        ];
+
+        let m = store.create_macro("选第二台", &steps).unwrap();
+        assert_eq!(m.name, "选第二台");
+        assert_eq!(m.steps, steps);
+        assert_eq!(store.list_macros().unwrap().len(), 1);
+
+        let updated = store.update_macro(&m.id, "选第三台", &steps[1..]).unwrap();
+        assert_eq!(updated.name, "选第三台");
+        assert_eq!(updated.steps.len(), 1);
+
+        store.delete_macro(&m.id).unwrap();
+        assert!(store.list_macros().unwrap().is_empty());
+        assert!(store.get_macro(&m.id).is_err());
+    }
+
+    #[test]
+    fn macro_rejects_empty_name() {
+        let store = temp_store("macro-name");
+        assert!(store.create_macro("   ", &[]).is_err());
+        let m = store.create_macro("ok", &[]).unwrap();
+        assert!(store.update_macro(&m.id, "", &[]).is_err());
+        // 名字非法时不该顺手把记录改坏
+        assert_eq!(store.get_macro(&m.id).unwrap().name, "ok");
     }
 }

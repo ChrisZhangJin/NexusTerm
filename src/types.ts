@@ -30,6 +30,32 @@ export interface NewSession {
   connectTimeout?: number | null;
 }
 
+/**
+ * 宏的一步。
+ *
+ * 只有三种原语，且字段名与 Rust 侧 serde 完全一致（`kind` 是判别式）——
+ * 多一种原语就多一个「行为不可预测」的来源；能表达复杂流程的应该写成脚本，
+ * 而不是把宏做成一个小语言。
+ */
+export type MacroStep =
+  /** 发送文本；`enter` 为真时末尾补回车 */
+  | { kind: "send"; text: string; enter: boolean }
+  /**
+   * 等屏幕出现 `pattern`（子串；`/.../` 或 `/.../i` 按正则）。
+   * `pattern` 为空串表示「等输出静默」—— 不依赖具体提示符，适合菜单类界面。
+   */
+  | { kind: "wait"; pattern: string; timeoutMs: number }
+  /** 无条件等着 */
+  | { kind: "sleep"; ms: number };
+
+export interface MacroRecord {
+  id: string;
+  name: string;
+  steps: MacroStep[];
+  createdAt: number;
+  updatedAt: number;
+}
+
 export type AuthMethod =
   | { kind: "password"; password: string }
   | { kind: "privateKey"; path: string; passphrase?: string }

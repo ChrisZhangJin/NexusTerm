@@ -154,6 +154,13 @@ html, body, #root {
 .tabbar .tabbar-conn { flex-shrink: 0; height: 26px; }
 .tabbar .tb-sep { flex-shrink: 0; margin: 0 2px 0 6px; }
 .tabbar .tabbar-agent { flex-shrink: 0; height: 26px; margin-left: 6px; }
+.tabbar .tabbar-macro { flex-shrink: 0; height: 26px; }
+/* 录制中：按钮上挂一个红点。没有它，用户很容易忘了还在录，把后面的操作也记进去 */
+.tabbar-macro .tb-rec {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--danger);
+  margin-left: 1px; animation: macro-pulse 1.2s ease-in-out infinite;
+}
+.tabbar-macro.rec { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 55%, transparent); }
 .tabs { flex: 1; min-width: 0; display: flex; overflow-x: auto; padding: 0 6px; }
 .tabs::-webkit-scrollbar { height: 0; }
 
@@ -511,6 +518,64 @@ html, body, #root {
 .sb-error { color: var(--danger); }
 .sb-item { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sb-spacer { flex: 1; }
+
+/* 服务端心跳（keepalive@openssh.com）：每次心跳描一遍心电波形。
+   静止时只留一条暗基线 —— 没有心跳就不假装有。 */
+.sb-ecg { display: inline-flex; align-items: center; margin-left: -6px; flex: 0 0 auto; }
+.sb-ecg svg { display: block; }
+.sb-ecg-base {
+  fill: none;
+  stroke: color-mix(in srgb, var(--text-dim) 38%, transparent);
+  stroke-width: 1.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.sb-ecg.live .sb-ecg-base { stroke: color-mix(in srgb, var(--accent) 32%, transparent); }
+.sb-ecg.stale { opacity: .5; }
+.sb-ecg-beat {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  /* 路径长约 60：dash 从「全隐藏」描到「全显示」，就是一次脉搏 */
+  stroke-dasharray: 64;
+  stroke-dashoffset: 64;
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--accent) 65%, transparent));
+  /* 先描一遍（dashoffset），再缓慢余辉淡出（opacity）—— 两条动画各管一个属性 */
+  animation:
+    sb-ecg-draw .95s cubic-bezier(.22, .9, .3, 1) forwards,
+    sb-ecg-glow 3.6s ease-out forwards;
+}
+@keyframes sb-ecg-draw {
+  0% { stroke-dashoffset: 64; opacity: .25; }
+  18% { opacity: 1; }
+  100% { stroke-dashoffset: 0; opacity: 1; }
+}
+/* 下一次心跳前，上一次的波形要淡下去；否则「早就没心跳了」看起来还活着 */
+@keyframes sb-ecg-glow {
+  0%, 25% { opacity: 1; }
+  100% { opacity: .22; }
+}
+
+/* 兼容模式：可点击重检（标记会自我固化，必须留一个手动出口） */
+.sb-compat {
+  font: inherit;
+  height: 16px;
+  padding: 0 6px;
+  line-height: 14px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px dashed color-mix(in srgb, var(--text-dim) 40%, transparent);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.sb-compat:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+.sb-compat:disabled { opacity: .65; cursor: default; }
 
 /* 远端资源指示（CPU / 内存 / 磁盘） */
 .sb-res {
@@ -1636,3 +1701,93 @@ html, body, #root {
   background: var(--bg-panel);
 }
 .agent-window-root .ap-root { flex: 1; min-height: 0; border-left: none; }
+
+/* ——— 宏管理器 ———
+   左侧列表 + 右侧步骤编辑。步骤行的参数宽度用 flex 分配而不是固定列宽：
+   中文界面里「等待出现 [Host]>」这种参数比「等待 1.5s」长得多，固定列宽会
+   把长参数挤成省略号。 */
+.macro-modal { width: 720px; max-width: 92vw; }
+.macro-body { display: flex; gap: 14px; min-height: 300px; }
+.macro-list {
+  width: 176px; flex: none; display: flex; flex-direction: column; gap: 4px;
+  border-right: 1px solid var(--border); padding-right: 12px;
+  max-height: 380px; overflow-y: auto;
+}
+.macro-item {
+  display: flex; align-items: baseline; gap: 8px; text-align: left;
+  background: transparent; border: 1px solid transparent; border-radius: 6px;
+  padding: 7px 9px; color: var(--text); font-size: 12.5px; cursor: pointer;
+}
+.macro-item:hover { background: var(--bg-panel); }
+.macro-item.active {
+  background: var(--bg-panel); border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.macro-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.macro-item-count { flex: none; color: var(--text-dim); font-size: 11px; }
+.macro-new { margin-top: auto; }
+.macro-editor { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.macro-placeholder { color: var(--text-dim); font-size: 12px; line-height: 1.7; }
+.macro-name-row { display: flex; align-items: center; gap: 8px; }
+.macro-name {
+  flex: 1; min-width: 0; background: var(--bg-panel); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); padding: 7px 9px; font-size: 13px; outline: none;
+}
+.macro-name:focus { border-color: var(--accent); }
+.macro-save { flex: none; font-size: 11px; color: var(--text-dim); }
+.macro-save.on { color: var(--accent); }
+.macro-steps {
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: 300px; overflow-y: auto; padding-right: 2px;
+}
+.macro-step { display: flex; align-items: center; gap: 6px; }
+.macro-step-no { width: 18px; flex: none; text-align: right; color: var(--text-dim); font-size: 11px; }
+.macro-param {
+  background: var(--bg-panel); border: 1px solid var(--border); border-radius: 5px;
+  color: var(--text); padding: 5px 7px; font-size: 12px; outline: none;
+  font-family: "Cascadia Code", Consolas, Menlo, monospace;
+}
+.macro-param:focus { border-color: var(--accent); }
+.macro-param.grow { flex: 1; min-width: 90px; }
+.macro-param.num { width: 60px; text-align: right; }
+.macro-param-label { color: var(--text-dim); font-size: 11.5px; }
+.macro-unit { color: var(--text-dim); font-size: 11px; }
+.macro-check {
+  display: flex; align-items: center; gap: 4px; flex: none;
+  font-size: 11.5px; color: var(--text-dim); white-space: nowrap;
+}
+.macro-check input { accent-color: var(--accent); }
+.macro-step-ops { display: flex; gap: 2px; margin-left: auto; flex: none; }
+.icon-btn {
+  width: 22px; height: 22px; display: flex; align-items: center; justify-content: center;
+  background: transparent; border: 1px solid var(--border); border-radius: 5px;
+  color: var(--text-dim); font-size: 11px; line-height: 1; cursor: pointer; padding: 0;
+}
+.icon-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.icon-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.icon-btn.danger:hover { color: var(--danger); border-color: var(--danger); }
+.macro-add { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.macro-add .btn { padding: 5px 10px; font-size: 11.5px; }
+.macro-del { margin-left: auto; color: var(--text-dim); border-color: transparent; background: transparent; }
+.macro-del:hover { color: var(--danger); border-color: var(--danger); }
+.macro-empty { color: var(--text-dim); font-size: 11.5px; margin: 4px 0; }
+.macro-bind { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; }
+.macro-bind .settings-check { margin: 0; }
+.macro-actions { margin-top: 12px; align-items: center; }
+.macro-spacer { flex: 1; }
+
+/* 宏回放中的悬浮条：贴在终端右上角，不遮内容，点一下即中止 */
+.macro-running {
+  position: absolute; top: 10px; right: 16px; z-index: 20;
+  display: flex; align-items: center; gap: 8px;
+  background: var(--bg-elev); border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  border-radius: 999px; padding: 5px 12px; font-size: 11.5px; color: var(--text);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35); cursor: pointer;
+}
+.macro-running .mr-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+  animation: macro-pulse 1.2s ease-in-out infinite;
+}
+.macro-running .mr-hint { color: var(--text-dim); }
+.macro-running.rec { border-color: color-mix(in srgb, var(--danger) 55%, transparent); }
+.macro-running.rec .mr-dot { background: var(--danger); }
+@keyframes macro-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }

@@ -31,6 +31,10 @@ portable-pty = "0.8"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# russh / russh-sftp 用的是 `log` crate，而本应用只装了 tracing 的 subscriber。
+# 不装这道桥，库里的 debug! / trace! 会被**静默丢弃** —— 开 NEXUS_DEBUG 也只能
+# 看到自己的日志，库内部（探活、kex、断开原因）一片空白。
+tracing-log = "0.2"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"

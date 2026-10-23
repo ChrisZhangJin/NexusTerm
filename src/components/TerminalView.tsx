@@ -593,7 +593,7 @@ export default function TerminalView({
 
     const dataSub = term.onData((d) => {
       if (zmodem.isActive()) return;
-      // 旁路监听（跳板机登录路径录制）。发不发送由这里决定，监听方只读
+      // 旁路监听（宏录制、宏回放时「用户插了一脚就中止」）。发不发送由这里决定，监听方只读
       emitInput(tabId, d);
       send(d).catch(() => {});
       // 补全：喂键攒行（同步、纯字符串运算），候选留到下一帧再算

@@ -337,7 +337,7 @@ impl SessionManager {
             self.known_hosts.clone(),
             timeout,
             super::LegacyPolicy::from_flag(req.legacy_crypto),
-            Some(std::time::Duration::from_secs(10)),
+            super::keepalive_interval(),
             &req.username,
             auth,
             &id,
@@ -363,28 +363,42 @@ impl SessionManager {
         let session = opened.session;
 
 
-        let channel = session
-            .channel_open_session()
-            .await
-            .map_err(|e| SessionError::Channel(e.to_string()))?;
+        // 建通道 / 申请 pty / 起 shell：任何一步失败，这条已经认证过的连接就废了，
+        // 但服务端那边可能已经给它建好会话、算进「同账号并发数」里了。
+        // 所以失败路径统一走 abort_session，主动告别而不是留个孤儿。
+        let prepared = async {
+            let channel = session
+                .channel_open_session()
+                .await
+                .map_err(|e| SessionError::Channel(e.to_string()))?;
 
-        channel
-            .request_pty(
-                false,
-                "xterm-256color",
-                req.cols as u32,
-                req.rows as u32,
-                0,
-                0,
-                &[],
-            )
-            .await
-            .map_err(|e| SessionError::Channel(e.to_string()))?;
+            channel
+                .request_pty(
+                    false,
+                    "xterm-256color",
+                    req.cols as u32,
+                    req.rows as u32,
+                    0,
+                    0,
+                    &[],
+                )
+                .await
+                .map_err(|e| SessionError::Channel(e.to_string()))?;
 
-        channel
-            .request_shell(false)
-            .await
-            .map_err(|e| SessionError::Channel(e.to_string()))?;
+            channel
+                .request_shell(false)
+                .await
+                .map_err(|e| SessionError::Channel(e.to_string()))?;
+            Ok::<_, SessionError>(channel)
+        }
+        .await;
+        let channel = match prepared {
+            Ok(channel) => channel,
+            Err(e) => {
+                super::abort_session(&session, "建立终端通道失败").await;
+                return Err(e);
+            }
+        };
 
         let (data_tx, data_rx) = mpsc::channel(INPUT_QUEUE);
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
@@ -1587,6 +1601,7 @@ mod kbi_probe {
                 passphrase: None,
             },
             "probe-key",
+            None,
             // 明文私钥不该问任何问题；问了就说明判定逻辑错了
             |_p: AuthPrompt| async move { Err(AskAbort::Cancelled) },
         )
@@ -1624,6 +1639,7 @@ mod kbi_probe {
                 passphrase: None,
             },
             "probe-encrypted",
+            None,
             move |p: AuthPrompt| {
                 sink.lock().unwrap().push(p.clone());
                 let answer = secret.clone();
@@ -1668,6 +1684,7 @@ mod kbi_probe {
                 passphrase: None,
             },
             "probe-wrong",
+            None,
             move |p: AuthPrompt| {
                 let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 sink.lock().unwrap().push(p.instructions.clone());

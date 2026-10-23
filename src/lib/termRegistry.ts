@@ -70,9 +70,9 @@ export function lastOutputAt(id: string): number {
 /**
  * 用户按键的旁路监听（不影响正常发送）。
  *
- * 跳板机登录路径的录制需要知道用户敲了什么，但按键处理在 TerminalView、
- * 录制逻辑在 App 层 —— 与其把 TerminalView 改成受控组件，不如在这里开一个
- * 只读的tap：多订阅方互不干扰，xterm 的 onData 本身也支持多监听。
+ * 宏录制需要知道用户敲了什么，但按键处理在 TerminalView、录制/回放逻辑在
+ * App 层 —— 与其把 TerminalView 改成受控组件，不如在这里开一个只读的 tap：
+ * 多订阅方互不干扰，xterm 的 onData 本身也支持多监听。
  */
 type InputTap = (data: string) => void;
 const inputTaps = new Map<string, Set<InputTap>>();

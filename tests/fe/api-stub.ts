@@ -24,4 +24,18 @@ export const api = {
     calls.push({ tabId, program });
     return Promise.resolve(TABLE[program] ?? []);
   },
+
+  /** 宏回放会把字节写到这里；测试据此断言「发了什么、顺序对不对」 */
+  sshWrite(tabId: string, data: number[]): Promise<void> {
+    writes.push({ tabId, data });
+    return Promise.resolve();
+  },
 };
+
+/** 宏回放记录：每次 sshWrite 一条 */
+export const writes: { tabId: string; data: number[] }[] = [];
+
+/** 与 `src/api.ts` 同语义：按 UTF-8 编码成字节数组 */
+export function stringToBytes(s: string): number[] {
+  return Array.from(new TextEncoder().encode(s));
+}

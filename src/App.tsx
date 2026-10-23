@@ -14,6 +14,7 @@ import {
   ShortcutsDialog,
 } from "./components/SettingsDialogs";
 import KeyManagerDialog from "./components/KeyManagerDialog";
+import MacroDialog from "./components/MacroDialog";
 import AuthPromptDialog from "./components/AuthPromptDialog";
 import { api, onAuthPrompt, onAgentTab, stringToBytes } from "./api";
 import { loadAgentConfig } from "./lib/agent";
@@ -26,11 +27,11 @@ import {
 } from "./lib/context";
 import { cellWidth, getTerm, onInput, snapshotConsole, waitForPrompt } from "./lib/termRegistry";
 import {
-  LoginRecorder,
-  parseSteps,
-  waitForMenu,
-  waitQuiet,
-} from "./lib/loginScript";
+  isTerminalReply,
+  runMacro,
+  startRecording,
+  type MacroRecorder,
+} from "./lib/macro";
 import ConfirmDialog, { type ConfirmOptions } from "./components/ConfirmDialog";
 import { resolveAuth } from "./lib/auth";
 import {
@@ -51,6 +52,8 @@ import type {
   AuthMethod,
   AuthPrompt,
   ClosedInfo,
+  MacroRecord,
+  MacroStep,
   NewSession,
   SessionRecord,
   TerminalTab,
@@ -395,84 +398,251 @@ export default function App() {
     [patchTab, showToast]
   );
 
-  /**
-   * 跳板机登录路径：录制 + 回放。
-   *
-   * 回放时机是「菜单画完、输出静止」——不靠固定延时，也不要求屏幕像 shell 提示符。
-   * 每发一步都等这一步的输出停下，再判断菜单是否再次出现；菜单不回来就收工，
-   * 不会再往目标机器里瞎敲。
-   */
-  const replayLogin = useCallback(
-    async (tabId: string, configId: string | undefined, since: number) => {
-      if (!configId) return;
-      const { loginScript, loginScriptOn } = getExtras(configId);
-      if (!loginScriptOn) return;
-      const steps = parseSteps(loginScript);
-      if (!steps.length) return;
+  // ───────────────────────── 宏 ─────────────────────────
+  //
+  // 宏替换掉了原来的「跳板机登录路径」专用功能：那是一套只会录「菜单里选序号」
+  // 的特例，换一台堡垒机、或者想顺手跑几条命令就不适用了。现在同一个引擎既能
+  // 重放登录路径，也能做任何「等一会儿、敲一行」的事，绑到会话上就是自动执行。
 
-      let mark = since;
-      let sent = 0;
-      for (const step of steps) {
-        const ok = await waitForMenu(tabId, mark, sent === 0 ? 25_000 : 12_000);
-        if (!ok) break;
-        const tab = tabsRef.current.find((t) => t.id === tabId);
-        if (!tab || tab.status !== "connected") break;
-        mark = Date.now();
-        try {
-          await api.sshWrite(tabId, stringToBytes(`${step}\r`));
-          sent++;
-        } catch {
-          break;
+  const [macros, setMacros] = useState<MacroRecord[]>([]);
+  const [macroOpen, setMacroOpen] = useState(false);
+  const [macroFocus, setMacroFocus] = useState<string | null>(null);
+  /** 正在回放的宏：悬浮条据此显示进度，点一下中止 */
+  const [macroRun, setMacroRun] = useState<{
+    tabId: string;
+    name: string;
+    step: number;
+    total: number;
+    ctl: AbortController;
+  } | null>(null);
+  const [recording, setRecording] = useState<{ tabId: string; rec: MacroRecorder } | null>(null);
+  const [recSteps, setRecSteps] = useState(0);
+
+  const macrosRef = useRef<MacroRecord[]>([]);
+  macrosRef.current = macros;
+  /** 标签 → 正在回放的宏的取消开关（关标签 / 断开时要收掉） */
+  const macroCtl = useRef(new Map<string, AbortController>());
+
+  const refreshMacros = useCallback(async () => {
+    try {
+      setMacros(await api.listMacros());
+    } catch (e) {
+      console.error("加载宏失败", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshMacros();
+  }, [refreshMacros]);
+
+  /**
+   * 旧版「跳板机登录路径」→ 宏 的一次性迁移。
+   *
+   * 原来的实现只认「屏幕像菜单」这一种场景，换台堡垒机或想顺手跑几条命令就
+   * 不适用了；现在统一成宏，但用户已经录过的路径不能丢。转换后清空旧字段，
+   * 下次启动就不会重复生成。
+   */
+  const migratedLogin = useRef(false);
+  useEffect(() => {
+    if (migratedLogin.current || sessions.length === 0) return;
+    migratedLogin.current = true;
+    void (async () => {
+      // 附加状态是异步加载的，迁移必须等它到位，否则读到的都是空值
+      await loadExtras();
+      const added: MacroRecord[] = [];
+      for (const s of sessionsRef.current) {
+        const e = getExtras(s.id);
+        if (!e.loginScript.trim() || e.macroId) continue;
+        const steps: MacroStep[] = [];
+        for (const line of e.loginScript
+          .split(/\r?\n/)
+          .map((x) => x.trim())
+          .filter(Boolean)) {
+          // 旧逻辑是「菜单出来 → 发一步」，等价于「等屏幕稳定 → 发一行」
+          steps.push({ kind: "wait", pattern: "", timeoutMs: 0 });
+          steps.push({ kind: "send", text: line, enter: true });
         }
-        await waitQuiet(tabId, 700, 15_000);
+        if (!steps.length) continue;
+        try {
+          const m = await api.createMacro(`登录路径 · ${s.name}`, steps);
+          updateExtras(s.id, { loginScript: "", macroId: m.id, macroOn: e.loginScriptOn });
+          added.push(m);
+        } catch (err) {
+          console.error("迁移登录路径失败", err);
+        }
       }
-      if (sent > 0) {
-        showToast(`已自动选择跳板机路径：${steps.slice(0, sent).join(" → ")}`);
+      if (added.length) {
+        // 重新拉一次而不是本地合并：启动时的 listMacros 可能与迁移并发，
+        // 它的快照里没有这些新宏，直接合并会被晚到的结果覆盖掉
+        await refreshMacros();
+        showToast(`已将 ${added.length} 条跳板机登录路径转成宏，可在「宏」里修改`);
+      }
+    })();
+  }, [sessions.length, showToast, refreshMacros]);
+
+  const createMacro = useCallback(async (name: string, steps: MacroStep[]) => {
+    const m = await api.createMacro(name, steps);
+    setMacros((prev) => [...prev, m]);
+    return m;
+  }, []);
+
+  const updateMacro = useCallback(async (id: string, name: string, steps: MacroStep[]) => {
+    const m = await api.updateMacro(id, name, steps);
+    setMacros((prev) => prev.map((x) => (x.id === id ? m : x)));
+    return m;
+  }, []);
+
+  const deleteMacro = useCallback(async (id: string) => {
+    await api.deleteMacro(id);
+    setMacros((prev) => prev.filter((m) => m.id !== id));
+    // 绑定关系也要一起断掉，否则会话每次连接都会去找一条不存在的宏
+    for (const s of sessionsRef.current) {
+      if (getExtras(s.id).macroId === id) updateExtras(s.id, { macroId: "", macroOn: false });
+    }
+  }, []);
+
+  /**
+   * 在一个标签上跑宏。
+   *
+   * 三重中止条件：连接断开、用户按键、用户点悬浮条。用户按键中止看着有点凶，
+   * 但宏正在往远端打字时人再插一脚，两边输入交错后基本没法收拾 —— 停下重来
+   * 永远比「看起来在跑、其实发错了」便宜。
+   */
+  const executeMacro = useCallback(
+    async (tabId: string, macro: MacroRecord, opts: { auto?: boolean } = {}) => {
+      // 提示里区分「手动点运行」和「连上就自动跑」：后者失败时用户可能正在干别的，
+      // 得让他一眼看出这条消息来自哪个机制
+      const tag = opts.auto ? "自动宏" : "宏";
+      const tab = tabsRef.current.find((t) => t.id === tabId);
+      if (!tab || tab.status !== "connected") {
+        showToast(`${tag}「${macro.name}」没有执行：当前标签未连接`);
+        return;
+      }
+      if (!macro.steps.length) {
+        showToast(`${tag}「${macro.name}」没有任何步骤`);
+        return;
+      }
+
+      macroCtl.current.get(tabId)?.abort();
+      const ctl = new AbortController();
+      macroCtl.current.set(tabId, ctl);
+      setMacroRun({ tabId, name: macro.name, step: 1, total: macro.steps.length, ctl });
+
+      // 终端对远端查询的自动应答不算「用户插手」，否则 tmux / vim 一发查询
+      // 就会把自动宏掐掉
+      const off = onInput(tabId, (d) => {
+        if (!isTerminalReply(d)) ctl.abort();
+      });
+      try {
+        const r = await runMacro(tabId, macro.steps, {
+          signal: ctl.signal,
+          write: tab.local
+            ? (id, bytes) => api.localWrite(id, bytes)
+            : undefined,
+          onStep: (i) =>
+            setMacroRun((prev) =>
+              prev && prev.ctl === ctl ? { ...prev, step: i + 1 } : prev
+            ),
+        });
+        if (r.ok) {
+          showToast(`${tag}「${macro.name}」执行完成（${r.sent} 步）`);
+        } else if (r.reason === "cancelled") {
+          showToast(`${tag}「${macro.name}」已中止`);
+        } else if (r.reason === "closed") {
+          showToast(`${tag}「${macro.name}」中断：连接已断开`);
+        } else {
+          const at = (r.step ?? 0) + 1;
+          const step = macro.steps[r.step ?? 0];
+          const why =
+            step?.kind === "wait" && step.pattern
+              ? `等不到「${step.pattern}」`
+              : "等待超时";
+          showToast(
+            `${tag}「${macro.name}」第 ${at} 步${why}，已停止（后面的步骤没有发出去）`
+          );
+        }
+      } finally {
+        off();
+        if (macroCtl.current.get(tabId) === ctl) macroCtl.current.delete(tabId);
+        setMacroRun((prev) => (prev && prev.ctl === ctl ? null : prev));
       }
     },
     [showToast]
   );
 
-  /** 标签 → 登录路径录制器。只在「屏幕是菜单」时记录，普通命令不会误记 */
-  const recorders = useRef(new Map<string, { rec: LoginRecorder; off: () => void }>());
-
-  const stopRecording = useCallback((tabId: string) => {
-    const r = recorders.current.get(tabId);
-    if (!r) return;
-    r.rec.dispose();
-    r.off();
-    recorders.current.delete(tabId);
-  }, []);
-
-  const startRecording = useCallback(
-    (tabId: string, configId: string | undefined) => {
+  /** 连接就绪后执行会话绑定的宏（登录路径、自动初始化命令…） */
+  const runAutoMacro = useCallback(
+    async (tabId: string, configId: string | undefined) => {
       if (!configId) return;
-      stopRecording(tabId);
-      const rec = new LoginRecorder(tabId, (script) => {
-        const before = getExtras(configId).loginScript;
-        if (before === script) return;
-        updateExtras(configId, { loginScript: script, loginScriptOn: true });
-        showToast(
-          `已记住登录路径：${parseSteps(script).join(" → ")}（重连时自动选择）`
-        );
-      });
-      recorders.current.set(tabId, { rec, off: onInput(tabId, (d) => rec.handleInput(d)) });
-      rec.start();
+      const e = getExtras(configId);
+      if (!e.macroOn || !e.macroId) return;
+      const m = macrosRef.current.find((x) => x.id === e.macroId);
+      if (!m) return;
+      await executeMacro(tabId, m, { auto: true });
     },
-    [showToast, stopRecording]
+    [executeMacro]
   );
 
-  // 标签关掉 / 掉线后回收录制器，别让定时器一直跑
+  /** 录制：把用户接下来的操作变成一条新宏，停下来就进编辑器 */
+  const toggleRecording = useCallback(async () => {
+    if (recording) {
+      const steps = recording.rec.stop();
+      setRecording(null);
+      setRecSteps(0);
+      if (!steps.length) {
+        showToast("没有录到任何操作");
+        return;
+      }
+      try {
+        const stamp = new Date();
+        const hhmm = `${String(stamp.getHours()).padStart(2, "0")}${String(
+          stamp.getMinutes()
+        ).padStart(2, "0")}`;
+        const m = await createMacro(`录制 ${hhmm}`, steps);
+        setMacroFocus(m.id);
+        setMacroOpen(true);
+        showToast(`已录成宏「${m.name}」，可以改名或调整等待条件`);
+      } catch (e) {
+        showToast(`保存宏失败：${String(e)}`);
+      }
+      return;
+    }
+    const tab = tabsRef.current.find((t) => t.id === activeTab);
+    if (!tab || tab.status !== "connected") {
+      showToast("先连接一个会话再录制");
+      return;
+    }
+    const rec = startRecording(tab.id);
+    setRecSteps(0);
+    setRecording({ tabId: tab.id, rec });
+    setMacroOpen(false);
+  }, [recording, activeTab, createMacro, showToast]);
+
+  // 录制中的步数：录制器是同步累积的，只有靠轮询才能反映到界面上
   useEffect(() => {
-    for (const [id, entry] of [...recorders.current]) {
+    if (!recording) return;
+    const t = window.setInterval(() => setRecSteps(recording.rec.count()), 400);
+    return () => window.clearInterval(t);
+  }, [recording]);
+
+  // 标签断开 / 关掉：收掉宏与录制，别把定时器和输入订阅留着
+  useEffect(() => {
+    for (const [id, ctl] of [...macroCtl.current]) {
       const tab = tabs.find((t) => t.id === id);
       if (!tab || tab.status !== "connected") {
-        entry.rec.dispose();
-        entry.off();
-        recorders.current.delete(id);
+        ctl.abort();
+        macroCtl.current.delete(id);
       }
     }
-  }, [tabs]);
+    if (recording) {
+      const tab = tabs.find((t) => t.id === recording.tabId);
+      if (!tab || tab.status !== "connected") {
+        recording.rec.cancel();
+        setRecording(null);
+        setRecSteps(0);
+      }
+    }
+  }, [tabs, recording]);
 
   /**
    * 新连接就绪后把上下文还原进去（cd / tmux）。
@@ -550,12 +720,12 @@ export default function App() {
         }
         patchTab(tabId, { status: "connected", ctx: restore });
         connectedAt.current.set(tabId, Date.now());
-        // 顺序很重要：先把跳板机菜单选完（进到目标机器），再注入 cd / tmux 还原命令。
-        // 反过来的话，还原命令会被喂给菜单本身，直接变成一个非法选项。
-        void replayLogin(tabId, s.id, since).then(() =>
+        // 顺序很重要：先跑会话绑定的宏（登录路径会在这里把菜单选完、进到目标机器），
+        // 再注入 cd / tmux 还原命令。反过来的话，还原命令会被喂给菜单本身，
+        // 直接变成一个非法选项。
+        void runAutoMacro(tabId, s.id).then(() =>
           applyContext(tabId, restore, "duplicate", since)
         );
-        startRecording(tabId, s.id);
       } catch (e) {
         // 用户自己关掉了验证码弹窗，不是连接出错，别标成红色错误
         if (authCancelled.current.delete(tabId)) {
@@ -622,11 +792,10 @@ export default function App() {
             closedAt: undefined,
           });
           // 用断线前最后一次探测到的上下文恢复（tmux 直接 attach 回原会话）。
-          // 仍然排在登录路径回放之后：菜单没选完时目标机器还没进去。
-          void replayLogin(tabId, s.id, since).then(() =>
+          // 仍然排在自动宏之后：宏没跑完时目标机器还没进去。
+          void runAutoMacro(tabId, s.id).then(() =>
             applyContext(tabId, tab.ctx, "reconnect", since)
           );
-          startRecording(tabId, s.id);
           return;
         } catch (e) {
           lastErr = toFriendlyError(String(e)).message;
@@ -1328,6 +1497,13 @@ export default function App() {
         onMove={moveTab}
         agentOpen={agentOpen}
         onToggleAgent={() => setAgentOpen((v) => !v)}
+        macroOpen={macroOpen}
+        recording={!!recording}
+        onMacros={() => {
+          // 录制中点「宏」= 停止录制（停止后会直接进编辑器）
+          if (recording) void toggleRecording();
+          else setMacroOpen((v) => !v);
+        }}
       />
 
       <div className="workspace">
@@ -1398,6 +1574,30 @@ export default function App() {
                 passphrase={passphraseRef.current.get(fmSession.id)}
                 onClose={() => setFmSession(null)}
               />
+            )}
+
+            {/* 宏回放 / 录制：贴在终端右上角，点一下即中止 */}
+            {macroRun && macroRun.tabId === activeTab && (
+              <div
+                className="macro-running"
+                title="点击中止这条宏"
+                onClick={() => macroRun.ctl.abort()}
+              >
+                <span className="mr-dot" />
+                宏「{macroRun.name}」{macroRun.step}/{macroRun.total}
+                <span className="mr-hint">点击中止</span>
+              </div>
+            )}
+            {recording && recording.tabId === activeTab && (
+              <div
+                className="macro-running rec"
+                title="点击停止录制"
+                onClick={() => void toggleRecording()}
+              >
+                <span className="mr-dot" />
+                正在录制宏 · {recSteps} 步
+                <span className="mr-hint">点击停止</span>
+              </div>
             )}
 
             {tabs.length === 0 && !fmSession && (
@@ -1510,9 +1710,43 @@ export default function App() {
       {settingsWin === "agent" && <AgentDialog onClose={() => setSettingsWin(null)} />}
       {settingsWin === "keys" && <KeyManagerDialog onClose={() => setSettingsWin(null)} />}
 
+      {macroOpen && (
+        <MacroDialog
+          macros={macros}
+          focusId={macroFocus}
+          tabReady={activeTabState?.status === "connected"}
+          tabLabel={
+            activeTabState ? activeTabState.customTitle || activeTabState.title : null
+          }
+          sessionId={activeSession?.id ?? null}
+          sessionName={activeSession?.name ?? null}
+          boundId={
+            activeSession && getExtras(activeSession.id).macroOn
+              ? getExtras(activeSession.id).macroId || null
+              : null
+          }
+          recording={!!recording}
+          onBind={(id) => {
+            if (!activeSession) return;
+            updateExtras(activeSession.id, { macroId: id ?? "", macroOn: !!id });
+          }}
+          onRecord={() => void toggleRecording()}
+          onRun={(m) => {
+            if (!activeTab) return;
+            setMacroOpen(false);
+            void executeMacro(activeTab, m);
+          }}
+          onCreate={createMacro}
+          onUpdate={updateMacro}
+          onDelete={deleteMacro}
+          onClose={() => setMacroOpen(false)}
+        />
+      )}
+
       {dialogOpen && (
         <SessionDialog
           editing={editing}
+          macros={macros}
           onSave={saveSession}
           onClose={() => {
             setDialogOpen(false);

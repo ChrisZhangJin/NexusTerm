@@ -29,8 +29,6 @@ const stub = (name) => fs.realpathSync(path.join(testsDir, name));
 const xtermStub = path.join(os.tmpdir(), "nx-fe-test-xterm-stub.ts");
 fs.writeFileSync(xtermStub, "export {};\n");
 
-const out = path.join(os.tmpdir(), "nx-fe-test-bundle.mjs");
-
 const redirect = {
   name: "fe-test-redirect",
   setup(build) {
@@ -39,17 +37,36 @@ const redirect = {
   },
 };
 
-await esbuild.build({
-  entryPoints: [path.join(testsDir, "complete.test.ts")],
-  bundle: true,
-  outfile: out,
-  platform: "node",
-  format: "esm",
-  target: `node${process.versions.node.split(".")[0]}`,
-  plugins: [redirect],
-  external: ["node:*"],
-  logLevel: "warning",
-});
+/**
+ * 每个 `*.test.ts` 单独打一个包、各自一个进程跑：
+ * 用例之间共享的模块级状态（比如 api-stub 里的调用记录）不会互相污染。
+ */
+const entries = fs
+  .readdirSync(testsDir)
+  .filter((f) => f.endsWith(".test.ts"))
+  .sort();
 
-const r = spawnSync(process.execPath, ["--test", out], { stdio: "inherit" });
+if (entries.length === 0) {
+  console.error("没有找到任何 tests/fe/*.test.ts");
+  process.exit(1);
+}
+
+const outs = [];
+for (const entry of entries) {
+  const out = path.join(os.tmpdir(), `nx-fe-test-${entry.replace(/\.ts$/, "")}.mjs`);
+  await esbuild.build({
+    entryPoints: [path.join(testsDir, entry)],
+    bundle: true,
+    outfile: out,
+    platform: "node",
+    format: "esm",
+    target: `node${process.versions.node.split(".")[0]}`,
+    plugins: [redirect],
+    external: ["node:*"],
+    logLevel: "warning",
+  });
+  outs.push(out);
+}
+
+const r = spawnSync(process.execPath, ["--test", ...outs], { stdio: "inherit" });
 process.exit(r.status ?? 1);

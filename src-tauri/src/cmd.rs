@@ -349,6 +349,40 @@ pub fn delete_session(id: String, state: State<'_, AppState>) -> Result<(), Stri
     state.store.delete(&id)
 }
 
+// ——— 宏 ———
+//
+// 宏的执行完全在前端（需要读终端屏幕、按输出节奏决定何时发下一步），
+// 后端只负责持久化 —— 这样宏的定义与执行不会出现两套解析逻辑。
+
+#[tauri::command]
+pub fn list_macros(state: State<'_, AppState>) -> Result<Vec<store::MacroRecord>, String> {
+    state.store.list_macros()
+}
+
+#[tauri::command]
+pub fn create_macro(
+    name: String,
+    steps: Vec<store::MacroStep>,
+    state: State<'_, AppState>,
+) -> Result<store::MacroRecord, String> {
+    state.store.create_macro(&name, &steps)
+}
+
+#[tauri::command]
+pub fn update_macro(
+    id: String,
+    name: String,
+    steps: Vec<store::MacroStep>,
+    state: State<'_, AppState>,
+) -> Result<store::MacroRecord, String> {
+    state.store.update_macro(&id, &name, &steps)
+}
+
+#[tauri::command]
+pub fn delete_macro(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.store.delete_macro(&id)
+}
+
 /// 拖拽后批量持久化排序与分组归属。
 /// items: [(id, sortOrder, folder), ...]
 #[tauri::command]

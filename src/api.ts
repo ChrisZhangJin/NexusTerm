@@ -18,6 +18,8 @@ import type {
   DiscoveredKey,
   GenerateKeyOptions,
   KeyInfo,
+  MacroRecord,
+  MacroStep,
   NewSession,
   RemoteEntry,
   SessionRecord,
@@ -61,6 +63,15 @@ export const api = {
   updateSession: (id: string, session: NewSession) =>
     invoke<SessionRecord>("update_session", { id, session }),
   deleteSession: (id: string) => invoke<void>("delete_session", { id }),
+
+  /** 宏：持久化在后端，回放由前端执行（要读屏幕、按输出节奏发下一步） */
+  listMacros: () => invoke<MacroRecord[]>("list_macros"),
+  createMacro: (name: string, steps: MacroStep[]) =>
+    invoke<MacroRecord>("create_macro", { name, steps }),
+  updateMacro: (id: string, name: string, steps: MacroStep[]) =>
+    invoke<MacroRecord>("update_macro", { id, name, steps }),
+  deleteMacro: (id: string) => invoke<void>("delete_macro", { id }),
+
   /** 拖拽后批量持久化排序与分组归属：items = [id, sortOrder, folder][] */
   reorderSessions: (items: [string, number, string][]) =>
     invoke<void>("reorder_sessions", { items }),
@@ -329,6 +340,20 @@ export async function onTermClosed(
     const p = ev.payload;
     handler(typeof p === "number" ? { code: p, reason: "eof" } : p);
   });
+}
+
+/**
+ * 服务端心跳（`keepalive@openssh.com`）到达。
+ *
+ * 后端在 russh 处理 keepalive 的分支里发这个事件（vendor 补丁 7）——
+ * 是「链路还活着」的正向证据，比任何本地计时都可信：
+ * 服务端愿意探活，说明它那边的会话与 NAT 映射都还在。
+ */
+export async function onTermPulse(
+  id: string,
+  handler: () => void
+): Promise<UnlistenFn> {
+  return listen(`nx://term/pulse/${id}`, () => handler());
 }
 
 // ——— AI Agent 流式事件 ———
