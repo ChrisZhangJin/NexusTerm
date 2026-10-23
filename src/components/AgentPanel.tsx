@@ -935,11 +935,21 @@ function StepCard({ step }: { step: AgentStep }) {
   const done = step.kind === "result";
   const okCode = done && step.exitCode === 0;
   const badCode = done && step.exitCode !== 0 && step.exitCode != null;
+  // 退出码拿不到（哨兵没打出来：shell 方言不匹配 / 命令被全屏程序接管 / 超时）
+  // 既不是 0 也不是「非 0」。以前这里被当成失败显示，明明成功的 dir 也报「非 0」。
+  const unknownCode = done && step.exitCode == null;
+  const tag = !done
+    ? "执行中"
+    : badCode
+      ? "已完成 · 非 0"
+      : unknownCode
+        ? "已完成 · 退出码未知"
+        : "已完成";
   const lines = (step.output ?? "").split("\n").length;
   return (
-    <div className={`ap-step${okCode ? "" : badCode ? " bad" : " pending"}`}>
+    <div className={`ap-step${badCode ? " bad" : okCode ? "" : " pending"}`}>
       <div className="ap-step-head">
-        <span className="ap-step-tag">{done ? (okCode ? "已完成" : "已完成 · 非 0") : "执行中"}</span>
+        <span className="ap-step-tag">{tag}</span>
         <span className="ap-step-where" title={step.target}>
           {step.targetLabel ?? "未知会话"}
         </span>

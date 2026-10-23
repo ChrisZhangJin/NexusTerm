@@ -46,7 +46,7 @@ use tauri::{AppHandle, Emitter};
 use super::capture;
 use super::danger::assess;
 use super::executor::{
-    strip_sentinel_wrappers, wait_for_end, ExecEnd, ExecOutcome, Sentinel, WaitConfig,
+    strip_sentinel_wrappers, wait_for_end, ExecEnd, ExecOutcome, Sentinel, Shell, WaitConfig,
 };
 use super::llm::{self, ChatMessage, CONTEXT_BEGIN, CONTEXT_END};
 use super::{AgentConfig, AgentError};
@@ -574,7 +574,10 @@ pub const ACTION_PROTOCOL: &str = concat!(
     "1) exec 的 command 必须是**单条单行**命令，不许用换行或 && 串联互不相关的操作；",
     "需要分几步就分几轮，每轮都会收到上一条的真实输出；\n",
     "2) 一次最多给 12 条动作，够用为止，不要贪多；\n",
-    "3) 优先用只读命令（ls / cat / grep / ss / df / ps / journalctl 等）把情况看清楚，",
+    "3) 优先用只读命令把情况看清楚：POSIX 用 ls / cat / grep / ss / df / ps / journalctl；",
+    "**Windows 本地会话（提示符形如 `C:\\Users\\…>`）是 cmd.exe，必须换成 dir / type /",
+    " findstr / ipconfig / tasklist / systeminfo 等 cmd 语法** —— ls、cat、grep 在 cmd 里",
+    "根本不存在，发过去只会得到「不是内部或外部命令」；",
     "确有必要才做写操作，并在下达前用一句话说明为什么要做、影响面多大；\n",
     "4) 命令的输出与退出码会原样回给你，**退出码非 0 不代表流程失败** ——",
     "照着真实输出继续判断，不要假装没看到；\n",
@@ -825,7 +828,14 @@ pub async fn run_one(
     state.agent.set_enabled(session_id, true);
 
     let sentinel = Sentinel::new();
-    let payload = sentinel.wrap(cmd);
+    // 本地 Windows 会话跑的是 cmd.exe，哨兵必须用 cmd 的方言；
+    // SSH 目标与 Unix 本地一律 POSIX。选错方言的后果不是「难看一点」，
+    // 而是哨兵永远打不出来 —— 只能等静默兜底，退出码丢失、还会被误显示成失败。
+    let shell = match sink_of(state, session_id) {
+        Some(Sink::Local) => Shell::native(),
+        _ => Shell::Posix,
+    };
+    let payload = sentinel.wrap_for(cmd, shell);
     write_to(state, session_id, payload.as_bytes()).await?;
     // 喂的是**包裹后**的原始字节：这样 pty 的回显才能被 pending_echo 逐字节抵消干净
     state.agent.feed(session_id, payload.as_bytes(), StreamKind::In);
@@ -844,16 +854,20 @@ pub async fn run_one(
     }
 
     let baseline = state.agent.snapshot(session_id).unwrap_or_default();
+    // 这里**绝对不能**先剥哨兵再交给 wait_for_end：剥的动作会把「哨兵已经打印出来」
+    // 那一行整行删掉，wait 就永远扫不到它，只能一路等到静默兜底 ——
+    // 结果是每条命令都要白等 1.5 秒、退出码永远 `None`，界面上还会被误显示成失败。
+    // 判定用原始增量；剥离只在最后给用户/模型看输出时做（见下面 outcome.output）。
     let delta = || {
         let now = state.agent.snapshot(session_id).unwrap_or_default();
         match now.strip_prefix(baseline.as_str()) {
-            Some(rest) => strip_sentinel_wrappers(rest),
+            Some(rest) => rest.to_string(),
             // 环形缓冲把开头丢掉了（超长输出）：基线不再是前缀，
             // 退回整份快照，兜里至少还能扫到哨兵。
-            None => strip_sentinel_wrappers(&now),
+            None => now,
         }
     };
-    let outcome = wait_for_end(
+    let mut outcome = wait_for_end(
         &sentinel,
         WaitConfig::default(),
         delta,
@@ -861,6 +875,9 @@ pub async fn run_one(
         |d| Box::pin(tokio::time::sleep(d)) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     )
     .await;
+    // 命令回显（含哨兵尾巴）与哨兵行的最终清理。留在这里而不是 delta 里，
+    // 就是为了不破坏上面那次判定。
+    outcome.output = strip_sentinel_wrappers(&outcome.output);
 
     if announce {
         emit_step(
