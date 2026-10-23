@@ -21,11 +21,8 @@ import {
   buildCompletions,
   dropCompletion,
   feedKeys,
-  firstToken,
-  lastToken,
+  loadHistory,
   newLineState,
-  optionsFor,
-  peekOptions,
   recordCommand,
   type CompletionItem,
 } from "../lib/complete";
@@ -99,6 +96,15 @@ interface Props {
   active: boolean;
   /** ssh = 远端会话；local = 本机 PTY。两者共用同一套渲染与事件协议 */
   kind?: "ssh" | "local";
+  /**
+   * 命令历史按「会话身份」存取，不是 tabId：本地 shell 固定 `"local"`，
+   * 已保存的 SSH 连接是它的 `SessionRecord.id`——这两种会持久化，重连/
+   * 重启应用都能接着用。没有保存记录的临时连接，调用方应该传 `tabId`
+   * 本身当 key：不会被持久化，行为与过去的纯内存历史一致。
+   */
+  historyKey: string;
+  /** `historyKey` 是否要落盘持久化（本地 / 已保存会话为 true，临时连接为 false） */
+  historyPersist: boolean;
   theme: Theme;
   fontFamily: string;
   fontSize: number;
@@ -147,6 +153,8 @@ export default function TerminalView({
   tabId,
   active,
   kind = "ssh",
+  historyKey,
+  historyPersist,
   theme,
   fontFamily,
   fontSize,
@@ -190,6 +198,10 @@ export default function TerminalView({
   //
   // 补全**只负责给建议**，从不自己写 pty。
   // 真正落到终端的只有两处：用户按 Tab 接受的那一段，以及用户自己敲的每一个键。
+  const historyKeyRef = useRef(historyKey);
+  historyKeyRef.current = historyKey;
+  const historyPersistRef = useRef(historyPersist);
+  historyPersistRef.current = historyPersist;
   const lineRef = useRef(newLineState());
   const ghostRef = useRef(new GhostText());
   /** 当前候选列表（null = 不显示下拉） */
@@ -206,8 +218,6 @@ export default function TerminalView({
   /** 上一次推给界面的候选签名（label 拼起来），用来跳过内容没变的重复渲染 */
   const hintSigRef = useRef("\u0000");
   const hintsRef = useRef<CompletionItem[]>([]);
-  /** 与后端请求对账用的序号：慢响应回来时若已过期就丢弃 */
-  const hintSeq = useRef(0);
   /**
    * 本帧有没有排队的补全重算（rAF 句柄，0 = 没排）。
    *
@@ -296,43 +306,17 @@ export default function TerminalView({
     const term = termRef.current;
     if (term) ghostRef.current.clear(term);
     hintsRef.current = [];
-    hintSeq.current++; // 让还在路上的 `--help` 请求回来时自己作废
     hintSigRef.current = "\u0000";
     setHints(null);
     setHintIndex(0);
   }, []);
 
-  /**
-   * 按当前这半行重算候选；需要时向后端问参数。
-   *
-   * 每次调用都会先把序号 +1 —— 于是上一次发起但还没回来的 `--help` 请求
-   * 回来时发现自己已过期，自动放弃。连打十个字符只会留下最后一次的结果。
-   */
+  /** 按当前这半行重算候选：历史是本地同步缓存，不用等网络往返。 */
   const refreshHints = useCallback(
     (line: string) => {
-      const seq = ++hintSeq.current;
-
-      const token = lastToken(line);
-      const program = firstToken(line);
-
-      // 半截 flag → 问这个程序支持哪些参数
-      if (token.startsWith("-") && program && program !== token) {
-        const cached = peekOptions(tabId, program);
-        if (cached) {
-          publish(buildCompletions(tabId, line, cached));
-          return;
-        }
-        void optionsFor(tabId, program).then((opts) => {
-          if (hintSeq.current !== seq) return; // 期间又敲了键 → 这次结果已过期
-          publish(buildCompletions(tabId, line, opts));
-        });
-        return;
-      }
-
-      // 命令名阶段：只用历史
-      publish(buildCompletions(tabId, line, []));
+      publish(buildCompletions(historyKeyRef.current, line));
     },
-    [tabId, publish]
+    [publish]
   );
 
   /**
@@ -410,6 +394,10 @@ export default function TerminalView({
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
+
+    // 只有持久化的 key（本地 / 已保存会话）才值得拉全量历史；
+    // 临时连接没有这个身份，维持现状的纯内存行为。
+    if (historyPersist) void loadHistory(historyKey).catch(() => {});
 
     const term = new Terminal({
       fontFamily,
@@ -598,7 +586,7 @@ export default function TerminalView({
       send(d).catch(() => {});
       // 补全：喂键攒行（同步、纯字符串运算），候选留到下一帧再算
       const committed = feedKeys(lineRef.current, d);
-      if (committed) recordCommand(tabId, committed);
+      if (committed) recordCommand(historyKeyRef.current, committed, historyPersistRef.current);
       refreshHintsSoon();
     });
 
@@ -692,9 +680,10 @@ export default function TerminalView({
       cleanups.forEach((f) => f());
       term.dispose();
       termRef.current = null;
-      // 标签关掉后，它攒的命令历史与参数缓存就没用了 ——
-      // 这两个 Map 的生命周期是整个进程，不放掉就是泄漏
-      dropCompletion(tabId);
+      // 临时连接的历史只在内存里，标签关掉就没用了；
+      // 持久化的 key（本地 / 已保存会话）不动——可能还有别的标签在用，
+      // 真正的数据也早就落盘了。
+      dropCompletion(historyKeyRef.current, historyPersistRef.current);
     };
     // 字体等外观变化通过下面的 effect 单独应用，不重建实例
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -8,8 +8,8 @@
   --accent: #5dcaa5;
   --danger: #e06c75;
   --radius: 8px;
-  /* 标题栏 / 工具栏 / 标签栏的总高，供浮层定位用 */
-  --chrome-h: 72px; /* 标题栏 38 + 标签栏 34（工具栏已并入标签栏） */
+  /* 顶部合并栏（标题栏 + 工具栏 + 标签栏）总高，供浮层定位用 */
+  --chrome-h: 38px;
   /* 交通灯预留宽度（Overlay 标题栏下由窗口服务器绘制在本页之上） */
   --lights-w: 80px;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -37,46 +37,25 @@ html, body, #root {
   overflow: hidden;
 }
 
-/* 自上而下：标题栏 → 工具栏 → 标签栏 → 主体 → 状态栏 */
+/* 自上而下：合并栏（标题栏 + 工具栏 + 标签栏）→ 主体 → 状态栏 */
 .app { display: flex; flex-direction: column; height: 100%; }
 
-/* ——— 标题栏（自绘，避开交通灯）——— */
-.titlebar {
-  flex: 0 0 38px;
-  height: 38px;
-  display: flex;
-  align-items: center;
-  background: var(--bg-panel);
-  border-bottom: 1px solid var(--border);
-  user-select: none;
-}
-/* 交通灯占位：不放任何可点击控件，也不吃事件 */
+/* 交通灯占位：不放任何可点击控件，也不吃事件。仅 macOS 需要 */
 .titlebar-lights {
   flex: 0 0 var(--lights-w);
   width: var(--lights-w);
   height: 100%;
   pointer-events: none;
 }
-/* 非 macOS 的应用图标。pointer-events 关掉，别阻断标题栏拖动 */
+/* 非 macOS 的应用图标。pointer-events 关掉，别阻断拖动 */
 .titlebar-appicon {
   flex: 0 0 16px;
   width: 16px;
   height: 16px;
   margin-left: 10px;
+  margin-right: 8px;
   pointer-events: none;
 }
-.titlebar-title {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12.5px;
-  color: var(--text-dim);
-  pointer-events: none;
-  padding-left: 10px;
-}
-.titlebar-actions { display: flex; align-items: center; gap: 6px; padding-right: 10px; }
 
 /* ——— 自绘窗口控制按钮（Windows / Linux，无系统装饰）——— */
 .titlebar-controls {
@@ -141,20 +120,23 @@ html, body, #root {
 .tb-sep { width: 1px; height: 18px; background: var(--border); margin: 0 5px; }
 .tb-spacer { flex: 1; }
 
-/* ——— 标签栏 ——— */
+/* ——— 标签栏（已并入标题栏 / 工具栏，顶部只剩这一条） ——— */
 .tabbar {
-  flex: 0 0 34px;
-  height: 34px;
+  flex: 0 0 38px;
+  height: 38px;
   display: flex;
   align-items: center;
   background: var(--bg-panel);
   border-bottom: 1px solid var(--border);
-  padding: 0 8px 0 6px;
+  padding: 0 0 0 6px;
+  user-select: none;
 }
 .tabbar .tabbar-conn { flex-shrink: 0; height: 26px; }
 .tabbar .tb-sep { flex-shrink: 0; margin: 0 2px 0 6px; }
 .tabbar .tabbar-agent { flex-shrink: 0; height: 26px; margin-left: 6px; }
 .tabbar .tabbar-macro { flex-shrink: 0; height: 26px; }
+/* macOS 没有自绘窗口按钮兜底，AI 按钮右边要留白，不然贴着窗口边缘 */
+html[data-platform="macos"] .tabbar { padding-right: 10px; }
 /* 录制中：按钮上挂一个红点。没有它，用户很容易忘了还在录，把后面的操作也记进去 */
 .tabbar-macro .tb-rec {
   width: 6px; height: 6px; border-radius: 50%; background: var(--danger);
@@ -638,6 +620,13 @@ html, body, #root {
 /* 输出字符数 */
 .sb-count { font-variant-numeric: tabular-nums; cursor: default; }
 
+/* 当前会话 id：点击复制，外观跟其它 sb-item 一致，只是加个可点击提示 */
+.sb-id {
+  font: inherit; color: inherit; background: none; border: none; padding: 0;
+  cursor: pointer; max-width: 220px; overflow: hidden; text-overflow: ellipsis;
+}
+.sb-id:hover { color: var(--accent); }
+
 /* NUM / CAP 指示 */
 .sb-lock {
   font-size: 10px; letter-spacing: .5px; font-weight: 600;
@@ -653,10 +642,20 @@ html, body, #root {
 }
 .ctx-menu.sb-menu { min-width: 170px; }
 
-/* ——— 标题栏「设置」下拉 ——— */
-.tb-settings { position: relative; }
-.ctx-menu.tb-settings-menu {
-  position: absolute; top: calc(100% + 6px); right: 0; left: auto;
+/* ——— 状态栏右下角「设置」齿轮 ——— */
+.sb-settings { position: relative; margin-left: 2px; }
+.sb-settings-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 20px; height: 18px; padding: 0;
+  background: transparent; border: 1px solid transparent; border-radius: 4px;
+  color: var(--text-dim); font-size: 12px; cursor: pointer;
+}
+.sb-settings-btn:hover, .sb-settings-btn.active {
+  color: var(--accent); border-color: var(--accent);
+}
+/* 菜单从底部栏往上开，贴着窗口下边缘不会被截断 */
+.ctx-menu.sb-settings-menu {
+  position: absolute; bottom: calc(100% + 6px); right: 0; left: auto; top: auto;
   min-width: 220px; z-index: 300;
 }
 
@@ -1582,26 +1581,18 @@ html, body, #root {
   border: 1px solid var(--border); background: var(--bg-elev);
 }
 .ap-step.pending { border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
-.ap-step.bad { border-color: color-mix(in srgb, #e5c07b 45%, transparent); }
 .ap-step.danger { border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
 .ap-step-head {
   display: flex; align-items: center; gap: 7px;
   padding: 5px 8px; border-bottom: 1px solid var(--border);
 }
 .ap-step-tag { flex: none; font-size: 10.5px; font-weight: 600; color: var(--accent); }
-.ap-step.bad .ap-step-tag { color: #e5c07b; }
 .ap-step.danger .ap-step-tag { color: var(--danger); }
 /* 哪台机器上跑的：多会话模式下这是最有信息量的一栏，不许被压缩掉 */
 .ap-step-where {
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   color: var(--text-dim); font-size: 11px;
 }
-.ap-step-code {
-  flex: none; padding: 0 6px; border-radius: 9px;
-  color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent);
-  font: 10.5px/1.6 ui-monospace, Consolas, monospace;
-}
-.ap-step-code.bad { color: #e5c07b; background: color-mix(in srgb, #e5c07b 16%, transparent); }
 .ap-step .ap-code { margin: 0; border: none; border-radius: 0; background: var(--bg-panel); }
 .ap-step-why { padding: 4px 9px 6px; color: var(--text-dim); font-size: 11px; line-height: 1.6; }
 .ap-out { padding: 5px 9px 7px; }
@@ -1675,22 +1666,9 @@ html, body, #root {
   color: var(--text); font: 12px/1 ui-monospace, Consolas, monospace;
 }
 .cp-item.on { background: color-mix(in srgb, var(--accent) 16%, transparent); }
-.cp-kind {
-  flex: none; padding: 0 6px; border-radius: 8px;
-  background: var(--bg); border: 1px solid var(--border);
-  color: var(--text-dim); font-size: 10px; line-height: 1.6;
-}
-.cp-item.on .cp-kind {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-}
 .cp-label {
-  flex: none; max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  color: var(--accent);
-}
-.cp-detail {
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  color: var(--text-dim); font-size: 11px;
+  color: var(--accent);
 }
 
 /* ——— 浮动 Agent 独立窗口 ———

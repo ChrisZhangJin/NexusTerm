@@ -24,6 +24,12 @@ interface Props {
   } | null;
   /** 当前激活标签（统计输出字符数） */
   activeTabId: string | null;
+  /** 复制成功 / 失败时弹一条提示（没传就静默） */
+  onNotify?: (msg: string) => void;
+  /** 打开「设置」下的某个窗口 */
+  onOpenSettings: (which: "appearance" | "behavior" | "shortcuts" | "keys" | "agent") => void;
+  /** 有设置窗口打开时高亮齿轮 */
+  settingsOpen: boolean;
 }
 
 const LABEL: Record<Props["status"], string> = {
@@ -480,11 +486,39 @@ export default function StatusBar({
   connectedCount,
   statsTarget,
   activeTabId,
+  onNotify,
+  onOpenSettings,
+  settingsOpen,
 }: Props) {
   const prefs = usePrefs();
   const locks = useLockKeys();
   const out = useOutputCount(activeTabId);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
+  const settingsMenuRef = useRef<HTMLDivElement>(null);
+
+  // 设置菜单：点外 / Esc / 窗口失焦收起
+  useEffect(() => {
+    if (!settingsMenuOpen) return;
+    const down = (e: MouseEvent) => {
+      if (!settingsMenuRef.current?.contains(e.target as Node)) setSettingsMenuOpen(false);
+    };
+    const key = (e: KeyboardEvent) => e.key === "Escape" && setSettingsMenuOpen(false);
+    const blur = () => setSettingsMenuOpen(false);
+    document.addEventListener("mousedown", down);
+    window.addEventListener("keydown", key);
+    window.addEventListener("blur", blur);
+    return () => {
+      document.removeEventListener("mousedown", down);
+      window.removeEventListener("keydown", key);
+      window.removeEventListener("blur", blur);
+    };
+  }, [settingsMenuOpen]);
+
+  const pickSettings = (w: "appearance" | "behavior" | "shortcuts" | "keys" | "agent") => {
+    setSettingsMenuOpen(false);
+    onOpenSettings(w);
+  };
 
   // 链路脉搏：服务端 keepalive（后端事件）或一次成功的资源采集，两者都算。
   // 只订阅当前标签：切走时清空状态，不给后台标签白跑动效。
@@ -572,6 +606,21 @@ export default function StatusBar({
           字符 {fmtCount(out.chars)}
         </span>
       )}
+      {activeTabId && (
+        <button
+          type="button"
+          className="sb-item sb-id"
+          title="当前会话 id（与 Agent 对话里引用的 target 是同一个值）点击复制"
+          onClick={() => {
+            api
+              .clipboardWrite(activeTabId)
+              .then(() => onNotify?.("已复制会话 id"))
+              .catch((e) => onNotify?.(`复制失败：${String(e)}`));
+          }}
+        >
+          ID {activeTabId}
+        </button>
+      )}
       <span
         className={`sb-lock${locks?.num ? " on" : ""}`}
         title={locks ? `NumLock ${locks.num ? "已开启" : "已关闭"}` : "按任意键后显示 NumLock 状态"}
@@ -588,6 +637,45 @@ export default function StatusBar({
         {sessionCount} 会话
         {connectedCount !== sessionCount ? `（${connectedCount} 在线）` : ""}
       </span>
+
+      <div className="sb-settings" ref={settingsMenuRef}>
+        <button
+          className={`sb-settings-btn${settingsOpen || settingsMenuOpen ? " active" : ""}`}
+          onClick={() => setSettingsMenuOpen((v) => !v)}
+          title="设置"
+          aria-haspopup="menu"
+          aria-expanded={settingsMenuOpen}
+        >
+          ⚙
+        </button>
+        {settingsMenuOpen && (
+          <div
+            className="ctx-menu sb-settings-menu"
+            role="menu"
+            data-tauri-drag-region="false"
+          >
+            <button className="ctx-item" role="menuitem" onClick={() => pickSettings("appearance")}>
+              外观…
+              <span className="ctx-shortcut">配色 · 字体 · 底部栏</span>
+            </button>
+            <button className="ctx-item" role="menuitem" onClick={() => pickSettings("behavior")}>
+              行为…
+              <span className="ctx-shortcut">终端行为 · 宏</span>
+            </button>
+            <button className="ctx-item" role="menuitem" onClick={() => pickSettings("shortcuts")}>
+              快捷键…
+            </button>
+            <button className="ctx-item" role="menuitem" onClick={() => pickSettings("keys")}>
+              密钥管理…
+              <span className="ctx-shortcut">生成 · 导入 · 导出</span>
+            </button>
+            <button className="ctx-item" role="menuitem" onClick={() => pickSettings("agent")}>
+              Nexus AI Agent…
+              <span className="ctx-shortcut">把会话输出旁路给模型</span>
+            </button>
+          </div>
+        )}
+      </div>
 
       {menu && (
         <>

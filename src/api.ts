@@ -12,7 +12,6 @@ import type {
   AgentTabRequest,
   AuthPrompt,
   ClosedInfo,
-  CmdOption,
   ConnectOutcome,
   ConnectRequest,
   DiscoveredKey,
@@ -246,15 +245,13 @@ export const api = {
       command,
     }),
 
-  // ——— Console 自动补全 ———
+  // ——— Console 自动补全：session 级命令历史 ———
 
-  /**
-   * 问出某个命令支持哪些参数（终端里的参数提示用）。
-   * 走旁路执行（本地子进程 / 远端 sidecar 通道），**不碰用户正在用的那个终端**。
-   * 查不到时返回空数组而不是报错 —— 提示本来可有可无。
-   */
-  consoleCommandOptions: (sessionId: string, command: string) =>
-    invoke<CmdOption[]>("console_command_options", { sessionId, command }),
+  /** 记一条命令到某个会话身份（SessionRecord.id，本地固定 'local'）的历史里 */
+  historyRecord: (key: string, command: string) =>
+    invoke<void>("history_record", { key, command }),
+  /** 取某个会话身份的历史，最近用过的排在前面 */
+  historyList: (key: string) => invoke<string[]>("history_list", { key }),
 
   /** 把 Agent 面板浮出为独立系统窗口（已开则切会话并聚焦） */
   agentOpenWindow: (sessionId: string) =>

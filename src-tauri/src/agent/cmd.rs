@@ -262,7 +262,6 @@ pub async fn agent_exec(
     })?;
     Ok(ExecResult {
         output: outcome.output,
-        exit_code: outcome.exit_code,
         reason: outcome.reason,
     })
 }

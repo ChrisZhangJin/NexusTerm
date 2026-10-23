@@ -134,6 +134,62 @@ export function AppearanceDialog(p: AppearanceProps) {
           </span>
         </div>
 
+        <div className="settings-section">底部栏</div>
+        <label className="settings-check">
+          <input
+            type="checkbox"
+            checked={prefs.showResources}
+            onChange={(e) => setPrefs({ showResources: e.target.checked })}
+          />
+          <span>
+            显示 CPU / 内存 / 磁盘
+            <em>SSH 会话显示远端主机，本地终端显示本机</em>
+          </span>
+        </label>
+        <label className={`settings-check${prefs.showResources ? "" : " disabled"}`}>
+          <input
+            type="checkbox"
+            checked={prefs.liveMonitor}
+            disabled={!prefs.showResources}
+            onChange={(e) => setPrefs({ liveMonitor: e.target.checked })}
+          />
+          <span>
+            实时监控
+            <em>每 5 秒刷新并播放过渡动画；关闭后停止采集，所有动画不再展示（也可在资源区右键切换）</em>
+          </span>
+        </label>
+
+        <div className="modal-actions">
+          <button className="btn primary" onClick={p.onClose}>
+            完成
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ——— 行为 ———
+
+interface BehaviorProps {
+  onClose: () => void;
+  /** 打开宏管理器（宏已收纳到「行为」下，这里只是个入口） */
+  onOpenMacros: () => void;
+}
+
+export function BehaviorDialog(p: BehaviorProps) {
+  const prefs = usePrefs();
+  useEsc(p.onClose);
+  return (
+    <div className="modal-backdrop" onMouseDown={p.onClose}>
+      <div className="modal settings-modal" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="settings-head">
+          <h2>行为</h2>
+          <button className="settings-x" onClick={p.onClose} title="关闭（Esc）">
+            ×
+          </button>
+        </div>
+
         <div className="settings-section">终端行为</div>
         <label className="settings-check">
           <input
@@ -172,30 +228,22 @@ export function AppearanceDialog(p: AppearanceProps) {
           </span>
         </label>
 
-        <div className="settings-section">底部栏</div>
-        <label className="settings-check">
-          <input
-            type="checkbox"
-            checked={prefs.showResources}
-            onChange={(e) => setPrefs({ showResources: e.target.checked })}
-          />
-          <span>
-            显示 CPU / 内存 / 磁盘
-            <em>SSH 会话显示远端主机，本地终端显示本机</em>
-          </span>
-        </label>
-        <label className={`settings-check${prefs.showResources ? "" : " disabled"}`}>
-          <input
-            type="checkbox"
-            checked={prefs.liveMonitor}
-            disabled={!prefs.showResources}
-            onChange={(e) => setPrefs({ liveMonitor: e.target.checked })}
-          />
-          <span>
-            实时监控
-            <em>每 5 秒刷新并播放过渡动画；关闭后停止采集，所有动画不再展示（也可在资源区右键切换）</em>
-          </span>
-        </label>
+        <div className="settings-section">宏</div>
+        <div className="row">
+          <label>录制与回放</label>
+          <button
+            className="btn"
+            onClick={() => {
+              p.onClose();
+              p.onOpenMacros();
+            }}
+          >
+            打开宏管理器…
+          </button>
+        </div>
+        <p className="ag-hint">
+          宏：录下一串操作（等什么、发什么），可一键重放，也能绑到某个会话上连接后自动执行。
+        </p>
 
         <div className="modal-actions">
           <button className="btn primary" onClick={p.onClose}>

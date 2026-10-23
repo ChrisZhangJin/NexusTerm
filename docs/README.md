@@ -6,6 +6,7 @@
 | [xsh-format.md](./xsh-format.md) | Xshell `.xsh` 会话文件格式核对报告：字段表、编码、密码不可迁移的证据与结论 |
 | [build.md](./build.md) | 构建 / 打包 / 签名全流程，含 macOS 的已知坑（dmg、Keychain ACL、Gatekeeper） |
 | [portability.md](./portability.md) | 跨平台说明：三端差异、平台相关代码清单、Windows / Linux 构建前置条件 |
+| [roadmap.md](./roadmap.md) | 已讨论设计但还没动手的方向（如 nexus-cli 控制面），避免结论随对话丢失 |
 
 顶层 [README.md](../README.md) 是唯一入口，包含快速开始、目录结构与安全边界。
 

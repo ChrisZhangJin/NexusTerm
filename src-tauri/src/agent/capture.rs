@@ -17,7 +17,6 @@
 
 use std::time::Duration;
 
-use crate::agent::executor::strip_sentinel_wrappers;
 use crate::cmd::AppState;
 
 /// 远端走旁路通道时，单次探测的超时（秒）。
@@ -153,7 +152,7 @@ async fn spawn_probe(script: &str) -> Option<String> {
 }
 
 fn push_section(sections: &mut Vec<(&'static str, String)>, label: &'static str, raw: &str) {
-    let text = strip_sentinel_wrappers(raw).trim().to_string();
+    let text = raw.trim().to_string();
     if !text.is_empty() {
         sections.push((label, tail_chars(&text, DEEP_SECTION_MAX_CHARS)));
     }

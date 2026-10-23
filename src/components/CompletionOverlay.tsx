@@ -72,11 +72,9 @@ export default function CompletionOverlay({
             className={`cp-item${i === active ? " on" : ""}`}
             onMouseEnter={() => onHover(i)}
             onClick={() => onPick(i)}
-            title={it.detail}
+            title={it.label}
           >
-            <span className="cp-kind">{it.kind === "flag" ? "参数" : "历史"}</span>
             <span className="cp-label">{it.label}</span>
-            <span className="cp-detail">{it.detail}</span>
           </button>
         ))}
       </div>

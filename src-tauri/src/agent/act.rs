@@ -31,8 +31,8 @@
 //!    被 `danger::assess` 判为危险的命令会先在 UI 上弹出来等人点头。
 //!    审批是有超时的 —— 人去接杯咖啡回来发现流程卡死，比「超时拒绝」糟糕得多。
 //! 3. **任何一步失败都不能让整轮蒸发**。执行报错会当成一条反馈续喂给模型，
-//!    让它自己决定重试、换命令还是收手；退出码非 0 也照常喂回去 ——
-//!    失败的输出往往比成功的信息量更大。
+//!    让它自己决定重试、换命令还是收手；命令的真实输出原样喂回去 ——
+//!    没有退出码这种参考信息，模型得照着输出文本自己判断成败，这与人操作时一致。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,14 +45,12 @@ use tauri::{AppHandle, Emitter};
 
 use super::capture;
 use super::danger::assess;
-use super::executor::{
-    strip_sentinel_wrappers, wait_for_end, ExecEnd, ExecOutcome, Sentinel, Shell, WaitConfig,
-};
+use super::executor::{wait_for_end, ExecEnd, ExecOutcome, Liveness, WaitConfig};
 use super::llm::{self, ChatMessage, CONTEXT_BEGIN, CONTEXT_END};
 use super::{AgentConfig, AgentError};
 use crate::agent::StreamKind;
 use crate::cmd::AppState;
-use crate::ssh::session::{AuthMethod, ConnectRequest};
+use crate::ssh::session::{AuthMethod, ConnectRequest, SessionError};
 use crate::store;
 
 /// 一次 run 最多允许多少轮「思考 → 动作 → 再思考」。
@@ -232,8 +230,6 @@ pub struct StepPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasons: Option<Vec<String>>,
@@ -248,7 +244,6 @@ impl StepPayload {
             target_label: None,
             command: None,
             output: None,
-            exit_code: None,
             text: None,
             reasons: None,
         }
@@ -271,7 +266,6 @@ pub struct ApprovePayload {
 #[serde(rename_all = "camelCase")]
 pub struct ExecResult {
     pub output: String,
-    pub exit_code: Option<i32>,
     pub reason: ExecEnd,
 }
 
@@ -579,8 +573,8 @@ pub const ACTION_PROTOCOL: &str = concat!(
     " findstr / ipconfig / tasklist / systeminfo 等 cmd 语法** —— ls、cat、grep 在 cmd 里",
     "根本不存在，发过去只会得到「不是内部或外部命令」；",
     "确有必要才做写操作，并在下达前用一句话说明为什么要做、影响面多大；\n",
-    "4) 命令的输出与退出码会原样回给你，**退出码非 0 不代表流程失败** ——",
-    "照着真实输出继续判断，不要假装没看到；\n",
+    "4) 命令的真实输出会原样回给你，**没有退出码这种参考信息**——",
+    "跟真人盯着终端一样，自己照着输出文本判断这条命令到底成没成功，不要假装没看到；\n",
     "5) 不要执行不可逆操作（rm -rf、mkfs、DROP、chmod -R 777、把未知脚本管道给 shell 等），",
     "除非用户在这一轮对话里明确要求；开新会话同理要有明确理由，不要为了好奇心乱开；\n",
     "6) 已经查清楚就不要再查了：直接用中文给出结论，说明依据与必要的后续建议；\n",
@@ -637,8 +631,7 @@ fn plan_message(
             Some(s) => tail_chars(s, max_bytes),
             None => state.agent.context(&t.id, max_bytes).unwrap_or_default(),
         };
-        // 擦掉过去几轮的哨兵包装痕迹：那是实现细节，不该占模型的注意力
-        let ctx = strip_sentinel_wrappers(&raw);
+        let ctx = raw;
         msg.push_str(&format!(
             "\n===== 会话 {} ({}) =====\n{}{}\n{}\n",
             t.label,
@@ -709,7 +702,7 @@ async fn capture_fullscreen(state: &AppState, session_id: &str) -> Option<String
         .run_sidecar(session_id, CMD, None, 4, "抓取全屏程序内容超时")
         .await
         .ok()?;
-    let text = strip_sentinel_wrappers(&raw).trim().to_string();
+    let text = raw.trim().to_string();
     if text.is_empty() {
         return None;
     }
@@ -729,19 +722,16 @@ fn tail_chars(s: &str, max: usize) -> String {
 }
 
 /// 把一次执行的原文结果变成喂回模型的反馈。
+///
+/// 没有退出码这种参考信息了——模型得照着下面的真实输出自己判断这条命令是否成功，
+/// 就像人盯着终端看一样。
 fn feedback_for(command: &str, label: &str, outcome: &ExecOutcome) -> String {
     let mut s = String::new();
     s.push_str(&format!("在会话「{label}」执行：`{}`\n", command.trim()));
     match outcome.reason {
-        ExecEnd::Sentinel => s.push_str(&format!(
-            "退出码：{}\n",
-            outcome
-                .exit_code
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "未知".into())
-        )),
-        ExecEnd::Silence => s.push_str("退出码：未知（长时间没有新输出，按执行完毕处理）\n"),
-        ExecEnd::Timeout => s.push_str("退出码：未知（等待超时，命令可能仍在运行）\n"),
+        ExecEnd::Confirmed => s.push_str("状态：已确认执行完毕（该会话已没有前台进程在跑）\n"),
+        ExecEnd::Silence => s.push_str("状态：长时间没有新输出，按执行完毕处理（未能确认是否真的结束）\n"),
+        ExecEnd::Timeout => s.push_str("状态：等待超时，命令可能仍在运行\n"),
         ExecEnd::Cancelled => return format!("{s}结果：已被用户取消，不要重试这条命令。\n"),
     }
     // 保留头部：报错与关键信息通常在最前面，尾部往往是无关的重复
@@ -801,12 +791,52 @@ async fn write_to(state: &AppState, id: &str, data: &[u8]) -> Result<(), String>
     }
 }
 
+// ——————————————————————————————— 活体确认 ———————————————————————————————
+
+/// 问一句「这个 SSH 会话的 shell 现在还有没有前台子进程」。
+///
+/// 复用 `SessionManager::probe`——它本来就是给控制台自动补全探测前台进程用的，
+/// 不是专门为这里新写的脚本。`SHELL_CWD`/`TTY` 有值说明探测脚本确实在远端
+/// /proc 里定位到了这条会话的交互 shell；此时 `FG_COMM` 有没有值，就是
+/// 「shell 自己是前台」还是「有个子进程正占着前台」的区别。
+///
+/// 远端没有 /proc（非 Linux）、探测脚本没能定位到 shell（两种都是空 map）、
+/// 旁路通道被堡垒机拒绝、探测超时——这些情况下答不上来，一律 `Unknown`，
+/// 交给静默兜底，不能被误判成「确认空闲」。
+async fn ssh_liveness(state: &AppState, session_id: &str) -> Liveness {
+    match state.sessions.probe(session_id).await {
+        Ok(info) if info.contains_key("FG_COMM") => Liveness::Busy,
+        Ok(info) if info.contains_key("SHELL_CWD") || info.contains_key("TTY") => Liveness::Idle,
+        // 探测脚本没能定位到 shell（空 map）：问不出来，不是「确认空闲」
+        Ok(_) => Liveness::Unknown,
+        // 会话已经不存在了——没什么可忙的了，等同于确认结束
+        Err(SessionError::NotFound(_)) => Liveness::Idle,
+        Err(_) => Liveness::Unknown,
+    }
+}
+
+/// 问一句「这个本地会话的 shell 现在还有没有前台子进程」。
+async fn local_liveness(state: &AppState, session_id: &str) -> Liveness {
+    if !state.local.contains(session_id) {
+        // 会话已经不存在了——没什么可忙的了，等同于确认结束
+        return Liveness::Idle;
+    }
+    match state.local.has_live_child(session_id).await {
+        Some(true) => Liveness::Busy,
+        Some(false) => Liveness::Idle,
+        None => Liveness::Unknown,
+    }
+}
+
 // ——————————————————————————————— 单条命令执行 ———————————————————————————————
 
-/// 在目标会话上跑一条命令，返回输出与退出码。
+/// 在目标会话上跑一条命令，返回输出与结束原因。
 ///
 /// **会把这条命令原样旁路进 agent 缓冲**：一方面让 `pending_echo` 抵消掉 pty 的回显，
 /// 另一方面留下「这一轮到底干了什么」的完整审计。
+///
+/// 不再往命令里拼任何哨兵——发的就是 `cmd\n`，跟人手敲一模一样，终端屏幕上
+/// 不会多出一个字符。判定结束靠「静默 + 活体确认」（见 `executor.rs` 顶部的说明）。
 pub async fn run_one(
     state: &AppState,
     app: &AppHandle,
@@ -822,22 +852,15 @@ pub async fn run_one(
         return Err(why.to_string());
     }
     let cmd = command.trim();
+    let sink = sink_of(state, session_id);
 
     // 要让这条命令的输出进得了旁路，缓冲必须是开着的。
     // 这里是「Agent 主动要用某个会话」，与全局 autoAttach 无关，故显式打开。
     state.agent.set_enabled(session_id, true);
 
-    let sentinel = Sentinel::new();
-    // 本地 Windows 会话跑的是 cmd.exe，哨兵必须用 cmd 的方言；
-    // SSH 目标与 Unix 本地一律 POSIX。选错方言的后果不是「难看一点」，
-    // 而是哨兵永远打不出来 —— 只能等静默兜底，退出码丢失、还会被误显示成失败。
-    let shell = match sink_of(state, session_id) {
-        Some(Sink::Local) => Shell::native(),
-        _ => Shell::Posix,
-    };
-    let payload = sentinel.wrap_for(cmd, shell);
+    let payload = format!("{cmd}\n");
     write_to(state, session_id, payload.as_bytes()).await?;
-    // 喂的是**包裹后**的原始字节：这样 pty 的回显才能被 pending_echo 逐字节抵消干净
+    // 喂的是实际发出去的原始字节：这样 pty 的回显才能被 pending_echo 逐字节抵消干净
     state.agent.feed(session_id, payload.as_bytes(), StreamKind::In);
 
     if announce {
@@ -854,30 +877,31 @@ pub async fn run_one(
     }
 
     let baseline = state.agent.snapshot(session_id).unwrap_or_default();
-    // 这里**绝对不能**先剥哨兵再交给 wait_for_end：剥的动作会把「哨兵已经打印出来」
-    // 那一行整行删掉，wait 就永远扫不到它，只能一路等到静默兜底 ——
-    // 结果是每条命令都要白等 1.5 秒、退出码永远 `None`，界面上还会被误显示成失败。
-    // 判定用原始增量；剥离只在最后给用户/模型看输出时做（见下面 outcome.output）。
     let delta = || {
         let now = state.agent.snapshot(session_id).unwrap_or_default();
         match now.strip_prefix(baseline.as_str()) {
             Some(rest) => rest.to_string(),
-            // 环形缓冲把开头丢掉了（超长输出）：基线不再是前缀，
-            // 退回整份快照，兜里至少还能扫到哨兵。
+            // 环形缓冲把开头丢掉了（超长输出）：基线不再是前缀，退回整份快照。
             None => now,
         }
     };
+    let liveness = || -> std::pin::Pin<Box<dyn std::future::Future<Output = Liveness> + Send>> {
+        match sink {
+            Some(Sink::Local) => Box::pin(local_liveness(state, session_id)),
+            Some(Sink::Ssh) => Box::pin(ssh_liveness(state, session_id)),
+            // 会话都不存在了，写入那一步应该已经报过错；这里只是兜底，不阻塞。
+            None => Box::pin(async { Liveness::Unknown }),
+        }
+    };
     let mut outcome = wait_for_end(
-        &sentinel,
         WaitConfig::default(),
         delta,
         || cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false),
         |d| Box::pin(tokio::time::sleep(d)) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        liveness,
     )
     .await;
-    // 命令回显（含哨兵尾巴）与哨兵行的最终清理。留在这里而不是 delta 里，
-    // 就是为了不破坏上面那次判定。
-    outcome.output = strip_sentinel_wrappers(&outcome.output);
+    outcome.output = outcome.output.trim().to_string();
 
     if announce {
         emit_step(
@@ -888,7 +912,6 @@ pub async fn run_one(
                 target_label: Some(label.into()),
                 command: Some(cmd.into()),
                 output: Some(outcome.output.clone()),
-                exit_code: outcome.exit_code,
                 ..StepPayload::new("result", step)
             },
         );
@@ -1049,17 +1072,14 @@ fn open_feedback(outcome: &OpenOutcome) -> String {
 }
 
 fn feedback_for_open_command(outcome: &ExecOutcome) -> String {
-    let code = match outcome.reason {
-        ExecEnd::Sentinel => outcome
-            .exit_code
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "未知".into()),
-        ExecEnd::Silence => "未知（长时间没有新输出，按执行完毕处理）".into(),
-        ExecEnd::Timeout => "未知（等待超时，命令可能仍在运行）".into(),
+    let status = match outcome.reason {
+        ExecEnd::Confirmed => "已确认执行完毕（该会话已没有前台进程在跑）".to_string(),
+        ExecEnd::Silence => "长时间没有新输出，按执行完毕处理（未能确认是否真的结束）".into(),
+        ExecEnd::Timeout => "等待超时，命令可能仍在运行".into(),
         ExecEnd::Cancelled => return "该命令已被用户取消。\n".into(),
     };
     format!(
-        "退出码：{code}\n输出：\n{}\n",
+        "状态：{status}\n输出：\n{}\n",
         head_chars(&outcome.output, MAX_FEEDBACK_CHARS)
     )
 }
@@ -2099,30 +2119,29 @@ mod tests {
     }
 
     #[test]
-    fn feedback_reports_exit_code_and_output() {
+    fn feedback_reports_confirmed_status_and_output() {
         let out = ExecOutcome {
             output: "err\n".into(),
-            exit_code: Some(1),
-            reason: ExecEnd::Sentinel,
+            reason: ExecEnd::Confirmed,
         };
         let text = feedback_for("false", "web-01", &out);
         assert!(text.contains("false"));
-        assert!(text.contains("退出码：1"));
+        assert!(text.contains("已确认执行完毕"));
         assert!(text.contains("err"));
         assert!(text.contains("web-01"));
     }
 
     #[test]
     fn cancellation_feedback_tells_model_not_to_retry() {
-        let out = ExecOutcome { output: String::new(), exit_code: None, reason: ExecEnd::Cancelled };
+        let out = ExecOutcome { output: String::new(), reason: ExecEnd::Cancelled };
         assert!(feedback_for("sleep 100", "x", &out).contains("不要重试"));
     }
 
     #[test]
-    fn unknown_exit_code_is_worded_as_unknown() {
-        let out = ExecOutcome { output: "alive".into(), exit_code: None, reason: ExecEnd::Silence };
+    fn silence_fallback_is_worded_as_unconfirmed() {
+        let out = ExecOutcome { output: "alive".into(), reason: ExecEnd::Silence };
         let text = feedback_for("top", "x", &out);
-        assert!(text.contains("未知"));
+        assert!(text.contains("未能确认"));
         assert!(text.contains("alive"));
     }
 

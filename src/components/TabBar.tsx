@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { TerminalTab } from "../types";
+import { isMacOS } from "../lib/platform";
+import appIcon from "../assets/app-icon.png";
 
 interface Props {
   tabs: TerminalTab[];
@@ -26,12 +29,9 @@ interface Props {
   /** 右侧 AI 助手面板开关 */
   agentOpen: boolean;
   onToggleAgent: () => void;
-  /** 宏管理器 */
-  onMacros: () => void;
-  macroOpen: boolean;
-  /** 正在录制宏：按钮上打个红点，提醒用户「你现在的操作会被记住」 */
-  recording: boolean;
 }
+
+const appWindow = getCurrentWindow();
 
 const tabLabel = (t: TerminalTab) => t.customTitle || t.title;
 
@@ -57,14 +57,30 @@ export default function TabBar({
   onToggleSessionPopup,
   agentOpen,
   onToggleAgent,
-  onMacros,
-  macroOpen,
-  recording,
 }: Props) {
+  const mac = isMacOS();
   const [ctx, setCtx] = useState<{ x: number; y: number; id: string } | null>(null);
   const ctxRef = useRef<HTMLDivElement>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const renamingRef = useRef<string | null>(null);
+  const [maximized, setMaximized] = useState(false);
+
+  // 非 macOS 才有自绘的最大化按钮，因此要跟踪窗口当前是否最大化
+  useEffect(() => {
+    if (mac) return;
+    const sync = () => {
+      appWindow.isMaximized().then(setMaximized).catch(() => {});
+    };
+    sync();
+    let unlisten: (() => void) | undefined;
+    appWindow
+      .onResized(() => sync())
+      .then((f) => {
+        unlisten = f;
+      })
+      .catch(() => {});
+    return () => unlisten?.();
+  }, [mac]);
 
   // 拖拽状态
   const [drag, setDrag] = useState<{ id: string; overId: string | null; after: boolean } | null>(
@@ -145,7 +161,12 @@ export default function TabBar({
   };
 
   return (
-    <div className="tabbar">
+    <div className="tabbar" data-tauri-drag-region="deep">
+      {/* 交通灯预留区：只占位，不响应任何交互。仅 macOS 需要 */}
+      {mac && <div className="titlebar-lights" aria-hidden />}
+      {/* 非 macOS 没有系统标题栏图标，补一枚应用 logo，否则标签栏左边空荡荡的 */}
+      {!mac && <img className="titlebar-appicon" src={appIcon} alt="" aria-hidden />}
+
       {/* sp-toggle：连接列表的「点外部关闭」会放行它，避免先关后开 */}
       <button
         className={`tb-action tabbar-conn sp-toggle ${sessionPopupOpen ? "active" : ""}`}
@@ -238,23 +259,6 @@ export default function TabBar({
         </button>
       </div>
 
-      {/* 宏：常驻按钮而不是只放右键菜单 —— 它是个「边试边改」的功能，
-          藏进二级菜单没人找得到；录制中按钮带红点，避免用户忘了还在录 */}
-      <button
-        className={`tb-action tabbar-macro ${macroOpen ? "active" : ""} ${recording ? "rec" : ""}`}
-        onClick={onMacros}
-        title={
-          recording
-            ? "正在录制宏：单击打开宏管理器并停止录制"
-            : "宏：录下一串操作（等什么、发什么），可一键重放或连接后自动执行"
-        }
-        aria-pressed={macroOpen}
-      >
-        <span className="tb-glyph">▤</span>
-        宏
-        {recording && <span className="tb-rec" aria-hidden />}
-      </button>
-
       {/* AI 助手面板开关：靠右，与标签列表分开（.tabs 是 flex:1，把这里顶到最右） */}
       <button
         className={`tb-action tabbar-agent ${agentOpen ? "active" : ""}`}
@@ -270,12 +274,51 @@ export default function TabBar({
         AI
       </button>
 
+      {/* 非 macOS 平台没有系统标题栏按钮，自绘一套放在最右（Windows 习惯） */}
+      {!mac && (
+        <div className="titlebar-controls">
+          <button
+            className="win-btn"
+            onClick={() => appWindow.minimize().catch(() => {})}
+            title="最小化"
+            aria-label="最小化"
+          >
+            <svg viewBox="0 0 10 10" aria-hidden>
+              <rect x="0" y="4.5" width="10" height="1" />
+            </svg>
+          </button>
+          <button
+            className="win-btn"
+            onClick={() => appWindow.toggleMaximize().catch(() => {})}
+            title={maximized ? "向下还原" : "最大化"}
+            aria-label={maximized ? "向下还原" : "最大化"}
+          >
+            {maximized ? (
+              <svg viewBox="0 0 10 10" aria-hidden>
+                <rect x="0.5" y="2.5" width="7" height="7" fill="none" strokeWidth="1" />
+                <path d="M2.5 2.5 V0.5 H9.5 V7.5 H7.5" fill="none" strokeWidth="1" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 10 10" aria-hidden>
+                <rect x="0.5" y="0.5" width="9" height="9" fill="none" strokeWidth="1" />
+              </svg>
+            )}
+          </button>
+          <button
+            className="win-btn win-btn-close"
+            onClick={() => appWindow.close().catch(() => {})}
+            title="关闭"
+            aria-label="关闭"
+          >
+            <svg viewBox="0 0 10 10" aria-hidden>
+              <path d="M0.5 0.5 L9.5 9.5 M9.5 0.5 L0.5 9.5" strokeWidth="1" />
+            </svg>
+          </button>
+        </div>
+      )}
+
       {ctx && ctxTab && (
         <div ref={ctxRef} className="ctx-menu" style={{ left: ctx.x, top: ctx.y }}>
-          <button className="ctx-item" onClick={run(() => onNewTab(ctxTab.id))}>
-            新标签页
-          </button>
-          <div className="ctx-sep" />
           {(ctxTab.status === "closed" || ctxTab.status === "error") && !ctxTab.local ? (
             <button className="ctx-item" onClick={run(() => onReconnect(ctxTab.id))}>
               重新连接
@@ -285,16 +328,6 @@ export default function TabBar({
               断开
             </button>
           ) : null}
-          {!ctxTab.local && (
-            <button
-              className="ctx-item"
-              disabled={ctxTab.status !== "connected"}
-              title={ctxTab.status === "connected" ? "" : "会话连接后可用"}
-              onClick={run(onMacros)}
-            >
-              宏…
-            </button>
-          )}
           {!ctxTab.local && (
             <button
               className="ctx-item"

@@ -163,7 +163,7 @@ function withStep(c: Conversation, step: AgentStep): Conversation {
         s.target === step.target &&
         s.command === step.command
       ) {
-        msgs[i] = { ...m, step: { ...s, kind: "result", output: step.output, exitCode: step.exitCode } };
+        msgs[i] = { ...m, step: { ...s, kind: "result", output: step.output } };
         return { ...c, messages: msgs };
       }
     }
@@ -932,30 +932,18 @@ function StepCard({ step }: { step: AgentStep }) {
     );
   }
 
+  // 没有退出码这回事了：命令是否成功，由模型读下面这段真实输出自己判断，
+  // 跟真人盯着终端看一样。这里只中性地标「执行中 / 已完成」，不再染色判对错。
   const done = step.kind === "result";
-  const okCode = done && step.exitCode === 0;
-  const badCode = done && step.exitCode !== 0 && step.exitCode != null;
-  // 退出码拿不到（哨兵没打出来：shell 方言不匹配 / 命令被全屏程序接管 / 超时）
-  // 既不是 0 也不是「非 0」。以前这里被当成失败显示，明明成功的 dir 也报「非 0」。
-  const unknownCode = done && step.exitCode == null;
-  const tag = !done
-    ? "执行中"
-    : badCode
-      ? "已完成 · 非 0"
-      : unknownCode
-        ? "已完成 · 退出码未知"
-        : "已完成";
+  const tag = done ? "已完成" : "执行中";
   const lines = (step.output ?? "").split("\n").length;
   return (
-    <div className={`ap-step${badCode ? " bad" : okCode ? "" : " pending"}`}>
+    <div className={`ap-step${done ? "" : " pending"}`}>
       <div className="ap-step-head">
         <span className="ap-step-tag">{tag}</span>
         <span className="ap-step-where" title={step.target}>
           {step.targetLabel ?? "未知会话"}
         </span>
-        {done && step.exitCode != null && (
-          <span className={`ap-step-code${okCode ? "" : " bad"}`}>{step.exitCode}</span>
-        )}
       </div>
       <pre className="ap-code">{step.command ?? ""}</pre>
       {done ? (

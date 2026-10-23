@@ -4,12 +4,12 @@ import SessionList from "./components/SessionList";
 import SessionDialog from "./components/SessionDialog";
 import TerminalView, { clock } from "./components/TerminalView";
 import FileManager from "./components/FileManager";
-import TitleBar from "./components/TitleBar";
 import TabBar from "./components/TabBar";
 import StatusBar from "./components/StatusBar";
 import { AgentPanel } from "./components/AgentPanel";
 import {
   AppearanceDialog,
+  BehaviorDialog,
   AgentDialog,
   ShortcutsDialog,
 } from "./components/SettingsDialogs";
@@ -84,7 +84,7 @@ export default function App() {
   const [editing, setEditing] = useState<SessionRecord | null>(null);
   /** 设置窗口：外观 / 快捷键 / 密钥管理 / AI 助手（模态，同一时刻只开一个） */
   const [settingsWin, setSettingsWin] = useState<
-    "appearance" | "shortcuts" | "keys" | "agent" | null
+    "appearance" | "behavior" | "shortcuts" | "keys" | "agent" | null
   >(null);
   const settingsOpen = settingsWin !== null;
   // 非空时展示该会话的 SFTP 文件管理器
@@ -1279,13 +1279,6 @@ export default function App() {
     [sessions, refresh, showToast]
   );
 
-  const cycleTheme = useCallback(() => {
-    setThemeName((cur) => {
-      const i = THEME_NAMES.indexOf(cur);
-      return THEME_NAMES[(i + 1) % THEME_NAMES.length] ?? DEFAULT_THEME;
-    });
-  }, []);
-
   /** 新开一个本地 shell 标签 */
   const newLocalTab = useCallback(
     (afterId?: string | null) => {
@@ -1441,10 +1434,6 @@ export default function App() {
     ? tabs.find((t) => t.id === authPrompt.sessionId)?.status === "reconnecting"
     : false;
 
-  const appTitle = activeSession
-    ? `${activeSession.name} — ${activeSession.username}@${activeSession.host}`
-    : "NexusTerm";
-
   const statusBar: "idle" | "connecting" | "connected" | "reconnecting" | "error" =
     activeTabState?.status === "error"
       ? "error"
@@ -1472,14 +1461,6 @@ export default function App() {
 
   return (
     <div className="app" data-theme={themeName}>
-      <TitleBar
-        title={appTitle}
-        themeName={themeName}
-        onCycleTheme={cycleTheme}
-        onOpenSettings={setSettingsWin}
-        settingsOpen={settingsOpen}
-      />
-
       <TabBar
         sessionPopupOpen={sessionPopupOpen}
         onToggleSessionPopup={() => setSessionPopupOpen((v) => !v)}
@@ -1497,13 +1478,6 @@ export default function App() {
         onMove={moveTab}
         agentOpen={agentOpen}
         onToggleAgent={() => setAgentOpen((v) => !v)}
-        macroOpen={macroOpen}
-        recording={!!recording}
-        onMacros={() => {
-          // 录制中点「宏」= 停止录制（停止后会直接进编辑器）
-          if (recording) void toggleRecording();
-          else setMacroOpen((v) => !v);
-        }}
       />
 
       <div className="workspace">
@@ -1515,6 +1489,11 @@ export default function App() {
                 tabId={t.id}
                 active={t.id === activeTab}
                 kind={t.local ? "local" : "ssh"}
+                // 命令历史按会话身份存取：本地固定 'local'，已保存的 SSH
+                // 连接是它的 sessionId；没有保存记录的临时连接退回 tabId
+                // 本身（不持久化，行为与过去的纯内存历史一致）。
+                historyKey={t.local ? "local" : t.sessionId ?? t.id}
+                historyPersist={t.local || !!t.sessionId}
                 onNotify={showToast}
                 theme={theme}
                 fontFamily={fontFamily}
@@ -1689,6 +1668,9 @@ export default function App() {
                 : null
         }
         activeTabId={activeTabState?.id ?? null}
+        onNotify={showToast}
+        onOpenSettings={setSettingsWin}
+        settingsOpen={settingsOpen}
       />
 
       {settingsWin === "appearance" && (
@@ -1704,6 +1686,12 @@ export default function App() {
           lineHeight={lineHeight}
           onLineHeight={setLineHeight}
           onClose={() => setSettingsWin(null)}
+        />
+      )}
+      {settingsWin === "behavior" && (
+        <BehaviorDialog
+          onClose={() => setSettingsWin(null)}
+          onOpenMacros={() => setMacroOpen(true)}
         />
       )}
       {settingsWin === "shortcuts" && <ShortcutsDialog onClose={() => setSettingsWin(null)} />}

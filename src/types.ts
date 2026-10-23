@@ -379,7 +379,6 @@ export interface AgentStep {
   targetLabel?: string;
   command?: string;
   output?: string;
-  exitCode?: number | null;
   text?: string;
   reasons?: string[];
 }
@@ -424,23 +423,10 @@ export interface AgentTabInfo {
 /** `agent_run` 在 UI 上的两种叫法 */
 export type AgentRunMode = "ask" | "act";
 
-/** `agent_exec` 的返回值。reason 是命令结束的方式。 */
+/** `agent_exec` 的返回值。reason 是命令结束的方式——没有退出码，
+ *  "confirmed" 是活体确认过「真的没有前台进程了」，"silence" 是静默兜底（问不出确定答案）。 */
 export interface AgentExecResult {
   output: string;
-  exitCode: number | null;
-  reason: "sentinel" | "silence" | "timeout" | "cancelled";
+  reason: "confirmed" | "silence" | "timeout" | "cancelled";
 }
 
-// ———————————————————————————— Console 自动补全 ————————————————————————————
-
-/**
- * 一个命令行参数。后端从 `<binary> --help` 的输出里解析出来（`CmdOption` 的镜像）。
- *
- * `flags` 里第一个是最短、最常敲的那种写法 —— 补全优先推荐它。
- */
-export interface CmdOption {
-  flags: string[];
-  summary: string;
-  /** 这个参数是可以带取值的；带方括号或大写占位符的都会标出来 */
-  takesValue: boolean;
-}

@@ -227,52 +227,20 @@ pub async fn local_stats() -> Result<crate::sysstat::Stats, String> {
     crate::sysstat::collect().await
 }
 
-// ——— Console 自动补全 ———
+// ——— Console 自动补全：session 级命令历史 ———
+//
+// 按会话身份（已保存连接配置的 id，本地固定 'local'）持久化，而不是按
+// 临时的标签页 id —— 这样同一台服务器下次重连、甚至重启应用后新开的
+// 标签，都能接着用之前在这台机器上敲过的命令做补全。
 
-/// 问出某个可执行命令支持哪些参数（给终端里的补全提示用）。
-///
-/// **刻意不在用户那个终端里跑**：那样会把屏幕弄脏、污染 shell 历史，
-/// 而且交互式程序会直接把终端抢走。所以走旁路：
-/// 本地会话 → 子进程；远端会话 → 该连接的旁路 exec 通道。
-///
-/// `command` 只需要程序名；带参数也行，只有第一个 token 会被拿去查。
-/// 查不到（程序不存在 / 它不认 --help / 服务端不允许开旁路通道）时返回空数组，
-/// 不把它当成错误 —— 补全提示本来就是「有则锦上添花，没有也不影响用」。
 #[tauri::command]
-pub async fn console_command_options(
-    session_id: String,
-    command: String,
-    state: State<'_, AppState>,
-) -> Result<Vec<crate::console::CmdOption>, String> {
-    let Some(program) = crate::console::program_of(&command) else {
-        return Ok(Vec::new());
-    };
-    if state.local.contains(&session_id) {
-        Ok(crate::console::local_options(program).await)
-    } else {
-        // 远端：走 sidecar。不容易 —— 堡垒机上这条路常被掐，
-        // 那时返回空数组即可，前端把提示藏起来，不打搅用户。
-        match state
-            .sessions
-            .run_sidecar(&session_id, &help_command(program), None, 5, "查询参数超时")
-            .await
-        {
-            Ok(text) => Ok(crate::console::parse_help(&text)),
-            Err(e) => {
-                tracing::debug!("查询 {} 的参数失败：{}", program, e);
-                Ok(Vec::new())
-            }
-        }
-    }
+pub fn history_record(key: String, command: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.store.record_history(&key, &command)
 }
 
-/// 拼 `--help` 命令行。
-///
-/// 各家并不统一：GNU 工具认 `--help`，BSD / Go / 自研工具往往只认 `-h`，
-/// 所以两个都试一遍（`||` 让没输出的那个自然落到下一个）。
-/// `2>&1` 是必须的 —— 不少程序把帮助写到 stderr。
-fn help_command(program: &str) -> String {
-    format!("{program} --help 2>&1 || {program} -h 2>&1")
+#[tauri::command]
+pub fn history_list(key: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    state.store.list_history(&key)
 }
 
 // ——— 会话附加状态（跳板机登录路径 / 兼容模式）———
