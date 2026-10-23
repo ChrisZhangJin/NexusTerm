@@ -1582,6 +1582,19 @@ html[data-platform="macos"] .tabbar { padding-right: 10px; }
 }
 .ap-step.pending { border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
 .ap-step.danger { border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+/* 工具调用卡：与「执行卡」区分开，边框走品牌色，一眼能看出这步是模型动的手 */
+.ap-step.tool { border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+.ap-step-tool {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text); font-size: 11px; font-weight: 600;
+}
+.ap-step-why code {
+  font: 11px/1.6 ui-monospace, Consolas, monospace; color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  padding: 1px 5px; border-radius: 4px;
+}
+.ap-tool-args { margin-left: 7px; font: 11px/1.6 ui-monospace, Consolas, monospace; }
+.ap-tool-args.dim { color: color-mix(in srgb, var(--text-dim) 70%, transparent); }
 .ap-step-head {
   display: flex; align-items: center; gap: 7px;
   padding: 5px 8px; border-bottom: 1px solid var(--border);

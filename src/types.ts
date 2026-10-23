@@ -372,9 +372,15 @@ export interface AgentRunRequest {
  * 扁平结构在 TS 侧写起来更省事，渲染时也不用写一堆类型收窄。
  */
 export interface AgentStep {
-  /** plan | exec | result | skip | note | answer | open | export | tab */
+  /** plan | tool | exec | result | skip | note | answer | open | export | tab */
   kind: string;
   step: number;
+  /** kind:"tool" 专用：模型调用的工具名（原始，如 nx_tab） */
+  tool?: string;
+  /** kind:"tool" 专用：给人看的中文工具名 */
+  toolLabel?: string;
+  /** kind:"tool" 专用：原始参数 JSON 文本 */
+  toolArgs?: string;
   target?: string;
   targetLabel?: string;
   command?: string;

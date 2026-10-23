@@ -886,6 +886,30 @@ function SuggestionCard({
 }
 
 /**
+ * 把工具的原始参数 JSON 排成一行人话：`{"op":"list"}` → `op=list`。
+ *
+ * 刻意做成单行而不是漂亮的缩进块：工具参数通常只有两三个字段，
+ * 缩进水一倍的高度，把对话区挤没了，换来的可读性却很有限。
+ */
+function prettyToolArgs(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === "{}") return "";
+  try {
+    const obj = JSON.parse(trimmed) as Record<string, unknown>;
+    if (typeof obj !== "object" || obj === null) return trimmed;
+    const parts = Object.entries(obj).map(([k, v]) => {
+      if (typeof v === "string") return `${k}=${v}`;
+      return `${k}=${JSON.stringify(v)}`;
+    });
+    return parts.length ? parts.join("  ") : trimmed;
+  } catch {
+    // 模型偶尔吐出不是 JSON 的参数串。原样展示比丢掉强：
+    // 用户至少能看到它到底想传什么。
+    return trimmed;
+  }
+}
+
+/**
  * 一次执行的卡片：命令 + 结果。
  *
  * 「在哪台机器上跑的」必须写得清清楚楚 —— Agent 是全局的、可以同时在好几个会话上下令，
@@ -894,6 +918,30 @@ function SuggestionCard({
 function StepCard({ step }: { step: AgentStep }) {
   if (step.kind === "note") {
     return <div className="ap-note">{step.text ?? ""}</div>;
+  }
+  // 工具调用卡片：把「模型调用了什么、传了什么参数」单独摆出来。
+  //
+  // 没有它的时候，模型想开新标签页会写出 `new-tab` 这种终端里根本不存在的命令，
+  // 敲进去只换来一句 command not found —— 界面上看起来就像它答应了却没动手。
+  // 走了原生工具调用之后，这一步变成结构化的（哪个工具 + 什么参数），
+  // 这里就把它原样展示，让调用过程看得见，也让"它到底想做什么"有据可查。
+  if (step.kind === "tool") {
+    return (
+      <div className="ap-step tool">
+        <div className="ap-step-head">
+          <span className="ap-step-tag">工具调用</span>
+          <span className="ap-step-tool">{step.toolLabel ?? "工具"}</span>
+        </div>
+        <div className="ap-step-why">
+          <code>{step.tool ?? ""}</code>
+          {step.toolArgs && step.toolArgs.trim() !== "{}" ? (
+            <span className="ap-tool-args">{prettyToolArgs(step.toolArgs)}</span>
+          ) : (
+            <span className="ap-tool-args dim">（无参数）</span>
+          )}
+        </div>
+      </div>
+    );
   }
   // `open` / `export` 不是「跑了一条命令」，没有 command / output。
   // 之前它们掉进下面那张执行卡里，就成了一个永远「执行中」的空框 ——
@@ -922,11 +970,17 @@ function StepCard({ step }: { step: AgentStep }) {
       <div className="ap-step danger">
         <div className="ap-step-head">
           <span className="ap-step-tag">未执行</span>
-          <span className="ap-step-where">{step.targetLabel ?? "未知会话"}</span>
+          {/* 被拦下的伪命令（new-tab 之类）没有目标会话：写"未知会话"会让人以
+              为它跑去了某台机器上，而实情是它一步都没出去。没有目标就别编一个。 */}
+          {step.targetLabel ? (
+            <span className="ap-step-where" title={step.target}>
+              {step.targetLabel}
+            </span>
+          ) : null}
         </div>
         <pre className="ap-code">{step.command ?? ""}</pre>
         {step.reasons?.length ? (
-          <div className="ap-step-why">判定理由：{step.reasons.join("；")}</div>
+          <div className="ap-step-why">原因：{step.reasons.join("；")}</div>
         ) : null}
       </div>
     );

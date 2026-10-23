@@ -217,6 +217,11 @@ struct OpenAiRequest {
     model: String,
     messages: Vec<ChatMessage>,
     stream: bool,
+    /// 空则不出现：不支持 tools 的兼容层收到空数组也可能报错，干脆不声明。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<OpenAiTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<OpenAiToolChoice>,
 }
 
 /// Anthropic 原生：`POST {base}/messages`
@@ -231,6 +236,108 @@ struct AnthropicRequest {
     /// Anthropic 没有默认值，必须显式给
     max_tokens: u32,
     stream: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<AnthropicTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<AnthropicToolChoice>,
+}
+
+/// 一个可下发给模型的工具。
+///
+/// 刻意与 wire format 解耦：act.rs 决定「有哪些工具、各自什么语义」，
+/// llm.rs 只负责翻译成 OpenAI / Anthropic 各自的形状。
+#[derive(Debug, Clone)]
+pub struct ToolSpec {
+    pub name: &'static str,
+    pub description: String,
+    pub schema: serde_json::Value,
+}
+
+/// OpenAI 侧的工具声明：function 外面还要包一层 `type:"function"`。
+#[derive(Debug, Serialize)]
+struct OpenAiTool {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ToolFunctionSpec,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolFunctionSpec {
+    name: &'static str,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+/// Anthropic 侧的工具声明：`name` / `description` / `input_schema` 是平铺的，
+/// 没有 function 那一层包装（写成 OpenAI 的形状会被整个拒掉）。
+#[derive(Debug, Serialize)]
+struct AnthropicTool {
+    name: &'static str,
+    description: String,
+    input_schema: serde_json::Value,
+}
+
+/// `auto`：让模型自己决定是直接回答还是调工具。
+///
+/// 不用 `required` —— 那样模型连「我查清楚了，直接给结论」都说不出来，
+/// 每一轮都被迫调一次工具，收不了尾。
+#[derive(Debug, Serialize)]
+struct OpenAiToolChoice {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicToolChoice {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+/// 模型要求调用的一个工具。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    pub name: String,
+    /// 原始参数 JSON 文本。
+    ///
+    /// 刻意留成字符串而不是直接反序列化：act.rs 里已经有一套 ExecBlock 解析
+    /// （缺字段给默认值、错名兼容），工具参数走同一条路就不用再写一遍。
+    pub arguments: String,
+}
+
+/// 一次模型回复：可能同时含正文与若干工具调用。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LlmReply {
+    pub text: String,
+    pub tool_calls: Vec<ToolCall>,
+    /// 本轮请求是否真的带上了 tools 声明。
+    ///
+    /// 降级重试（服务方不认 tools）后置 false，调用方据此改回围栏协议。
+    pub tools_supported: bool,
+}
+
+fn openai_tools(specs: &[ToolSpec]) -> Vec<OpenAiTool> {
+    specs
+        .iter()
+        .map(|s| OpenAiTool {
+            kind: "function",
+            function: ToolFunctionSpec {
+                name: s.name,
+                description: s.description.clone(),
+                parameters: s.schema.clone(),
+            },
+        })
+        .collect()
+}
+
+fn anthropic_tools(specs: &[ToolSpec]) -> Vec<AnthropicTool> {
+    specs
+        .iter()
+        .map(|s| AnthropicTool {
+            name: s.name,
+            description: s.description.clone(),
+            input_schema: s.schema.clone(),
+        })
+        .collect()
 }
 
 fn is_blank(s: &str) -> bool {
@@ -280,6 +387,21 @@ pub fn build_messages(
     messages: &[ChatMessage],
     stream: bool,
 ) -> Result<PreparedRequest, AgentError> {
+    build_messages_with_tools(acct, provider, system, messages, stream, &[])
+}
+
+/// 带工具声明版 [`build_messages`]。
+///
+/// 抽成独立函数而不是给 `build_messages` 加参数：那会让流式问答、测试连接、
+/// 以及一众 wire format 单测都得多传一个 `&[]`，而这些路径根本不需要工具。
+pub fn build_messages_with_tools(
+    acct: &AgentAccount,
+    provider: Provider,
+    system: &str,
+    messages: &[ChatMessage],
+    stream: bool,
+    tools: &[ToolSpec],
+) -> Result<PreparedRequest, AgentError> {
     if acct.base_url.trim().is_empty() {
         return Err(AgentError::BadRequest("尚未填写接口地址（Base URL）".into()));
     }
@@ -303,6 +425,12 @@ pub fn build_messages(
                 model: model.to_string(),
                 messages: messages.to_vec(),
                 stream,
+                tools: openai_tools(tools),
+                tool_choice: if tools.is_empty() {
+                    None
+                } else {
+                    Some(OpenAiToolChoice { kind: "auto" })
+                },
             };
             let body = serde_json::to_string(&req).map_err(|e| AgentError::Serialize(e.to_string()))?;
             (headers, body)
@@ -320,6 +448,12 @@ pub fn build_messages(
                 messages: messages.to_vec(),
                 max_tokens: ANTHROPIC_MAX_TOKENS,
                 stream,
+                tools: anthropic_tools(tools),
+                tool_choice: if tools.is_empty() {
+                    None
+                } else {
+                    Some(AnthropicToolChoice { kind: "auto" })
+                },
             };
             let body = serde_json::to_string(&req).map_err(|e| AgentError::Serialize(e.to_string()))?;
             (headers, body)
@@ -1215,6 +1349,91 @@ pub fn extract_answer_text(provider: Provider, body: &str) -> Option<String> {
     text.and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
+/// 从一次非流式响应里取出正文 + 工具调用。
+///
+/// 两种方言的形状差别不小，但都刻意不反序列化成具体类型：
+/// 兼容层各家往 `tool_calls` / `content` 里塞的字段五花八门，
+/// 用 `pointer` 逐个取，缺哪个就当那个没有，比整体反序列化抗造。
+pub fn extract_reply(provider: Provider, body: &str) -> Option<LlmReply> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let mut reply = LlmReply::default();
+
+    match provider {
+        Provider::OpenAI => {
+            if let Some(text) = value.pointer("/choices/0/message/content").and_then(|v| v.as_str())
+            {
+                reply.text = text.to_string();
+            }
+            if let Some(calls) =
+                value.pointer("/choices/0/message/tool_calls").and_then(|v| v.as_array())
+            {
+                for c in calls {
+                    let name = c.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or_default();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    // arguments 规范上是一段 JSON **字符串**；少数兼容层直接给对象。
+                    // 两种都接住：对象就用它的文本形式，等于帮它补上一层引号。
+                    let arguments = match c.pointer("/function/arguments").and_then(|v| v.as_str()) {
+                        Some(s) => s.to_string(),
+                        None => c
+                            .pointer("/function/arguments")
+                            .filter(|v| !v.is_null())
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "{}".to_string()),
+                    };
+                    reply.tool_calls.push(ToolCall { name: name.to_string(), arguments });
+                }
+            }
+        }
+        Provider::Anthropic => {
+            // Anthropic 把正文和工具调用混在同一个 content 数组里，按 type 分拣。
+            // 只取 /content/0/text 会漏掉「模型边说边调」时排在后面的 text 块。
+            if let Some(blocks) = value.pointer("/content").and_then(|v| v.as_array()) {
+                for b in blocks {
+                    match b.get("type").and_then(|v| v.as_str()).unwrap_or_default() {
+                        "text" => {
+                            if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                                reply.text.push_str(t);
+                            }
+                        }
+                        "tool_use" => {
+                            let name = b.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+                            if name.is_empty() {
+                                continue;
+                            }
+                            let arguments = b
+                                .get("input")
+                                .filter(|v| !v.is_null())
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "{}".to_string());
+                            reply.tool_calls.push(ToolCall { name: name.to_string(), arguments });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    Some(reply)
+}
+
+/// 服务方是否在抱怨我们传了 tools。
+///
+/// 只按关键字猜，不做结构化解析：各家报错文案完全不同
+/// （`Unknown parameter: tools` / `tools is not supported` / `Invalid value for 'tools'` …），
+/// 而这里的代价只是一次重试，宁可多判一点。
+fn is_tool_unsupported(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("tools")
+        && (lower.contains("unknown parameter")
+            || lower.contains("unsupported")
+            || lower.contains("not supported")
+            || lower.contains("invalid value")
+            || lower.contains("does not support")
+            || lower.contains("unrecognized"))
+}
+
 /// 单次 actor 回应体上限。
 ///
 /// 一次完整的 HTTP 响应够用了；超限时会被截断。
@@ -1233,26 +1452,69 @@ async fn until_cancelled(cancel: &AtomicBool) {
     }
 }
 
-/// 非流式取一次完整回复（**Agentic 循环专用**）。
+/// 带工具调用的 [`complete`]（**Agentic 循环专用**）。
 ///
-/// 与流式问答的区别：Agentic 循环必须拿到**完整**回复才能判断「里面有没有动作块」——
-/// 半个代码块是没法解析的。所以这一轮牺牲首字延迟，换取可靠的动作协议。
+/// 返回正文 + 模型要求调用的工具。`tools` 为空时等价 [`complete`]。
 ///
-/// `messages` 是完整的多轮历史，调用方负责把「执行了什么、终端回了什么」续在后面。
-/// `cancel` 置位时返回 `Err`。
-pub async fn complete(
+/// **服务方不认 tools 时自动降级**：拿掉 tools 重发一次，并把
+/// `tools_supported` 置回 false。这样接第三方兼容层（不少自建网关只转发
+/// messages）不会直接把整个 Agentic 循环打死 —— 调用方据此改回围栏协议，
+/// 而围栏协议本来就是它认的老路。
+pub async fn complete_reply(
     acct: &AgentAccount,
     system: &str,
     messages: &[ChatMessage],
+    tools: &[ToolSpec],
     cancel: Option<&AtomicBool>,
-) -> Result<String, AgentError> {
+) -> Result<LlmReply, AgentError> {
+    // 首轮先按「支持 tools」发
+    let first = post_chat(acct, system, messages, tools, cancel).await?;
+    let provider = first.provider;
+
+    let mut degraded = false;
+    let (status, body) = if !first.status.is_success()
+        && !tools.is_empty()
+        && is_tool_unsupported(&first.body)
+    {
+        tracing::warn!("服务方不接受 tools 声明（HTTP {}），本轮起改为纯文本协议", first.status.as_u16());
+        degraded = true;
+        post_chat(acct, system, messages, &[], cancel).await?.into_parts()
+    } else {
+        first.into_parts()
+    };
+
+    if !status.is_success() {
+        return Err(AgentError::Transport(http_status_message(status, &body)));
+    }
+
+    let mut reply = extract_reply(provider, &body).unwrap_or_default();
+    reply.tools_supported = !tools.is_empty() && !degraded;
+    if reply.text.trim().is_empty() && reply.tool_calls.is_empty() {
+        return Err(AgentError::Transport(
+            "模型返回了空回复：请确认该模型可用于对话接口".into(),
+        ));
+    }
+    Ok(reply)
+}
+
+/// 发一次非流式请求。返回「状态码 + 响应体 + 解析出的 provider」。
+///
+/// 三条出网路径（complete / complete_reply / 降级重试）共用，
+/// 免得取消判定与限长读取被复制三份。
+async fn post_chat(
+    acct: &AgentAccount,
+    system: &str,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+    cancel: Option<&AtomicBool>,
+) -> Result<PostResult, AgentError> {
     if let Some(flag) = cancel {
         if flag.load(Ordering::Relaxed) {
             return Err(AgentError::Transport("已取消".into()));
         }
     }
     let provider = resolve_provider(acct);
-    let prepared = build_messages(acct, provider, system, messages, false)?;
+    let prepared = build_messages_with_tools(acct, provider, system, messages, false, tools)?;
     let client = http_client()?;
     let headers = header_map(&prepared.headers)?;
 
@@ -1282,15 +1544,19 @@ pub async fn complete(
     } else {
         read_error_body(resp).await
     };
-    if !status.is_success() {
-        return Err(AgentError::Transport(http_status_message(status, &body)));
-    }
+    Ok(PostResult { status, body, provider })
+}
 
-    match extract_answer_text(provider, &body) {
-        Some(text) if !text.trim().is_empty() => Ok(text),
-        _ => Err(AgentError::Transport(
-            "模型返回了空回复：请确认该模型可用于对话接口".into(),
-        )),
+/// [`post_chat`] 的结果。小结构是为了让重试那行能直接 `.into_parts()`。
+struct PostResult {
+    status: StatusCode,
+    body: String,
+    provider: Provider,
+}
+
+impl PostResult {
+    fn into_parts(self) -> (reqwest::StatusCode, String) {
+        (self.status, self.body)
     }
 }
 
@@ -1977,5 +2243,128 @@ mod tests {
             Some("ok")
         );
         assert_eq!(extract_answer_text(Provider::OpenAI, "not json"), None);
+    }
+
+    // ——————————————————— 工具调用：wire format ———————————————————
+
+    fn spec() -> ToolSpec {
+        ToolSpec {
+            name: "nx_tab",
+            description: "操作标签页".into(),
+            schema: serde_json::json!({"type": "object", "properties": {"op": {"type": "string"}}}),
+        }
+    }
+
+    /// OpenAI 侧：function 外面要包 `type:"function"`，且必须有 tool_choice。
+    #[test]
+    fn openai_wire_declares_tools() {
+        let req = build_messages_with_tools(
+            &acct(),
+            Provider::OpenAI,
+            "SYS",
+            &[ChatMessage::user("U")],
+            false,
+            &[spec()],
+        )
+        .expect("应组装成功");
+        let json: serde_json::Value = serde_json::from_str(&req.body).expect("body 应是 JSON");
+        assert_eq!(json["tools"][0]["type"], "function");
+        assert_eq!(json["tools"][0]["function"]["name"], "nx_tab");
+        assert_eq!(json["tools"][0]["function"]["parameters"]["type"], "object");
+        assert_eq!(json["tool_choice"]["type"], "auto");
+    }
+
+    /// Anthropic 侧：name/description/input_schema 是平铺的，没有 function 包装层。
+    /// 写成 OpenAI 的形状会被整个拒掉。
+    #[test]
+    fn anthropic_wire_declares_tools_flat() {
+        let req = build_messages_with_tools(
+            &acct(),
+            Provider::Anthropic,
+            "SYS",
+            &[ChatMessage::user("U")],
+            false,
+            &[spec()],
+        )
+        .expect("应组装成功");
+        let json: serde_json::Value = serde_json::from_str(&req.body).expect("body 应是 JSON");
+        assert_eq!(json["tools"][0]["name"], "nx_tab");
+        assert!(json["tools"][0]["function"].is_null(), "Anthropic 不该有 function 包装层");
+        assert_eq!(json["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    /// 不带 tools 时，请求里不该出现 tools / tool_choice 字段 ——
+    /// 部分兼容层收到不认识的参数名会直接 400，而不是忽略。
+    #[test]
+    fn no_tools_leaves_no_trace_in_body() {
+        for provider in [Provider::OpenAI, Provider::Anthropic] {
+            let req = build_messages(&acct(), provider, "SYS", &[ChatMessage::user("U")], false)
+                .expect("应组装成功");
+            let json: serde_json::Value = serde_json::from_str(&req.body).expect("body 应是 JSON");
+            assert!(json.get("tools").is_none(), "{provider:?} 不该带 tools");
+            assert!(json.get("tool_choice").is_none(), "{provider:?} 不该带 tool_choice");
+        }
+    }
+
+    /// OpenAI 的 arguments 按规范是**字符串**。
+    #[test]
+    fn openai_tool_calls_are_parsed() {
+        let body = r#"{"choices":[{"message":{"content":"先看看",
+            "tool_calls":[{"id":"c1","type":"function",
+            "function":{"name":"nx_tab","arguments":"{\"op\":\"list\"}"}}]}}]}"#;
+        let reply = extract_reply(Provider::OpenAI, body).expect("应解析成功");
+        assert_eq!(reply.text, "先看看");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].name, "nx_tab");
+        assert_eq!(reply.tool_calls[0].arguments, r#"{"op":"list"}"#);
+    }
+
+    /// 有些兼容层把 arguments 直接给成对象而不是字符串，两种都要接住。
+    #[test]
+    fn openai_tool_calls_accept_object_arguments() {
+        let body = r#"{"choices":[{"message":{"content":null,
+            "tool_calls":[{"function":{"name":"nx_exec","arguments":{"command":"uptime"}}}]}}]}"#;
+        let reply = extract_reply(Provider::OpenAI, body).expect("应解析成功");
+        assert_eq!(reply.tool_calls[0].arguments, r#"{"command":"uptime"}"#);
+    }
+
+    /// Anthropic 把正文与工具调用混在同一个 content 数组里。
+    /// 只取 content[0] 会漏掉「边说边调」时排在后面的 text 块。
+    #[test]
+    fn anthropic_tool_use_is_parsed_alongside_text() {
+        let body = r#"{"content":[
+            {"type":"text","text":"先看看有哪些标签页"},
+            {"type":"tool_use","id":"tu1","name":"nx_tab","input":{"op":"list"}},
+            {"type":"text","text":"，再说。"}]}"#;
+        let reply = extract_reply(Provider::Anthropic, body).expect("应解析成功");
+        assert_eq!(reply.text, "先看看有哪些标签页，再说。");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].name, "nx_tab");
+        assert_eq!(reply.tool_calls[0].arguments, r#"{"op":"list"}"#);
+    }
+
+    /// 没调工具时 tool_calls 必须是空，且正文照常取出 ——
+    /// 上层靠「有没有工具调用」来决定走工具路径还是围栏路径。
+    #[test]
+    fn plain_answer_has_no_tool_calls() {
+        let oai = r#"{"choices":[{"message":{"content":"已经查清楚了"}}]}"#;
+        let reply = extract_reply(Provider::OpenAI, oai).expect("应解析成功");
+        assert!(reply.tool_calls.is_empty());
+        assert_eq!(reply.text, "已经查清楚了");
+
+        let anth = r#"{"content":[{"type":"text","text":"已经查清楚了"}]}"#;
+        let reply = extract_reply(Provider::Anthropic, anth).expect("应解析成功");
+        assert!(reply.tool_calls.is_empty());
+    }
+
+    /// 降级判据：必须是「在抱怨 tools」才算，普通的 400 不能触发重试。
+    #[test]
+    fn tool_unsupported_is_detected_only_for_tools() {
+        assert!(is_tool_unsupported(r#"{"error":{"message":"Unknown parameter: tools"}}"#));
+        assert!(is_tool_unsupported("tools is not supported by this model"));
+        assert!(is_tool_unsupported("Invalid value for 'tools'"));
+        // 普通的 400（比如 context length）不该被当成「不支持 tools」
+        assert!(!is_tool_unsupported("maximum context length exceeded"));
+        assert!(!is_tool_unsupported("invalid api key"));
     }
 }

@@ -7,9 +7,17 @@
 //! 提问 → 模型决定做点什么 → 真的去做 → 把终端回了什么续喂回去 → 再决定 → … → 给结论
 //! ```
 //!
-//! ## 动作协议
+//! ## 动作协议：工具调用优先，围栏兜底
 //!
-//! 模型要执行东西，就在回复里写这样一段围栏代码块：
+//! **首选路径是原生 function calling**。请求里带上工具声明，模型要动手就发
+//! `tool_calls`，名字与参数都由 JSON Schema 约束 —— 它没法凭空编出一个
+//! `new-tab`，也不能把界面动作当成 shell 命令。
+//!
+//! 围栏代码块是**兜底**，两条理由：
+//!
+//! 1. 大量自建网关/兼容层只转发 messages，收到 `tools` 直接 400。
+//!    `llm::complete_reply` 会识别并自动降级，本层随即改用围栏解析。
+//! 2. 部分模型即便给了工具，仍习惯把 JSON 写进代码块。围栏解析照接不误。
 //!
 //! ````text
 //! ```nx-exec
@@ -17,11 +25,17 @@
 //! ```
 //! ````
 //!
-//! 之所以选「围栏代码块里放 JSON」而不是函数调用 tool-calls：后者各家方言
-//! 差异极大（OpenAI / Anthropic / 各种兼容层各写各的），而围栏代码块只有一种写法，
-//! 任何能说人话的模型都写得出来 —— 这才是对未知模型最稳的那一版。
 //! 一个块里也可以给 `targets` + `commands` 两个数组，一次对多台机器下发同一批命令。
 //! 不写 `target` 就默认落到「当前会话」。
+//!
+//! ## 伪命令护栏
+//!
+//! 模型在终端场景下有个顽固的先验：「想做什么就写个命令」。于是它会写出
+//! `new-tab`、`reconnect` 这种**根本不存在的命令** —— 敲进终端只是换来一句
+//! `command not found`，还白白浪费一轮。
+//!
+//! 这些是界面动作。本层在**下发到终端之前**把它们拦下来，转成一张说明卡片 +
+//! 一句纠正喂回模型，而不是等 shell 报错再说。
 //!
 //! ## 三条不可妥协的约束
 //!
@@ -66,6 +80,12 @@ const MAX_ACTIONS: usize = 12;
 /// 一次足够它纠正格式；再多就是拿步数上限当儿戏了。
 const MAX_MISFIRE_RETRY: usize = 1;
 
+/// 提示词里最多列出多少条已保存的主机。
+///
+/// 这清单的作用是让模型能挑出 `sessionRecordId`，不是让它背通讯录。
+/// 保存上百条的人并不罕见，全列出去纯属浪费上下文预算。
+const MAX_SAVED_HOST_HINTS: usize = 40;
+
 /// 人工审批的最长等待。超时按「拒绝」处理。
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -109,14 +129,15 @@ pub struct AgentRunRequest {
     pub console_alt: bool,
 }
 
-/// 模型下发的一个动作。四选一：
+/// 模型下发的一个动作。五选一：
 ///
-/// - `Exec`：在某个会话上跑一条命令（原有能力）。
+/// - `Exec`：在某个会话上跑一条命令。
 /// - `Export`：把某个会话迄今为止的全部输出要回来（`agent::capture`）。
 /// - `Open`：开一个新会话（本地或某个已保存的 SSH 主机），可选顺手发一条命令。
 /// - `Tab`：操作窗口上的标签页（列出 / 切换 / 关闭 / 改名 / 重连）。
+/// - `Reject`：模型把界面动作写成了 shell 命令，被拦下来了（见 `pseudo_command_hint`）。
 ///
-/// `Tab` 与前三者有个本质区别：**它不由后端执行**。tab 是前端 React state，
+/// `Tab` 与 `Exec` 有个本质区别：**它不由后端执行**。tab 是前端 React state，
 /// 后端连「用户开了几个标签页」都不知道；这里只把动作转成一个事件，等前端回执。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentAction {
@@ -124,6 +145,11 @@ pub enum AgentAction {
     Export { target: Option<String>, deep: bool },
     Open { kind: OpenKind, label: Option<String>, command: Option<String> },
     Tab { op: TabOp, target: Option<String>, name: Option<String> },
+    /// 不是「命令有风险」，而是「这条命令根本不该出现」。
+    ///
+    /// 它照样占一个动作位、照样例行走反馈链路 —— 让模型看到自己错在哪，
+    /// 而不是让这轮静悄悄什么都不发生。
+    Reject { command: String, hint: String },
 }
 
 /// 对标签页能做些什么。
@@ -209,6 +235,210 @@ struct ExecBlock {
     name: Option<String>,
 }
 
+// ——————————————————————————————— 工具声明 ———————————————————————————————
+
+/// 工具名。
+///
+/// 刻意与围栏协议的 `action` 取值一一对应（去掉 `nx_` 前缀就是）：
+/// 工具参数因此可以直接补一层 `action` 后喂给同一套 `ExecBlock` 解析，
+/// 不用为工具再维护一份字段表 —— 那两份迟早会走散。
+pub const TOOL_EXEC: &str = "nx_exec";
+pub const TOOL_EXPORT: &str = "nx_export";
+pub const TOOL_OPEN: &str = "nx_open_tab";
+pub const TOOL_TAB: &str = "nx_tab";
+
+/// 声明给模型的全部工具。
+///
+/// 名字带 `nx_` 前缀：模型可能在别的上下文里见过 `exec` / `open` 这类通用名，
+/// 用带前缀的名字能把它从「通用先验」里拽出来，照我们的语义用。
+pub fn tool_specs() -> Vec<llm::ToolSpec> {
+    vec![
+        llm::ToolSpec {
+            name: TOOL_EXEC,
+            description: "在一个终端会话里执行一条 shell 命令，并拿到它的真实输出。".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "目标会话 id。省略表示落到用户当前所在的会话。"
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "单条单行命令。不要换行串联，也不要用 && 串起互不相关的操作。"
+                    }
+                },
+                "required": ["command"]
+            }),
+        },
+        llm::ToolSpec {
+            name: TOOL_EXPORT,
+            description: "导出一个会话迄今为止的全部输出记录（不受喂给你的上下文长度限制）。".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "目标会话 id。省略表示当前会话。"
+                    },
+                    "deep": {
+                        "type": "boolean",
+                        "description": "true 时额外探一遍该会话里的 tmux pane 与 docker 容器日志，更全但更慢。"
+                    }
+                }
+            }),
+        },
+        llm::ToolSpec {
+            name: TOOL_OPEN,
+            description: "开一个新的标签页（本地 shell，或连到一个用户已保存的 SSH 主机）。".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["local", "ssh"],
+                        "description": "local = 本机 shell；ssh = 连到远程主机（此时必须给 sessionRecordId）。"
+                    },
+                    "sessionRecordId": {
+                        "type": "string",
+                        "description": "kind=ssh 时必填：用户在侧栏里已保存的会话配置 id。\
+                                        只能引用它，**绝不能自己编造主机名/用户名/密码**。"
+                    },
+                    "label": { "type": "string", "description": "新标签页的展示名，可省略。" },
+                    "command": { "type": "string", "description": "开好之后顺手执行的命令，可省略。" }
+                },
+                "required": ["kind"]
+            }),
+        },
+        llm::ToolSpec {
+            name: TOOL_TAB,
+            description: "操作界面上的标签页。标签页是界面元素，\
+                          没有任何 shell 命令能操作它 —— 不要试图用命令代替这个工具。".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": ["list", "focus", "close", "rename", "reconnect"],
+                        "description": "list = 列出所有标签页（**先做这个拿到 id**）；\
+                                        focus = 切过去；close = 关掉；\
+                                        rename = 改名；reconnect = SSH 断线后重连。"
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "标签页 id（与 nx_exec 的 target 是同一套会话 id）。\
+                                        除 list 外必填。"
+                    },
+                    "name": { "type": "string", "description": "op=rename 时的新名字。" }
+                },
+                "required": ["op"]
+            }),
+        },
+    ]
+}
+
+/// 模型在终端语境下习惯写 `{"command":["uptime","df -h"]}`（一排命令），
+/// 而工具的 schema 里 `command` 是字符串。
+///
+/// 这里把数组形态搬到 `commands` / `targets` 上，让围栏协议那套批量下发
+/// 照样能用 —— 否则一次类型不符就要白耗一整轮去重发。
+fn promote_arrays(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    for (single, plural) in [("command", "commands"), ("target", "targets")] {
+        if obj.get(single).map(|v| v.is_array()).unwrap_or(false) {
+            let arr = obj.remove(single).unwrap_or(serde_json::Value::Null);
+            obj.insert(plural.to_string(), arr);
+        }
+    }
+}
+
+/// 工具名 → 围栏协议的 `action` 取值。
+fn tool_action_name(name: &str) -> Option<&'static str> {
+    match name {
+        TOOL_EXEC => Some("exec"),
+        TOOL_EXPORT => Some("export"),
+        TOOL_OPEN => Some("open"),
+        TOOL_TAB => Some("tab"),
+        _ => None,
+    }
+}
+
+/// 把模型的一个工具调用翻译成动作。
+///
+/// 工具参数是 `{"op":"list"}` 这种扁平对象，围栏协议则在同层还要一个
+/// `{"action":"tab"}`。这里把 `action` 补进去，就能完全复用围栏侧的解析 ——
+/// 包括「缺字段给默认值」「`switchTo` 等同 `focus`」这些已有的宽容处理。
+///
+/// 动作序列刻意覆写 `action` 字段：万一模型在参数里自己写了个 `action`，
+/// 也该以工具名为准（工具名是它选这条路时真正的意图）。
+pub fn actions_from_tool_call(call: &llm::ToolCall) -> Vec<AgentAction> {
+    let action = match tool_action_name(call.name.trim()) {
+        Some(a) => a,
+        // 未知工具：宁可什么都不做，也不要猜。
+        None => return Vec::new(),
+    };
+    let mut args: serde_json::Value = match serde_json::from_str(&call.arguments) {
+        Ok(serde_json::Value::Object(m)) => serde_json::Value::Object(m),
+        // 工具参数偶有空串（模型没传参就直接调了），按空对象继续，
+        // 后面 parse_* 会因为缺必填字段自行丢弃。
+        _ => serde_json::Value::Object(serde_json::Map::new()),
+    };
+    if let Some(obj) = args.as_object_mut() {
+        obj.insert("action".into(), serde_json::Value::String(action.into()));
+        promote_arrays(obj);
+    }
+    let block: ExecBlock = match serde_json::from_value(args) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    match action {
+        "export" => parse_export(block),
+        "open" => parse_open(block).into_iter().collect(),
+        "tab" => parse_tab(block).into_iter().collect(),
+        _ => parse_exec(block),
+    }
+}
+
+/// 工具调用在历史里的文本形态。
+///
+/// 为什么不能直接把带 `tool_calls` 的 assistant 消息塞回历史：OpenAI 系接口
+/// 要求那条消息后面必须紧跟 `role:"tool"` 的回执，否则下一轮直接 400 ——
+/// 而我们的回执是「终端回了什么」这条普通 user 文本。
+///
+/// 所以把这一轮「调用了什么」写成人话记进去。协议上仍是干净的
+/// user/assistant 交替，对任何兼容层都成立。
+fn describe_tool_calls(reply: &llm::LlmReply) -> String {
+    let mut out = reply.text.clone();
+    for c in &reply.tool_calls {
+        if !out.trim().is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("（调用工具 {}：{}）", c.name, c.arguments));
+    }
+    out
+}
+
+/// 工具名（+ 参数）在界面上给人看的说法。
+pub fn tool_label(name: &str, args: &str) -> &'static str {
+    match name.trim() {
+        TOOL_EXEC => "执行命令",
+        TOOL_EXPORT => "导出记录",
+        TOOL_OPEN => "新建标签页",
+        TOOL_TAB => match serde_json::from_str::<serde_json::Value>(args)
+            .ok()
+            .and_then(|v| v.get("op").and_then(|o| o.as_str()).map(|s| s.to_string()))
+            .as_deref()
+        {
+            Some("list") => "列出标签页",
+            Some("focus" | "switch" | "switchTo") => "切换标签页",
+            Some("close") => "关闭标签页",
+            Some("rename") => "重命名标签页",
+            Some("reconnect" | "reopen") => "重连标签页",
+            _ => "操作标签页",
+        },
+        _ => "工具调用",
+    }
+}
+
 // ——————————————————————————————— 事件载荷 ———————————————————————————————
 
 /// `nx://agent/step/{session}` 的载荷：一轮里发生的每一件事。
@@ -218,9 +448,18 @@ struct ExecBlock {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StepPayload {
-    /// `plan` | `exec` | `result` | `skip` | `note` | `answer`
+    /// `plan` | `tool` | `exec` | `result` | `skip` | `note` | `answer`
     pub kind: &'static str,
     pub step: usize,
+    /// `kind:"tool"` 专用：模型调用的工具名。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// `kind:"tool"` 专用：给人看的工具名（中文）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_label: Option<String>,
+    /// `kind:"tool"` 专用：原始参数 JSON。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_args: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,6 +479,9 @@ impl StepPayload {
         Self {
             kind,
             step,
+            tool: None,
+            tool_label: None,
+            tool_args: None,
             target: None,
             target_label: None,
             command: None,
@@ -404,7 +646,7 @@ fn parse_raw_shell(raw: &str) -> Vec<AgentAction> {
             if cmd.is_empty() || cmd.starts_with('#') {
                 return None;
             }
-            Some(AgentAction::Exec { target: None, command: cmd.to_string() })
+            Some(action_for_command(None, cmd))
         })
         .collect()
 }
@@ -431,12 +673,12 @@ fn parse_exec(block: ExecBlock) -> Vec<AgentAction> {
     let mut out = Vec::new();
     if targets.is_empty() {
         for c in &commands {
-            out.push(AgentAction::Exec { target: None, command: c.clone() });
+            out.push(action_for_command(None, c));
         }
     } else {
         for t in &targets {
             for c in &commands {
-                out.push(AgentAction::Exec { target: Some(t.clone()), command: c.clone() });
+                out.push(action_for_command(Some(t.clone()), c));
             }
         }
     }
@@ -496,6 +738,66 @@ fn parse_tab(block: ExecBlock) -> Option<AgentAction> {
     Some(AgentAction::Tab { op, target, name })
 }
 
+/// 「看起来像命令、其实是界面动作」的伪命令 → 纠正话术。
+///
+/// 终端场景下模型有个顽固的先验：「想做什么，就写个命令」。于是它会写出
+/// `new-tab`、`reconnect` 这类**终端里根本不存在**的东西 —— 敲过去只会被
+/// shell 回一句 `command not found`，既浪费一轮，又在用户终端里留下一行垃圾。
+///
+/// 这些动作本来就有对应的工具，所以在**下发到终端之前**拦下来：
+/// 卡片上写清楚为什么没执行，再把正确用法喂回模型。
+///
+/// 只认「命令名本身就是这些词」的情况：先取第一个 token，
+/// 这样 `new-tab --ssh foo` 这种带参数的也拦得住，而 `ls | grep tab` 不受影响。
+fn pseudo_command_hint(cmd: &str) -> Option<&'static str> {
+    let head = cmd
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_start_matches("./")
+        .to_ascii_lowercase();
+    if head.is_empty() {
+        return None;
+    }
+    match head.as_str() {
+        h if matches!(
+            h,
+            "new-tab" | "newtab" | "new_tab" | "open-tab" | "opentab" | "open_tab"
+            | "tab-new" | "tabnew" | "create-tab" | "add-tab" | "tab-create" | "newtabpage"
+        ) =>
+        {
+            Some("「新建标签页」是界面动作，终端里没有这条命令。请改用 nx_open_tab 工具")
+        }
+        h if matches!(
+            h,
+            "reconnect" | "reconnect-tab" | "reconnecttab" | "reconnect_tab" | "re-tab"
+            | "tab-reconnect"
+        ) => Some("「重连标签页」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=reconnect）"),
+        h if matches!(h, "close-tab" | "closetab" | "close_tab" | "tab-close" | "kill-tab") => {
+            Some("「关闭标签页」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=close）")
+        }
+        h if matches!(
+            h,
+            "switch-tab" | "switchtab" | "switch_tab" | "tab-switch" | "focus-tab" | "tab-focus"
+        ) => Some("「切换标签页」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=focus）"),
+        h if matches!(h, "list-tabs" | "listtab" | "tab-list" | "tabs") => {
+            Some("「查看标签页」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=list）")
+        }
+        h if matches!(h, "rename-tab" | "renametab" | "rename_tab" | "tab-rename") => {
+            Some("「标签页改名」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=rename）")
+        }
+        _ => None,
+    }
+}
+
+/// 把一条命令变成动作：被判为伪命令时转成 `Reject`，否则就是普通的 `Exec`。
+fn action_for_command(target: Option<String>, command: &str) -> AgentAction {
+    match pseudo_command_hint(command) {
+        Some(hint) => AgentAction::Reject { command: command.trim().into(), hint: hint.into() },
+        None => AgentAction::Exec { target, command: command.to_string() },
+    }
+}
+
 /// 校验一条命令能不能下发。返回可读的拒绝理由。
 ///
 /// 拒绝换行是这里最重要的一条：一次注入一串操作会让「逐步审批」彻底失效 ——
@@ -535,6 +837,12 @@ pub const AGENTIC_SYSTEM_PROMPT_INTRO: &str = concat!(
 /// 之前自定义路径用的是压缩版说明，结果用户的提示词里写着「只给结论与必要命令」，
 /// 模型就真把 shell 直接抄进围栏 —— 协议写歪了，界面上什么都不发生。
 pub const ACTION_PROTOCOL: &str = concat!(
+    "【优先用工具】你有 nx_exec / nx_export / nx_open_tab / nx_tab 四个工具。",
+    "能用工具调用时**直接用工具**，不要写成下面的围栏文本；",
+    "只有当你确认自己无法发起工具调用时，才退化成围栏代码块。\n",
+    "**绝不要把界面动作当成 shell 命令**：`new-tab`、`reconnect`、`close-tab`、",
+    "`switch-tab`、`list-tabs`、`rename-tab` 这些在终端里根本不存在，",
+    "敲过去只会得到 command not found。它们对应的都是 nx_tab / nx_open_tab 工具。\n\n",
     "【要执行命令时】在回复里写且只写这样一个围栏代码块（不写 action 等同 \"exec\"）：\n",
     "```nx-exec\n{\"action\":\"exec\",\"target\":\"<会话id>\",\"command\":\"<命令>\"}\n```\n",
     "一次要对多台机器发同一批命令时，用 targets / commands 两个数组：\n",
@@ -666,11 +974,46 @@ fn plan_message(
             _ => msg.push_str("必要时先用「输出抓取 skill」拿到内容再判断。\n"),
         }
     }
+    msg.push_str(&saved_hosts_hint(state));
     msg.push_str(&format!(
-        "\n目标：{}\n\n需要执行操作就用 ```nx-exec 代码块，已经查清就直接给结论。",
+        "\n目标：{}\n\n需要执行操作就调用工具，已经查清就直接给结论。",
         req.question.trim()
     ));
     msg
+}
+
+/// 用户已保存的主机清单。
+///
+/// 没有这一段，`nx_open_tab(kind=ssh)` 是个死功能：协议要求模型给出「已存在的
+/// 会话配置 id」，却从不告诉它有哪些 id 存在。模型只能瞎编一个，然后被
+/// 「未找到会话配置」打回来 —— 这正是截图里它放弃工具、转而自己写
+/// `new-tab` 这条伪命令的真正原因。工具再标准，没有可填的参数也是空的。
+///
+/// 只给 id / 名称 / host:port，**不给用户名与认证方式**：开新连接用不到，
+/// 没必要多往外发一份凭据相关的数据。
+fn saved_hosts_hint(state: &AppState) -> String {
+    let records = match state.store.list() {
+        Ok(v) => v,
+        // 库读取失败不该把整轮问答拖垮：少这一段，模型最多是开不了 SSH 标签页
+        Err(_) => return String::new(),
+    };
+    let total = records.len();
+    if total == 0 {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n【已保存的主机】下面是用户在侧栏里存过的连接目标。\
+         要开一个连到其中某台的标签页，用 nx_open_tab 工具、把这一行的 id 填进 sessionRecordId。\
+         **只能引用这些 id，绝不能自己编造主机**；列表里没有的目标，如实告诉用户你连不了：\n",
+    );
+    for r in records.into_iter().take(MAX_SAVED_HOST_HINTS) {
+        let name = if r.name.trim().is_empty() { &r.host } else { &r.name };
+        out.push_str(&format!("· id={} 「{}」 {}:{}\n", r.id, name, r.host, r.port));
+    }
+    if total > MAX_SAVED_HOST_HINTS {
+        out.push_str(&format!("……（还有 {} 条未列出）\n", total - MAX_SAVED_HOST_HINTS));
+    }
+    out
 }
 
 /// 全屏程序（tmux / screen / less / vim …）把自己的画面画在 alternate buffer 上，
@@ -741,11 +1084,27 @@ fn feedback_for(command: &str, label: &str, outcome: &ExecOutcome) -> String {
 
 /// 也有可能执行本身就没跑起来（会话关了、拒绝-ID 不存在）。
 fn failure_feedback(command: &str, label: &str, why: &str) -> String {
-    format!(
+    let mut out = format!(
         "在会话「{label}」执行 `{}` 失败：{}\n请据此调整：换一条命令、换个会话，或直接给结论。\n",
         command.trim(),
         why
-    )
+    );
+    // 断线的会话敲不进任何东西。不点破的话模型只会在这里空转 ——
+    // 实测过它连着报两次「输入通道已关闭」还在下发第三条命令。
+    if is_channel_closed(why) {
+        out.push_str(&format!(
+            "注意：这个会话的通道已经关闭，**再往里发命令也不会有结果**，不要重试。\n\
+             要恢复它请用 {TOOL_TAB} 工具（op=reconnect，target 填这个会话的 id）；\
+             拿不到工具就用围栏写 {{\"action\":\"tab\",\"op\":\"reconnect\",\"target\":\"<该会话id>\"}}。\n\
+             不需要它了就直接给结论：标签页本身还在，用户随时能自己点右键重连。\n"
+        ));
+    }
+    out
+}
+
+/// 这条失败是不是「会话通道已关闭」。
+fn is_channel_closed(why: &str) -> bool {
+    why.contains("通道") && (why.contains("关闭") || why.contains("失效") || why.contains("断开"))
 }
 
 /// 按**字符**截断并给出提示。按 `char` 而不是字节，否则中文会切出半个字。
@@ -1376,6 +1735,9 @@ pub async fn run(
     let mut feedback = String::new();
     // 动作块写歪的次数。允许模型改一次，但不许它拿这个把步数刷完。
     let mut misfires = 0usize;
+    // 服务方不认 tools 时置 false：此后一律走围栏协议，不再每轮都白试一次。
+    let mut use_tools = true;
+    let specs = tool_specs();
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -1400,8 +1762,11 @@ pub async fn run(
             feedback.clear();
         }
 
-        let reply = match llm::complete(acct, &system, &messages, Some(&cancel)).await {
-            Ok(text) => text,
+        let asked_tools = if use_tools { specs.as_slice() } else { &[] };
+        let reply = match llm::complete_reply(acct, &system, &messages, asked_tools, Some(&cancel))
+            .await
+        {
+            Ok(r) => r,
             Err(e) => {
                 // 先把自己这一轮从登记表里摘掉，再报错 —— 否则会话会被永久卡住「运行中」
                 runtime.finish(&session);
@@ -1409,15 +1774,53 @@ pub async fn run(
                 return Err(e);
             }
         };
-        messages.push(ChatMessage::assistant(reply.clone()));
+        // 服务方/模型不认 tools 就永久退回围栏协议：每轮都白试一次既慢，
+        // 又会让"带上 tool_choice 却拿不到调用"的怪状态一直挂着。
+        if use_tools && !reply.tools_supported {
+            use_tools = false;
+        }
 
-        let actions = extract_actions(&reply);
-        trace_round(&session, step, &reply, actions.len());
+        // 工具优先：有结构化调用就不再看围栏 —— 模型常常两种都写，
+        // 若两边都收，同一件事会被执行两遍。
+        let actions: Vec<AgentAction> = if reply.tool_calls.is_empty() {
+            extract_actions(&reply.text)
+        } else {
+            reply.tool_calls.iter().flat_map(actions_from_tool_call).collect()
+        };
+        trace_round(&session, step, &reply.text, actions.len());
+
+        // 进了历史的这条 assistant 消息：带工具调用时不能原样存，
+        // 否则下一轮会被接口以「tool_calls 后面必须跟 tool 回执」拒掉。
+        messages.push(ChatMessage::assistant(describe_tool_calls(&reply)));
+
         if actions.is_empty() {
+            // 调了工具但一个动作都没产出（多半是缺必填参数，比如 nx_tab 没给 op）。
+            // 卡片已经摆出去了，后面却什么都没发生 —— 那正是以前最招骂的那种
+            // 「它说要做，然后没有然后」。这里必须说清楚卡在哪。
+            if !reply.tool_calls.is_empty() && misfires < MAX_MISFIRE_RETRY {
+                misfires += 1;
+                emit_step(
+                    app,
+                    &session,
+                    StepPayload {
+                        text: Some(
+                            "工具调用缺少必要参数，未产生任何动作，已请模型重发。".into(),
+                        ),
+                        ..StepPayload::new("note", step)
+                    },
+                );
+                feedback.push_str(
+                    "你的工具调用没有产生任何动作，多半是缺了必填参数。\
+                     nx_exec 必须有 command；nx_tab 必须有 op，\
+                     且除 list 外都要带 target；nx_open_tab 必须有 kind，\
+                     kind=ssh 时还要带 sessionRecordId。请补齐后重新调用。\n",
+                );
+                continue;
+            }
             // 回复里有围栏却抽不出任何动作 = 协议写歪了，不是「模型想收尾」。
             // 这种情况必须让人看见：以前直接 break，界面上只留下模型那段
             // 「我需要打开一个新的会话…」，看起来就像它答应了却没动手。
-            if reply.contains(FENCE_OPEN) && misfires < MAX_MISFIRE_RETRY {
+            if reply.text.contains(FENCE_OPEN) && misfires < MAX_MISFIRE_RETRY {
                 misfires += 1;
                 emit_step(
                     app,
@@ -1435,12 +1838,29 @@ pub async fn run(
                 ));
                 continue;
             }
-            // 没有动作块 = 模型准备收尾了，这段纯文本就是给用户的结论
-            let text = strip_action_blocks(&reply);
+            // 没有动作 = 模型准备收尾了，这段纯文本就是给用户的结论
+            let text = strip_action_blocks(&reply.text);
             if !text.trim().is_empty() {
                 emit_step(app, &session, StepPayload { text: Some(text), ..StepPayload::new("answer", step) });
             }
             break;
+        }
+
+        // 先把「模型调用了什么」摆到界面上，再逐个展示执行过程。
+        //
+        // 这张卡是原生工具调用独有的：围栏路径只是一段文本，没有结构化的
+        // 「调了哪个工具、传了什么参数」，自然也不该有一张凭空造出来的卡。
+        for c in &reply.tool_calls {
+            emit_step(
+                app,
+                &session,
+                StepPayload {
+                    tool: Some(c.name.clone()),
+                    tool_label: Some(tool_label(&c.name, &c.arguments).into()),
+                    tool_args: Some(c.arguments.clone()),
+                    ..StepPayload::new("tool", step)
+                },
+            );
         }
 
         for action in actions {
@@ -1450,6 +1870,24 @@ pub async fn run(
             }
             // 一轮内的多个动作共用同一个 step 号：UI 按 step 折叠，同一步归在一张卡里
             match action {
+                AgentAction::Reject { command, hint } => {
+                    // 静默丢弃是最糟的：用户看到模型说「我要开个新标签页」，
+                    // 终端里却只留下一行 command not found。这里把「为什么没下发」
+                    // 落一张卡，同时把正确用法喂回模型。
+                    emit_step(
+                        app,
+                        &session,
+                        StepPayload {
+                            command: Some(command.clone()),
+                            reasons: Some(vec!["不是 shell 命令，已拦下".into(), hint.clone()]),
+                            ..StepPayload::new("skip", step)
+                        },
+                    );
+                    feedback.push_str(&format!(
+                        "命令 `{}` 已被拦下、没有下发到终端：{hint}\n",
+                        command
+                    ));
+                }
                 AgentAction::Exec { target, command } => {
                     let (target_id, target_label) = locate(target.as_deref(), &targets, &session);
 
@@ -2275,5 +2713,192 @@ mod tests {
             }
             other => panic!("应解析成 Open，实际 {other:?}"),
         }
+    }
+
+    // ——————————————————— 原生工具调用 ———————————————————
+
+    #[test]
+    fn tool_call_maps_to_tab_action() {
+        let call = llm::ToolCall {
+            name: TOOL_TAB.into(),
+            arguments: r#"{"op":"reconnect","target":"tab-9"}"#.into(),
+        };
+        assert_eq!(
+            actions_from_tool_call(&call),
+            vec![AgentAction::Tab {
+                op: TabOp::Reconnect,
+                target: Some("tab-9".into()),
+                name: None
+            }]
+        );
+    }
+
+    #[test]
+    fn tool_call_maps_to_open_ssh_action() {
+        let call = llm::ToolCall {
+            name: TOOL_OPEN.into(),
+            arguments: r#"{"kind":"ssh","sessionRecordId":"rec-1","label":"db-01"}"#.into(),
+        };
+        assert_eq!(
+            actions_from_tool_call(&call),
+            vec![AgentAction::Open {
+                kind: OpenKind::Ssh { session_record_id: "rec-1".into() },
+                label: Some("db-01".into()),
+                command: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn tool_call_maps_to_exec_action() {
+        let call = llm::ToolCall {
+            name: TOOL_EXEC.into(),
+            arguments: r#"{"target":"s1","command":"uptime"}"#.into(),
+        };
+        assert_eq!(
+            actions_from_tool_call(&call),
+            vec![AgentAction::Exec { target: Some("s1".into()), command: "uptime".into() }]
+        );
+    }
+
+    /// 工具名是意图的权威来源：模型在参数里自己塞了个 `action` 也不能信它，
+    /// 否则 `nx_exec` 配 `{"action":"tab"}` 会绕过 exec 的校验直接去操作界面。
+    #[test]
+    fn tool_name_beats_a_smuggled_action_field() {
+        let call = llm::ToolCall {
+            name: TOOL_EXEC.into(),
+            arguments: r#"{"action":"tab","command":"rm -rf /"}"#.into(),
+        };
+        assert_eq!(
+            actions_from_tool_call(&call),
+            vec![AgentAction::Exec { target: None, command: "rm -rf /".into() }]
+        );
+    }
+
+    /// 模型习惯把一排命令写成数组，而工具 schema 里 `command` 是字符串。
+    /// 搬到 commands 上，批量下发照样能用，省掉一整轮重发。
+    #[test]
+    fn tool_call_accepts_array_commands() {
+        let call = llm::ToolCall {
+            name: TOOL_EXEC.into(),
+            arguments: r#"{"target":"s1","command":["uptime","df -h"]}"#.into(),
+        };
+        assert_eq!(
+            actions_from_tool_call(&call),
+            vec![
+                AgentAction::Exec { target: Some("s1".into()), command: "uptime".into() },
+                AgentAction::Exec { target: Some("s1".into()), command: "df -h".into() },
+            ]
+        );
+    }
+
+    /// 参数缺失必须在界面上说清楚：卡片已经摆出去了，
+    /// 后面却什么都没发生，那就是最招骂的「它说要做，然后没有然后」。
+    #[test]
+    fn empty_tool_actions_produce_a_correction_hint() {
+        let call = llm::ToolCall { name: TOOL_TAB.into(), arguments: r#"{"op":"bogus"}"#.into() };
+        assert!(actions_from_tool_call(&call).is_empty());
+    }
+
+    #[test]
+    fn unknown_tool_call_yields_nothing() {
+        // 未知工具宁可什么都不做，也不要按名字去猜它想干什么
+        let call = llm::ToolCall { name: "nx_destroy_everything".into(), arguments: "{}".into() };
+        assert!(actions_from_tool_call(&call).is_empty());
+        // 空参数（模型直接调了没传参）也不能崩，由后面的必填字段校验丢掉
+        let call = llm::ToolCall { name: TOOL_TAB.into(), arguments: "".into() };
+        assert!(actions_from_tool_call(&call).is_empty());
+        let call = llm::ToolCall { name: TOOL_TAB.into(), arguments: "not json".into() };
+        assert!(actions_from_tool_call(&call).is_empty());
+    }
+
+    #[test]
+    fn tool_label_names_the_tab_op() {
+        assert_eq!(tool_label(TOOL_TAB, r#"{"op":"list"}"#), "列出标签页");
+        assert_eq!(tool_label(TOOL_TAB, r#"{"op":"reconnect"}"#), "重连标签页");
+        assert_eq!(tool_label(TOOL_TAB, "{}"), "操作标签页");
+        assert_eq!(tool_label(TOOL_EXEC, "{}"), "执行命令");
+        assert_eq!(tool_label(TOOL_OPEN, "{}"), "新建标签页");
+    }
+
+    /// 历史里那条 assistant 消息必须是「人话」而不是原始 tool_calls：
+    /// OpenAI 系接口要求 tool_calls 后面紧跟 role:tool 回执，否则下一轮直接 400。
+    #[test]
+    fn history_records_tool_calls_as_text() {
+        let reply = llm::LlmReply {
+            text: "先看看有哪些标签页。".into(),
+            tool_calls: vec![llm::ToolCall {
+                name: TOOL_TAB.into(),
+                arguments: r#"{"op":"list"}"#.into(),
+            }],
+            tools_supported: true,
+        };
+        let text = describe_tool_calls(&reply);
+        assert!(text.contains("nx_tab"), "工具名要留在历史里：{text}");
+        assert!(text.contains("list"), "参数也要留着：{text}");
+        assert!(text.contains("先看看有哪些标签页"), "正文不能被吃掉：{text}");
+    }
+
+    // ——————————————————— 伪命令护栏 ———————————————————
+
+    /// 截图里的真实翻车：模型想开新标签页，写出 `new-tab` 当成命令。
+    /// 这条必须被拦下，绝不能敲进终端换回一句 command not found。
+    #[test]
+    fn new_tab_is_not_a_command() {
+        let acts = extract_actions(&block(r#"{"action":"exec","command":"new-tab"}"#));
+        assert_eq!(acts.len(), 1);
+        match &acts[0] {
+            AgentAction::Reject { command, hint } => {
+                assert_eq!(command, "new-tab");
+                assert!(hint.contains("nx_open_tab"), "纠正话术要指到工具上：{hint}");
+            }
+            other => panic!("应拦成 Reject，实际 {other:?}"),
+        }
+        // 围栏里直接写 shell 的那条路径同样要拦
+        let acts = extract_actions("```nx-exec\nnew-tab\n```\n");
+        assert_eq!(acts.len(), 1);
+        assert!(matches!(acts[0], AgentAction::Reject { .. }), "实际 {acts:?}");
+    }
+
+    #[test]
+    fn pseudo_commands_are_all_caught() {
+        for cmd in [
+            "new-tab", "newtab", "new_tab", "open-tab", "opentab", "tab-new",
+            "create-tab", "add-tab", "reconnect", "reconnect-tab", "re-tab",
+            "close-tab", "closetab", "kill-tab", "switch-tab", "focus-tab",
+            "list-tabs", "tabs", "rename-tab",
+        ] {
+            assert!(
+                pseudo_command_hint(cmd).is_some(),
+                "「{cmd}」应被判为伪命令"
+            );
+            // 带参数时也要拦
+            assert!(
+                pseudo_command_hint(&format!("{cmd} --host 1.2.3.4")).is_some(),
+                "「{cmd} --host …」应被判为伪命令"
+            );
+        }
+    }
+
+    /// 护栏不能误伤真命令：这些词出现在管道/参数里都不算伪命令
+    #[test]
+    fn real_commands_pass_the_guard() {
+        for cmd in ["ls", "uptime", "cat tabs.txt", "grep -r tab .", "tmux new-session", "df -h"] {
+            assert!(pseudo_command_hint(cmd).is_none(), "「{cmd}」不该被拦");
+        }
+    }
+
+    /// 断线的会话再发命令也不会有结果。不点破的话模型会一直空转 ——
+    /// 实测过它连着报两次「输入通道已关闭」还在下发第三条。
+    #[test]
+    fn closed_channel_feedback_points_at_reconnect() {
+        let out = failure_feedback("uptime", "机器A", "通道错误: 输入通道已关闭");
+        assert!(out.contains("不要重试"), "必须明确叫它别重试：{out}");
+        assert!(out.contains("reconnect"), "必须指到重连动作上：{out}");
+        assert!(out.contains(TOOL_TAB), "必须给出正确工具：{out}");
+
+        // 普通失败不该夹带这段，否则每次报错都让模型去重连
+        let out = failure_feedback("uptime", "机器A", "命令超时");
+        assert!(!out.contains("reconnect"), "不该误报：{out}");
     }
 }
