@@ -2,8 +2,8 @@
 
 跨平台 SSH / SFTP 终端客户端。Rust 后端 + TypeScript / React 前端，基于 Tauri 2，安装包约 2.6 MiB。
 
-多标签终端、断线自动重连、SFTP 双栏、ZMODEM（rz/sz）、资源监控，以及一个可以直接在远端「阅读」
-Markdown / HTML / 图片 / 配置文件的独立窗口。
+多标签终端、断线自动重连、SFTP 双栏、ZMODEM（rz/sz）、资源监控，一个可以直接在远端「阅读」
+Markdown / HTML / 图片 / 配置文件的独立窗口，以及可以绑定到会话上的 AI 助手。
 
 | 平台 | 状态 |
 |---|---|
@@ -69,11 +69,32 @@ Markdown / HTML / 图片 / 配置文件的独立窗口。
 | 状态指示 | NUM / CAP 锁定状态、输出字符数 |
 | 主题与字体 | 多套内置主题，外壳颜色随终端配色派生；字号 / 行高实时预览，设置持久化 |
 
+### AI 助手
+
+终端会话的输出一边照常显示在屏幕上，一边**旁路复制**一份给 AI 助手。人既能继续在终端里干活，
+也能在侧栏跟助手对话——助手因为拿到了实时的 console 流，回答时自带完整上下文，不用你再贴一遍报错。
+
+| 能力 | 说明 |
+|---|---|
+| 旁路采集 | 每会话一个 256 KB 环形缓冲，区分「程序输出」与「人的输入」，剥离 ANSI 控制序列；超限丢弃最旧内容并计数 |
+| 流式问答 | OpenAI 兼容协议与 Anthropic 原生协议双支持；SSE 流式返回逐段渲染，可随时取消；同一会话同时只放行一路提问 |
+| 上下文窗口 | 默认取最近 32 KB（16 / 32 / 64 / 128 KB 可选），连同提问一起发出 |
+| 出网前脱敏 | 默认开启，规则见下方「安全设计」 |
+| 命令建议 | 回答里的代码块会升级成建议卡片，**需人工确认后才会写入终端**（只插入，不自动回车执行） |
+| 每会话开关 | 新建会话时默认跟随「新会话自动旁路」，之后可在面板里单独切换；关掉即停止采集，清空即丢弃已缓存内容 |
+
+**怎么配**：设置 → AI 助手。依次填 服务商（OpenAI / Anthropic / 自定义）、接口地址、模型、API Key，
+可再选系统提示词（留空用内置默认）、上下文上限、是否脱敏、总开关与「新会话自动旁路」。
+填完建议先点「测试连接」确认地址 / 模型 / Key 三件套可用。
+
+面板里的消息按会话分桶隔离：切到另一个标签，看到的是那个会话自己的对话与缓冲，互不串台。
+
 ---
 
 ## 安全设计
 
-- 密码只存系统凭据服务（macOS Keychain / Windows Credential Manager / Linux Secret Service），**绝不落库**
+- 会话密码明文保存在 `nexus.db` 的 `sessions.password` 列——刻意如此，换台机器复制数据库即可带着凭据走；安全边界落在文件权限 `0600` 上。
+  旧版本存在系统凭据服务（macOS Keychain / Windows Credential Manager / Linux Secret Service）里的密码，会在首次启动时一次性迁入 db 并从凭据服务删除
 - `nexus.db` 权限强制 `0600`，仅所有者可读写
 - 主机公钥采用 TOFU 策略，指纹变化会中断连接并告警
 - 导出 `.xsh` 时密码位永远留空，明文密码不落盘
@@ -82,6 +103,15 @@ Markdown / HTML / 图片 / 配置文件的独立窗口。
   - HTML 放在**不带 `allow-same-origin`** 的沙箱 iframe 中，由后端按需下发 CSP；即使开启脚本，页面也碰不到应用的 IPC 与存储
   - SVG 以 `<img>` 方式加载，其中的脚本不会执行
   - 单文件上限：图片 50 MB，其他 20 MB；窗口关闭即释放内容
+- AI 助手（这是会**把数据发往外部**的功能，逐条看清楚再开）：
+  - API Key 与会话密码**同一套策略**：明文保存在 `nexus.db`（便于跨机器迁移），安全边界是文件权限 `0600`；
+    备份或迁移数据库文件时它就包含在里面，不是系统钥匙串
+  - 总开关默认关闭；开启后，**该会话的终端输出会发往第三方模型服务**——屏幕上出现过的内容都可能出网
+  - 脱敏默认开启（`sk-` 前缀 key、`Bearer`、AWS `AKIA`、PEM 私钥块、邮箱、IPv4，以及 URL / 命令行里
+    `token` `api_key` `password` 等参数的值）。它只能**降低**风险，**无法保证不泄露**：
+    敏感环境请谨慎开启，或改用自托管模型（服务商选「自定义」填入自己的地址）
+  - AI 给出的命令**不会自动执行**，只进建议区，人工确认后才写入终端，且只插入不回车
+  - 不放心时随时关：面板里的旁路开关即时生效，「清空」会丢弃该会话已缓存的输出
 
 ---
 
@@ -107,11 +137,13 @@ npm run tauri:build    # 生产构建
 nexus-term/
 ├── src/                        前端（TypeScript / React）
 │   ├── components/             TitleBar · TabBar · SessionList · TerminalView · FileManager
-│   │                           · StatusBar · SettingsDialogs · IOMenu · ConfirmDialog …
+│   │                           · StatusBar · SettingsDialogs · IOMenu · ConfirmDialog
+│   │                           · AgentPanel（AI 对话面板）…
 │   ├── reader/                 阅读窗口：Reader · ImageView · CodeView
 │   ├── lib/                    theme / chrome（配色与外壳派生）· prefs（偏好 store）
 │   │                           · zmodem（lrzsz）· context（远端上下文）· highlight（关键字标记）
-│   │                           · readable（可阅读类型）· errors · auth · platform
+│   │                           · readable（可阅读类型）· agent（AI 配置 store）
+│   │                           · errors · auth · platform
 │   ├── api.ts                  IPC 封装 · base64 转码
 │   └── main.tsx                入口：主窗口 / 阅读窗口分流
 ├── src-tauri/src/              后端（Rust）
@@ -121,6 +153,7 @@ nexus-term/
 │   ├── sftp/                   SFTP 子系统
 │   ├── reader.rs               阅读窗口：文档暂存 · 窗口管理 · nxdoc 协议（CSP）
 │   ├── sysstat.rs              本机 CPU / 内存 / 磁盘采集
+│   ├── agent/                  AI 旁路：环形缓冲 · 脱敏 · LLM 客户端（OpenAI / Anthropic）
 │   ├── store/                  SQLite 会话仓库 + 系统凭据封装
 │   ├── keys/                   OpenSSH 私钥解析 · ~/.ssh 自动发现
 │   ├── xsh.rs                  Xshell 会话文件解析 / 生成
@@ -138,6 +171,7 @@ nexus-term/
 │  TerminalView    xterm.js 实例 · 尺寸同步 · ZMODEM 嗅探 · 右键菜单 │
 │  Reader          阅读窗口（独立 WebviewWindow，同一前端包分流）   │
 │  api.ts          IPC 封装 · base64 转码                          │
+│  AgentPanel   AI 对话面板 · 按会话分桶 · 建议命令二次确认         │
 └──────────────────────────────┬───────────────────────────────────┘
                      Tauri IPC · invoke / emit · nxdoc://
 ┌── Backend · Rust / tokio ────┴───────────────────────────────────┐
@@ -145,6 +179,7 @@ nexus-term/
 │  local/     本机 PTY          sftp/     russh-sftp                │
 │  store/     SQLite + 凭据     reader.rs 阅读文档 + 自定义协议     │
 │  sysstat.rs 本机资源          xsh.rs    Xshell 会话文件           │
+│  agent/     AI 旁路缓冲 · 脱敏 · LLM 客户端                       │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -169,11 +204,18 @@ nexus-term/
 - [x] 断线自动重连与远端上下文恢复
 - [x] 资源监控（远端 / 本机）
 - [x] 阅读窗口（Markdown / HTML / 图片 / 配置文件）
+- [x] AI Agent 绑定会话：把每个 session 的输出流实时旁路给 agent，人既能与 console 交互、
+      也能与 agent 交互。本次落地范围是**旁路采集 + 流式问答 + 出网前脱敏 + 每会话开关**
+      （抓原始字节流），关键取舍里的脱敏与开关已解决；
+      **「抓语义块」（OSC 133 shell 集成，区分 prompt / 命令输出 / 退出码）仍为待办**
 - [ ] 传输队列与进度条（SFTP 当前为单次同步传输，无并发 / 断点续传）
 - [ ] 多窗格拆分（布局树已设计，尚未实现拖拽）
 - [ ] 端口转发隧道
 - [ ] Linux 实机构建验证
 - [ ] 旧 ssh-dss 算法兼容（russh 不支持，需老旧设备时再加 `ssh2` 回退路径）
+- [ ] 内置会话多路复用：不依赖远端 tmux，把「pty 持有 + 屏幕模型 + 布局树 + 客户端协议」
+      做进 Rust 后端。注意远端会话保活仍必须在远端有进程（tmux / dtach / 自研 agent），
+      客户端无法凭空改变远端进程生命周期
 
 ## 许可
 

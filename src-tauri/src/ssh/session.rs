@@ -8,7 +8,7 @@ const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::
 use russh::client::Handle;
 use russh::{ChannelMsg, Disconnect};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
 use super::prompt::{AskAbort, AuthPrompt, AuthPromptField, AuthPrompts};
@@ -292,6 +292,12 @@ impl SessionManager {
         self.known_hosts.clone()
     }
 
+    /// 该会话是否还活着。**轻量且无副作用**（不握手、不占通道），
+    /// 供需要「先判断是 SSH 还是本地，再决定往哪写」的调用方使用。
+    pub fn contains(&self, id: &str) -> bool {
+        self.inner.lock().contains_key(id)
+    }
+
     pub fn close(&self, id: &str) {
         // 认证可能正卡在「等用户填验证码」上，先把它叫醒，
         // 否则后台 connect 任务会挂到超时为止。
@@ -331,7 +337,7 @@ impl SessionManager {
             self.known_hosts.clone(),
             timeout,
             super::LegacyPolicy::from_flag(req.legacy_crypto),
-            Some(std::time::Duration::from_secs(10)),
+            super::keepalive_interval(),
             &req.username,
             auth,
             &id,
@@ -357,28 +363,42 @@ impl SessionManager {
         let session = opened.session;
 
 
-        let channel = session
-            .channel_open_session()
-            .await
-            .map_err(|e| SessionError::Channel(e.to_string()))?;
+        // 建通道 / 申请 pty / 起 shell：任何一步失败，这条已经认证过的连接就废了，
+        // 但服务端那边可能已经给它建好会话、算进「同账号并发数」里了。
+        // 所以失败路径统一走 abort_session，主动告别而不是留个孤儿。
+        let prepared = async {
+            let channel = session
+                .channel_open_session()
+                .await
+                .map_err(|e| SessionError::Channel(e.to_string()))?;
 
-        channel
-            .request_pty(
-                false,
-                "xterm-256color",
-                req.cols as u32,
-                req.rows as u32,
-                0,
-                0,
-                &[],
-            )
-            .await
-            .map_err(|e| SessionError::Channel(e.to_string()))?;
+            channel
+                .request_pty(
+                    false,
+                    "xterm-256color",
+                    req.cols as u32,
+                    req.rows as u32,
+                    0,
+                    0,
+                    &[],
+                )
+                .await
+                .map_err(|e| SessionError::Channel(e.to_string()))?;
 
-        channel
-            .request_shell(false)
-            .await
-            .map_err(|e| SessionError::Channel(e.to_string()))?;
+            channel
+                .request_shell(false)
+                .await
+                .map_err(|e| SessionError::Channel(e.to_string()))?;
+            Ok::<_, SessionError>(channel)
+        }
+        .await;
+        let channel = match prepared {
+            Ok(channel) => channel,
+            Err(e) => {
+                super::abort_session(&session, "建立终端通道失败").await;
+                return Err(e);
+            }
+        };
 
         let (data_tx, data_rx) = mpsc::channel(INPUT_QUEUE);
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
@@ -482,6 +502,35 @@ impl SessionManager {
         script: &'static str,
         timeout_msg: &'static str,
     ) -> Result<ProbeInfo, SessionError> {
+        let text = self
+            .run_sidecar(id, &format!("exec sh -s"), Some(script), 8, timeout_msg)
+            .await?;
+        let mut info = ProbeInfo::new();
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                if !v.is_empty() {
+                    info.insert(k.trim().to_string(), v.to_string());
+                }
+            }
+        }
+        Ok(info)
+    }
+
+    /// 在该会话的旁路 exec 通道上跑一条**完整 shell 命令**，原样返回输出。
+    ///
+    /// `stdin_script` 为 `Some` 时先 `exec sh -s` 再把脚本喂进 stdin（这是 `probe` /
+    /// `stats` 用的形态，脚本体不必出现在命令行上）；为 `None` 时直接执行 `command`。
+    ///
+    /// 与那些脚本不同：console 自动补全要拿的是 `<binary> --help` 的**原始输出**，
+    /// 不能被 `k=v` 的解析规则吃掉。
+    pub async fn run_sidecar(
+        &self,
+        id: &str,
+        command: &str,
+        stdin_script: Option<&str>,
+        timeout_secs: u64,
+        timeout_msg: &'static str,
+    ) -> Result<String, SessionError> {
         let (handle, sidecar, last_sidecar) = {
             let map = self.inner.lock();
             let rt = map
@@ -501,13 +550,15 @@ impl SessionManager {
                 .await
                 // 被拒（而不是网络断）时给出可识别的文案，前端据此自动切兼容模式
                 .map_err(|e| SessionError::Channel(sidecar_error(&e)))?;
-            ch.exec(true, "sh -s")
+            ch.exec(true, command)
                 .await
                 .map_err(|e| SessionError::Channel(sidecar_error(&e)))?;
-            ch.data(script.as_bytes())
-                .await
-                .map_err(|e| SessionError::Channel(e.to_string()))?;
-            ch.eof().await.map_err(|e| SessionError::Channel(e.to_string()))?;
+            if let Some(script) = stdin_script {
+                ch.data(script.as_bytes())
+                    .await
+                    .map_err(|e| SessionError::Channel(e.to_string()))?;
+                ch.eof().await.map_err(|e| SessionError::Channel(e.to_string()))?;
+            }
             let mut out = Vec::new();
             while let Some(msg) = ch.wait().await {
                 match msg {
@@ -518,19 +569,11 @@ impl SessionManager {
             }
             Ok::<_, SessionError>(out)
         };
-        let out = tokio::time::timeout(std::time::Duration::from_secs(8), run)
-            .await
-            .map_err(|_| SessionError::Channel(timeout_msg.into()))??;
-        let text = String::from_utf8_lossy(&out);
-        let mut info = ProbeInfo::new();
-        for line in text.lines() {
-            if let Some((k, v)) = line.split_once('=') {
-                if !v.is_empty() {
-                    info.insert(k.trim().to_string(), v.to_string());
-                }
-            }
-        }
-        Ok(info)
+        let out =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run)
+                .await
+                .map_err(|_| SessionError::Channel(timeout_msg.into()))??;
+        Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
     /// 在同一连接上开 exec 通道 `cat` 一个文件（阅读窗口用，不依赖 SFTP 子系统）。
@@ -1018,6 +1061,12 @@ async fn read_loop(
                         {
                             info.reason = "user"; // 前端已不在，无需提示
                             break;
+                        }
+                        // 旁路：主链路已经把数据投到屏幕上了，这里只是顺手复制一份。
+                        // 拿不到状态（AppState 尚未托管）就安静跳过 —— 绝不能因为
+                        // agent 缓冲出错而让终端断连。
+                        if let Some(st) = app.try_state::<crate::cmd::AppState>() {
+                            st.agent.feed(&id, &data, crate::agent::StreamKind::Out);
                         }
                     }
                     Some(ChannelMsg::ExtendedData { data, ext, .. }) => {
@@ -1552,6 +1601,7 @@ mod kbi_probe {
                 passphrase: None,
             },
             "probe-key",
+            None,
             // 明文私钥不该问任何问题；问了就说明判定逻辑错了
             |_p: AuthPrompt| async move { Err(AskAbort::Cancelled) },
         )
@@ -1589,6 +1639,7 @@ mod kbi_probe {
                 passphrase: None,
             },
             "probe-encrypted",
+            None,
             move |p: AuthPrompt| {
                 sink.lock().unwrap().push(p.clone());
                 let answer = secret.clone();
@@ -1633,6 +1684,7 @@ mod kbi_probe {
                 passphrase: None,
             },
             "probe-wrong",
+            None,
             move |p: AuthPrompt| {
                 let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 sink.lock().unwrap().push(p.instructions.clone());

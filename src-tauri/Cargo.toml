@@ -31,6 +31,10 @@ portable-pty = "0.8"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# russh / russh-sftp 用的是 `log` crate，而本应用只装了 tracing 的 subscriber。
+# 不装这道桥，库里的 debug! / trace! 会被**静默丢弃** —— 开 NEXUS_DEBUG 也只能
+# 看到自己的日志，库内部（探活、kex、断开原因）一片空白。
+tracing-log = "0.2"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
@@ -49,6 +53,34 @@ argon2 = "0.5"
 # 否则 trait 不是同一个，编译期会报「未实现」。
 ssh-encoding = "0.2"
 parking_lot = "0.12"
+# 上下文脱敏。已在依赖树里（tracing-subscriber/env-filter 传递依赖），
+# 直接引用不会引入额外的编译单元。
+regex = "1"
+
+# AI agent 的 LLM 流式调用（agent/llm.rs）。
+# 0.13 已经在依赖树里（tauri 的移动目标依赖它），引用同一版本不会拉出第二份副本。
+#
+# default-features = false 是必须的：默认的 `default-tls` 会走 aws-lc-rs，
+# 那东西要 cmake + C 工具链，在 Windows / macOS / Linux 三端交叉编译都太重。
+# 这里改为 rustls-no-provider（用 rustls-platform-verifier 走系统根证书），
+# 也就是 tauri 自己 `rustls-tls` feature 的定义方式。
+# reqwest 0.13 把 0.12 的 `rustls-tls` 改名成了 `rustls-no-provider`，含义一致。
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-no-provider",
+] }
+# 读 SSE 流要用 `StreamExt::next`。futures-util 0.3 已在依赖树里
+# （reqwest 的 stream feature 就是靠它实现的），显式声明不会多拉一个包。
+futures-util = { version = "0.3", default-features = false }
+# rustls-no-provider 要求调用方自己装 crypto provider，否则建 Client 时会 panic。
+# 选 ring 而不是默认的 aws-lc-rs，理由同上（ring 用预生成的汇编，不需要 cmake）。
+# 装 provider 的代码在 llm.rs 里，且用 OnceLock + Result，绝不在路径上 panic。
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
 
 # 凭据存储后端随平台切换。keyring 的通用 API 三端一致，
 # 只是 native backend 要按目标选择，否则在别的平台上编译不过或退化到 secret-service。

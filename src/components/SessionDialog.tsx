@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { normalizeTimeout } from "../lib/errors";
-import { parseSteps } from "../lib/loginScript";
 import { getExtras, updateExtras } from "../lib/sessionExtras";
-import type { KeyInfo, NewSession, SessionRecord } from "../types";
+import type { KeyInfo, MacroRecord, NewSession, SessionRecord } from "../types";
 
 interface Props {
   editing: SessionRecord | null;
+  /** 会话可绑定的宏（连接后自动执行） */
+  macros: MacroRecord[];
   onSave: (
     payload: NewSession,
     password: string,
@@ -16,7 +17,7 @@ interface Props {
   onClose: () => void;
 }
 
-export default function SessionDialog({ editing, onSave, onClose }: Props) {
+export default function SessionDialog({ editing, macros, onSave, onClose }: Props) {
   const [name, setName] = useState("");
   const [folder, setFolder] = useState("");
   const [host, setHost] = useState("");
@@ -263,7 +264,7 @@ export default function SessionDialog({ editing, onSave, onClose }: Props) {
 
         {error && <p className="error">{error}</p>}
 
-        {editing && <LoginPathSection sessionId={editing.id} />}
+        {editing && <AutoRunSection sessionId={editing.id} macros={macros} />}
 
         <div className="modal-actions">
           <button className="btn" onClick={onClose} disabled={saving}>
@@ -279,87 +280,78 @@ export default function SessionDialog({ editing, onSave, onClose }: Props) {
 }
 
 /**
- * 跳板机 / 堡垒机的「登录路径」与兼容模式。
+ * 连接成功后的自动化：绑定一条宏 + 兼容模式。
  *
- * 这块内容直接读写 `lib/sessionExtras` 的缓存（不走 onSave）：它不属于会话
- * 连接参数，而且录制是随时发生的 —— 用户在这里改完立刻生效，不必点「保存」。
+ * 以前这里是「跳板机登录路径」——只能录「在菜单里选序号」。现在登录路径
+ * 只是宏的一种用法，用户还能顺手跑几条初始化命令、`tmux attach`、看日志…
+ * 宏本身的录制与编辑在标签栏右侧的「宏」里，这里只负责「连上之后跑哪条」。
+ *
+ * 直接读写 `lib/sessionExtras` 的缓存（不走 onSave）：它不属于连接参数，
+ * 改完立刻生效，不必点「保存」。
  */
-function LoginPathSection({ sessionId }: { sessionId: string }) {
+function AutoRunSection({
+  sessionId,
+  macros,
+}: {
+  sessionId: string;
+  macros: MacroRecord[];
+}) {
   const [extras, setExtras] = useState(() => getExtras(sessionId));
-  const [draft, setDraft] = useState(() => getExtras(sessionId).loginScript);
 
   useEffect(() => {
-    const e = getExtras(sessionId);
-    setExtras(e);
-    setDraft(e.loginScript);
+    setExtras(getExtras(sessionId));
   }, [sessionId]);
 
-  const steps = parseSteps(extras.loginScript);
   const apply = (patch: Partial<typeof extras>) => {
     updateExtras(sessionId, patch);
     setExtras(getExtras(sessionId));
   };
 
+  const bound = macros.find((m) => m.id === extras.macroId && extras.macroOn) ?? null;
+
   return (
     // 折叠：编辑连接本来就有七八个字段，这块是次要信息。
-    // 摘要行直接给出结论（记了什么 / 是否兼容模式），需要改再展开。
+    // 摘要行直接给出结论（绑了哪条宏 / 是否兼容模式），需要改再展开。
     <details className="login-path">
       <summary className="login-path-head">
         <span className="login-path-caret" aria-hidden>
           ▸
         </span>
-        <span>跳板机登录路径</span>
-        {steps.length > 0 ? (
+        <span>登录后自动执行</span>
+        {bound ? (
           <span className="login-path-steps">
-            {steps.map((s, i) => (
-              <span key={i} className="login-path-chip">
-                {s}
-              </span>
-            ))}
+            <span className="login-path-chip">
+              {bound.name} · {bound.steps.length} 步
+            </span>
           </span>
         ) : (
-          <span className="login-path-idle">未记录</span>
+          <span className="login-path-idle">未设置</span>
         )}
         {extras.compat && <span className="login-path-badge">兼容模式</span>}
       </summary>
 
       <div className="login-path-body">
-        {steps.length === 0 ? (
-          <p className="hint" style={{ margin: "0 0 8px" }}>
-            连上跳板机后，按平时的方式在菜单里选一次（例如输入 2 回车），
-            这一步会被记住；以后连接 / 断线重连时会自动帮你选。
-          </p>
-        ) : (
-          <>
-            <textarea
-              className="login-path-edit"
-              value={draft}
-              spellCheck={false}
-              rows={Math.min(4, Math.max(2, draft.split("\n").length))}
-              onChange={(e) => setDraft(e.target.value)}
-              onBlur={() => apply({ loginScript: draft })}
-              placeholder="每行一步，按顺序发送"
-            />
-            <label className="settings-check login-path-check">
-              <input
-                type="checkbox"
-                checked={extras.loginScriptOn}
-                onChange={(e) => apply({ loginScriptOn: e.target.checked })}
-              />
-              <span>
-                自动回放
-                <em>连接后菜单出现时按上面的顺序自动选择</em>
-              </span>
-            </label>
-            <button
-              type="button"
-              className="btn login-path-clear"
-              onClick={() => apply({ loginScript: "", loginScriptOn: true })}
-            >
-              清除已记住的路径
-            </button>
-          </>
-        )}
+        <div className="row">
+          <label>执行宏</label>
+          <select
+            value={extras.macroOn ? extras.macroId : ""}
+            onChange={(e) =>
+              apply({ macroId: e.target.value, macroOn: !!e.target.value })
+            }
+          >
+            <option value="">不执行</option>
+            {macros.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <p className="hint" style={{ margin: "0 0 8px" }}>
+          {macros.length === 0
+            ? "还没有宏。在标签栏右侧「宏」里新建或录制一条，就会出现在这里。"
+            : "连接 / 断线重连成功后自动执行，执行完再恢复上次的目录与 tmux。"}
+        </p>
 
         <label className="settings-check login-path-check">
           <input

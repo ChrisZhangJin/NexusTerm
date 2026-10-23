@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>NexusTerm</title>
+  <rect width="1024" height="1024" rx="232" fill="#5DCAA5"/>
+  <polygon points="280.0,261.0 856.0,261.0 744.0,763.0 168.0,763.0" fill="#0F2A23"/>
+  <path d="M 401.0 405.0 L 567.0 520.0 L 401.0 635.0" fill="none" stroke="#FFFFFF" stroke-width="68" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 583.0 635.0 L 675.0 635.0" fill="none" stroke="#FFFFFF" stroke-width="68" stroke-linecap="round"/>
+</svg>

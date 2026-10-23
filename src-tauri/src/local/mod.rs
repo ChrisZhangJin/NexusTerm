@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
@@ -21,6 +21,10 @@ struct LocalSession {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: SharedChild,
+    /// 本地 shell 自身的 pid，开局捕获一次。Agent 判断「命令是否还在跑」时，
+    /// 靠它去查这个 shell 现在有没有活着的前台子进程（见 `has_live_child`）。
+    /// 极少数平台 `Child::process_id()` 拿不到时为 `None`，届时活体确认直接答不上来。
+    pid: Option<u32>,
 }
 
 pub struct LocalManager {
@@ -77,6 +81,8 @@ impl LocalManager {
             .take_writer()
             .map_err(|e| format!("获取 PTY 写端失败：{}", e))?;
 
+        // 必须在 Arc<Mutex<>> 包装之前取 —— trait 对象本身就有这个方法，不需要等包装。
+        let pid = child.process_id();
         let child = Arc::new(Mutex::new(child));
         {
             let mut guard = self.sessions.lock().unwrap();
@@ -86,6 +92,7 @@ impl LocalManager {
                     master: pair.master,
                     writer,
                     child: Arc::clone(&child),
+                    pid,
                 },
             );
         }
@@ -101,6 +108,12 @@ impl LocalManager {
                     Ok(n) => {
                         let payload = B64.encode(&buf[..n]);
                         let _ = app_handle.emit(&format!("nx://local/data/{}", session_id), payload);
+                        // 旁路。这里是 std::thread（不是 tokio task），只能同步取状态，
+                        // 故用 try_state 而不是 tauri 的异步 State；取不到就静默跳过。
+                        if let Some(st) = app_handle.try_state::<crate::cmd::AppState>() {
+                            st.agent
+                                .feed(&session_id, &buf[..n], crate::agent::StreamKind::Out);
+                        }
                     }
                     Err(_) => break,
                 }
@@ -114,6 +127,12 @@ impl LocalManager {
         });
 
         Ok(())
+    }
+
+    /// 该本地会话是否存在。**轻量且无副作用**（不取写锁、不碰 pty），
+    /// 供需要按 id 判断「到底是本地 shell 还是 SSH 会话」的调用方使用。
+    pub fn contains(&self, id: &str) -> bool {
+        self.sessions.lock().unwrap().contains_key(id)
     }
 
     pub fn write(&self, id: &str, data: &[u8]) -> Result<(), String> {
@@ -139,6 +158,9 @@ impl LocalManager {
     }
 
     /// 关闭：先杀进程，再从表里移除。
+    ///
+    /// 这里只管 PTY 本体：agent 的旁路缓冲拿不到 AppState（本结构体不持有它），
+    /// 清理统一由命令层 `cmd::local_close` 在调用本方法后做。
     pub fn close(&self, id: &str) -> Result<(), String> {
         let mut guard = self.sessions.lock().unwrap();
         let Some(s) = guard.remove(id) else {
@@ -147,6 +169,73 @@ impl LocalManager {
         let _ = s.child.lock().unwrap().kill();
         Ok(())
     }
+
+    /// 这个本地 shell 现在是否还有活着的前台子进程——Agent 判断「命令跑完了没有」
+    /// 的活体确认用这个，不依赖命令自己打印退出码。
+    ///
+    /// `None` = 问不出来（拿不到 pid，或平台查询失败），调用方要退回静默兜底，
+    /// **不能**当成「确认没有子进程」处理。
+    pub async fn has_live_child(&self, id: &str) -> Option<bool> {
+        let pid = {
+            let guard = self.sessions.lock().unwrap();
+            guard.get(id)?.pid
+        }?;
+        tokio::task::spawn_blocking(move || platform_has_child(pid))
+            .await
+            .ok()
+            .flatten()
+    }
+}
+
+/// 查某个 pid 当前是否还有直接子进程存活。只看「直接子进程」而不是整棵子树——
+/// 和 SSH 那边的 tpgid 前台进程组判定是同一个口径：命令自己 `nohup xxx &` 丢出去的
+/// 孙进程不算数，只关心「这个 shell 现在是不是还在等一个前台命令跑完」。
+#[cfg(unix)]
+fn platform_has_child(pid: u32) -> Option<bool> {
+    // `pgrep -P <pid>`：退出码 0 = 至少匹配到一个，1 = 没有匹配到，其余 = 查询本身出错。
+    // Linux 的 procps 和 macOS/BSD 自带的 pgrep 在这个退出码约定上是一致的，
+    // 不像 `ps --ppid` 那样 GNU/BSD 两套方言打架。
+    let status = std::process::Command::new("pgrep")
+        .arg("-P")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    match status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// Windows 没有 `pgrep`。`wmic` 已标记弃用但目前仍随系统安装，先用它；
+/// 查不到 / 命令本身不存在时一律 `None`，交给调用方退回静默兜底，不堵死整条路径。
+///
+/// 未在真实 Windows 上跑过，只是按同样的「找直接子进程」语义写的——下次有 Windows
+/// 环境时应该专门补一次手测。
+#[cfg(windows)]
+fn platform_has_child(pid: u32) -> Option<bool> {
+    let out = std::process::Command::new("wmic")
+        .args([
+            "process",
+            "where",
+            &format!("(ParentProcessId={pid})"),
+            "get",
+            "ProcessId",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // 正常输出是一行表头 `ProcessId` 后面跟零或多行纯数字 pid；没有子进程时表头后面全是空行。
+    let has_child = text
+        .lines()
+        .map(str::trim)
+        .any(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit()));
+    Some(has_child)
 }
 
 /// 各平台的默认登录 shell。

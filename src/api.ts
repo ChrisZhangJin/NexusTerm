@@ -1,6 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AgentApproveRequest,
+  AgentBufferStats,
+  AgentConfig,
+  AgentDonePayload,
+  AgentExecResult,
+  AgentRunRequest,
+  AgentStep,
+  AgentTabInfo,
+  AgentTabRequest,
   AuthPrompt,
   ClosedInfo,
   ConnectOutcome,
@@ -8,6 +17,8 @@ import type {
   DiscoveredKey,
   GenerateKeyOptions,
   KeyInfo,
+  MacroRecord,
+  MacroStep,
   NewSession,
   RemoteEntry,
   SessionRecord,
@@ -51,6 +62,15 @@ export const api = {
   updateSession: (id: string, session: NewSession) =>
     invoke<SessionRecord>("update_session", { id, session }),
   deleteSession: (id: string) => invoke<void>("delete_session", { id }),
+
+  /** 宏：持久化在后端，回放由前端执行（要读屏幕、按输出节奏发下一步） */
+  listMacros: () => invoke<MacroRecord[]>("list_macros"),
+  createMacro: (name: string, steps: MacroStep[]) =>
+    invoke<MacroRecord>("create_macro", { name, steps }),
+  updateMacro: (id: string, name: string, steps: MacroStep[]) =>
+    invoke<MacroRecord>("update_macro", { id, name, steps }),
+  deleteMacro: (id: string) => invoke<void>("delete_macro", { id }),
+
   /** 拖拽后批量持久化排序与分组归属：items = [id, sortOrder, folder][] */
   reorderSessions: (items: [string, number, string][]) =>
     invoke<void>("reorder_sessions", { items }),
@@ -129,6 +149,118 @@ export const api = {
   appendFileB64: (path: string, data: string, truncate: boolean) =>
     invoke<void>("append_file_b64", { path, data, truncate }),
 
+  // ——— AI Agent 旁路（终端输出旁路喂给 LLM） ———
+
+  agentGetConfig: () => invoke<AgentConfig>("agent_get_config"),
+  agentSetConfig: (config: AgentConfig) =>
+    invoke<void>("agent_set_config", { config }),
+  /** 开关某个会话的旁路 */
+  agentSetSession: (sessionId: string, enabled: boolean) =>
+    invoke<void>("agent_set_session", { sessionId, enabled }),
+  agentGetSession: (sessionId: string) =>
+    invoke<boolean>("agent_get_session", { sessionId }),
+  /**
+   * 取该会话最近的上下文。
+   * `maxBytes` 省略（或 0）时后端回落到配置里的 maxContextBytes。
+   * 返回值是**未脱敏**原文 —— 脱敏只在真正出网前做，便于界面如实展示。
+   */
+  agentContext: (sessionId: string, maxBytes?: number) =>
+    invoke<string>("agent_context", { sessionId, maxBytes: maxBytes ?? null }),
+  /** 清空缓冲（让 agent 忘掉刚才的事） */
+  agentClear: (sessionId: string) => invoke<void>("agent_clear", { sessionId }),
+  /** 会话没登记过旁路时返回 null，而不是抛错 */
+  agentStats: (sessionId: string) =>
+    invoke<AgentBufferStats | null>("agent_stats", { sessionId }),
+  /**
+   * 提问。**resolve 只代表流已启动，不代表回答完成** ——
+   * 答案要走 `onAgentToken` / `onAgentDone` / `onAgentError` 事件收。
+   */
+  agentAsk: (sessionId: string, question: string) =>
+    invoke<void>("agent_ask", { sessionId, question }),
+  agentCancel: (sessionId: string) => invoke<void>("agent_cancel", { sessionId }),
+  /** 用「还没保存」的那份配置测连通性（刻意不读库里的值） */
+  agentTest: (config: AgentConfig) => invoke<string>("agent_test", { config }),
+
+  // ——— Agentic：让 Agent 真的去终端里执行 ———
+
+  /**
+   * 发起一轮「会动手」的问答。**resolve 代表这一整轮已经跑完**（含所有执行步骤），
+   * 过程信息全部走 `onAgentStep` / `onAgentApprove` / `onAgentError` 事件。
+   * 与 `agentAsk` 的分工：这条会真在终端里跑命令。
+   */
+  agentRun: (request: AgentRunRequest) => invoke<void>("agent_run", { request }),
+  /** 中止该会话正在进行的一轮。幂等。 */
+  agentRunCancel: (sessionId: string) =>
+    invoke<void>("agent_run_cancel", { sessionId }),
+  /**
+   * 答复一条审批请求。
+   * 返回 false 表示这条请求已经没人接了（超时 / 答复晚到）—— 不是错误。
+   */
+  agentApprove: (requestId: string, approved: boolean) =>
+    invoke<boolean>("agent_approve", { requestId, approved }),
+  /**
+   * 回执一次标签页动作。
+   *
+   * 后端在等这句话：不回，它就只能当成「没办成」—— 而那个判断会被喂给模型。
+   * `tabs` 只在 list 时有意义。返回 false 表示请求已超时被丢弃，不是错误。
+   */
+  agentTabAck: (
+    requestId: string,
+    ok: boolean,
+    detail?: string,
+    tabs?: AgentTabInfo[]
+  ) => invoke<boolean>("agent_tab_ack", { requestId, ok, detail, tabs }),
+  /**
+   * 不经模型、直接在会话里跑一条命令并拿回结果。
+   *
+   * 这条会给终端**真的下发输入** —— 只有用户点「执行」时才被调用。
+   * 与 `agent_run` 共用同一条哨兵执行链路（同一套结束判定与脱敏策略）。
+   */
+  agentExec: (sessionId: string, command: string) =>
+    invoke<AgentExecResult>("agent_exec", { sessionId, command }),
+  /**
+   * 导出一个会话迄今为止的全部输出（旁路缓冲的完整记录，不受「喂给模型」那个
+   * 字节上限约束）。`deep=true` 额外探一遍该会话里的 tmux / docker 现状。
+   * 没有可导出的内容时返回空字符串，不算错误。
+   */
+  agentExportSession: (sessionId: string, deep: boolean) =>
+    invoke<string>("agent_export_session", { sessionId, deep }),
+  /**
+   * 开一个新会话：本地 shell，或连到一个已保存的会话配置（`kind:"ssh"` 时必填
+   * `sessionRecordId`），可选顺手跑一条命令。成功后会收到
+   * `nx://agent/session-opened` 事件，前端据此接出一个真正的标签页。
+   */
+  agentOpenSession: (
+    originSessionId: string,
+    kind: "local" | "ssh",
+    sessionRecordId: string | null,
+    label: string,
+    command: string | null
+  ) =>
+    invoke<string>("agent_open_session", {
+      originSessionId,
+      kind,
+      sessionRecordId,
+      label,
+      command,
+    }),
+
+  // ——— Console 自动补全：session 级命令历史 ———
+
+  /** 记一条命令到某个会话身份（SessionRecord.id，本地固定 'local'）的历史里 */
+  historyRecord: (key: string, command: string) =>
+    invoke<void>("history_record", { key, command }),
+  /** 取某个会话身份的历史，最近用过的排在前面 */
+  historyList: (key: string) => invoke<string[]>("history_list", { key }),
+
+  /** 把 Agent 面板浮出为独立系统窗口（已开则切会话并聚焦） */
+  agentOpenWindow: (sessionId: string) =>
+    invoke<void>("agent_open_window", { sessionId }),
+  /** 关闭浮动 Agent 窗口（幂等） */
+  agentCloseWindow: () => invoke<void>("agent_close_window"),
+  /** 浮动窗口是否已打开 */
+  agentWindowOpen: () => invoke<boolean>("agent_window_open"),
+
   // ——— 阅读窗口（.md / .html 渲染查看） ———
   readerOpenSftp: (sftpId: string, path: string, source: string) =>
     invoke<void>("reader_open_sftp", { sftpId, path, source }),
@@ -205,6 +337,85 @@ export async function onTermClosed(
     const p = ev.payload;
     handler(typeof p === "number" ? { code: p, reason: "eof" } : p);
   });
+}
+
+/**
+ * 服务端心跳（`keepalive@openssh.com`）到达。
+ *
+ * 后端在 russh 处理 keepalive 的分支里发这个事件（vendor 补丁 7）——
+ * 是「链路还活着」的正向证据，比任何本地计时都可信：
+ * 服务端愿意探活，说明它那边的会话与 NAT 映射都还在。
+ */
+export async function onTermPulse(
+  id: string,
+  handler: () => void
+): Promise<UnlistenFn> {
+  return listen(`nx://term/pulse/${id}`, () => handler());
+}
+
+// ——— AI Agent 流式事件 ———
+//
+// 后端契约：error 是终态（其后不再发 done），done 一定会发
+// （流自然结束却没收到结束标记时兜底为 stop）。
+// 所以收尾只认事件，**不要靠超时**。
+
+/** agent 答案的增量文本块 */
+export async function onAgentToken(
+  id: string,
+  handler: (text: string) => void
+): Promise<UnlistenFn> {
+  return listen<string>(`nx://agent/token/${id}`, (ev) => handler(ev.payload));
+}
+
+/** 本次流结束（含 reason：stop / length / cancelled） */
+export async function onAgentDone(
+  id: string,
+  handler: (p: AgentDonePayload) => void
+): Promise<UnlistenFn> {
+  return listen<AgentDonePayload>(`nx://agent/done/${id}`, (ev) => handler(ev.payload));
+}
+
+/** 终态错误，payload 是后端翻译好的中文文案 */
+export async function onAgentError(
+  id: string,
+  handler: (msg: string) => void
+): Promise<UnlistenFn> {
+  return listen<string>(`nx://agent/error/${id}`, (ev) => handler(ev.payload));
+}
+
+/**
+ * Agentic 一轮里发生的每一步：下令 / 执行结果 / 被跳过 / 提示 / 最终结论。
+ * 与 token/done 是两条并行的线：这里送过程，那边送说了什么话。
+ */
+export async function onAgentStep(
+  id: string,
+  handler: (step: AgentStep) => void
+): Promise<UnlistenFn> {
+  return listen<AgentStep>(`nx://agent/step/${id}`, (ev) => handler(ev.payload));
+}
+
+/** 请用户批准一条危险命令（只有 approval 模式下才会出现） */
+export async function onAgentApprove(
+  id: string,
+  handler: (req: AgentApproveRequest) => void
+): Promise<UnlistenFn> {
+  return listen<AgentApproveRequest>(`nx://agent/approve/${id}`, (ev) =>
+    handler(ev.payload)
+  );
+}
+
+/**
+ * Agent 要对标签页动手（列出 / 切换 / 关闭 / 改名 / 重连）。
+ *
+ * 这是唯一一类**必须由前端执行**的动作：tab 是 React state，后端不知道它存在。
+ * 处理完务必 `api.agentTabAck(...)`，后端在等回执。
+ *
+ * 全局事件（不分会话）：标签页是整个窗口的东西，不是某个会话的私产。
+ */
+export async function onAgentTab(
+  handler: (req: AgentTabRequest) => void
+): Promise<UnlistenFn> {
+  return listen<AgentTabRequest>("nx://agent/tab", (ev) => handler(ev.payload));
 }
 
 /**

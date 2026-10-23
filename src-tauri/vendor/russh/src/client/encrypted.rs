@@ -602,28 +602,56 @@ impl Session {
                     }
                     "keepalive@openssh.com" => {
                         let wants_reply = map_err!(u8::decode(&mut r))?;
+                        // RFC 4254 §5.4：应答里的 recipient channel 必须是**对端**的
+                        // 通道号，不是本地通道号。这里原来写的是 channel_num（本地号），
+                        // 于是把 ERR 级别的 SSH 实现（golang.org/x/crypto/ssh）打成
+                        // `mux.handleUnknownChannelPacket` → `ssh: invalid channel N`
+                        // → `conn.Close()`，并且**不发 SSH DISCONNECT**，对端只能看到
+                        // TCP 被掐断（我方日志表现为 `early eof`）。
+                        // JumpServer/koko 会在登录后第 30 秒用通道请求发这个 keepalive，
+                        // 于是表现为「连上 30.2 秒必断」。
+                        let peer_channel = self
+                            .common
+                            .encrypted
+                            .as_ref()
+                            .and_then(|enc| enc.channels.get(&channel_num))
+                            .map(|p| p.recipient_channel)
+                            .unwrap_or_else(|| u32::from(channel_num));
+                        debug!(
+                            "收到通道 keepalive local_channel={} peer_channel={} want_reply={}",
+                            channel_num, peer_channel, wants_reply
+                        );
                         if wants_reply == 1 {
                             if let Some(ref mut enc) = self.common.encrypted {
-                                trace!("Received channel keep alive message: {req:?}",);
                                 self.common.wants_reply = false;
                                 push_packet!(enc.write, {
                                     map_err!(msg::CHANNEL_SUCCESS.encode(&mut enc.write))?;
-                                    map_err!(channel_num.encode(&mut enc.write))?;
+                                    map_err!(peer_channel.encode(&mut enc.write))?;
                                 });
                             }
                         } else {
-                            warn!("Received keepalive without reply request!");
+                            debug!("通道 keepalive 未要求应答");
                         }
+                        // NexusTerm 补丁 7：通知宿主「链路刚刚被服务端探活」。
+                        client.server_keepalive().await?;
                         Ok(())
                     }
                     _ => {
                         let wants_reply = map_err!(u8::decode(&mut r))?;
                         if wants_reply == 1 {
+                            // 同上：应答必须带对端通道号，不能用本地号。
+                            let peer_channel = self
+                                .common
+                                .encrypted
+                                .as_ref()
+                                .and_then(|enc| enc.channels.get(&channel_num))
+                                .map(|p| p.recipient_channel)
+                                .unwrap_or_else(|| u32::from(channel_num));
                             if let Some(ref mut enc) = self.common.encrypted {
                                 self.common.wants_reply = false;
                                 push_packet!(enc.write, {
                                     map_err!(msg::CHANNEL_FAILURE.encode(&mut enc.write))?;
-                                    map_err!(channel_num.encode(&mut enc.write))?;
+                                    map_err!(peer_channel.encode(&mut enc.write))?;
                                 })
                             }
                         }
@@ -660,6 +688,10 @@ impl Session {
             Some((&msg::GLOBAL_REQUEST, mut r)) => {
                 let req = map_err!(String::decode(&mut r))?;
                 let wants_reply = map_err!(u8::decode(&mut r))?;
+                debug!(
+                    "收到服务端全局请求 req={:?} want_reply={wants_reply}",
+                    req
+                );
                 if let Some(ref mut enc) = self.common.encrypted {
                     if req.starts_with("keepalive") {
                         if wants_reply == 1 {
@@ -669,6 +701,8 @@ impl Session {
                         } else {
                             warn!("Received keepalive without reply request!");
                         }
+                        // 补丁 7：全局 keepalive（OpenSSH ClientAliveInterval）同样算一次心跳
+                        client.server_keepalive().await?;
                     } else if req == "hostkeys-00@openssh.com" {
                         let mut keys = vec![];
                         loop {

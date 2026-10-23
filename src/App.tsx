@@ -1,15 +1,23 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { emit, listen } from "@tauri-apps/api/event";
 import SessionList from "./components/SessionList";
 import SessionDialog from "./components/SessionDialog";
 import TerminalView, { clock } from "./components/TerminalView";
 import FileManager from "./components/FileManager";
-import TitleBar from "./components/TitleBar";
 import TabBar from "./components/TabBar";
 import StatusBar from "./components/StatusBar";
-import { AppearanceDialog, ShortcutsDialog } from "./components/SettingsDialogs";
+import { AgentPanel } from "./components/AgentPanel";
+import {
+  AppearanceDialog,
+  BehaviorDialog,
+  AgentDialog,
+  ShortcutsDialog,
+} from "./components/SettingsDialogs";
 import KeyManagerDialog from "./components/KeyManagerDialog";
+import MacroDialog from "./components/MacroDialog";
 import AuthPromptDialog from "./components/AuthPromptDialog";
-import { api, onAuthPrompt, stringToBytes } from "./api";
+import { api, onAuthPrompt, onAgentTab, stringToBytes } from "./api";
+import { loadAgentConfig } from "./lib/agent";
 import {
   parseProbe,
   restoreCommand,
@@ -17,13 +25,13 @@ import {
   stealthInput,
   type TermContext,
 } from "./lib/context";
-import { cellWidth, getTerm, onInput, waitForPrompt } from "./lib/termRegistry";
+import { cellWidth, getTerm, onInput, snapshotConsole, waitForPrompt } from "./lib/termRegistry";
 import {
-  LoginRecorder,
-  parseSteps,
-  waitForMenu,
-  waitQuiet,
-} from "./lib/loginScript";
+  isTerminalReply,
+  runMacro,
+  startRecording,
+  type MacroRecorder,
+} from "./lib/macro";
 import ConfirmDialog, { type ConfirmOptions } from "./components/ConfirmDialog";
 import { resolveAuth } from "./lib/auth";
 import {
@@ -38,9 +46,14 @@ import { BUILTIN_THEMES, DEFAULT_THEME, FONT_FAMILIES } from "./lib/theme";
 import { applyChromeVars } from "./lib/chrome";
 import { formatCombo, getPrefs, setPrefs, useShortcuts } from "./lib/prefs";
 import type {
+  AgentTabInfo,
+  AgentTabRequest,
+  AgentTarget,
   AuthMethod,
   AuthPrompt,
   ClosedInfo,
+  MacroRecord,
+  MacroStep,
   NewSession,
   SessionRecord,
   TerminalTab,
@@ -57,19 +70,68 @@ const reconnectDelay = (attempt: number) => RECONNECT_BASE * 2 ** (attempt - 1);
 
 const THEME_NAMES = Object.keys(BUILTIN_THEMES);
 
+/** AI 面板宽度边界（px）：下限保证内容不挤压，上限防止把终端拖没 */
+const AGENT_MIN_W = 280;
+const AGENT_MAX_W = 760;
+const clampAgentWidth = (w: number) =>
+  Math.min(AGENT_MAX_W, Math.max(AGENT_MIN_W, Math.round(w)));
+
 export default function App() {
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeTab, setActiveTab] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<SessionRecord | null>(null);
-  /** 设置窗口：外观 / 快捷键（模态，同一时刻只开一个） */
+  /** 设置窗口：外观 / 快捷键 / 密钥管理 / AI 助手（模态，同一时刻只开一个） */
   const [settingsWin, setSettingsWin] = useState<
-    "appearance" | "shortcuts" | "keys" | null
+    "appearance" | "behavior" | "shortcuts" | "keys" | "agent" | null
   >(null);
   const settingsOpen = settingsWin !== null;
   // 非空时展示该会话的 SFTP 文件管理器
   const [fmSession, setFmSession] = useState<SessionRecord | null>(null);
+  /**
+   * AI 助手侧栏是否展开。
+   * 与「面板是否挂载」是两件事：面板始终挂载、只切 visible，
+   * 否则一轮对话的历史会随收起一起丢掉。
+   */
+  const [agentOpen, setAgentOpen] = useState(false);
+  /**
+   * AI 面板宽度（px），持久化到 localStorage。
+   * 拖动左缘手柄改宽；clamp 在 [AGENT_MIN_W, AGENT_MAX_W]，避免拖没或把终端挤没。
+   */
+  const [agentWidth, setAgentWidth] = useState(() => {
+    const v = Number(localStorage.getItem("nx.agentWidth"));
+    return Number.isFinite(v) && v >= AGENT_MIN_W && v <= AGENT_MAX_W ? v : 340;
+  });
+  useEffect(() => {
+    localStorage.setItem("nx.agentWidth", String(agentWidth));
+  }, [agentWidth]);
+  /** 面板左缘拖拽：按下时记录起点，move 时按反向位移（往左拖=变宽）更新宽度 */
+  const startAgentResize = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startW = agentWidth;
+      const onMove = (ev: MouseEvent) => {
+        const next = clampAgentWidth(startW + (startX - ev.clientX));
+        setAgentWidth(next);
+      };
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      };
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+      // 拖动期间全局锁定光标与选区，否则会连带选中终端文本
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    },
+    [agentWidth],
+  );
+  /** AI 面板是否已浮出为独立窗口。浮出时主窗口内嵌面板收起。 */
+  const [agentFloated, setAgentFloated] = useState(false);
 
   // 外观持久化到 localStorage（之前每次启动都回到默认）
   const [themeName, setThemeName] = useState(() => {
@@ -228,6 +290,9 @@ export default function App() {
   // 异步流程（重连循环、连接回调）里要读最新值，用 ref 桥接
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
+  /** 同上：Agent 的 tab 动作在下发时才读「哪个标签是当前的」，不能闭包捕获旧值 */
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
   /** 每个标签当前重连循环的取消开关 */
@@ -245,6 +310,26 @@ export default function App() {
       return [...prev.slice(0, i + 1), tab, ...prev.slice(i + 1)];
     });
     setActiveTab(tab.id);
+  }, []);
+
+  /**
+   * 新会话建立时，把「是否旁路」的默认值下发到后端。
+   *
+   * 后端对「没登记过的会话」本来就回落到全局 autoAttach，所以这条 IPC 严格说
+   * 是冗余的；仍然发一次，是为了让这个会话的开关状态**在还没有任何输出时就
+   * 是确定的** —— 面板打开即可看到它是开是关、也能在采集开始前就关掉它，
+   * 而不是等第一字节输出时被 feed() 顺手建出来、想关也已经采了一截。
+   *
+   * 两条硬约束：
+   * - 总开关关着时什么都不发。未启用 = 零开销，一条 IPC 也不该有。
+   * - 只在**建会话时**发一次。之后用户在面板里的每次开关都由面板直接写后端
+   *   （它是这条状态的唯一写入者），App 不另起一份镜像，避免两处状态打架。
+   */
+  const seedAgentAttach = useCallback((tabId: string) => {
+    void loadAgentConfig().then((cfg) => {
+      if (!cfg.enabled || !cfg.autoAttach) return;
+      api.agentSetSession(tabId, true).catch(() => {});
+    });
   }, []);
 
   /** 对指定标签发起一次 SSH 拨号（新建与重连共用） */
@@ -313,84 +398,251 @@ export default function App() {
     [patchTab, showToast]
   );
 
-  /**
-   * 跳板机登录路径：录制 + 回放。
-   *
-   * 回放时机是「菜单画完、输出静止」——不靠固定延时，也不要求屏幕像 shell 提示符。
-   * 每发一步都等这一步的输出停下，再判断菜单是否再次出现；菜单不回来就收工，
-   * 不会再往目标机器里瞎敲。
-   */
-  const replayLogin = useCallback(
-    async (tabId: string, configId: string | undefined, since: number) => {
-      if (!configId) return;
-      const { loginScript, loginScriptOn } = getExtras(configId);
-      if (!loginScriptOn) return;
-      const steps = parseSteps(loginScript);
-      if (!steps.length) return;
+  // ───────────────────────── 宏 ─────────────────────────
+  //
+  // 宏替换掉了原来的「跳板机登录路径」专用功能：那是一套只会录「菜单里选序号」
+  // 的特例，换一台堡垒机、或者想顺手跑几条命令就不适用了。现在同一个引擎既能
+  // 重放登录路径，也能做任何「等一会儿、敲一行」的事，绑到会话上就是自动执行。
 
-      let mark = since;
-      let sent = 0;
-      for (const step of steps) {
-        const ok = await waitForMenu(tabId, mark, sent === 0 ? 25_000 : 12_000);
-        if (!ok) break;
-        const tab = tabsRef.current.find((t) => t.id === tabId);
-        if (!tab || tab.status !== "connected") break;
-        mark = Date.now();
-        try {
-          await api.sshWrite(tabId, stringToBytes(`${step}\r`));
-          sent++;
-        } catch {
-          break;
+  const [macros, setMacros] = useState<MacroRecord[]>([]);
+  const [macroOpen, setMacroOpen] = useState(false);
+  const [macroFocus, setMacroFocus] = useState<string | null>(null);
+  /** 正在回放的宏：悬浮条据此显示进度，点一下中止 */
+  const [macroRun, setMacroRun] = useState<{
+    tabId: string;
+    name: string;
+    step: number;
+    total: number;
+    ctl: AbortController;
+  } | null>(null);
+  const [recording, setRecording] = useState<{ tabId: string; rec: MacroRecorder } | null>(null);
+  const [recSteps, setRecSteps] = useState(0);
+
+  const macrosRef = useRef<MacroRecord[]>([]);
+  macrosRef.current = macros;
+  /** 标签 → 正在回放的宏的取消开关（关标签 / 断开时要收掉） */
+  const macroCtl = useRef(new Map<string, AbortController>());
+
+  const refreshMacros = useCallback(async () => {
+    try {
+      setMacros(await api.listMacros());
+    } catch (e) {
+      console.error("加载宏失败", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshMacros();
+  }, [refreshMacros]);
+
+  /**
+   * 旧版「跳板机登录路径」→ 宏 的一次性迁移。
+   *
+   * 原来的实现只认「屏幕像菜单」这一种场景，换台堡垒机或想顺手跑几条命令就
+   * 不适用了；现在统一成宏，但用户已经录过的路径不能丢。转换后清空旧字段，
+   * 下次启动就不会重复生成。
+   */
+  const migratedLogin = useRef(false);
+  useEffect(() => {
+    if (migratedLogin.current || sessions.length === 0) return;
+    migratedLogin.current = true;
+    void (async () => {
+      // 附加状态是异步加载的，迁移必须等它到位，否则读到的都是空值
+      await loadExtras();
+      const added: MacroRecord[] = [];
+      for (const s of sessionsRef.current) {
+        const e = getExtras(s.id);
+        if (!e.loginScript.trim() || e.macroId) continue;
+        const steps: MacroStep[] = [];
+        for (const line of e.loginScript
+          .split(/\r?\n/)
+          .map((x) => x.trim())
+          .filter(Boolean)) {
+          // 旧逻辑是「菜单出来 → 发一步」，等价于「等屏幕稳定 → 发一行」
+          steps.push({ kind: "wait", pattern: "", timeoutMs: 0 });
+          steps.push({ kind: "send", text: line, enter: true });
         }
-        await waitQuiet(tabId, 700, 15_000);
+        if (!steps.length) continue;
+        try {
+          const m = await api.createMacro(`登录路径 · ${s.name}`, steps);
+          updateExtras(s.id, { loginScript: "", macroId: m.id, macroOn: e.loginScriptOn });
+          added.push(m);
+        } catch (err) {
+          console.error("迁移登录路径失败", err);
+        }
       }
-      if (sent > 0) {
-        showToast(`已自动选择跳板机路径：${steps.slice(0, sent).join(" → ")}`);
+      if (added.length) {
+        // 重新拉一次而不是本地合并：启动时的 listMacros 可能与迁移并发，
+        // 它的快照里没有这些新宏，直接合并会被晚到的结果覆盖掉
+        await refreshMacros();
+        showToast(`已将 ${added.length} 条跳板机登录路径转成宏，可在「宏」里修改`);
+      }
+    })();
+  }, [sessions.length, showToast, refreshMacros]);
+
+  const createMacro = useCallback(async (name: string, steps: MacroStep[]) => {
+    const m = await api.createMacro(name, steps);
+    setMacros((prev) => [...prev, m]);
+    return m;
+  }, []);
+
+  const updateMacro = useCallback(async (id: string, name: string, steps: MacroStep[]) => {
+    const m = await api.updateMacro(id, name, steps);
+    setMacros((prev) => prev.map((x) => (x.id === id ? m : x)));
+    return m;
+  }, []);
+
+  const deleteMacro = useCallback(async (id: string) => {
+    await api.deleteMacro(id);
+    setMacros((prev) => prev.filter((m) => m.id !== id));
+    // 绑定关系也要一起断掉，否则会话每次连接都会去找一条不存在的宏
+    for (const s of sessionsRef.current) {
+      if (getExtras(s.id).macroId === id) updateExtras(s.id, { macroId: "", macroOn: false });
+    }
+  }, []);
+
+  /**
+   * 在一个标签上跑宏。
+   *
+   * 三重中止条件：连接断开、用户按键、用户点悬浮条。用户按键中止看着有点凶，
+   * 但宏正在往远端打字时人再插一脚，两边输入交错后基本没法收拾 —— 停下重来
+   * 永远比「看起来在跑、其实发错了」便宜。
+   */
+  const executeMacro = useCallback(
+    async (tabId: string, macro: MacroRecord, opts: { auto?: boolean } = {}) => {
+      // 提示里区分「手动点运行」和「连上就自动跑」：后者失败时用户可能正在干别的，
+      // 得让他一眼看出这条消息来自哪个机制
+      const tag = opts.auto ? "自动宏" : "宏";
+      const tab = tabsRef.current.find((t) => t.id === tabId);
+      if (!tab || tab.status !== "connected") {
+        showToast(`${tag}「${macro.name}」没有执行：当前标签未连接`);
+        return;
+      }
+      if (!macro.steps.length) {
+        showToast(`${tag}「${macro.name}」没有任何步骤`);
+        return;
+      }
+
+      macroCtl.current.get(tabId)?.abort();
+      const ctl = new AbortController();
+      macroCtl.current.set(tabId, ctl);
+      setMacroRun({ tabId, name: macro.name, step: 1, total: macro.steps.length, ctl });
+
+      // 终端对远端查询的自动应答不算「用户插手」，否则 tmux / vim 一发查询
+      // 就会把自动宏掐掉
+      const off = onInput(tabId, (d) => {
+        if (!isTerminalReply(d)) ctl.abort();
+      });
+      try {
+        const r = await runMacro(tabId, macro.steps, {
+          signal: ctl.signal,
+          write: tab.local
+            ? (id, bytes) => api.localWrite(id, bytes)
+            : undefined,
+          onStep: (i) =>
+            setMacroRun((prev) =>
+              prev && prev.ctl === ctl ? { ...prev, step: i + 1 } : prev
+            ),
+        });
+        if (r.ok) {
+          showToast(`${tag}「${macro.name}」执行完成（${r.sent} 步）`);
+        } else if (r.reason === "cancelled") {
+          showToast(`${tag}「${macro.name}」已中止`);
+        } else if (r.reason === "closed") {
+          showToast(`${tag}「${macro.name}」中断：连接已断开`);
+        } else {
+          const at = (r.step ?? 0) + 1;
+          const step = macro.steps[r.step ?? 0];
+          const why =
+            step?.kind === "wait" && step.pattern
+              ? `等不到「${step.pattern}」`
+              : "等待超时";
+          showToast(
+            `${tag}「${macro.name}」第 ${at} 步${why}，已停止（后面的步骤没有发出去）`
+          );
+        }
+      } finally {
+        off();
+        if (macroCtl.current.get(tabId) === ctl) macroCtl.current.delete(tabId);
+        setMacroRun((prev) => (prev && prev.ctl === ctl ? null : prev));
       }
     },
     [showToast]
   );
 
-  /** 标签 → 登录路径录制器。只在「屏幕是菜单」时记录，普通命令不会误记 */
-  const recorders = useRef(new Map<string, { rec: LoginRecorder; off: () => void }>());
-
-  const stopRecording = useCallback((tabId: string) => {
-    const r = recorders.current.get(tabId);
-    if (!r) return;
-    r.rec.dispose();
-    r.off();
-    recorders.current.delete(tabId);
-  }, []);
-
-  const startRecording = useCallback(
-    (tabId: string, configId: string | undefined) => {
+  /** 连接就绪后执行会话绑定的宏（登录路径、自动初始化命令…） */
+  const runAutoMacro = useCallback(
+    async (tabId: string, configId: string | undefined) => {
       if (!configId) return;
-      stopRecording(tabId);
-      const rec = new LoginRecorder(tabId, (script) => {
-        const before = getExtras(configId).loginScript;
-        if (before === script) return;
-        updateExtras(configId, { loginScript: script, loginScriptOn: true });
-        showToast(
-          `已记住登录路径：${parseSteps(script).join(" → ")}（重连时自动选择）`
-        );
-      });
-      recorders.current.set(tabId, { rec, off: onInput(tabId, (d) => rec.handleInput(d)) });
-      rec.start();
+      const e = getExtras(configId);
+      if (!e.macroOn || !e.macroId) return;
+      const m = macrosRef.current.find((x) => x.id === e.macroId);
+      if (!m) return;
+      await executeMacro(tabId, m, { auto: true });
     },
-    [showToast, stopRecording]
+    [executeMacro]
   );
 
-  // 标签关掉 / 掉线后回收录制器，别让定时器一直跑
+  /** 录制：把用户接下来的操作变成一条新宏，停下来就进编辑器 */
+  const toggleRecording = useCallback(async () => {
+    if (recording) {
+      const steps = recording.rec.stop();
+      setRecording(null);
+      setRecSteps(0);
+      if (!steps.length) {
+        showToast("没有录到任何操作");
+        return;
+      }
+      try {
+        const stamp = new Date();
+        const hhmm = `${String(stamp.getHours()).padStart(2, "0")}${String(
+          stamp.getMinutes()
+        ).padStart(2, "0")}`;
+        const m = await createMacro(`录制 ${hhmm}`, steps);
+        setMacroFocus(m.id);
+        setMacroOpen(true);
+        showToast(`已录成宏「${m.name}」，可以改名或调整等待条件`);
+      } catch (e) {
+        showToast(`保存宏失败：${String(e)}`);
+      }
+      return;
+    }
+    const tab = tabsRef.current.find((t) => t.id === activeTab);
+    if (!tab || tab.status !== "connected") {
+      showToast("先连接一个会话再录制");
+      return;
+    }
+    const rec = startRecording(tab.id);
+    setRecSteps(0);
+    setRecording({ tabId: tab.id, rec });
+    setMacroOpen(false);
+  }, [recording, activeTab, createMacro, showToast]);
+
+  // 录制中的步数：录制器是同步累积的，只有靠轮询才能反映到界面上
   useEffect(() => {
-    for (const [id, entry] of [...recorders.current]) {
+    if (!recording) return;
+    const t = window.setInterval(() => setRecSteps(recording.rec.count()), 400);
+    return () => window.clearInterval(t);
+  }, [recording]);
+
+  // 标签断开 / 关掉：收掉宏与录制，别把定时器和输入订阅留着
+  useEffect(() => {
+    for (const [id, ctl] of [...macroCtl.current]) {
       const tab = tabs.find((t) => t.id === id);
       if (!tab || tab.status !== "connected") {
-        entry.rec.dispose();
-        entry.off();
-        recorders.current.delete(id);
+        ctl.abort();
+        macroCtl.current.delete(id);
       }
     }
-  }, [tabs]);
+    if (recording) {
+      const tab = tabs.find((t) => t.id === recording.tabId);
+      if (!tab || tab.status !== "connected") {
+        recording.rec.cancel();
+        setRecording(null);
+        setRecSteps(0);
+      }
+    }
+  }, [tabs, recording]);
 
   /**
    * 新连接就绪后把上下文还原进去（cd / tmux）。
@@ -456,6 +708,8 @@ export default function App() {
         { id: tabId, title: s.name, customTitle: title, sessionId: s.id, status: "connecting" },
         afterId
       );
+      // 旁路开关的默认值只跟会话一起定一次，之后交给面板
+      seedAgentAttach(tabId);
       try {
         const since = Date.now();
         await dial(tabId, s);
@@ -466,12 +720,12 @@ export default function App() {
         }
         patchTab(tabId, { status: "connected", ctx: restore });
         connectedAt.current.set(tabId, Date.now());
-        // 顺序很重要：先把跳板机菜单选完（进到目标机器），再注入 cd / tmux 还原命令。
-        // 反过来的话，还原命令会被喂给菜单本身，直接变成一个非法选项。
-        void replayLogin(tabId, s.id, since).then(() =>
+        // 顺序很重要：先跑会话绑定的宏（登录路径会在这里把菜单选完、进到目标机器），
+        // 再注入 cd / tmux 还原命令。反过来的话，还原命令会被喂给菜单本身，
+        // 直接变成一个非法选项。
+        void runAutoMacro(tabId, s.id).then(() =>
           applyContext(tabId, restore, "duplicate", since)
         );
-        startRecording(tabId, s.id);
       } catch (e) {
         // 用户自己关掉了验证码弹窗，不是连接出错，别标成红色错误
         if (authCancelled.current.delete(tabId)) {
@@ -481,7 +735,7 @@ export default function App() {
         patchTab(tabId, { status: "error", error: String(e) });
       }
     },
-    [dial, insertTab, patchTab, applyContext]
+    [dial, insertTab, seedAgentAttach, patchTab, applyContext]
   );
 
   /**
@@ -538,11 +792,10 @@ export default function App() {
             closedAt: undefined,
           });
           // 用断线前最后一次探测到的上下文恢复（tmux 直接 attach 回原会话）。
-          // 仍然排在登录路径回放之后：菜单没选完时目标机器还没进去。
-          void replayLogin(tabId, s.id, since).then(() =>
+          // 仍然排在自动宏之后：宏没跑完时目标机器还没进去。
+          void runAutoMacro(tabId, s.id).then(() =>
             applyContext(tabId, tab.ctx, "reconnect", since)
           );
-          startRecording(tabId, s.id);
           return;
         } catch (e) {
           lastErr = toFriendlyError(String(e)).message;
@@ -717,6 +970,197 @@ export default function App() {
     [askConfirm, closeTabNow]
   );
 
+  /**
+   * 把文本写进某个会话的 pty —— AI 面板「插入到终端」的唯一落地路径。
+   *
+   * 调用链上必然已经过了两道人为确认：点建议卡片上的「插入到终端」→ 在确认框里
+   * 点「插入」。除这条链路外，本函数没有任何调用方，也不接受任何自动触发。
+   *
+   * **刻意不追加 \n**：只把命令插进当前输入行，回车执行留给人在终端里自己按。
+   * 替用户按下这个回车，等于替他执行一条可能没读完的命令 —— 那不是便利，是事故。
+   * 后端会把这次写入当成 StreamKind::In 记进上下文，与人手敲进去的命令同等对待。
+   */
+  const sendToTerminal = useCallback(async (tabId: string, text: string) => {
+    if (!text) return;
+    const t = tabsRef.current.find((x) => x.id === tabId);
+    if (!t) return;
+    const bytes = stringToBytes(text);
+    if (t.local) await api.localWrite(tabId, bytes);
+    else await api.sshWrite(tabId, bytes);
+  }, []);
+
+  /** 把 AI 面板浮出为独立窗口：开窗 + 收起内嵌面板 */
+  const floatAgentOut = useCallback(async () => {
+    if (!activeTab) return;
+    await api.agentOpenWindow(activeTab);
+    setAgentFloated(true);
+    setAgentOpen(false);
+  }, [activeTab]);
+
+  /**
+   * 交给 Agent 的「可操作会话」清单。
+   *
+   * 只列**还活着**的标签：给模型一个已经断开的会话 id，它会在那边吃到
+   * 一句看不懂的「会话不存在」，而用户完全不知道该去修什么。
+   */
+  const agentSessions: AgentTarget[] = useMemo(
+    () =>
+      tabs
+        .filter((t) => t.status === "connected" || t.status === "reconnecting")
+        .map((t) => ({ id: t.id, label: t.customTitle || t.title || t.id })),
+    [tabs],
+  );
+
+  // 浮窗开着时，主窗口切换活动会话要通知浮窗跟随。
+  // 顺带把「可操作会话」清单一起发过去 —— 浮窗里没有标签树，
+  // 而「执行」模式的作用范围选择器全靠这份清单。
+  const agentSessionKey = agentSessions.map((s) => s.id).join("|");
+  useEffect(() => {
+    if (!agentFloated || !activeTab) return;
+    void emit("nx://agent/active-session", { sessionId: activeTab, sessions: agentSessions });
+    // agentSessionKey 代替 agentSessions 本身进依赖数组：数组每次渲染都是新引用，
+    // 直接放进去会让这个 effect 每帧都跑一遍。
+  }, [agentFloated, activeTab, agentSessionKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 监听浮窗回传的事件：写终端、开设置、窗口关闭
+  useEffect(() => {
+    const unSend = listen<{ sessionId: string; text: string }>(
+      "nx://agent/send-to-terminal",
+      (e) => {
+        if (e.payload?.sessionId) void sendToTerminal(e.payload.sessionId, e.payload.text);
+      },
+    );
+    const unSettings = listen("nx://agent/open-settings", () => setSettingsWin("agent"));
+    // 浮窗被关掉 → 恢复「未浮出」状态，让用户能重新内嵌或再次浮出
+    const unClosed = listen("nx://agent/window-closed", () => setAgentFloated(false));
+    return () => {
+      void unSend.then((f) => f());
+      void unSettings.then((f) => f());
+      void unClosed.then((f) => f());
+    };
+  }, [sendToTerminal]);
+
+  // Agent 自己开的新会话（`nx-exec` 的 open 动作）：后端已经真的 spawn/connect
+  // 好了，这里只需要把它接成一个标签页，不再重复调用 localSpawn / sshConnect。
+  useEffect(() => {
+    const un = listen<{
+      id: string;
+      originSessionId: string;
+      kind: "local" | "ssh";
+      label: string;
+    }>("nx://agent/session-opened", (e) => {
+      const { id, originSessionId, kind, label } = e.payload;
+      insertTab(
+        {
+          id,
+          title: label || (kind === "local" ? "本地终端" : "远端会话"),
+          sessionId: null,
+          status: "connected",
+          local: kind === "local",
+        },
+        originSessionId
+      );
+      seedAgentAttach(id);
+    });
+    return () => void un.then((f) => f());
+  }, [insertTab, seedAgentAttach]);
+
+  // 启动时同步一次浮窗状态（热重载 / 重开主窗口时浮窗可能还在）
+  useEffect(() => {
+    void api.agentWindowOpen().then(setAgentFloated).catch(() => {});
+  }, []);
+
+  /**
+   * Agent 下发的标签页动作（`nx-exec` 的 `tab` 动作）。
+   *
+   * 只能在这里落地：tab 是 React state，后端连「开着几个标签页」都不知道，
+   * 它只负责把动作转过来。后端在等回执（3 秒超时，超时会被记成「未确认」），
+   * 所以**每条分支都必须 ack**，失败也要说清楚为什么 —— 静默就是上次那种
+   * 「它说了要做，然后没有然后」。
+   *
+   * 关闭走的是 `closeTabNow`：用户选了「直接执行，面板留痕」，
+   * 不再弹确认框，但步骤卡里会写明关了哪一个。
+   */
+  const handleAgentTab = useCallback(
+    async (req: AgentTabRequest) => {
+      const ack = (ok: boolean, detail: string, list?: AgentTabInfo[]) =>
+        api.agentTabAck(req.requestId, ok, detail, list).catch(() => false);
+      const now = tabsRef.current;
+      const nameOf = (t: TerminalTab) => t.customTitle || t.title || t.id;
+      const toInfo = (t: TerminalTab): AgentTabInfo => ({
+        id: t.id,
+        title: nameOf(t),
+        kind: t.local ? "local" : "ssh",
+        status: t.status,
+        active: t.id === activeTabRef.current,
+      });
+
+      if (req.op === "list") {
+        const list = now.map(toInfo);
+        await ack(true, `当前共 ${list.length} 个标签页`, list);
+        return;
+      }
+
+      const target = now.find((t) => t.id === req.target);
+      if (!target) {
+        await ack(false, `没有 id 为「${req.target ?? "（空）"}」的标签页`);
+        return;
+      }
+
+      switch (req.op) {
+        case "focus":
+          setActiveTab(target.id);
+          await ack(true, `已切到「${nameOf(target)}」`);
+          return;
+        case "rename": {
+          const name = (req.name ?? "").trim();
+          if (!name) {
+            await ack(false, "新名字为空");
+            return;
+          }
+          const before = nameOf(target);
+          patchTab(target.id, { customTitle: name });
+          await ack(true, `已把「${before}」改名为「${name}」`);
+          return;
+        }
+        case "close": {
+          // 与后端同一条护栏：关掉它等于把 Agent 自己的会话也收了
+          if (target.id === req.sessionId) {
+            await ack(false, "不能关闭 Agent 自己所在的标签页");
+            return;
+          }
+          const name = nameOf(target);
+          closeTabNow(target.id);
+          await ack(true, `已关闭「${name}」及其中的进程`);
+          return;
+        }
+        case "reconnect": {
+          if (target.local) {
+            await ack(false, "本地终端不需要重连，只能关掉重开");
+            return;
+          }
+          if (target.status === "connected" || target.status === "connecting") {
+            await ack(false, `「${nameOf(target)}」当前是 ${target.status}，不需要重连`);
+            return;
+          }
+          void reconnect(target.id, false);
+          await ack(true, `已开始重连「${nameOf(target)}」`);
+          return;
+        }
+        default:
+          await ack(false, `不认识的操作：${req.op}`);
+      }
+    },
+    [closeTabNow, patchTab, reconnect]
+  );
+
+  useEffect(() => {
+    const un = onAgentTab((req) => {
+      void handleAgentTab(req);
+    });
+    return () => void un.then((f) => f());
+  }, [handleAgentTab]);
+
   const saveSession = useCallback(
     async (payload: NewSession, password: string, passphrase: string | null) => {
       let id = editing?.id;
@@ -835,13 +1279,6 @@ export default function App() {
     [sessions, refresh, showToast]
   );
 
-  const cycleTheme = useCallback(() => {
-    setThemeName((cur) => {
-      const i = THEME_NAMES.indexOf(cur);
-      return THEME_NAMES[(i + 1) % THEME_NAMES.length] ?? DEFAULT_THEME;
-    });
-  }, []);
-
   /** 新开一个本地 shell 标签 */
   const newLocalTab = useCallback(
     (afterId?: string | null) => {
@@ -851,12 +1288,14 @@ export default function App() {
         { id, title: "本地终端", sessionId: null, status: "connected", local: true },
         afterId
       );
+      // 本地终端也走同一条旁路（后端 local 读线程同样会 feed）
+      seedAgentAttach(id);
       api.localSpawn(id, 120, 32).catch((e) => {
         patchTab(id, { status: "error", error: String(e) });
         showToast(`本地终端启动失败：${String(e)}`);
       });
     },
-    [insertTab, patchTab, showToast]
+    [insertTab, seedAgentAttach, patchTab, showToast]
   );
 
   // —— 启动时开一个本地 shell：没有 SSH 连接时也能当终端用 ——
@@ -995,10 +1434,6 @@ export default function App() {
     ? tabs.find((t) => t.id === authPrompt.sessionId)?.status === "reconnecting"
     : false;
 
-  const appTitle = activeSession
-    ? `${activeSession.name} — ${activeSession.username}@${activeSession.host}`
-    : "NexusTerm";
-
   const statusBar: "idle" | "connecting" | "connected" | "reconnecting" | "error" =
     activeTabState?.status === "error"
       ? "error"
@@ -1017,16 +1452,15 @@ export default function App() {
   // 当前激活标签是否有对应会话（用于导出按钮状态）
   const canExportActive = !!activeSession;
 
+  /**
+   * 侧栏真正占位的时机。
+   * 面板本身帮不上忙的两种情况：用户收起、或一个会话都没有（旁路无从谈起）。
+   * 这两种情况下容器宽度直接归零，不留一条空白。
+   */
+  const agentShown = agentOpen && !!activeTab;
+
   return (
     <div className="app" data-theme={themeName}>
-      <TitleBar
-        title={appTitle}
-        themeName={themeName}
-        onCycleTheme={cycleTheme}
-        onOpenSettings={setSettingsWin}
-        settingsOpen={settingsOpen}
-      />
-
       <TabBar
         sessionPopupOpen={sessionPopupOpen}
         onToggleSessionPopup={() => setSessionPopupOpen((v) => !v)}
@@ -1042,6 +1476,8 @@ export default function App() {
         onDuplicateWithState={(id) => duplicateTab(id, true)}
         onRename={renameTab}
         onMove={moveTab}
+        agentOpen={agentOpen}
+        onToggleAgent={() => setAgentOpen((v) => !v)}
       />
 
       <div className="workspace">
@@ -1053,6 +1489,11 @@ export default function App() {
                 tabId={t.id}
                 active={t.id === activeTab}
                 kind={t.local ? "local" : "ssh"}
+                // 命令历史按会话身份存取：本地固定 'local'，已保存的 SSH
+                // 连接是它的 sessionId；没有保存记录的临时连接退回 tabId
+                // 本身（不持久化，行为与过去的纯内存历史一致）。
+                historyKey={t.local ? "local" : t.sessionId ?? t.id}
+                historyPersist={t.local || !!t.sessionId}
                 onNotify={showToast}
                 theme={theme}
                 fontFamily={fontFamily}
@@ -1114,6 +1555,30 @@ export default function App() {
               />
             )}
 
+            {/* 宏回放 / 录制：贴在终端右上角，点一下即中止 */}
+            {macroRun && macroRun.tabId === activeTab && (
+              <div
+                className="macro-running"
+                title="点击中止这条宏"
+                onClick={() => macroRun.ctl.abort()}
+              >
+                <span className="mr-dot" />
+                宏「{macroRun.name}」{macroRun.step}/{macroRun.total}
+                <span className="mr-hint">点击中止</span>
+              </div>
+            )}
+            {recording && recording.tabId === activeTab && (
+              <div
+                className="macro-running rec"
+                title="点击停止录制"
+                onClick={() => void toggleRecording()}
+              >
+                <span className="mr-dot" />
+                正在录制宏 · {recSteps} 步
+                <span className="mr-hint">点击停止</span>
+              </div>
+            )}
+
             {tabs.length === 0 && !fmSession && (
               <div className="welcome">
                 <h1>NexusTerm</h1>
@@ -1142,6 +1607,44 @@ export default function App() {
               ))}
           </div>
         </main>
+
+        {/*
+          AI 助手侧栏。
+
+          放在 .workspace 里（与 .main 并列）而不是 .term-area 里：.term-area 是
+          position:relative，终端宿主是 inset:0 的绝对定位元素，塞在这里只会盖住
+          终端右边一块；而 .workspace 本来就是 flex 行容器、.main 是 flex:1，
+          于是侧栏占多少、.main 就少多少 —— 终端宽度自然跟着变，
+          TerminalView 现有的 ResizeObserver 会重新 fit 并把新尺寸推给后端。
+          这样既不用改 term-area 的内部结构，也不用新造一套尺寸通知。
+
+          面板**始终挂载**：整份对话是全局唯一的（助手面向所有会话，
+          切标签只换「当前上下文」，不换聊天记录），卸载即丢失。
+          收起只是把 visible 置 false（组件自己返回 null、停掉事件订阅），
+          并把容器宽度归零。
+        */}
+        <div
+          className={`agent-side${agentShown ? "" : " collapsed"}`}
+          style={agentShown ? { width: agentWidth } : undefined}
+        >
+          {agentShown && (
+            <div
+              className="agent-resize"
+              onMouseDown={startAgentResize}
+              title="拖动调整面板宽度"
+            />
+          )}
+          <AgentPanel
+            sessionId={activeTab ?? ""}
+            visible={agentShown}
+            onClose={() => setAgentOpen(false)}
+            onSendToTerminal={sendToTerminal}
+            onOpenSettings={() => setSettingsWin("agent")}
+            onFloatOut={floatAgentOut}
+            sessions={agentSessions}
+            onGetConsole={snapshotConsole}
+          />
+        </div>
       </div>
 
       {/* 右下角计数 = 当前打开的标签数（与 Xshell「N 会话」一致），不是已保存的连接数 */}
@@ -1165,6 +1668,9 @@ export default function App() {
                 : null
         }
         activeTabId={activeTabState?.id ?? null}
+        onNotify={showToast}
+        onOpenSettings={setSettingsWin}
+        settingsOpen={settingsOpen}
       />
 
       {settingsWin === "appearance" && (
@@ -1182,12 +1688,53 @@ export default function App() {
           onClose={() => setSettingsWin(null)}
         />
       )}
+      {settingsWin === "behavior" && (
+        <BehaviorDialog
+          onClose={() => setSettingsWin(null)}
+          onOpenMacros={() => setMacroOpen(true)}
+        />
+      )}
       {settingsWin === "shortcuts" && <ShortcutsDialog onClose={() => setSettingsWin(null)} />}
+      {settingsWin === "agent" && <AgentDialog onClose={() => setSettingsWin(null)} />}
       {settingsWin === "keys" && <KeyManagerDialog onClose={() => setSettingsWin(null)} />}
+
+      {macroOpen && (
+        <MacroDialog
+          macros={macros}
+          focusId={macroFocus}
+          tabReady={activeTabState?.status === "connected"}
+          tabLabel={
+            activeTabState ? activeTabState.customTitle || activeTabState.title : null
+          }
+          sessionId={activeSession?.id ?? null}
+          sessionName={activeSession?.name ?? null}
+          boundId={
+            activeSession && getExtras(activeSession.id).macroOn
+              ? getExtras(activeSession.id).macroId || null
+              : null
+          }
+          recording={!!recording}
+          onBind={(id) => {
+            if (!activeSession) return;
+            updateExtras(activeSession.id, { macroId: id ?? "", macroOn: !!id });
+          }}
+          onRecord={() => void toggleRecording()}
+          onRun={(m) => {
+            if (!activeTab) return;
+            setMacroOpen(false);
+            void executeMacro(activeTab, m);
+          }}
+          onCreate={createMacro}
+          onUpdate={updateMacro}
+          onDelete={deleteMacro}
+          onClose={() => setMacroOpen(false)}
+        />
+      )}
 
       {dialogOpen && (
         <SessionDialog
           editing={editing}
+          macros={macros}
           onSave={saveSession}
           onClose={() => {
             setDialogOpen(false);

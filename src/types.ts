@@ -30,6 +30,32 @@ export interface NewSession {
   connectTimeout?: number | null;
 }
 
+/**
+ * 宏的一步。
+ *
+ * 只有三种原语，且字段名与 Rust 侧 serde 完全一致（`kind` 是判别式）——
+ * 多一种原语就多一个「行为不可预测」的来源；能表达复杂流程的应该写成脚本，
+ * 而不是把宏做成一个小语言。
+ */
+export type MacroStep =
+  /** 发送文本；`enter` 为真时末尾补回车 */
+  | { kind: "send"; text: string; enter: boolean }
+  /**
+   * 等屏幕出现 `pattern`（子串；`/.../` 或 `/.../i` 按正则）。
+   * `pattern` 为空串表示「等输出静默」—— 不依赖具体提示符，适合菜单类界面。
+   */
+  | { kind: "wait"; pattern: string; timeoutMs: number }
+  /** 无条件等着 */
+  | { kind: "sleep"; ms: number };
+
+export interface MacroRecord {
+  id: string;
+  name: string;
+  steps: MacroStep[];
+  createdAt: number;
+  updatedAt: number;
+}
+
 export type AuthMethod =
   | { kind: "password"; password: string }
   | { kind: "privateKey"; path: string; passphrase?: string }
@@ -217,3 +243,196 @@ export interface Theme {
   brightCyan: string;
   brightWhite: string;
 }
+
+// ———————————————————————————— AI Agent（会话旁路） ————————————————————————————
+
+/** 后端 `AgentConfig.provider` 的取值。注意 Rust 侧是 String，这里收窄成联合类型便于 UI 做下拉。 */
+export type AgentProvider = "openai" | "anthropic" | "custom";
+
+/**
+ * 单个 AI 账号的连接与行为配置。后端 `AgentAccount` 的镜像（camelCase）。
+ *
+ * 多账号设计：用户可配多组（OpenAI / Anthropic / 自建网关…），整组切换。
+ * 连接字段与行为字段都随账号走，这样换账号时系统提示词、脱敏策略一并切换。
+ */
+export interface AgentAccount {
+  /** 账号唯一 id（前端生成）。切换、删除按它定位。 */
+  id: string;
+  /** 展示名，例如「OpenAI 正式」。空时 UI 退回显示模型名。 */
+  name: string;
+  provider: AgentProvider;
+  /** OpenAI 兼容根地址；后端会去掉尾斜杠与重复的 /chat/completions 再拼。 */
+  baseUrl: string;
+  model: string;
+  /** 明文存在 db 里，db 文件权限已锁 0600 —— 不要让 UI 把它打进日志 */
+  apiKey: string;
+  /** 单次喂给模型的最近字节数（在环形缓冲容量内的二次截取） */
+  maxContextBytes: number;
+  /** 留空 = 用后端内置提示词（后端会 trim 后判空） */
+  systemPrompt: string;
+  /** 出网前是否脱敏。默认 true：关掉意味着把原始终端输出发给第三方 */
+  redact: boolean;
+}
+
+/**
+ * Agent 的执行模式。后端 `ExecMode` 的镜像（lowercase）。
+ * - `agentic`：全自动，判定出来的动作直接下发到终端；
+ * - `approval`：人在回路，`danger` 一栏判为危险的命令先弹出来等人点头。
+ */
+export type AgentExecMode = "agentic" | "approval";
+
+/**
+ * AI 助手配置。后端持久化在 SQLite settings 表（key=`agent.config`），
+ * serde `rename_all = "camelCase"`，故此处的字段名必须与 TS 侧一致。
+ *
+ * 顶层只保留全局行为（总开关、新会话默认旁路、执行模式），连接相关下沉到 accounts。
+ */
+export interface AgentConfig {
+  /** 全局总开关。关着的时候后端旁路完全不动，连一次哈希查找都没有。 */
+  enabled: boolean;
+  /** 新会话是否默认开启旁路 */
+  autoAttach: boolean;
+  /** 所有已配置的账号。至少有一个。 */
+  accounts: AgentAccount[];
+  /** 当前生效账号的 id。找不到时后端回落到第一个。 */
+  activeId: string;
+  /** 下令方式。后端对未知字符串降级到 approval（最安全的那一种）。 */
+  execMode: AgentExecMode;
+}
+
+/** 某个会话当前的旁路缓冲状态（后端 `BufferStats` 的镜像） */
+export interface AgentBufferStats {
+  bytes: number;
+  /** 累计因超出容量被丢掉的字节数 */
+  dropped: number;
+  /** 曾经超限丢弃过 → 首尾都不完整，模型看不到 session 全貌 */
+  truncated: boolean;
+}
+
+/** 流结束原因：stop=模型说完，length=撞到 max_tokens 被截断，cancelled=用户取消 */
+export type AgentDoneReason = "stop" | "length" | "cancelled";
+
+/** `nx://agent/done/{sessionId}` 的载荷 */
+export interface AgentDonePayload {
+  reason: AgentDoneReason;
+}
+
+/** 聊天面板里的一条消息。纯前端对象，不进 IPC。 */
+export interface AgentMessage {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  ts: number;
+  /** 答案还在流式追加中（收到 done/error 后置回 false） */
+  streaming?: boolean;
+  /** 这条是一次失败的提问（文本是错误文案） */
+  error?: boolean;
+  /** Agentic 模式下这一步的过程信息（下令 / 结果 / 被跳过 / 提示） */
+  step?: AgentStep;
+  /** Agentic 审批模式下的待批请求；这张卡片自带「允许 / 拒绝」按钮 */
+  approve?: AgentApproveRequest;
+  /** 审批结果：true 已允许 / false 已拒绝 / undefined 还在等人 */
+  approveResult?: boolean;
+}
+
+// ———————————————————————————— Agentic（会动手的那种） ————————————————————————————
+
+/** 一个可操作目标。label 由前端给：后端只认 uuid，把 uuid 贴在进程边上毫无意义。 */
+export interface AgentTarget {
+  id: string;
+  label: string;
+}
+
+/** `agent_run` 的入参 */
+export interface AgentRunRequest {
+  /** 面板当前绑定的会话，同时是模型省略 target 时的默认目标 */
+  sessionId: string;
+  question: string;
+  /** 允许操作的会话。留空时后端退回 [sessionId]。 */
+  targets: AgentTarget[];
+  /**
+   * 由前端从 xterm 缓冲区抓的当前屏幕快照（含 scrollback）。
+   *
+   * 旁路缓冲只记「开了之后」的字节，可能缺开头、也可能被容量截断；
+   * 而用户此刻屏幕上看到的东西才是他要问的那件事的完整现场。
+   * 有它时后端优先用它当上下文，旁路缓冲只作兜底。
+   */
+  consoleText?: string;
+  /**
+   * 该会话当前是否停在 alternate buffer（vim / less / top / tmux / docker attach 等）。
+   * 后端据此提示模型：这类程序的输出抓不到，要用 capture-pane / docker logs 之类的 skill。
+   */
+  consoleAlt?: boolean;
+}
+
+/**
+ * `nx://agent/step/{sessionId}` 的载荷：一轮里发生的每一件事。
+ *
+ * 刻意是「扁平结构 + kind」而不是判别联合：多数字段本就可选，
+ * 扁平结构在 TS 侧写起来更省事，渲染时也不用写一堆类型收窄。
+ */
+export interface AgentStep {
+  /** plan | tool | exec | result | skip | note | answer | open | export | tab */
+  kind: string;
+  step: number;
+  /** kind:"tool" 专用：模型调用的工具名（原始，如 nx_tab） */
+  tool?: string;
+  /** kind:"tool" 专用：给人看的中文工具名 */
+  toolLabel?: string;
+  /** kind:"tool" 专用：原始参数 JSON 文本 */
+  toolArgs?: string;
+  target?: string;
+  targetLabel?: string;
+  command?: string;
+  output?: string;
+  text?: string;
+  reasons?: string[];
+}
+
+/** `nx://agent/approve/{sessionId}` 的载荷：请人点头 */
+export interface AgentApproveRequest {
+  requestId: string;
+  command: string;
+  target: string;
+  targetLabel: string;
+  reasons: string[];
+}
+
+/**
+ * `nx://agent/tab/{sessionId}` 的载荷：请前端动一下标签页。
+ *
+ * 后端没有 tab 这个概念（它只知道 pty / ssh 连接），所以这不是「执行」，
+ * 是「转达」。办完必须回一句 `agentTabAck`，否则后端只能当成没办成。
+ */
+export interface AgentTabRequest {
+  requestId: string;
+  /** 发起这次操作的会话，只为定位来源 */
+  sessionId: string;
+  /** list | focus | close | rename | reconnect */
+  op: string;
+  /** 中文说法，直接可以拿去展示 */
+  opLabel: string;
+  target?: string;
+  name?: string;
+}
+
+/** 一个标签页的对外视图（回执里的清单） */
+export interface AgentTabInfo {
+  id: string;
+  title: string;
+  /** local | ssh */
+  kind: string;
+  status: string;
+  active: boolean;
+}
+
+/** `agent_run` 在 UI 上的两种叫法 */
+export type AgentRunMode = "ask" | "act";
+
+/** `agent_exec` 的返回值。reason 是命令结束的方式——没有退出码，
+ *  "confirmed" 是活体确认过「真的没有前台进程了」，"silence" 是静默兜底（问不出确定答案）。 */
+export interface AgentExecResult {
+  output: string;
+  reason: "confirmed" | "silence" | "timeout" | "cancelled";
+}
+

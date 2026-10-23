@@ -9,6 +9,7 @@ use ssh::session::SessionManager;
 use store::Store;
 
 pub mod errors;
+mod agent;
 mod cmd;
 mod keys;
 mod local;
@@ -25,14 +26,107 @@ fn app_data_dir(app: &tauri::AppHandle) -> PathBuf {
         .expect("无法定位应用数据目录")
 }
 
-pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+/// 日志写入器：所有事件共用同一个文件句柄。
+///
+/// 为什么需要它：release 版是 `windows_subsystem = "windows"` 的 GUI 程序，
+/// 根本没有 stderr 可看，`tracing_subscriber::fmt()` 的默认输出等于扔进黑洞。
+/// 现场问题（尤其是「连上十几秒自己断」这种）没有日志就完全没法查。
+#[derive(Clone)]
+struct LogFile(std::sync::Arc<std::sync::Mutex<std::fs::File>>);
 
+impl std::io::Write for LogFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut f = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("日志文件锁已中毒"))?;
+        std::io::Write::write_all(&mut *f, buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.0.lock() {
+            Ok(mut f) => std::io::Write::flush(&mut *f),
+            Err(_) => Ok(()),
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogFile {
+    type Writer = LogFile;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// 日志过滤规则。
+///
+/// - `RUST_LOG` 优先（临时精细控制用）
+/// - `NEXUS_DEBUG=1`：本项目 + russh 全开 debug。断链、握手、算法协商这类问题
+///   基本都要靠它，`info` 级别看不到库内部发生了什么。
+/// - 默认 `info`：但「服务端主动断开」那条是 `warn!`，所以**不开任何环境变量也能看到断链原因**。
+fn log_filter() -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    if let Ok(f) = EnvFilter::try_from_default_env() {
+        return f;
+    }
+    if std::env::var("NEXUS_DEBUG")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+    {
+        return EnvFilter::new("info,nexus_term=debug,russh=debug,russh_sftp=debug");
+    }
+    EnvFilter::new("info")
+}
+
+/// 初始化日志：stderr（开发时看）+ `<app_data>/logs/nexus.log`（现场排查用）。
+fn init_logging(data_dir: &std::path::Path) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    // 把 `log` 宏接进 tracing。russh / russh-sftp 全部用 `log`，不装这道桥，
+    // 它们内部的探活、kex、断开诊断全都会被丢掉（表现为「开了 debug 也什么都看不到」）。
+    // 重复调用（例如测试里多次初始化）会返回 Err，忽略即可。
+    let _ = tracing_log::LogTracer::init();
+
+    let filter = log_filter();
+    let log_dir = data_dir.join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let path = log_dir.join("nexus.log");
+
+    // 超过 8MB 滚一份旧的，避免长期运行把用户磁盘写满
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > 8 * 1024 * 1024)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::rename(&path, log_dir.join("nexus.log.1"));
+    }
+
+    let registry = tracing_subscriber::registry().with(filter);
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => {
+            let _ = registry
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(LogFile(std::sync::Arc::new(std::sync::Mutex::new(f))))
+                        .with_ansi(false),
+                )
+                .try_init();
+            tracing::info!(path = %path.display(), "日志已就绪（文件 + stderr）");
+        }
+        Err(e) => {
+            let _ = registry.with(tracing_subscriber::fmt::layer()).try_init();
+            tracing::warn!(error = %e, "日志文件打不开，只输出到 stderr");
+        }
+    }
+}
+
+pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -40,6 +134,8 @@ pub fn run() {
         .register_uri_scheme_protocol("nxdoc", reader::protocol)
         .setup(|app| {
             let dir = app_data_dir(app.handle());
+            // 先起日志：下面每一步（建库、恢复会话）出错都需要留下记录
+            init_logging(&dir);
             let keys_dir = dir.join(crate::keys::VAULT_DIR);
             let store = Store::open(dir).expect("SQLite 初始化失败");
             // 把旧版存在系统凭据服务里的密码迁移到 db 明文列
@@ -56,12 +152,19 @@ pub fn run() {
                 auth_prompts.clone(),
                 sessions.shared(),
             );
+            // AI 旁路：启动时把 db 里的配置灌进内存里的原子开关，
+            // 否则设施齐全但全局默认关闭，feed 会一路短路
+            let agent = agent::AgentManager::new();
+            agent.apply_config(&agent::load_config(&store));
             app.manage(reader::DocStore::default());
             app.manage(AppState {
                 sessions,
                 sftp,
                 store,
                 local: LocalManager::new(),
+                agent,
+                llm: agent::llm::LlmRuntime::new(),
+                act: agent::act::ActRuntime::new(),
                 auth_prompts,
                 keys_dir,
             });
@@ -81,6 +184,8 @@ pub fn run() {
             cmd::local_write_b64,
             cmd::ssh_stats,
             cmd::local_stats,
+            cmd::history_record,
+            cmd::history_list,
             cmd::session_extras,
             cmd::set_session_extras,
             cmd::ssh_set_sidecar,
@@ -90,6 +195,10 @@ pub fn run() {
             cmd::create_session,
             cmd::update_session,
             cmd::delete_session,
+            cmd::list_macros,
+            cmd::create_macro,
+            cmd::update_macro,
+            cmd::delete_macro,
             cmd::save_password,
             cmd::load_password,
             cmd::reorder_sessions,
@@ -129,6 +238,26 @@ pub fn run() {
             reader::reader_open_ssh,
             reader::reader_open_local,
             reader::reader_doc,
+            agent::cmd::agent_get_config,
+            agent::cmd::agent_set_config,
+            agent::cmd::agent_set_session,
+            agent::cmd::agent_get_session,
+            agent::cmd::agent_context,
+            agent::cmd::agent_clear,
+            agent::cmd::agent_stats,
+            agent::cmd::agent_ask,
+            agent::cmd::agent_cancel,
+            agent::cmd::agent_test,
+            agent::cmd::agent_run,
+            agent::cmd::agent_run_cancel,
+            agent::cmd::agent_approve,
+            agent::cmd::agent_tab_ack,
+            agent::cmd::agent_exec,
+            agent::cmd::agent_export_session,
+            agent::cmd::agent_open_session,
+            agent::cmd::agent_open_window,
+            agent::cmd::agent_close_window,
+            agent::cmd::agent_window_open,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

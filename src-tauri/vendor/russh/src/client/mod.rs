@@ -230,7 +230,22 @@ pub struct Handle<H: Handler> {
 
 impl<H: Handler> Drop for Handle<H> {
     fn drop(&mut self) {
-        debug!("drop handle")
+        debug!("drop handle");
+        // NEXUS 补丁（3）：丢弃句柄时主动告别。
+        //
+        // 默认实现只打一行日志，然后关闭发送端；会话循环看到 channel 关闭后
+        // 直接 shutdown TCP。协议上看这仍然是「客户端一言不发地消失」——
+        // 服务端要等自己的超时才回收 shell 进程与会话记录，堡垒机上还会继续
+        // 占着「同账号并发会话」的名额。
+        //
+        // 这里在关闭发送端之前塞一条 SSH_MSG_DISCONNECT 进队列：接收端在
+        // 收到 None 之前仍会处理已入队的消息，于是对端能立刻销毁会话。
+        // 满队列 / 对端已关闭时 try_send 失败，忽略即可 —— 那说明连接本来就没了。
+        let _ = self.sender.try_send(Msg::Disconnect {
+            reason: Disconnect::ByApplication,
+            description: "closing".to_string(),
+            language_tag: String::new(),
+        });
     }
 }
 
@@ -958,6 +973,15 @@ impl Session {
                         return Err(crate::Error::KeepaliveTimeout.into());
                     }
                     self.common.alive_timeouts = self.common.alive_timeouts.saturating_add(1);
+                    // NEXUS 补丁：默认实现一声不响地发探活，事后完全无法判断
+                    // 「连接断之前探活到底有没有发出去 / 服务端有没有回」。
+                    // 排「连上几十秒就断」这类问题时这一行是唯一的时间锚点。
+                    // 注意本 crate 用 `log`（不支持 key=value 结构字段）。
+                    debug!(
+                        "发送 keepalive@openssh.com（第 {} 次，间隔 {:?}s）",
+                        self.common.alive_timeouts,
+                        self.common.config.keepalive_interval.map(|d| d.as_secs())
+                    );
                     self.send_keepalive(true)?;
                     sent_keepalive = true;
                 }
@@ -1550,6 +1574,18 @@ pub trait Handler: Sized + Send {
         server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
         Ok(false)
+    }
+
+    /// Called whenever the server sends a `keepalive@openssh.com` request,
+    /// either as a global request (OpenSSH `ClientAliveInterval`) or as a
+    /// channel request (JumpServer/koko sends it on the session channel).
+    ///
+    /// NexusTerm 补丁 7：这是**链路还活着**的唯一正向信号 —— 安静期里服务端
+    /// 主动探活，说明它那边的会话、NAT 映射、堡垒机授权都还在。界面拿它画心跳。
+    /// 默认空实现，对既有 handler 完全无影响。
+    #[allow(unused_variables)]
+    async fn server_keepalive(&mut self) -> Result<(), Self::Error> {
+        Ok(())
     }
 
     /// Called when the server confirmed our request to open a

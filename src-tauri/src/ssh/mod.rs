@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tauri::Emitter;
 
 /// 主机公钥指纹缓存 —— 实现 Trust-on-First-Use。
 /// 首次连接时记录指纹，之后若发生变化则拒绝连接（防中间人）。
@@ -59,6 +60,8 @@ pub struct ClientHandler {
     /// 主机指纹冲突标记。russh 在 check_server_key 返回 false 时会直接断开连接，
     /// 因此需要这个旁路标记，才能在事后把失败原因精确地报给前端。
     pub host_key_rejected: Arc<AtomicBool>,
+    /// 服务端 keepalive 到达时的回调（前端心跳动效，见 vendor 补丁 7）。
+    pub on_keepalive: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[async_trait::async_trait]
@@ -72,6 +75,59 @@ impl client::Handler for ClientHandler {
             self.host_key_rejected.store(true, Ordering::SeqCst);
         }
         Ok(ok)
+    }
+
+    /// 服务端 keepalive（全局或通道请求）→ 通知前端画一次脉搏。
+    ///
+    /// 这是「链路还活着」的正向证据：安静期里服务端主动探活，说明会话、
+    /// NAT 映射、堡垒机授权都还在。**不改协议行为**，回调失败也不影响连接。
+    async fn server_keepalive(&mut self) -> Result<(), Self::Error> {
+        match &self.on_keepalive {
+            Some(cb) => {
+                // 临时 INFO：用来确认「服务端心跳 → 前端」这条链有没有打通，
+                // 稳定后降回 debug（每 30 秒一条，不应长期占 INFO）。
+                tracing::info!(host = %self.host, port = self.port, "收到服务端 keepalive");
+                cb();
+            }
+            None => {
+                tracing::debug!(host = %self.host, "收到服务端 keepalive（未注册回调）");
+            }
+        }
+        Ok(())
+    }
+
+    /// 连接为什么会断 —— 这里是**唯一**能拿到服务端原始理由的钩子。
+    ///
+    /// russh 的默认实现只 `debug!("disconnected: {:?}")` 然后返回 `Ok(())`：
+    /// `SSH_MSG_DISCONNECT` 里服务端写的原因（reason code + 人话）就这么被吞了，
+    /// 上层只能看到「通道流结束」，退出码 0、原因 unknown，排查时完全没有抓手。
+    /// 现场那台二次验证服务器「连上 10 秒就断」就是被这条吞掉的。
+    async fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        match reason {
+            client::DisconnectReason::ReceivedDisconnect(info) => {
+                tracing::warn!(
+                    host = %self.host,
+                    port = self.port,
+                    reason_code = ?info.reason_code,
+                    message = %info.message,
+                    "服务端主动断开连接"
+                );
+                // 保持库的默认语义：服务端主动断开不算错误，只是连接结束
+                Ok(())
+            }
+            client::DisconnectReason::Error(e) => {
+                tracing::warn!(
+                    host = %self.host,
+                    port = self.port,
+                    error = %e,
+                    "连接异常中断"
+                );
+                Err(e)
+            }
+        }
     }
 }
 
@@ -251,6 +307,35 @@ async fn connect_once(
     client::connect(config, format!("{host}:{port}"), handler).await
 }
 
+/// 终端会话的探活间隔。
+///
+/// **默认不发**（返回 `None`），与 OpenSSH 客户端一致（它的 `ServerAliveInterval`
+/// 默认就是 0）。之前这里写死 10 秒，对标准 sshd 无害，但会平白增加与
+/// 「对非标准全局请求敏感」的实现产生分歧的机会 —— 探活应当是可选项，不是默认行为。
+///
+/// 需要探活（穿 NAT、防中间设备清表、防服务端空闲回收）时用环境变量打开：
+///
+/// - `NEXUS_KEEPALIVE_SECS=<秒>`：开启并指定间隔（建议 ≥60）
+/// - `NEXUS_NO_KEEPALIVE=1`：显式关闭（现在已是默认，保留是为了兼容旧脚本）
+///
+/// 都在启动时读取，改完要重启应用。
+///
+/// 注意：`wiz-jump` 那台「连上 30.2 秒必断」**不是**探活造成的 —— 真凶是
+/// 通道请求应答里的通道号写错（见 `vendor/russh/PATCHES.md` 补丁 6）。
+pub(crate) fn keepalive_interval() -> Option<Duration> {
+    if std::env::var("NEXUS_NO_KEEPALIVE")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let secs = std::env::var("NEXUS_KEEPALIVE_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)?;
+    Some(Duration::from_secs(secs))
+}
+
 // ───────────────────────── 连接 + 认证 ─────────────────────────
 //
 // 为什么认证要放在这一层：终端通道和 SFTP 通道都需要「握手 → 认证」这套流程，
@@ -281,12 +366,18 @@ pub struct Opened {
     pub legacy: bool,
 }
 
-fn handler_for(host: &str, port: u16, known_hosts: &Arc<KnownHosts>) -> ClientHandler {
+fn handler_for(
+    host: &str,
+    port: u16,
+    known_hosts: &Arc<KnownHosts>,
+    on_keepalive: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> ClientHandler {
     ClientHandler {
         known_hosts: known_hosts.clone(),
         host: host.to_string(),
         port,
         host_key_rejected: Arc::new(AtomicBool::new(false)),
+        on_keepalive,
     }
 }
 
@@ -312,6 +403,15 @@ pub async fn open_authenticated(
     session_id: &str,
     ctx: AuthContext<'_>,
 ) -> Result<Opened, OpenError> {
+    // 服务端 keepalive → 前端心跳（vendor 补丁 7）。
+    // 事件名带会话 id：多标签各画各的，SFTP 复用同一条 id 也无害。
+    let on_keepalive: Option<Arc<dyn Fn() + Send + Sync>> = {
+        let app: tauri::AppHandle = (*ctx.app).clone();
+        let id = session_id.to_string();
+        Some(Arc::new(move || {
+            let _ = app.emit(&format!("nx://term/pulse/{id}"), ());
+        }))
+    };
     open_authenticated_with(
         host,
         port,
@@ -322,9 +422,63 @@ pub async fn open_authenticated(
         username,
         auth,
         session_id,
+        on_keepalive,
         |p| async move { ctx.prompts.ask(ctx.app, p).await },
     )
     .await
+}
+
+/// 认证半途而废时，最多等多久让会话循环自己收尾（发完 DISCONNECT 之后）。
+const ABORT_WAIT: Duration = Duration::from_millis(800);
+
+/// 把一条「还没能用起来」的连接主动收掉。
+///
+/// 只 `drop(handle)` 在协议层是「不告而别」：我们不通知服务端，它只能在
+/// TCP 层发现对端消失，而这中间它那边的 shell 进程、会话记录、以及
+/// **「同账号在线会话数」配额**都还记着这个人。堡垒机普遍限制并发会话数，
+/// 而二次验证（OTP）偏偏又是最容易被放弃的一步 —— 输慢了、超时了、
+/// 直接关标签页了，都会留下一条这样的连接。攒上几条就是「明明能连，
+/// 突然一个都连不上」，要等它在服务端自然过期才恢复。
+///
+/// 所以这里发一条 `SSH_MSG_DISCONNECT`（`ByApplication` = 客户端主动退出，
+/// 不会在服务端留攻击性告警），再等 run 循环真正退出。
+/// `Handle::is_closed()` 在 run 收尾时置位，是唯一能观察到的关闭信号。
+///
+/// 等待有上限：走到这里本来就是错误路径，网络也不一定健康，
+/// 不能让收尾把错误提示再拖一秒。
+pub(super) async fn abort_session(session: &client::Handle<ClientHandler>, why: &str) {
+    if session.is_closed() {
+        return;
+    }
+    tracing::debug!(why, "认证未完成，主动关闭连接");
+    let _ = session
+        .disconnect(russh::Disconnect::ByApplication, "authentication aborted", "")
+        .await;
+    let deadline = tokio::time::Instant::now() + ABORT_WAIT;
+    while !session.is_closed() {
+        if tokio::time::Instant::now() >= deadline {
+            // 没等到。要么 run 循环没处理这条 Disconnect，要么它卡在别处。
+            // 再发一次并把 send 的结果记下来：`SendError` 说明接收端已经没了
+            // （只是 is_closed 没反映出来），`Ok` 说明队列还活着、消息进去了
+            // 却没被消费 —— 这两种情况的下一步完全不同，别猜，记下来。
+            let again = session
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "authentication aborted",
+                    "",
+                )
+                .await;
+            tracing::warn!(
+                why,
+                resend_err = ?again.as_ref().err(),
+                "未完成的连接未在 {:?} 内关闭（drop 交给运行时收尾）",
+                ABORT_WAIT
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tracing::debug!(why, "未完成的连接已关闭");
 }
 
 /// [`open_authenticated`] 的实现体，「问用户」换成任意闭包 ——
@@ -340,6 +494,7 @@ async fn open_authenticated_with<F, Fut>(
     username: &str,
     auth: &AuthMethod,
     session_id: &str,
+    on_keepalive: Option<Arc<dyn Fn() + Send + Sync>>,
     ask: F,
 ) -> Result<Opened, OpenError>
 where
@@ -354,7 +509,7 @@ where
     let hs = handshake(
         host,
         port,
-        handler_for(host, port, &known_hosts),
+        handler_for(host, port, &known_hosts, on_keepalive.clone()),
         timeout,
         policy,
         keepalive,
@@ -370,7 +525,10 @@ where
             return Ok(Opened { session, legacy });
         }
         Ok(AuthOutcome::NeedKeyboardInteractive) => {}
-        Err(e) => return Err(OpenError::Auth(e.to_string())),
+        Err(e) => {
+            abort_session(&session, "主认证失败").await;
+            return Err(OpenError::Auth(e.to_string()));
+        }
     }
 
     // ── 第二因素：先在**同一条连接**上接着走 keyboard-interactive ──
@@ -388,15 +546,18 @@ where
             // 服务端压根不支持 KBI（返回「一个问题都没问的拒绝」），
             // 或者第一因子就是错的。落到下面的换连接流程，给出准确文案。
         }
-        Err(e) => return Err(OpenError::Auth(e.to_string())),
+        Err(e) => {
+            // 用户在验证码上超时 / 点了取消。这条连接已经没救了，
+            // 但服务端的会话还活着 —— 不主动告别就一直占着并发配额。
+            abort_session(&session, "二次验证未完成").await;
+            return Err(OpenError::Auth(e.to_string()));
+        }
     }
 
     // 断开旧连接：下面按「KBI 必须是本次连接第一个认证请求」的老路子再试一次。
     // 显式 disconnect 而不是只 drop —— 否则服务端那条 sshd 会挂到 TCP 超时才回收，
     // 密码输错时每次重连都会留下一个这样的僵尸进程。
-    let _ = session
-        .disconnect(russh::Disconnect::ByApplication, "", "")
-        .await;
+    abort_session(&session, "改用新连接走二次验证").await;
     drop(session);
     tracing::info!(
         host,
@@ -408,7 +569,7 @@ where
     let hs = handshake(
         host,
         port,
-        handler_for(host, port, &known_hosts),
+        handler_for(host, port, &known_hosts, on_keepalive.clone()),
         timeout,
         policy,
         keepalive,
@@ -423,10 +584,16 @@ where
         Ok(session::KbiOutcome::Done) => Ok(Opened { session, legacy }),
         // 换了新连接还是一个问题都不问 → 服务端确实不要这一步，
         // 那就回到「主认证方式失败」的原始文案。
-        Ok(session::KbiOutcome::Unavailable) => Err(OpenError::Auth(
-            session::refusal_message(&auth).to_string(),
-        )),
-        Err(e) => Err(OpenError::Auth(e.to_string())),
+        Ok(session::KbiOutcome::Unavailable) => {
+            abort_session(&session, "服务端未要求二次验证").await;
+            Err(OpenError::Auth(
+                session::refusal_message(&auth).to_string(),
+            ))
+        }
+        Err(e) => {
+            abort_session(&session, "二次验证未完成").await;
+            Err(OpenError::Auth(e.to_string()))
+        }
     }
 }
 
@@ -540,6 +707,48 @@ fn map_handshake(e: HandshakeError) -> OpenError {
 }
 
 #[cfg(test)]
+mod handler_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// 服务端 keepalive 必须打到宿主回调上 —— 状态栏的小心电图靠它。
+    ///
+    /// vendor 侧（补丁 7）在两处 keepalive 分支各调一次；这里锁住宿主这一半：
+    /// 回调有没有被调用、没有回调时会不会炸。
+    #[tokio::test]
+    async fn keepalive_callback_fires() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let n = hits.clone();
+        let mut h = ClientHandler {
+            known_hosts: Arc::new(KnownHosts::new()),
+            host: "example".into(),
+            port: 22,
+            host_key_rejected: Arc::new(AtomicBool::new(false)),
+            on_keepalive: Some(Arc::new(move || {
+                n.fetch_add(1, Ordering::SeqCst);
+            })),
+        };
+        client::Handler::server_keepalive(&mut h)
+            .await
+            .expect("回调不该失败");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // 没挂回调（探针 / SFTP 复用路径）也必须是无害的空操作
+        let mut bare = ClientHandler {
+            known_hosts: Arc::new(KnownHosts::new()),
+            host: "example".into(),
+            port: 22,
+            host_key_rejected: Arc::new(AtomicBool::new(false)),
+            on_keepalive: None,
+        };
+        client::Handler::server_keepalive(&mut bare)
+            .await
+            .expect("无回调时也该成功");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
 mod crypto_tests {
     use super::*;
 
@@ -607,6 +816,7 @@ mod crypto_tests {
             host: host.clone(),
             port,
             host_key_rejected: Arc::new(AtomicBool::new(false)),
+            on_keepalive: None,
         };
 
         match handshake(
@@ -655,6 +865,7 @@ mod crypto_tests {
             host: host.clone(),
             port,
             host_key_rejected: Arc::new(AtomicBool::new(false)),
+            on_keepalive: None,
         };
 
         let opened = handshake(
@@ -720,7 +931,7 @@ mod crypto_tests {
             let mut hs = handshake(
                 &host,
                 port,
-                handler_for(&host, port, &Arc::new(KnownHosts::new())),
+                handler_for(&host, port, &Arc::new(KnownHosts::new()), None),
                 Duration::from_secs(15),
                 LegacyPolicy::Auto,
                 None,
@@ -789,7 +1000,7 @@ mod crypto_tests {
         let mut hs = handshake(
             &host,
             port,
-            handler_for(&host, port, &Arc::new(KnownHosts::new())),
+            handler_for(&host, port, &Arc::new(KnownHosts::new()), None),
             Duration::from_secs(15),
             LegacyPolicy::Auto,
             None,
@@ -854,6 +1065,7 @@ mod crypto_tests {
                 password: password.clone(),
             },
             "probe",
+            None,
             move |p: prompt::AuthPrompt| {
                 sink.lock().unwrap().push(p.clone());
                 let otp = otp.clone();
@@ -923,6 +1135,7 @@ mod kbi_flow {
                 password: "test123".into(),
             },
             "probe",
+            None,
             move |p: prompt::AuthPrompt| {
                 sink.lock().unwrap().push(p.clone());
                 async move {
@@ -976,6 +1189,7 @@ mod kbi_flow {
                 passphrase: None,
             },
             "probe",
+            None,
             |_p: prompt::AuthPrompt| async move { Err(prompt::AskAbort::Cancelled) },
         )
         .await

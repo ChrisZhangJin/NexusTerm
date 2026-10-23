@@ -1,5 +1,6 @@
 use tauri::State;
 
+use crate::agent::StreamKind;
 use crate::keys;
 use crate::sftp::{RemoteEntry, SftpError, SftpManager};
 use crate::ssh::session::{ConnectOutcome, ConnectRequest, SessionError, SessionManager};
@@ -10,9 +11,17 @@ pub struct AppState {
     pub sftp: SftpManager,
     pub store: Store,
     pub local: crate::local::LocalManager,
+    /// AI agent 的旁路缓冲。会话数据流在完成一次 emit 之后顺手喂一份给它。
+    pub agent: crate::agent::AgentManager,
+    /// AI agent 的出网层：流式提问与取消。
+    pub llm: crate::agent::llm::LlmRuntime,
+    /// AI agent 的动作层运行时：一轮 Agentic 运行的取消标记 + 人工审批登记表。
+    pub act: crate::agent::act::ActRuntime,
     /// 二次验证（keyboard-interactive）的问答登记表。
     /// 与 `sessions` / `sftp` 内部持有的是同一个 Arc。
     pub auth_prompts: std::sync::Arc<crate::ssh::prompt::AuthPrompts>,
+    /// 用户密钥库目录（`<app_data>/keys`）。私钥文件落在这里，
+    /// 不碰 `~/.ssh` —— 那是 ssh / git 自己的资产。
     /// 用户密钥库目录（`<app_data>/keys`）。私钥文件落在这里，
     /// 不碰 `~/.ssh` —— 那是 ssh / git 自己的资产。
     pub keys_dir: std::path::PathBuf,
@@ -79,16 +88,22 @@ pub fn local_spawn(
 
 #[tauri::command]
 pub fn local_write(id: String, data: Vec<u8>, state: State<'_, AppState>) -> Result<(), String> {
-    state.local.write(&id, &data)
+    state.local.write(&id, &data)?;
+    // 写成功才旁路：没真正送进 PTY 的输入不该出现在 agent 的上下文里
+    state.agent.feed(&id, &data, StreamKind::In);
+    Ok(())
 }
 
 #[tauri::command]
 pub fn local_write_b64(id: String, data: String, state: State<'_, AppState>) -> Result<(), String> {
     use base64::Engine as _;
+    // 先解码再喂：缓冲里必须存原始字节，存 base64 的话快照全是乱码
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
         .map_err(|e| format!("base64 解码失败：{}", e))?;
-    state.local.write(&id, &bytes)
+    state.local.write(&id, &bytes)?;
+    state.agent.feed(&id, &bytes, StreamKind::In);
+    Ok(())
 }
 
 #[tauri::command]
@@ -103,7 +118,10 @@ pub fn local_resize(
 
 #[tauri::command]
 pub fn local_close(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    state.local.close(&id)
+    let res = state.local.close(&id);
+    // 无论关闭是否报错（会话可能根本不存在），agent 侧都要清干净
+    state.agent.remove(&id);
+    res
 }
 
 #[tauri::command]
@@ -122,7 +140,14 @@ pub async fn ssh_write(
     data: Vec<u8>,
     state: State<'_, AppState>,
 ) -> Result<(), SessionError> {
-    state.sessions.write(&id, data).await
+    // 多一次拷贝换来的是严格的顺序：只有真正发出去的输入才进 agent 上下文。
+    // 写失败（会话已关）时缓冲里不该留下这一段 —— 命令没执行过，却出现在
+    // 「人干过什么」里，比少记一条的误导性大得多。
+    let res = state.sessions.write(&id, data.clone()).await;
+    if res.is_ok() {
+        state.agent.feed(&id, &data, StreamKind::In);
+    }
+    res
 }
 
 /// 大块二进制写入（ZMODEM 上传）：base64 字符串比 JSON 数字数组小 ~3 倍、解析快得多。
@@ -136,10 +161,15 @@ pub async fn ssh_write_b64(
     state: State<'_, AppState>,
 ) -> Result<(), SessionError> {
     use base64::Engine as _;
+    // 解码后再喂：缓冲里存原始字节，base64 正文对模型毫无意义
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
         .map_err(|e| SessionError::Channel(format!("base64 解码失败：{}", e)))?;
-    state.sessions.write(&id, bytes).await
+    let res = state.sessions.write(&id, bytes.clone()).await;
+    if res.is_ok() {
+        state.agent.feed(&id, &bytes, StreamKind::In);
+    }
+    res
 }
 
 #[tauri::command]
@@ -155,6 +185,9 @@ pub fn ssh_resize(
 #[tauri::command]
 pub fn ssh_close(id: String, state: State<'_, AppState>) {
     state.sessions.close(&id);
+    // 会话没了，旁路缓冲也要跟着放掉：AppState 活到应用退出，
+    // 不清理的话每个关掉的标签都会留下最多 256KB 常驻内存
+    state.agent.remove(&id);
 }
 
 /// 回填二次验证（keyboard-interactive）的答案。
@@ -192,6 +225,22 @@ pub async fn ssh_stats(
 #[tauri::command]
 pub async fn local_stats() -> Result<crate::sysstat::Stats, String> {
     crate::sysstat::collect().await
+}
+
+// ——— Console 自动补全：session 级命令历史 ———
+//
+// 按会话身份（已保存连接配置的 id，本地固定 'local'）持久化，而不是按
+// 临时的标签页 id —— 这样同一台服务器下次重连、甚至重启应用后新开的
+// 标签，都能接着用之前在这台机器上敲过的命令做补全。
+
+#[tauri::command]
+pub fn history_record(key: String, command: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.store.record_history(&key, &command)
+}
+
+#[tauri::command]
+pub fn history_list(key: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    state.store.list_history(&key)
 }
 
 // ——— 会话附加状态（跳板机登录路径 / 兼容模式）———
@@ -266,6 +315,40 @@ pub fn update_session(
 pub fn delete_session(id: String, state: State<'_, AppState>) -> Result<(), String> {
     // 密码随 sessions 行一起删除，无需单独清理
     state.store.delete(&id)
+}
+
+// ——— 宏 ———
+//
+// 宏的执行完全在前端（需要读终端屏幕、按输出节奏决定何时发下一步），
+// 后端只负责持久化 —— 这样宏的定义与执行不会出现两套解析逻辑。
+
+#[tauri::command]
+pub fn list_macros(state: State<'_, AppState>) -> Result<Vec<store::MacroRecord>, String> {
+    state.store.list_macros()
+}
+
+#[tauri::command]
+pub fn create_macro(
+    name: String,
+    steps: Vec<store::MacroStep>,
+    state: State<'_, AppState>,
+) -> Result<store::MacroRecord, String> {
+    state.store.create_macro(&name, &steps)
+}
+
+#[tauri::command]
+pub fn update_macro(
+    id: String,
+    name: String,
+    steps: Vec<store::MacroStep>,
+    state: State<'_, AppState>,
+) -> Result<store::MacroRecord, String> {
+    state.store.update_macro(&id, &name, &steps)
+}
+
+#[tauri::command]
+pub fn delete_macro(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.store.delete_macro(&id)
 }
 
 /// 拖拽后批量持久化排序与分组归属。
