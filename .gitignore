@@ -19,3 +19,6 @@ Thumbs.db
 # cargo vendor marker
 src-tauri/vendor/**/.cargo-ok
 src-tauri/vendor/**/.cargo_vcs_info.json
+
+# 图标的中间产物（`tauri icon` 的输出，由 icon-design/icon-1024.png 重新生成）
+icon-design/icons/
