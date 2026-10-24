@@ -24,7 +24,9 @@ export interface CompletionOverlayProps {
 
 /** 单条高度与下拉的最大高度，与 styles.css 里的 .cp-item / .cp-pop 保持一致 */
 const ITEM_H = 26;
-const POP_MAX_H = 26 * 7;
+/** 底部那行按键说明的高度，与 styles.css 里的 .cp-tip 保持一致 */
+const TIP_H = 22;
+const POP_MAX_H = ITEM_H * 7 + TIP_H;
 
 export default function CompletionOverlay({
   items,
@@ -51,7 +53,7 @@ export default function CompletionOverlay({
   if (items.length === 0) return null;
 
   // 下方放不下就翻到光标上方；上方也放不下就取一个能塞下的高度贴边显示
-  const wanted = Math.min(items.length * ITEM_H, POP_MAX_H);
+  const wanted = Math.min(items.length * ITEM_H + TIP_H, POP_MAX_H);
   const below = viewportHeight - y - ITEM_H;
   let top: number;
   let height: number;
@@ -62,7 +64,6 @@ export default function CompletionOverlay({
     height = Math.min(y - ITEM_H, POP_MAX_H);
     top = y - ITEM_H - height;
   }
-
   return (
     <div className="cp-pop" style={{ left: x, top, height }} onMouseDown={(e) => e.preventDefault()}>
       <div className="cp-list" ref={listRef}>
@@ -77,6 +78,23 @@ export default function CompletionOverlay({
             <span className="cp-label">{it.label}</span>
           </button>
         ))}
+      </div>
+      {/* 这几个键被下拉接管了，不写出来的话人只能靠猜：
+          为什么回车不执行、为什么 Tab 补的是第一条。 */}
+      <div className="cp-tip">
+        <span>
+          <kbd>↑</kbd>
+          <kbd>↓</kbd> 选择
+        </span>
+        <span>
+          <kbd>Tab</kbd> 补全
+        </span>
+        <span>
+          <kbd>Enter</kbd> 补全并运行
+        </span>
+        <span className="cp-tip-esc">
+          <kbd>Esc</kbd> 关闭
+        </span>
       </div>
     </div>
   );

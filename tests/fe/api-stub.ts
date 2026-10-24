@@ -6,29 +6,19 @@
  * 以及返回一份固定的参数表。
  */
 
-import type { CmdOption } from "../../src/types";
-
-export const calls: { tabId: string; program: string }[] = [];
-
-/** 只有 `tail` 有参数表；其它程序一律空 —— 顺便覆盖「程序不存在」那条路 */
-const TABLE: Record<string, CmdOption[]> = {
-  tail: [
-    { flags: ["-f", "--follow"], summary: "跟踪新增内容", takesValue: false },
-    { flags: ["-n", "--lines"], summary: "输出末尾 N 行", takesValue: true },
-    { flags: ["--verbose"], summary: "显示详细过程", takesValue: false },
-  ],
-};
-
 export const api = {
-  consoleCommandOptions(tabId: string, program: string): Promise<CmdOption[]> {
-    calls.push({ tabId, program });
-    return Promise.resolve(TABLE[program] ?? []);
-  },
-
   /** 宏回放会把字节写到这里；测试据此断言「发了什么、顺序对不对」 */
   sshWrite(tabId: string, data: number[]): Promise<void> {
     writes.push({ tabId, data });
     return Promise.resolve();
+  },
+
+  /** 历史只在 `persist` 为真时才真落盘，测试默认不走到这里 */
+  historyRecord(): Promise<void> {
+    return Promise.resolve();
+  },
+  historyList(): Promise<string[]> {
+    return Promise.resolve([]);
   },
 };
 

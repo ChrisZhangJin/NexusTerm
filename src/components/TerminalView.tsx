@@ -26,7 +26,8 @@ import {
   recordCommand,
   type CompletionItem,
 } from "../lib/complete";
-import { GhostText, cursorFollowsTyped } from "../lib/ghost";
+import { GhostText, cursorAtLineEnd, cursorFollowsTyped } from "../lib/ghost";
+import { ImeGuard, type KeyLike } from "../lib/ime";
 import CompletionOverlay from "./CompletionOverlay";
 
 import {
@@ -211,27 +212,22 @@ export default function TerminalView({
   // 用 ref 桥接 —— 否则按 ↑↓ 挑中第 3 条后按 Tab，补进去的还是第 1 条
   const hintIndexRef = useRef(0);
   hintIndexRef.current = hintIndex;
+  /**
+   * 唯一的「改高亮项」入口：ref 与 state 一起写。
+   *
+   * 只调 `setHintIndex` 是不够的 —— ref 要等下一次渲染才跟上，而鼠标划过下拉、
+   * 或按完 ↑↓ 之后，人可能在同一帧内就按 Tab / Enter。那一刻读到的还是旧下标，
+   * 补进去的自然不是屏幕上高亮的那条（表现为「按 Tab 总是补第一条」）。
+   */
+  const setActiveHint = useCallback((i: number) => {
+    hintIndexRef.current = i;
+    setHintIndex(i);
+  }, []);
   /** 下拉锚点：光标在视口里的像素坐标 */
   const [hintPos, setHintPos] = useState({ x: 0, y: 0 });
   /** 上一次推给界面的下拉位置（用来跳过「位置没变」的重复渲染） */
   const hintPosRef = useRef({ x: 0, y: 0 });
 
-  /**
-   * 现在能不能把灰字画在光标后面。
-   *
-   * 两个条件缺一不可：主屏（全屏程序里没有「命令行」这回事），以及光标确实
-   * 停在我们刚敲的那半行末尾（`cursorFollowsTyped`）。
-   *
-   * 少了第二条就会**覆盖真实字符**：灰字是直接往显示缓冲里写的，写在哪就从
-   * 哪开始盖。shell 把整行重画一遍之后（zsh 语法高亮 / autosuggest、长行折行、
-   * 后台任务打印），光标可能停在行中间、右边还有真实字符 —— 这时候画灰字，
-   * 用户已经敲出来的字母就被抹掉一个，看起来正是「丢字」。
-   */
-  const canDrawGhost = useCallback((term: Terminal) => {
-    return (
-      term.buffer.active.type === "normal" && cursorFollowsTyped(term, lineRef.current.text)
-    );
-  }, []);
   /** 上一次推给界面的候选签名（label 拼起来），用来跳过内容没变的重复渲染 */
   const hintSigRef = useRef("\u0000");
   const hintsRef = useRef<CompletionItem[]>([]);
@@ -252,7 +248,7 @@ export default function TerminalView({
     // 取 `hintsRef` 而不是 `hints`：状态里的那份可能因为「候选没变就不推送」
     // 而落后一步（`insert` 是随行内容变的），灰字必须跟真正会被 Tab 补进去的一致。
     const items = hintsRef.current;
-    if (!term || items.length === 0 || !canDrawGhost(term)) return;
+    if (!term || items.length === 0 || term.buffer.active.type !== "normal") return;
     const item = items[Math.min(hintIndex, items.length - 1)];
     if (!item) return;
     ghostRef.current.show(term, item.insert, term.cols - term.buffer.active.cursorX - 1);
@@ -272,16 +268,15 @@ export default function TerminalView({
     // vim / less / top 用的是 alternate buffer：那里没有 shell 提示符，
     // 「当前行 = 人敲的命令」这个前提根本不成立。全屏程序里一律不提示，
     // 否则灰字会直接画在编辑器内容上。
-    //
-    // 光标已经不在刚敲的那半行末尾（shell 重画过整行、或输出插进来了）时
-    // 同样不能画：那会把光标右边的真实字符盖掉 —— 见 `canDrawGhost`。
-    if (!canDrawGhost(term)) {
-      ghostRef.current.clear(term);
-      hintsRef.current = [];
-      // 签名也要作废，否则下次算出同一批候选时会因为「签名没变」而不推状态
-      hintSigRef.current = "\u0000";
-      setHints(null);
-      setHintIndex(0);
+    if (term.buffer.active.type !== "normal") {
+      dismissHints();
+      return;
+    }
+    // 人在行中间删改时一律不提示：补进去的那段会插到句子中间，
+    // 而且灰字的擦除只敢从光标往后抹 —— 那里有真字就会连真字一起抹掉
+    // （屏幕上看没了、shell 里还在，回车就又冒出来）。见 `cursorAtLineEnd`。
+    if (!cursorAtLineEnd(term)) {
+      dismissHints();
       return;
     }
 
@@ -293,7 +288,7 @@ export default function TerminalView({
     if (sig !== hintSigRef.current) {
       hintSigRef.current = sig;
       setHints(items.length ? items : null);
-      setHintIndex(0);
+      setActiveHint(0);
     }
 
     const room = term.cols - term.buffer.active.cursorX - 1;
@@ -319,7 +314,7 @@ export default function TerminalView({
       hintPosRef.current = { x, y };
       setHintPos({ x, y });
     }
-  }, [canDrawGhost]);
+  }, []);
 
   /** 收起提示：擦掉灰字、清空候选。 */
   const dismissHints = useCallback(() => {
@@ -328,8 +323,8 @@ export default function TerminalView({
     hintsRef.current = [];
     hintSigRef.current = "\u0000";
     setHints(null);
-    setHintIndex(0);
-  }, []);
+    setActiveHint(0);
+  }, [setActiveHint]);
 
   /** 按当前这半行重算候选：历史是本地同步缓存，不用等网络往返。 */
   const refreshHints = useCallback(
@@ -372,6 +367,12 @@ export default function TerminalView({
       const items = hintsRef.current;
       const term = termRef.current;
       if (!term || items.length === 0) return;
+      // 光标已经挪到行中间（人在改前面敲错的字）：这时补进去会插在句子中间，
+      // 收起下拉比硬补安全 —— 想继续补全，按 End 回到行尾即可。
+      if (!cursorAtLineEnd(term)) {
+        dismissHints();
+        return;
+      }
       const item = items[Math.min(index, items.length - 1)];
       if (!item.insert) {
         dismissHints();
@@ -395,6 +396,36 @@ export default function TerminalView({
   const acceptHint = useCallback(() => {
     acceptHintAt(hintIndexRef.current);
   }, [acceptHintAt]);
+
+  /** 写 pty 的那条路定义在 mount 的 effect 里，用 ref 桥给下面的回调 */
+  const sendRef = useRef<(d: string) => void>(() => {});
+  /**
+   * 输入法状态。接管回车之前必须问它一句：拼音组合里按回车是「上屏」，
+   * 不是「执行」 —— 吞掉就打不出中文了。判定逻辑见 `lib/ime.ts`。
+   */
+  const imeRef = useRef<ImeGuard>(new ImeGuard());
+
+  /**
+   * Enter：先把高亮项补齐，**再**补一个真正的回车（也就是直接跑起来）。
+   *
+   * 下拉开着时，屏幕上的这行是「已经敲进去的半句 + 灰字」，灰字看着就是命令的
+   * 一部分。这时候回车如果照旧只发半句，就成了「看到 A 执行 B」——
+   * 敲的是 `vim P`，跑的是 `vim `。所以回车必须先把高亮项补上。
+   *
+   * 补完一定要收起下拉：`acceptHintAt` 末尾会重算候选，补出来的整句常常还能
+   * 接着联想，下拉会马上又弹出来；不收起的话第二次回车又被吞掉，
+   * 这条命令就永远发不出去了。
+   */
+  const acceptHintThenRun = useCallback(() => {
+    acceptHintAt(hintIndexRef.current);
+    dismissHints();
+    // 走的是与「自己敲回车」同一条记账路径：行状态提交 + 进历史，再发 \r。
+    const committed = feedKeys(lineRef.current, "\r");
+    if (committed) {
+      recordCommand(historyKeyRef.current, committed, historyPersistRef.current);
+    }
+    sendRef.current("\r");
+  }, [acceptHintAt, dismissHints]);
 
   /** 把当前行列数同步给后端（SSH 是 window_change，本地是 PTY resize） */
   const syncSize = useCallback(() => {
@@ -480,16 +511,40 @@ export default function TerminalView({
     };
     host.addEventListener("mousedown", onSelDown, true);
     window.addEventListener("mouseup", onSelUp, true);
+    // 输入法：xterm 自己会处理组合输入，这里只是旁观 —— 记下「组合开始/结束」
+    // 就够了，键盘处理器据此决定回车该不该被补全接管。capture 是为了抢在
+    // xterm 内部处理之前拿到（顺序无所谓，但能保证不漏）。
+    const onImeStart = () => imeRef.current.begin();
+    const onImeEnd = (e: CompositionEvent) => imeRef.current.finish(e.timeStamp);
+    // 组合中被切走时 compositionend 不一定来，留着 composing=true 会把回车全吞掉
+    const onImeReset = () => imeRef.current.reset();
+    host.addEventListener("compositionstart", onImeStart, true);
+    host.addEventListener("compositionend", onImeEnd, true);
+    window.addEventListener("blur", onImeReset);
     cleanups.push(() => {
       host.removeEventListener("mousedown", onSelDown, true);
       window.removeEventListener("mouseup", onSelUp, true);
+      host.removeEventListener("compositionstart", onImeStart, true);
+      host.removeEventListener("compositionend", onImeEnd, true);
+      window.removeEventListener("blur", onImeReset);
     });
     const resizeSub = term.onResize(() => hl.refresh());
     const bufSub = term.buffer.onBufferChange(() => hl.refresh());
+    // 光标一挪就要复查：灰字是画在「当时的光标」之后的，
+    // 按 ← / Home 回到行中间之后，它还赖在原处就变成了插在句子里的半截命令，
+    // 而下一次擦除又会从新光标一路抹到行尾 —— 把后面真敲的字抹掉。
+    // 只在灰字真的画着时才查 buffer，挪动光标本身是很热的路径。
+    const cursorSub = term.onCursorMove(() => {
+      if (!ghostRef.current.active) return;
+      if (term.buffer.active.type !== "normal" || !cursorAtLineEnd(term)) {
+        dismissHints();
+      }
+    });
     cleanups.push(
       () => parsedSub.dispose(),
       () => resizeSub.dispose(),
       () => bufSub.dispose(),
+      () => cursorSub.dispose(),
       () => hl.dispose()
     );
 
@@ -504,11 +559,12 @@ export default function TerminalView({
       const items = hintsRef.current;
       const typed = lineRef.current.text;
       if (!items.length || !typed) return;
-      if (term.buffer.active.type !== "normal" || !cursorFollowsTyped(term, typed)) {
-        hintsRef.current = [];
-        hintSigRef.current = "\u0000";
-        setHints(null);
-        setHintIndex(0);
+      if (
+        term.buffer.active.type !== "normal" ||
+        !cursorAtLineEnd(term) ||
+        !cursorFollowsTyped(term, typed)
+      ) {
+        dismissHints();
         return;
       }
       const item = items[Math.min(hintIndexRef.current, items.length - 1)];
@@ -595,6 +651,7 @@ export default function TerminalView({
       isLocal
         ? api.localWrite(tabId, stringToBytes(d))
         : api.sshWrite(tabId, stringToBytes(d));
+    sendRef.current = send;
 
     /**
      * 所有「用户敲进来的字节」的唯一出口。
@@ -625,27 +682,48 @@ export default function TerminalView({
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
 
-      // 只在**有候选**时才接管 Tab / Esc / ↑↓。
+      // 只在**有候选**时才接管 Tab / Enter / Esc / ↑↓。
       // 没有候选时一律放行 —— 那几个键本来属于 shell 自己的补全与历史，
       // 不能因为我们多了个提示层就把终端原本的能力挤掉。
       if (hintsRef.current && hintsRef.current.length > 0) {
-        if (e.key === "Tab") {
-          e.preventDefault();
-          acceptHint();
-          return false;
-        }
-        if (e.key === "Escape") {
-          e.preventDefault();
-          dismissHints();
-          return false;
-        }
-        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-          e.preventDefault();
-          setHintIndex((i) => {
+        // 输入法组合中的按键一律不接管：那时候按回车是「选词上屏」、
+        // 按 Esc 是「取消这组候选」，跟补全没关系，吞了就打不出中文了。
+        // 判定走 `lib/ime.ts` 的那套（229 / isComposing / 组合刚结束的窗口），
+        // 这里拿到的是原生事件，直接压成 KeyLike 即可。
+        const info: KeyLike = {
+          key: e.key,
+          shiftKey: e.shiftKey,
+          isComposing: e.isComposing,
+          keyCode: e.keyCode ?? 0,
+          timeStamp: e.timeStamp,
+        };
+
+        if (!imeRef.current.captures(info)) {
+          if (e.key === "Tab") {
+            e.preventDefault();
+            acceptHint();
+            return false;
+          }
+          if (e.key === "Enter") {
+            // "send" 才是真回车；"ime" / "ime-after-commit" 是输入法在收尾，
+            // "pass" 是 Shift+Enter 之类 —— 这几种都交回给终端自己处理。
+            if (imeRef.current.verdict(info) !== "send") return true;
+            e.preventDefault();
+            acceptHintThenRun();
+            return false;
+          }
+          if (e.key === "Escape") {
+            e.preventDefault();
+            dismissHints();
+            return false;
+          }
+          if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+            e.preventDefault();
             const n = hintsRef.current?.length ?? 1;
-            return (i + (e.key === "ArrowDown" ? 1 : -1) + n) % n;
-          });
-          return false;
+            const step = e.key === "ArrowDown" ? 1 : -1;
+            setActiveHint((hintIndexRef.current + step + n) % n);
+            return false;
+          }
         }
       }
 
@@ -1083,10 +1161,10 @@ export default function TerminalView({
           y={hintPos.y}
           viewportHeight={window.innerHeight}
           onPick={(i) => {
-            setHintIndex(i);
+            setActiveHint(i);
             acceptHintAt(i);
           }}
-          onHover={setHintIndex}
+          onHover={setActiveHint}
         />
       )}
       {active && dropHint && (
