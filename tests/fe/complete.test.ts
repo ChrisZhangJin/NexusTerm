@@ -12,28 +12,24 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { calls } from "./api-stub";
 
 import {
   buildCompletions,
   dropCompletion,
   feedKeys,
-  firstToken,
-  lastToken,
-  matchOptions,
   newLineState,
-  optionsFor,
-  peekOptions,
   predictHistory,
-  programName,
   recordCommand,
-  worthAsking,
 } from "../../src/lib/complete";
 import { matchSessions, scanMention } from "../../src/lib/mention";
 import { shouldResyncKeyDownSeen } from "../../src/lib/macInput";
 import { COMMIT_WINDOW_MS, ImeGuard, enterVerdict, isImeKey, keyInfoFrom, type KeyLike } from "../../src/lib/ime";
 import { GhostText, cursorFollowsTyped } from "../../src/lib/ghost";
-import type { CmdOption } from "../../src/types";
+
+// 注：命令参数（flag）补全那一档 —— `optionsFor` / `matchOptions` / `worthAsking`
+// 与它的后端 `cmd_options` —— 已经整档下线（src/types.ts 的 `CmdOption`、
+// src/api.ts 的 `consoleCommandOptions` 一并删掉了）。当前只剩历史前缀补全，
+// 下面的用例也就只覆盖这一层。
 
 const T = "tab-1";
 
@@ -124,46 +120,8 @@ test("dropCompletion 放掉历史与缓存", () => {
   const id = "h5";
   recordCommand(id, "uname -a");
   assert.equal(predictHistory(id, "una"), "uname -a");
-  dropCompletion(id);
+  dropCompletion(id, false);
   assert.equal(predictHistory(id, "una"), null);
-});
-
-// ——— token 拆分 ———
-
-test("firstToken / lastToken / programName", () => {
-  assert.equal(firstToken("  tail -f x.log"), "tail");
-  assert.equal(lastToken("tail -f x.lo"), "x.lo");
-  assert.equal(lastToken("tail "), "");
-  assert.equal(programName("/usr/bin/tail"), "tail");
-  assert.equal(programName("tail"), "tail");
-});
-
-// ——— 参数表 ———
-
-const OPTS: CmdOption[] = [
-  { flags: ["-f", "--follow"], summary: "跟踪新增内容", takesValue: false },
-  { flags: ["-n", "--lines"], summary: "输出末尾 N 行", takesValue: true },
-  { flags: ["--verbose"], summary: "显示详细过程", takesValue: false },
-];
-
-test("matchOptions 把命中的那个 flag 提到最前，短候选在前", () => {
-  // "--" 命中 --lines(7) / --follow(9) / --verbose(9)，按长度升序
-  const m = matchOptions(OPTS, "--");
-  assert.deepEqual(m.map((o) => o.flags[0]), ["--lines", "--follow", "--verbose"]);
-
-  // "-" 命中 -f / -n / --verbose → 短的在前
-  const m2 = matchOptions(OPTS, "-");
-  assert.deepEqual(m2.map((o) => o.flags[0]), ["-f", "-n", "--verbose"]);
-  // 命中项被提到 flags 首位，方便调用方直接取 flags[0]；其余别名保留在后面
-  assert.deepEqual(m2[0].flags, ["-f", "--follow"]);
-});
-
-test("matchOptions 不返回与已输入完全相同的那一个", () => {
-  assert.deepEqual(matchOptions(OPTS, "-f").map((o) => o.flags[0]), []);
-});
-
-test("matchOptions 没输入时不给候选", () => {
-  assert.deepEqual(matchOptions(OPTS, ""), []);
 });
 
 // ——— 合成候选 ———
@@ -172,91 +130,16 @@ test("命令名阶段：只出历史，insert 只补缺的那一段", () => {
   const id = "c1";
   recordCommand(id, "git status --short");
   recordCommand(id, "git stash list");
-  const items = buildCompletions(id, "git st", []);
+  const items = buildCompletions(id, "git st");
   assert.ok(items.length >= 2, "两条历史都该出现");
-  assert.ok(items.every((i) => i.kind === "history"));
   const st = items.find((i) => i.label === "git status --short");
   assert.ok(st);
   assert.equal(st.insert, "atus --short"); // 不能把已输入的 "git st" 再写一遍
 });
 
-test("参数阶段：参数排在前，并且补完后留一个空格", () => {
-  const id = "c2";
-  // 历史里放一条以 "tail --f" 开头的，才能同时验「参数排在历史之前」
-  recordCommand(id, "tail --follow /var/log/syslog");
-  const items = buildCompletions(id, "tail --f", OPTS);
-  assert.ok(items.length > 0);
-  assert.equal(items[0].kind, "flag");
-  assert.equal(items[0].label, "--follow");
-  assert.equal(items[0].insert, "ollow "); // "--f" 已输入 → 只补 "ollow "
-  // 历史那条也在，但排在参数之后
-  const h = items.find((i) => i.kind === "history");
-  assert.ok(h);
-  assert.ok(items.indexOf(items[0]) < items.indexOf(h));
-});
-
-test("参数阶段：insert 绝不含已输入的 token", () => {
-  for (const typed of ["tail -", "tail --", "tail --f", "tail --fo"]) {
-    const items = buildCompletions("c3", typed, OPTS);
-    const token = typed.slice(typed.lastIndexOf(" ") + 1);
-    for (const it of items) {
-      if (it.kind !== "flag") continue;
-      assert.ok(it.insert.length > 0);
-      // 关键不变式：token + insert 必须正好等于完整 flag 加一个尾随空格，
-      // 既不能少补（补不完整），也不能多补（把已输入的又写一遍 → 屏幕上出现重复字符）
-      assert.equal(token + it.insert, it.label + " ");
-      // insert 不能比 flag 本身还长（那说明没扣掉已输入的部分）
-      assert.ok(it.insert.length <= it.label.length + 1, `${typed} → ${it.label}`);
-    }
-  }
-});
-
-test("flag 已打完就不再把它列出来（不重复提示）", () => {
-  const items = buildCompletions("c3b", "tail -n", OPTS);
-  assert.deepEqual(items.filter((i) => i.kind === "flag"), []);
-});
-
 test("空行不给任何候选", () => {
-  assert.deepEqual(buildCompletions("c4", "", OPTS), []);
-  assert.deepEqual(buildCompletions("c4", "   ", OPTS), []);
-});
-
-// ——— worthAsking / optionsFor ———
-
-test("shell 内建命令不去问 --help", () => {
-  assert.equal(worthAsking("cd"), false);
-  assert.equal(worthAsking("echo"), false);
-  assert.equal(worthAsking("/usr/bin/tail"), true);
-  assert.equal(worthAsking(""), false);
-  assert.equal(worthAsking("a b"), false);
-});
-
-test("optionsFor 对同一个程序只发一次请求（缓存 + 去重）", async () => {
-  const id = "o1";
-  const before = calls.length;
-  const p1 = optionsFor(id, "tail");
-  const p2 = optionsFor(id, "tail"); // 与 p1 同一时刻
-  const [a, b] = await Promise.all([p1, p2]);
-  assert.equal(a.length, 3);
-  assert.equal(b.length, 3);
-  assert.equal(calls.length - before, 1, "并发的第二次必须命中 inflight");
-
-  // 第三次走缓存，不再发请求
-  const c = await optionsFor(id, "tail");
-  assert.equal(c.length, 3);
-  assert.equal(calls.length - before, 1, "缓存命中后不该再发");
-  assert.ok(peekOptions(id, "tail"));
-});
-
-test("optionsFor 对内建命令直接返回空，不发请求", async () => {
-  const before = calls.length;
-  assert.deepEqual(await optionsFor("o2", "cd"), []);
-  assert.equal(calls.length, before);
-});
-
-test("程序不存在时退化成空数组而不是抛错", async () => {
-  // api-stub 对未知程序返回 []；真实后端失败时 complete.ts 会 catch 成 []
-  assert.deepEqual(await optionsFor("o3", "definitely-not-a-binary"), []);
+  assert.deepEqual(buildCompletions("c4", ""), []);
+  assert.deepEqual(buildCompletions("c4", "   "), []);
 });
 
 // ——— `@会话名` 联想 ———
@@ -435,41 +318,14 @@ test("灰字：clear 之后状态归零", () => {
 
 // ——— 端到端：敲一行命令的完整链路 ———
 
-test("端到端：敲 'tail -' 到按 Tab，补全的那段正好接上", async () => {
-  const id = "e2e";
-  dropCompletion(id);
-  const s = newLineState();
-
-  // 先让历史里有一条，好区分「参数」与「历史」两类候选
-  feedKeys(s, "tail -f /var/log/syslog");
-  recordCommand(id, feedKeys(s, "\r") ?? "");
-
-  // 再敲半句
-  for (const ch of "tail --f") feedKeys(s, ch);
-  assert.equal(s.text, "tail --f");
-
-  const opts = await optionsFor(id, "tail");
-  const items = buildCompletions(id, s.text, opts);
-  assert.ok(items.length > 0);
-  const flag = items.find((i) => i.kind === "flag");
-  assert.ok(flag);
-  assert.equal(flag.label, "--follow");
-  assert.equal(flag.insert, "ollow ");
-
-  // 接受：只把缺的那段写进 pty，行状态同步前进
-  s.text += flag.insert;
-  assert.equal(s.text, "tail --follow ");
-  assert.ok(s.text.startsWith("tail --f"), "已输入部分不能被改写");
-});
-
 test("端到端：acceptHint 之后行状态与终端内容一致", () => {
   const id = "e2e2";
-  dropCompletion(id);
+  dropCompletion(id, false);
   const s = newLineState();
   recordCommand(id, "kubectl get pods -A");
 
   for (const ch of "kubectl g") feedKeys(s, ch);
-  const items = buildCompletions(id, s.text, []);
+  const items = buildCompletions(id, s.text);
   assert.equal(items.length, 1);
   s.text += items[0].insert;
   assert.equal(s.text, "kubectl get pods -A");
@@ -479,13 +335,13 @@ test("端到端：acceptHint 之后行状态与终端内容一致", () => {
   assert.equal(committed, "kubectl get pods -A");
   recordCommand(id, committed);
   // 去重生效：历史里仍然只有一条，再敲前缀也只提示这一条
-  const again = buildCompletions(id, "kubectl", []);
+  const again = buildCompletions(id, "kubectl");
   assert.equal(again.length, 1);
   assert.equal(again[0].label, "kubectl get pods -A");
   assert.equal(again[0].insert, " get pods -A");
 
   // 整条打完 → 不再提示自己
-  assert.deepEqual(buildCompletions(id, "kubectl get pods -A", []), []);
+  assert.deepEqual(buildCompletions(id, "kubectl get pods -A"), []);
 });
 
 // ——— macOS 丢字修复：beforeinput 复位判定 ———
