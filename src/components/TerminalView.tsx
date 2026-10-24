@@ -40,7 +40,7 @@ import {
 } from "../api";
 import { themeToXterm } from "../lib/theme";
 import { isMacOS } from "../lib/platform";
-import { installMacInputGuard } from "../lib/macInput";
+import { installMacKeyboard } from "../lib/macInput";
 import { attachZmodem, type ZmodemGate } from "../lib/zmodem";
 import type { ClosedInfo, TerminalTab, Theme } from "../types";
 
@@ -215,6 +215,23 @@ export default function TerminalView({
   const [hintPos, setHintPos] = useState({ x: 0, y: 0 });
   /** 上一次推给界面的下拉位置（用来跳过「位置没变」的重复渲染） */
   const hintPosRef = useRef({ x: 0, y: 0 });
+
+  /**
+   * 现在能不能把灰字画在光标后面。
+   *
+   * 两个条件缺一不可：主屏（全屏程序里没有「命令行」这回事），以及光标确实
+   * 停在我们刚敲的那半行末尾（`cursorFollowsTyped`）。
+   *
+   * 少了第二条就会**覆盖真实字符**：灰字是直接往显示缓冲里写的，写在哪就从
+   * 哪开始盖。shell 把整行重画一遍之后（zsh 语法高亮 / autosuggest、长行折行、
+   * 后台任务打印），光标可能停在行中间、右边还有真实字符 —— 这时候画灰字，
+   * 用户已经敲出来的字母就被抹掉一个，看起来正是「丢字」。
+   */
+  const canDrawGhost = useCallback((term: Terminal) => {
+    return (
+      term.buffer.active.type === "normal" && cursorFollowsTyped(term, lineRef.current.text)
+    );
+  }, []);
   /** 上一次推给界面的候选签名（label 拼起来），用来跳过内容没变的重复渲染 */
   const hintSigRef = useRef("\u0000");
   const hintsRef = useRef<CompletionItem[]>([]);
@@ -235,7 +252,7 @@ export default function TerminalView({
     // 取 `hintsRef` 而不是 `hints`：状态里的那份可能因为「候选没变就不推送」
     // 而落后一步（`insert` 是随行内容变的），灰字必须跟真正会被 Tab 补进去的一致。
     const items = hintsRef.current;
-    if (!term || items.length === 0 || term.buffer.active.type !== "normal") return;
+    if (!term || items.length === 0 || !canDrawGhost(term)) return;
     const item = items[Math.min(hintIndex, items.length - 1)];
     if (!item) return;
     ghostRef.current.show(term, item.insert, term.cols - term.buffer.active.cursorX - 1);
@@ -255,7 +272,10 @@ export default function TerminalView({
     // vim / less / top 用的是 alternate buffer：那里没有 shell 提示符，
     // 「当前行 = 人敲的命令」这个前提根本不成立。全屏程序里一律不提示，
     // 否则灰字会直接画在编辑器内容上。
-    if (term.buffer.active.type !== "normal") {
+    //
+    // 光标已经不在刚敲的那半行末尾（shell 重画过整行、或输出插进来了）时
+    // 同样不能画：那会把光标右边的真实字符盖掉 —— 见 `canDrawGhost`。
+    if (!canDrawGhost(term)) {
       ghostRef.current.clear(term);
       hintsRef.current = [];
       // 签名也要作废，否则下次算出同一批候选时会因为「签名没变」而不推状态
@@ -299,7 +319,7 @@ export default function TerminalView({
       hintPosRef.current = { x, y };
       setHintPos({ x, y });
     }
-  }, []);
+  }, [canDrawGhost]);
 
   /** 收起提示：擦掉灰字、清空候选。 */
   const dismissHints = useCallback(() => {
@@ -428,9 +448,6 @@ export default function TerminalView({
     term.open(host);
     // 必须在 open() 之后：SelectionService 是 open() 里才创建的
     patchShiftSelection(term);
-    // macOS(WKWebView) 上 beforeinput 早于 keydown，xterm 会把真实输入误判为重复
-    // 而丢掉；这里只在 mac 上把那个去重标志复位（详见 lib/macInput）。
-    const unMacInput = installMacInputGuard(term, isMacOS());
     termRef.current = term;
     fitRef.current = fit;
     const hl = new Highlighter(term);
@@ -579,7 +596,14 @@ export default function TerminalView({
         ? api.localWrite(tabId, stringToBytes(d))
         : api.sshWrite(tabId, stringToBytes(d));
 
-    const dataSub = term.onData((d) => {
+    /**
+     * 所有「用户敲进来的字节」的唯一出口。
+     *
+     * 两个调用方：`term.onData`（回车、Ctrl 组合、方向键、输入法上屏、粘贴）
+     * 和 `lib/macInput` 的接管层（mac 上的普通字符 —— xterm 自己那条路会丢字）。
+     * 两者共用这一份逻辑，宏录制与补全行状态才不会漏掉其中一半。
+     */
+    const handleInput = (d: string) => {
       if (zmodem.isActive()) return;
       // 旁路监听（宏录制、宏回放时「用户插了一脚就中止」）。发不发送由这里决定，监听方只读
       emitInput(tabId, d);
@@ -588,7 +612,13 @@ export default function TerminalView({
       const committed = feedKeys(lineRef.current, d);
       if (committed) recordCommand(historyKeyRef.current, committed, historyPersistRef.current);
       refreshHintsSoon();
-    });
+    };
+
+    const dataSub = term.onData(handleInput);
+
+    // macOS(WKWebView) 上普通字符改由我们自己在捕获阶段发 —— 详见 lib/macInput。
+    // 必须挂在 host 上：xterm 的监听在 textarea 上，捕获阶段我们先到。
+    cleanups.push(installMacKeyboard(host, term, handleInput, isMacOS()));
 
     // 快捷键全部来自「设置 → 快捷键」（lib/prefs），改了立即生效。
     // 默认 Windows / Linux 用 Ctrl+Shift+C/V/F：Ctrl+C 必须留给中断信号（^C）。
@@ -676,7 +706,6 @@ export default function TerminalView({
       ro.disconnect();
       dataSub.dispose();
       binSub.dispose();
-      unMacInput();
       cleanups.forEach((f) => f());
       term.dispose();
       termRef.current = null;

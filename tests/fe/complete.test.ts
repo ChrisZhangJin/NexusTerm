@@ -18,22 +18,20 @@ import {
   buildCompletions,
   dropCompletion,
   feedKeys,
-  firstToken,
-  lastToken,
-  matchOptions,
+  historyMatches,
   newLineState,
-  optionsFor,
-  peekOptions,
   predictHistory,
-  programName,
   recordCommand,
-  worthAsking,
 } from "../../src/lib/complete";
 import { matchSessions, scanMention } from "../../src/lib/mention";
-import { shouldResyncKeyDownSeen } from "../../src/lib/macInput";
+import {
+  KeyLedger,
+  installMacKeyboard,
+  isPlainChar,
+  isPlainKeystroke,
+} from "../../src/lib/macInput";
 import { COMMIT_WINDOW_MS, ImeGuard, enterVerdict, isImeKey, keyInfoFrom, type KeyLike } from "../../src/lib/ime";
 import { GhostText, cursorFollowsTyped } from "../../src/lib/ghost";
-import type { CmdOption } from "../../src/types";
 
 const T = "tab-1";
 
@@ -90,9 +88,9 @@ test("feedKeys 不清掉 Tab 之后的状态（Tab 走的是另一条路）", ()
 
 test("历史：最近用过的优先，重复输入只算一次", () => {
   const id = "h1";
-  recordCommand(id, "tail -f app.log");
-  recordCommand(id, "tail -n 100 app.log");
-  recordCommand(id, "tail -f app.log"); // 再次使用 → 应排到最前
+  recordCommand(id, "tail -f app.log", false);
+  recordCommand(id, "tail -n 100 app.log", false);
+  recordCommand(id, "tail -f app.log", false); // 再次使用 → 应排到最前
 
   assert.equal(predictHistory(id, "tail -f"), "tail -f app.log");
 
@@ -102,161 +100,77 @@ test("历史：最近用过的优先，重复输入只算一次", () => {
 
 test("历史预测有两个字符的门槛：敲一个字母不该弹一堆噪声", () => {
   const id = "h2";
-  recordCommand(id, "docker ps -a");
+  recordCommand(id, "docker ps -a", false);
   assert.equal(predictHistory(id, "d"), null);
   assert.equal(predictHistory(id, "do"), "docker ps -a");
 });
 
 test("已经打完的整条不再预测（不打扰）", () => {
   const id = "h3";
-  recordCommand(id, "ls -la");
+  recordCommand(id, "ls -la", false);
   assert.equal(predictHistory(id, "ls -la"), null);
 });
 
 test("含控制字符的残句不进历史", () => {
   const id = "h4";
-  recordCommand(id, "ls\x1b[Axyz");
-  recordCommand(id, "  ");
+  recordCommand(id, "ls\x1b[Axyz", false);
+  recordCommand(id, "  ", false);
   assert.equal(predictHistory(id, "ls"), null);
 });
 
 test("dropCompletion 放掉历史与缓存", () => {
   const id = "h5";
-  recordCommand(id, "uname -a");
+  recordCommand(id, "uname -a", false);
   assert.equal(predictHistory(id, "una"), "uname -a");
   dropCompletion(id);
   assert.equal(predictHistory(id, "una"), null);
 });
 
-// ——— token 拆分 ———
-
-test("firstToken / lastToken / programName", () => {
-  assert.equal(firstToken("  tail -f x.log"), "tail");
-  assert.equal(lastToken("tail -f x.lo"), "x.lo");
-  assert.equal(lastToken("tail "), "");
-  assert.equal(programName("/usr/bin/tail"), "tail");
-  assert.equal(programName("tail"), "tail");
-});
-
-// ——— 参数表 ———
-
-const OPTS: CmdOption[] = [
-  { flags: ["-f", "--follow"], summary: "跟踪新增内容", takesValue: false },
-  { flags: ["-n", "--lines"], summary: "输出末尾 N 行", takesValue: true },
-  { flags: ["--verbose"], summary: "显示详细过程", takesValue: false },
-];
-
-test("matchOptions 把命中的那个 flag 提到最前，短候选在前", () => {
-  // "--" 命中 --lines(7) / --follow(9) / --verbose(9)，按长度升序
-  const m = matchOptions(OPTS, "--");
-  assert.deepEqual(m.map((o) => o.flags[0]), ["--lines", "--follow", "--verbose"]);
-
-  // "-" 命中 -f / -n / --verbose → 短的在前
-  const m2 = matchOptions(OPTS, "-");
-  assert.deepEqual(m2.map((o) => o.flags[0]), ["-f", "-n", "--verbose"]);
-  // 命中项被提到 flags 首位，方便调用方直接取 flags[0]；其余别名保留在后面
-  assert.deepEqual(m2[0].flags, ["-f", "--follow"]);
-});
-
-test("matchOptions 不返回与已输入完全相同的那一个", () => {
-  assert.deepEqual(matchOptions(OPTS, "-f").map((o) => o.flags[0]), []);
-});
-
-test("matchOptions 没输入时不给候选", () => {
-  assert.deepEqual(matchOptions(OPTS, ""), []);
-});
-
-// ——— 合成候选 ———
+// ——— 合成候选（新实现只做历史预测） ———
+//
+// 7fbb27a 之后补全不再去问 `--help` 捞 options，改成整行历史前缀匹配。
+// 这里钉住两条不变式：insert 只补缺的那一段；候选按「最近用过的在前」。
 
 test("命令名阶段：只出历史，insert 只补缺的那一段", () => {
   const id = "c1";
-  recordCommand(id, "git status --short");
-  recordCommand(id, "git stash list");
-  const items = buildCompletions(id, "git st", []);
+  recordCommand(id, "git status --short", false);
+  recordCommand(id, "git stash list", false);
+  const items = buildCompletions(id, "git st");
   assert.ok(items.length >= 2, "两条历史都该出现");
-  assert.ok(items.every((i) => i.kind === "history"));
   const st = items.find((i) => i.label === "git status --short");
   assert.ok(st);
   assert.equal(st.insert, "atus --short"); // 不能把已输入的 "git st" 再写一遍
 });
 
-test("参数阶段：参数排在前，并且补完后留一个空格", () => {
+test("insert 绝不含已输入的前缀：token + insert 必须正好补齐整条", () => {
   const id = "c2";
-  // 历史里放一条以 "tail --f" 开头的，才能同时验「参数排在历史之前」
-  recordCommand(id, "tail --follow /var/log/syslog");
-  const items = buildCompletions(id, "tail --f", OPTS);
-  assert.ok(items.length > 0);
-  assert.equal(items[0].kind, "flag");
-  assert.equal(items[0].label, "--follow");
-  assert.equal(items[0].insert, "ollow "); // "--f" 已输入 → 只补 "ollow "
-  // 历史那条也在，但排在参数之后
-  const h = items.find((i) => i.kind === "history");
-  assert.ok(h);
-  assert.ok(items.indexOf(items[0]) < items.indexOf(h));
-});
-
-test("参数阶段：insert 绝不含已输入的 token", () => {
-  for (const typed of ["tail -", "tail --", "tail --f", "tail --fo"]) {
-    const items = buildCompletions("c3", typed, OPTS);
-    const token = typed.slice(typed.lastIndexOf(" ") + 1);
-    for (const it of items) {
-      if (it.kind !== "flag") continue;
-      assert.ok(it.insert.length > 0);
-      // 关键不变式：token + insert 必须正好等于完整 flag 加一个尾随空格，
-      // 既不能少补（补不完整），也不能多补（把已输入的又写一遍 → 屏幕上出现重复字符）
-      assert.equal(token + it.insert, it.label + " ");
-      // insert 不能比 flag 本身还长（那说明没扣掉已输入的部分）
-      assert.ok(it.insert.length <= it.label.length + 1, `${typed} → ${it.label}`);
+  recordCommand(id, "tail --follow /var/log/syslog", false);
+  for (const typed of ["t", "ta", "tail ", "tail --f"]) {
+    for (const it of buildCompletions(id, typed)) {
+      assert.equal(typed.trimStart() + it.insert, it.label, `${typed} 补出来对不上`);
+      assert.ok(it.insert.length > 0, `${typed} 不该出现空 insert（那就是重复提示）`);
     }
   }
 });
 
-test("flag 已打完就不再把它列出来（不重复提示）", () => {
-  const items = buildCompletions("c3b", "tail -n", OPTS);
-  assert.deepEqual(items.filter((i) => i.kind === "flag"), []);
+test("已经打完的整条不再作为候选", () => {
+  const id = "c3";
+  recordCommand(id, "docker ps -a", false);
+  assert.deepEqual(buildCompletions(id, "docker ps -a"), []);
 });
 
 test("空行不给任何候选", () => {
-  assert.deepEqual(buildCompletions("c4", "", OPTS), []);
-  assert.deepEqual(buildCompletions("c4", "   ", OPTS), []);
+  assert.deepEqual(buildCompletions("c4", ""), []);
+  assert.deepEqual(buildCompletions("c4", "   "), []);
 });
 
-// ——— worthAsking / optionsFor ———
-
-test("shell 内建命令不去问 --help", () => {
-  assert.equal(worthAsking("cd"), false);
-  assert.equal(worthAsking("echo"), false);
-  assert.equal(worthAsking("/usr/bin/tail"), true);
-  assert.equal(worthAsking(""), false);
-  assert.equal(worthAsking("a b"), false);
-});
-
-test("optionsFor 对同一个程序只发一次请求（缓存 + 去重）", async () => {
-  const id = "o1";
-  const before = calls.length;
-  const p1 = optionsFor(id, "tail");
-  const p2 = optionsFor(id, "tail"); // 与 p1 同一时刻
-  const [a, b] = await Promise.all([p1, p2]);
-  assert.equal(a.length, 3);
-  assert.equal(b.length, 3);
-  assert.equal(calls.length - before, 1, "并发的第二次必须命中 inflight");
-
-  // 第三次走缓存，不再发请求
-  const c = await optionsFor(id, "tail");
-  assert.equal(c.length, 3);
-  assert.equal(calls.length - before, 1, "缓存命中后不该再发");
-  assert.ok(peekOptions(id, "tail"));
-});
-
-test("optionsFor 对内建命令直接返回空，不发请求", async () => {
-  const before = calls.length;
-  assert.deepEqual(await optionsFor("o2", "cd"), []);
-  assert.equal(calls.length, before);
-});
-
-test("程序不存在时退化成空数组而不是抛错", async () => {
-  // api-stub 对未知程序返回 []；真实后端失败时 complete.ts 会 catch 成 []
-  assert.deepEqual(await optionsFor("o3", "definitely-not-a-binary"), []);
+test("historyMatches：最近用过的排前面，且封顶 30 条", () => {
+  const id = "c5";
+  recordCommand(id, "make build", false);
+  recordCommand(id, "make test", false);
+  assert.deepEqual(historyMatches(id, "make"), ["make test", "make build"]);
+  for (let i = 0; i < 40; i++) recordCommand(id, `long-${i}`, false);
+  assert.equal(historyMatches(id, "long-").length, 30);
 });
 
 // ——— `@会话名` 联想 ———
@@ -435,41 +349,38 @@ test("灰字：clear 之后状态归零", () => {
 
 // ——— 端到端：敲一行命令的完整链路 ———
 
-test("端到端：敲 'tail -' 到按 Tab，补全的那段正好接上", async () => {
+test("端到端：敲 'tail --f' 到按 Tab，补全的那段正好接上", () => {
   const id = "e2e";
-  dropCompletion(id);
+  dropCompletion(id, false);
   const s = newLineState();
 
-  // 先让历史里有一条，好区分「参数」与「历史」两类候选
-  feedKeys(s, "tail -f /var/log/syslog");
-  recordCommand(id, feedKeys(s, "\r") ?? "");
+  // 先让历史里有一条完整命令
+  for (const ch of "tail --follow /var/log/syslog") feedKeys(s, ch);
+  recordCommand(id, feedKeys(s, "\r") ?? "", false);
 
   // 再敲半句
   for (const ch of "tail --f") feedKeys(s, ch);
   assert.equal(s.text, "tail --f");
 
-  const opts = await optionsFor(id, "tail");
-  const items = buildCompletions(id, s.text, opts);
-  assert.ok(items.length > 0);
-  const flag = items.find((i) => i.kind === "flag");
-  assert.ok(flag);
-  assert.equal(flag.label, "--follow");
-  assert.equal(flag.insert, "ollow ");
+  const items = buildCompletions(id, s.text);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].label, "tail --follow /var/log/syslog");
+  assert.equal(items[0].insert, "ollow /var/log/syslog");
 
   // 接受：只把缺的那段写进 pty，行状态同步前进
-  s.text += flag.insert;
-  assert.equal(s.text, "tail --follow ");
+  s.text += items[0].insert;
+  assert.equal(s.text, "tail --follow /var/log/syslog");
   assert.ok(s.text.startsWith("tail --f"), "已输入部分不能被改写");
 });
 
 test("端到端：acceptHint 之后行状态与终端内容一致", () => {
   const id = "e2e2";
-  dropCompletion(id);
+  dropCompletion(id, false);
   const s = newLineState();
-  recordCommand(id, "kubectl get pods -A");
+  recordCommand(id, "kubectl get pods -A", false);
 
   for (const ch of "kubectl g") feedKeys(s, ch);
-  const items = buildCompletions(id, s.text, []);
+  const items = buildCompletions(id, s.text);
   assert.equal(items.length, 1);
   s.text += items[0].insert;
   assert.equal(s.text, "kubectl get pods -A");
@@ -477,89 +388,448 @@ test("端到端：acceptHint 之后行状态与终端内容一致", () => {
   // 再回车 → 这条命令被记进历史（且不会因为补全而变成重复项）
   const committed = feedKeys(s, "\r");
   assert.equal(committed, "kubectl get pods -A");
-  recordCommand(id, committed);
+  recordCommand(id, committed, false);
   // 去重生效：历史里仍然只有一条，再敲前缀也只提示这一条
-  const again = buildCompletions(id, "kubectl", []);
+  const again = buildCompletions(id, "kubectl");
   assert.equal(again.length, 1);
   assert.equal(again[0].label, "kubectl get pods -A");
   assert.equal(again[0].insert, " get pods -A");
 
   // 整条打完 → 不再提示自己
-  assert.deepEqual(buildCompletions(id, "kubectl get pods -A", []), []);
+  assert.deepEqual(buildCompletions(id, "kubectl get pods -A"), []);
 });
 
-// ——— macOS 丢字修复：beforeinput 复位判定 ———
+// ——— macOS 丢字修复：整条键路接管 ———
 //
-// 这段判定如果放得太宽（例如不排除输入法组合），会把中文上屏搅乱；
-// 放得太窄又修不好丢字。所以四个维度各钉一条。
+// 读 xterm 5.5 源码后确认的事实（`lib/xterm.js`）：
+//   · `evaluateKeyboardEvent` 对「keyCode>=48 的单字符」直接返回
+//     `o.key = e.key`，`_keyDown` 随后 `triggerDataEvent(i.key)` 并
+//     `cancel(e, true)` —— **普通字符是在 keydown 发出的**，
+//     之后浏览器不再派发 keypress / input。
+//   · `_keyDown` 第一条语句就 `_keyDownSeen = true`，紧接着
+//     `if (!this._compositionHelper.keydown(e)) return;` —— 而后者对
+//     keyCode 229 一律返回 false。WebKit 在输入法上下文残留时会把普通
+//     字母标成 229：标志置了位、字节没发出去，随后那条 input 又被
+//     `(!composed || !_keyDownSeen)` 判成重复丢掉。
+// 所以不再去调 xterm 的私有标志，而是整条接管。
 
-test("mac 丢字：普通字符的 composed insertText 要复位", () => {
-  assert.equal(
-    shouldResyncKeyDownSeen({
-      composed: true,
-      data: "b",
-      inputType: "insertText",
-      isComposing: false,
-    }),
-    true
-  );
+/** 只记录监听器的假容器：我们关心的是「谁拦下了事件、发了什么」 */
+function fakeHost() {
+  const map = new Map<string, Array<(ev: unknown) => void>>();
+  return {
+    addEventListener(type: string, fn: (ev: unknown) => void) {
+      const list = map.get(type) ?? [];
+      list.push(fn);
+      map.set(type, list);
+    },
+    removeEventListener(type: string, fn: (ev: unknown) => void) {
+      const list = map.get(type);
+      if (list) map.set(type, list.filter((f) => f !== fn));
+    },
+    /** 派发一条事件，返回它（含 preventDefault / stopPropagation 的痕迹） */
+    fire(type: string, init: Record<string, unknown>) {
+      const ev = {
+        ...init,
+        defaultPrevented: false,
+        propagationStopped: false,
+        preventDefault() {
+          ev.defaultPrevented = true;
+        },
+        stopPropagation() {
+          ev.propagationStopped = true;
+        },
+      };
+      for (const fn of map.get(type) ?? []) fn(ev);
+      return ev;
+    },
+    listeners(type: string) {
+      return (map.get(type) ?? []).length;
+    },
+  };
+}
+
+const plainKey = (k: string, over: Record<string, unknown> = {}) => ({
+  key: k,
+  keyCode: k.length === 1 ? k.toUpperCase().charCodeAt(0) : 0,
+  ctrlKey: false,
+  altKey: false,
+  metaKey: false,
+  shiftKey: false,
+  isComposing: false,
+  ...over,
 });
 
-test("mac 丢字：输入法组合中的字符绝不能碰", () => {
-  assert.equal(
-    shouldResyncKeyDownSeen({
-      composed: true,
-      data: "中",
-      inputType: "insertText",
-      isComposing: true,
-    }),
-    false
-  );
+/** 装好接管层，返回 { host, term, out, send, un } */
+function rig() {
+  const host = fakeHost();
+  const term = { textarea: { value: "" } };
+  const out = { text: "" };
+  const send = (d: string) => {
+    out.text += d;
+  };
+  const un = installMacKeyboard(host as never, term as never, send, true);
+  return { host, term, out, send, un };
+}
+
+test("接管：keydown 直接把字符发出，并拦下默认行为与冒泡", () => {
+  const { host, out, un } = rig();
+  const ev = host.fire("keydown", plainKey("c"));
+  assert.equal(out.text, "c");
+  assert.equal(ev.defaultPrevented, true, "必须 preventDefault，否则 keypress/input 会再来一遍");
+  assert.equal(ev.propagationStopped, true, "必须拦住 xterm 的 _keyDown");
+  un();
 });
 
-test("mac 丢字：粘贴（insertFromPaste）不归它管", () => {
-  assert.equal(
-    shouldResyncKeyDownSeen({
-      composed: true,
-      data: "ls -la",
-      inputType: "insertFromPaste",
-      isComposing: false,
-    }),
-    false
-  );
+test("接管：连打 config 一字不丢、不重复", () => {
+  const { host, out, un } = rig();
+  for (const ch of "config") host.fire("keydown", plainKey(ch));
+  assert.equal(out.text, "config");
+  un();
 });
 
-test("mac 丢字：非 composed 事件不碰（那是正常 keydown 路径）", () => {
-  assert.equal(
-    shouldResyncKeyDownSeen({
-      composed: false,
-      data: "a",
-      inputType: "insertText",
-      isComposing: false,
-    }),
-    false
-  );
+test("接管：keyCode 229 的普通字母（丢字现场）照样能发出去", () => {
+  // 这就是用户看到 cnfig 的那条路：_keyDownSeen 被置位、_keyDown 提前返回，
+  // 字符只能靠 input 来救，而 input 又被判成重复丢掉。
+  const { host, out, un } = rig();
+  host.fire("keydown", plainKey("o", { keyCode: 229 }));
+  assert.equal(out.text, "o", "229 不是「不归我管」的理由，是「必须归我管」的证据");
+  un();
 });
 
-test("mac 丢字：空 data（删除等）不碰", () => {
-  assert.equal(
-    shouldResyncKeyDownSeen({
-      composed: true,
-      data: null,
-      inputType: "insertText",
-      isComposing: false,
-    }),
-    false
-  );
-  assert.equal(
-    shouldResyncKeyDownSeen({
-      composed: true,
-      data: "",
-      inputType: "insertText",
-      isComposing: false,
-    }),
-    false
-  );
+test("接管：WebKit 无视 preventDefault 又派发了 input，不重复发送", () => {
+  const { host, out, un } = rig();
+  host.fire("keydown", plainKey("c"));
+  host.fire("input", { data: "c", inputType: "insertText", isComposing: false });
+  assert.equal(out.text, "c");
+  un();
+});
+
+test("接管：input 带着 isComposing=true（上下文残留）也不重复发送", () => {
+  const { host, out, un } = rig();
+  host.fire("keydown", plainKey("c"));
+  // 残留状态下 WebKit 会给 input 标上 isComposing=true；信它就等于放弃这颗字符
+  host.fire("input", { data: "c", inputType: "insertText", isComposing: true });
+  assert.equal(out.text, "c");
+  un();
+});
+
+test("接管：input 抢在 keydown 之前（WebKit bug 165004）仍只发一次", () => {
+  const { host, out, un } = rig();
+  host.fire("input", { data: "o", inputType: "insertText", isComposing: false });
+  host.fire("keydown", plainKey("o"));
+  assert.equal(out.text, "o", "谁先到谁发，后到的在账本里认领");
+  un();
+});
+
+test("接管：keydown 被跳过、只有 input 到达时补发那颗字符", () => {
+  // key="Process"（真组合）时 keydown 不归我们管；但如果浏览器随后只给了一条
+  // 普通 insertText，说明它就是一颗普通字符 —— 由 input 这条兜底发出去。
+  const { host, out, un } = rig();
+  host.fire("input", { data: "g", inputType: "insertText", isComposing: false });
+  assert.equal(out.text, "g");
+  un();
+});
+
+test("接管：组合态里一律不插手", () => {
+  const { host, out, un } = rig();
+  host.fire("compositionstart", {});
+  host.fire("keydown", plainKey("n"));
+  host.fire("input", { data: "n", inputType: "insertText", isComposing: true });
+  assert.equal(out.text, "", "拼音的字母不能被当成命令输入");
+  host.fire("compositionend", {});
+  host.fire("keydown", plainKey("n"));
+  assert.equal(out.text, "n", "组合结束后恢复正常接管");
+  un();
+});
+
+test("接管：修饰键与不可打印键交给 xterm", () => {
+  const { host, out, un } = rig();
+  const cases = [
+    plainKey("c", { ctrlKey: true }),
+    plainKey("c", { altKey: true }),
+    plainKey("c", { metaKey: true }),
+    plainKey("Enter"),
+    plainKey("Tab"),
+    plainKey("中"),
+  ];
+  for (const c of cases) {
+    const ev = host.fire("keydown", c);
+    assert.equal(ev.defaultPrevented, false, `${JSON.stringify(c)} 不该被接管`);
+  }
+  assert.equal(out.text, "");
+  un();
+});
+
+// ——— 第二轮：多出来的空格 ———
+
+test("接管：keydown 后跟着一对 composition 事件，空格不能发两遍", () => {
+  // WebKit 在输入法上下文还热着时会给普通按键补 compositionstart/end（空格
+  // 本来就是输入法上屏键）。上一版在 compositionstart 里清账本，于是：
+  // 空格发过一次 → 账本被清 → 随后那条 input 认领失败 → 再发一次。
+  const { host, out, un } = rig();
+  host.fire("keydown", plainKey(" "));
+  host.fire("compositionstart", {});
+  host.fire("compositionend", {});
+  host.fire("input", { data: " ", inputType: "insertText", isComposing: true });
+  assert.equal(out.text, " ", "只能有一个空格");
+  un();
+});
+
+test("接管：多字符 input（双空格被系统换成「. 」）不逐字重放", () => {
+  // macOS「连按两下空格插入句号」把 "  " 替换成 ". " 再派发一条两字符 input。
+  // 那两个空格各自的 keydown 已经发过了，再补一个 "." 就变成三个字符。
+  const { host, out, un } = rig();
+  host.fire("keydown", plainKey(" "));
+  host.fire("keydown", plainKey(" "));
+  host.fire("input", { data: ". ", inputType: "insertText", isComposing: false });
+  assert.equal(out.text, "  ", "多字符 data 不是「一颗键」，整条忽略");
+  un();
+});
+
+test("接管：合并成一条的多字符 input 也不会重复发送", () => {
+  const { host, out, un } = rig();
+  for (const ch of "git") host.fire("keydown", plainKey(ch));
+  host.fire("input", { data: "git", inputType: "insertText", isComposing: false });
+  assert.equal(out.text, "git", "每个字符的 keydown 都发过了，合并的 input 只是回声");
+  un();
+});
+
+test("接管：接管的键要清掉隐藏 textarea 里的残留", () => {
+  // xterm 只在 `_keyDown` 里清 textarea，而我们把 keydown 整条拦住了 ——
+  // 不清就会一直攒，等下次走组合路径时被 `_handleAnyTextareaChanges`
+  // 当 diff 整段发出去（多字符的来源之一）。
+  const { host, term, out, un } = rig();
+  (term.textarea as { value: string }).value = "  ";
+  host.fire("keydown", plainKey("x"));
+  assert.equal(out.text, "x");
+  assert.equal((term.textarea as { value: string }).value, "", "残留必须清干净");
+  un();
+});
+
+test("接管：input 兜底发完也要清 textarea", () => {
+  const { host, term, out, un } = rig();
+  (term.textarea as { value: string }).value = "g";
+  host.fire("input", { data: "g", inputType: "insertText", isComposing: false });
+  assert.equal(out.text, "g");
+  assert.equal((term.textarea as { value: string }).value, "");
+  un();
+});
+
+test("接管：中文上屏不动 textarea（xterm 要读它算上屏范围）", () => {
+  // `_finalizeComposition` 会回头 `textarea.value.substring(start, end)`，
+  // 提前清掉就是把刚上屏的中文抹了。
+  const { host, term, out, un } = rig();
+  (term.textarea as { value: string }).value = "你好";
+  host.fire("input", { data: "你好", inputType: "insertText", isComposing: false });
+  assert.equal(out.text, "");
+  assert.equal((term.textarea as { value: string }).value, "你好", "组合路径一个字都不能动");
+  un();
+});
+
+test("接管：isComposing 谎报（非组合态）时交给 xterm，绝不自己发", () => {
+  // 我们没收到 compositionstart 就说明组合没真的开着。这种键交给 xterm 会因
+  // 229 丢掉，但 onInput 那条兜底刻意不看 isComposing，会补发。
+  // 这里同样**不能清 textarea**：万一判断错了，清它就是把刚上屏的字抹掉。
+  const { host, term, out, un } = rig();
+  (term.textarea as { value: string }).value = "pin";
+  const ev = host.fire("keydown", plainKey("n", { isComposing: true }));
+  assert.equal(ev.defaultPrevented, false);
+  assert.equal(ev.propagationStopped, false, "交给 xterm 的组合路径");
+  assert.equal(out.text, "");
+  assert.equal((term.textarea as { value: string }).value, "pin", "textarea 一个字都不能动");
+  un();
+});
+
+// ——— 第五轮：拼音上屏后多一个空格 ———
+
+test("接管：拼音组合中按空格确认，不能让它漏进 pty", () => {
+  // WKWebView 给空格的 keyCode 是 32 而不是 229，xterm 的 CompositionHelper
+  // 只对 229 提前返回 —— 于是它先把组合文本 finalize 一遍，再把空格当普通
+  // 输入发出去。用户看到的就是「pin + 空格 → 拼 」。
+  const { host, out, un } = rig();
+  host.fire("compositionstart", {});
+  for (const ch of "pin") host.fire("keydown", plainKey(ch, { keyCode: 229 }));
+  const ev = host.fire("keydown", plainKey(" ", { keyCode: 229 }));
+  assert.equal(ev.propagationStopped, true, "必须拦住 xterm 的 _keyDown");
+  assert.equal(ev.defaultPrevented, false, "不能 preventDefault，否则 IME 上不了屏");
+  assert.equal(out.text, "", "确认键一个字节都不发");
+  un();
+});
+
+test("接管：组合态回车确认同样不漏进 pty", () => {
+  const { host, out, un } = rig();
+  host.fire("compositionstart", {});
+  const ev = host.fire("keydown", plainKey("Enter", { keyCode: 229 }));
+  assert.equal(ev.propagationStopped, true);
+  assert.equal(ev.defaultPrevented, false);
+  assert.equal(out.text, "");
+  un();
+});
+
+test("接管：组合态的字母仍然交给 xterm（不能抢拼音）", () => {
+  const { host, out, un } = rig();
+  host.fire("compositionstart", {});
+  const ev = host.fire("keydown", plainKey("p", { keyCode: 229 }));
+  assert.equal(ev.propagationStopped, false);
+  assert.equal(ev.defaultPrevented, false);
+  assert.equal(out.text, "", "拼音字母绝不能进 shell");
+  un();
+});
+
+test("接管：isComposing 谎报时的空格也拦掉", () => {
+  const { host, out, un } = rig();
+  const ev = host.fire("keydown", plainKey(" ", { isComposing: true }));
+  assert.equal(ev.propagationStopped, true);
+  assert.equal(out.text, "");
+  un();
+});
+
+test("接管：compositionend 先于 keydown 到达时，空格仍按确认键拦掉", () => {
+  // WebKit 的另一种顺序：先把候选提交、派发 compositionend，再派发 keydown。
+  // 这时 composing 已经翻回 false，只能靠时间戳认出「同一次按键的两半」。
+  const { host, out, un } = rig();
+  host.fire("compositionstart", {});
+  host.fire("compositionend", { timeStamp: 5000 });
+  const ev = host.fire("keydown", plainKey(" ", { timeStamp: 5006 }));
+  assert.equal(ev.propagationStopped, true);
+  assert.equal(ev.defaultPrevented, true, "上屏已完成，可以直接拦掉插入，不留残留");
+  assert.equal(out.text, "", "确认键哪怕晚一步到也不能漏");
+  un();
+});
+
+test("接管：上屏之后再敲的空格是真输入，不能被当成确认键吞掉", () => {
+  const { host, out, un } = rig();
+  host.fire("compositionstart", {});
+  host.fire("compositionend", { timeStamp: 5000 });
+  // 人手极限约 80ms/键，150ms 之后那颗空格就是想打空格
+  host.fire("keydown", plainKey(" ", { timeStamp: 5150 }));
+  assert.equal(out.text, " ", "否则「拼 」这种正常输入会变成「拼」");
+  un();
+});
+
+test("接管：组合结束后空格恢复正常发送", () => {
+  const { host, out, un } = rig();
+  host.fire("compositionstart", {});
+  host.fire("compositionend", {});
+  host.fire("keydown", plainKey(" "));
+  assert.equal(out.text, " ", "上屏之后用户再敲的空格必须发出去");
+  un();
+});
+
+test("接管：空格确认后 compositionend 剥掉 textarea 尾部空格", () => {
+  // 那颗空格拦不掉「写进 textarea」（按键先被 IME 消费，preventDefault 无效），
+  // 而 xterm 的 `_finalizeComposition(true)` 是 `substring(start)` 取到末尾 ——
+  // 不剥就会跟着「拼」一起发进 pty。
+  const { host, term, out, un } = rig();
+  host.fire("compositionstart", {});
+  host.fire("keydown", plainKey(" ", { keyCode: 229 }));
+  (term.textarea as { value: string }).value = "拼 ";
+  host.fire("compositionend", {});
+  assert.equal((term.textarea as { value: string }).value, "拼");
+  assert.equal(out.text, "");
+  un();
+});
+
+test("接管：没按确认键时绝不改 textarea（避免误伤正常上屏）", () => {
+  const { host, term, un } = rig();
+  host.fire("compositionstart", {});
+  (term.textarea as { value: string }).value = "a ";
+  host.fire("compositionend", {});
+  assert.equal((term.textarea as { value: string }).value, "a ");
+  un();
+});
+
+test("接管：粘贴与组合上屏的 input 不碰", () => {
+  const { host, out, un } = rig();
+  host.fire("input", { data: "ls -la", inputType: "insertFromPaste", isComposing: false });
+  host.fire("input", { data: "中文", inputType: "insertText", isComposing: false });
+  assert.equal(out.text, "", "非 ASCII / 非 insertText 一律留给 xterm");
+  un();
+});
+
+test("接管：卸载后监听器全部撤掉", () => {
+  const { host, un } = rig();
+  assert.equal(host.listeners("keydown"), 1);
+  un();
+  assert.equal(host.listeners("keydown"), 0);
+  assert.equal(host.listeners("input"), 0);
+  assert.equal(host.listeners("compositionstart"), 0);
+  assert.equal(host.listeners("compositionend"), 0);
+});
+
+test("接管：非 macOS 空转（Windows / Linux 不走自绘发送路径）", () => {
+  const host = fakeHost();
+  const out = { text: "" };
+  const un = installMacKeyboard(host as never, {} as never, (d) => (out.text += d), false);
+  host.fire("keydown", plainKey("c"));
+  assert.equal(out.text, "");
+  un();
+});
+
+// ——— 账本：两条路共用一个出口时怎么去重 ———
+
+test("账本：keydown 发过的字符，input 回声认领掉", () => {
+  const l = new KeyLedger();
+  assert.equal(l.keyDown("c", 0), true);
+  assert.equal(l.input("c", 5), "", "回声不该再发一次");
+});
+
+test("账本：input 先发过，随后来的 keydown 不再发", () => {
+  const l = new KeyLedger();
+  assert.equal(l.input("c", 0), "c");
+  assert.equal(l.keyDown("c", 5), false);
+});
+
+test("账本：连续两个同样的字母各算各的", () => {
+  const l = new KeyLedger();
+  assert.equal(l.keyDown("l", 0), true);
+  assert.equal(l.keyDown("l", 3), true, "第二颗 l 不能被第一颗的账目吃掉");
+  assert.equal(l.input("l", 6), "", "第一颗的回声");
+  assert.equal(l.input("l", 9), "", "第二颗的回声");
+});
+
+test("账本：过期条目不认领（十秒后的同字符照样要发）", () => {
+  const l = new KeyLedger(250);
+  assert.equal(l.keyDown("c", 0), true);
+  assert.equal(l.input("c", 400), "c", "过期了就不能再当成回声吞掉");
+});
+
+test("账本：多字符 data 只补真正缺的那部分", () => {
+  const l = new KeyLedger();
+  l.keyDown("a", 0);
+  l.keyDown("b", 1);
+  assert.equal(l.input("abc", 2), "c");
+});
+
+test("账本：容量封顶，不会无限增长", () => {
+  const l = new KeyLedger();
+  for (let i = 0; i < 40; i++) l.keyDown("x", i);
+  assert.ok(l.size <= 16, `账本不该无界增长，实际 ${l.size}`);
+});
+
+// ——— 判据 ———
+
+test("isPlainChar：只认单个可打印 ASCII", () => {
+  assert.equal(isPlainChar("c"), true);
+  assert.equal(isPlainChar("~"), true);
+  assert.equal(isPlainChar(" "), true);
+  assert.equal(isPlainChar(""), false);
+  assert.equal(isPlainChar("ab"), false);
+  assert.equal(isPlainChar("é"), false);
+  assert.equal(isPlainChar("中"), false);
+  assert.equal(isPlainChar("\n"), false);
+  assert.equal(isPlainChar("\x7f"), false);
+});
+
+test("isPlainKeystroke：修饰键与多字符键一律放行给 xterm", () => {
+  assert.equal(isPlainKeystroke(plainKey("c")), true);
+  assert.equal(isPlainKeystroke(plainKey("C", { shiftKey: true })), true);
+  assert.equal(isPlainKeystroke(plainKey("c", { ctrlKey: true })), false);
+  assert.equal(isPlainKeystroke(plainKey("c", { altKey: true })), false);
+  assert.equal(isPlainKeystroke(plainKey("c", { metaKey: true })), false);
+  assert.equal(isPlainKeystroke(plainKey("Enter")), false);
+  assert.equal(isPlainKeystroke(plainKey("Process")), false, "输入法的键名不是字符");
+  assert.equal(isPlainKeystroke(plainKey("Dead")), false);
 });
 
 // ——— 输入法确认回车 vs 发送 ———
