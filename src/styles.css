@@ -22,6 +22,12 @@ html:not([data-platform="macos"]) {
   --lights-w: 0px;
 }
 
+/* 全屏时系统把红绿灯藏起来了，预留必须收回去，否则左边留一块纯白。
+   data-fullscreen 由 TabBar 监听窗口状态写入。 */
+html[data-fullscreen="1"] {
+  --lights-w: 0px;
+}
+
 /* Windows 上没有 -apple-system，且默认 sans-serif 下中文会掉到宋体 */
 html[data-platform="windows"] {
   font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
@@ -137,6 +143,8 @@ html, body, #root {
 .tabbar .tabbar-macro { flex-shrink: 0; height: 26px; }
 /* macOS 没有自绘窗口按钮兜底，AI 按钮右边要留白，不然贴着窗口边缘 */
 html[data-platform="macos"] .tabbar { padding-right: 10px; }
+/* 全屏收掉交通灯预留后，「连接」别贴着屏幕左边 */
+html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 /* 录制中：按钮上挂一个红点。没有它，用户很容易忘了还在录，把后面的操作也记进去 */
 .tabbar-macro .tb-rec {
   width: 6px; height: 6px; border-radius: 50%; background: var(--danger);

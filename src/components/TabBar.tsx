@@ -82,6 +82,40 @@ export default function TabBar({
     return () => unlisten?.();
   }, [mac]);
 
+  /**
+   * macOS 全屏时系统会**把红绿灯整个藏起来**，那条 80px 的预留就变成了纯白留 ——
+   * 用户看到的就是「标题栏左边空了一块」。所以全屏下要把预留收回去，
+   * 顺便把栏左内边距补回来，免得「连接」贴到屏幕边上。
+   *
+   * 只在 mac 上跑：别的平台本来就没有交通灯，--lights-w 是 0。
+   */
+  useEffect(() => {
+    if (!mac) return;
+    const root = document.documentElement;
+    const sync = () => {
+      appWindow
+        .isFullscreen()
+        .then((fs) => {
+          root.dataset.fullscreen = fs ? "1" : "0";
+        })
+        .catch(() => {
+          root.dataset.fullscreen = "0";
+        });
+    };
+    sync();
+    let unlisten: (() => void) | undefined;
+    appWindow
+      .onResized(() => sync())
+      .then((f) => {
+        unlisten = f;
+      })
+      .catch(() => {});
+    return () => {
+      unlisten?.();
+      delete root.dataset.fullscreen;
+    };
+  }, [mac]);
+
   // 拖拽状态
   const [drag, setDrag] = useState<{ id: string; overId: string | null; after: boolean } | null>(
     null
