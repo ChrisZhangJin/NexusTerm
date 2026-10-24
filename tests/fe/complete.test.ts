@@ -24,7 +24,7 @@ import {
 import { matchSessions, scanMention } from "../../src/lib/mention";
 import { shouldResyncKeyDownSeen } from "../../src/lib/macInput";
 import { COMMIT_WINDOW_MS, ImeGuard, enterVerdict, isImeKey, keyInfoFrom, type KeyLike } from "../../src/lib/ime";
-import { GhostText, cursorFollowsTyped } from "../../src/lib/ghost";
+import { GhostText, cursorAtLineEnd, cursorFollowsTyped } from "../../src/lib/ghost";
 
 // 注：命令参数（flag）补全那一档 —— `optionsFor` / `matchOptions` / `worthAsking`
 // 与它的后端 `cmd_options` —— 已经整档下线（src/types.ts 的 `CmdOption`、
@@ -191,14 +191,39 @@ test("matchSessions：结果封顶 8 条，免得标签多的时候糊满屏", (
 
 // ——— GhostText：灰字的字节序列 ———
 
-/** 假 Terminal：只把 write 的内容攒下来 */
-function fakeTerm() {
+/**
+ * 假 Terminal：只把 write 的内容攒下来。
+ *
+ * 带上最小可用的 buffer —— 灰字现在会先问一句「光标是不是在行尾」
+ * （见 `cursorAtLineEnd`），没有 buffer 就没法验证这条守卫。
+ * 默认光标在行尾、后面没有别的字，也就是「可以画灰字」的那种状态。
+ */
+function fakeTerm(opts?: { cursorX?: number; lineText?: string }) {
   const written: string[] = [];
+  const cells = [...(opts?.lineText ?? "")];
+  const cursorX = opts?.cursorX ?? (opts?.lineText?.length ?? 0);
   return {
     written,
+    cols: 80,
+    cursorX,
     text: () => written.join(""),
     write(s: string) {
       written.push(s);
+    },
+    buffer: {
+      active: {
+        type: "normal",
+        cursorX,
+        cursorY: 0,
+        baseY: 0,
+        getLine: (y: number) =>
+          y === 0
+            ? {
+                getCell: (x: number) =>
+                  x < cells.length ? { getChars: () => cells[x] } : undefined,
+              }
+            : undefined,
+      },
     },
   };
 }
@@ -253,8 +278,50 @@ test("灰字：clear 只在画过时才擦，重复 show 会先擦旧的", () =>
   const n = term.written.length;
   g.show(term as never, "de", 20);
   assert.ok(term.written.length > n, "第二次 show 应先擦再画");
-  assert.equal(term.written[n], `${ESC}[K`);
+  // ECH（擦 n 个字符）而不是 EL（擦到行尾）：只抹掉自己画的那几列
+  assert.equal(term.written[n], `${ESC}[3X`);
   assert.equal(g.cols, 2);
+});
+
+// ——— 行中间编辑：灰字绝不能动光标后面的真字 ———
+
+test("cursorAtLineEnd：光标后面还有字 → 不画灰字", () => {
+  // "abc def" 共 7 字，光标停在 3（"abc| def"）
+  const term = fakeTerm({ lineText: "abc def", cursorX: 3 });
+  assert.equal(cursorAtLineEnd(term as never), false);
+});
+
+test("cursorAtLineEnd：光标贴着行尾 → 可以画", () => {
+  const term = fakeTerm({ lineText: "abc def", cursorX: 7 });
+  assert.equal(cursorAtLineEnd(term as never), true);
+});
+
+test("cursorAtLineEnd：行尾的空格不算内容", () => {
+  const term = fakeTerm({ lineText: "abc     ", cursorX: 3 });
+  assert.equal(cursorAtLineEnd(term as never), true);
+});
+
+test("灰字：人在行中间时一个字节都不写（不覆盖光标后的真字）", () => {
+  const term = fakeTerm({ lineText: "abc def", cursorX: 3 });
+  const g = new GhostText();
+  assert.equal(g.show(term as never, "def", 20), "");
+  assert.equal(term.written.length, 0, "一个字节都不该写");
+  assert.equal(g.active, false);
+});
+
+test("灰字：行中间时连擦除也不该发生（不能拿 CSI K 抹到行尾）", () => {
+  const term = fakeTerm({ lineText: "abc def", cursorX: 7 });
+  const g = new GhostText();
+  g.show(term as never, "gh", 20);
+  assert.equal(g.active, true);
+
+  // 光标被挪到行中间（人按了 ← / Backspace / Home）之后再 clear：
+  // 这时从光标往后那一段已经不是我们画的字了，写了就是删用户的字
+  term.cursorX = 3;
+  term.buffer.active.cursorX = 3;
+  g.clear(term as never);
+  assert.equal(term.written.length, 1, "只有第一次 show 写过的那一次");
+  assert.equal(g.active, false, "状态该清干净，屏幕上的残字交给 shell 自己重绘");
 });
 
 // ——— 回显之后要不要把灰字画回来 ———

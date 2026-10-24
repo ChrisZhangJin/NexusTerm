@@ -76,11 +76,36 @@ export function cursorFollowsTyped(term: Terminal, text: string): boolean {
   return false;
 }
 
+/**
+ * 光标是不是停在这一行**内容的末尾**（它后面没有别的字）。
+ *
+ * 灰字画在光标之后，擦除也从光标起算。所以只要光标后面还留着真实字符
+ * —— 人在行中间删改（按了 ← / Backspace / Home）、或者 shell 把整行重绘过
+ * —— 画灰字、擦灰字都会把那半截真字一起抹掉。
+ *
+ * 抹掉只是**显示缓冲**上的事，pty 里的行缓冲一点没动，于是屏幕上看着没了、
+ * 回车一按那些字又原样冒出来：这就是「回车后消失的部分还在」的由来。
+ */
+export function cursorAtLineEnd(term: Terminal): boolean {
+  const buf = term.buffer.active;
+  const line = buf.getLine(buf.baseY + buf.cursorY);
+  if (!line) return false;
+  for (let x = buf.cursorX; x < term.cols; x++) {
+    const ch = line.getCell(x)?.getChars();
+    // 没写过的位置是 ""，宽字符的后半格也是 ""；行尾的空格不算「有内容」
+    if (ch && ch !== " " && ch !== "\u0000") return false;
+  }
+  return true;
+}
+
 export class GhostText {
   /** 当前画在屏幕上的灰字（用于计算光标回退量） */
   private shown = "";
   /** 灰字占了多少**列**。CJK / emoji 占两格，不能用字符数替代 */
   private shownCols = 0;
+  /** 画灰字时光标在哪（用于判断还能不能照原样擦掉，见 `clear`） */
+  private atX = -1;
+  private atY = -1;
 
   get text(): string {
     return this.shown;
@@ -95,12 +120,26 @@ export class GhostText {
     return this.shownCols;
   }
 
-  /** 擦掉屏幕上的灰字。光标此刻停在它的开头，`EL` 从光标擦到行尾正合适。 */
+  /**
+   * 擦掉屏幕上的灰字。
+   *
+   * 两个约束，缺一个都会删掉用户敲的字：
+   * - **只擦自己画的那几列**：用 `ECH`（`CSI n X`，擦光标起的 n 个字符）
+   *   而不是 `EL`（`CSI K`，擦到行尾）。光标后面万一还有真字，`EL` 会一路抹到行尾。
+   * - **光标必须还在原地**：光标被挪走之后（shell 重绘了整行、输出把光标顶走），
+   *   从当前光标往后那一段已经不是我们画的了，这时候一个字节都不能写。
+   */
   clear(term: Terminal): void {
     if (!this.shown) return;
-    term.write(CSI + "K");
+    const buf = term.buffer.active;
+    const sameSpot = this.atX === buf.cursorX && this.atY === buf.baseY + buf.cursorY;
+    if (sameSpot && this.shownCols > 0) {
+      term.write(CSI + this.shownCols + "X");
+    }
     this.shown = "";
     this.shownCols = 0;
+    this.atX = -1;
+    this.atY = -1;
   }
 
   /**
@@ -117,6 +156,13 @@ export class GhostText {
    * @returns 真正画出来的那部分文本
    */
   show(term: Terminal, suggestion: string, room: number): string {
+    // 光标后面还有真字：一个字节都别写（理由见 `cursorAtLineEnd`）。
+    // 放在最前面是故意的 —— 它是唯一能让「擦除」这件事变安全的前提，
+    // 不能指望每个调用方都记得先问一句。
+    if (!cursorAtLineEnd(term)) {
+      this.clear(term);
+      return "";
+    }
     const { text: used, cols } = this.fit(suggestion, room);
     // 屏幕上已经是这一段：一个字节都不用写。
     // 打字时每一次按键、每一次回显都会来问一遍，而绝大多数时候答案是「没变」——
@@ -124,6 +170,10 @@ export class GhostText {
     if (used === this.shown) return this.shown;
     this.clear(term);
     if (!used) return "";
+
+    const buf = term.buffer.active;
+    this.atX = buf.cursorX;
+    this.atY = buf.baseY + buf.cursorY;
 
     // 先切暗色 → 写字 → 关暗色 → 光标左移回原位。
     // 顺序不能反：属性码本身不占列，但写文本会把光标推走，

@@ -26,7 +26,7 @@ import {
   recordCommand,
   type CompletionItem,
 } from "../lib/complete";
-import { GhostText, cursorFollowsTyped } from "../lib/ghost";
+import { GhostText, cursorAtLineEnd, cursorFollowsTyped } from "../lib/ghost";
 import { ImeGuard, type KeyLike } from "../lib/ime";
 import CompletionOverlay from "./CompletionOverlay";
 
@@ -268,12 +268,14 @@ export default function TerminalView({
     // 「当前行 = 人敲的命令」这个前提根本不成立。全屏程序里一律不提示，
     // 否则灰字会直接画在编辑器内容上。
     if (term.buffer.active.type !== "normal") {
-      ghostRef.current.clear(term);
-      hintsRef.current = [];
-      // 签名也要作废，否则下次算出同一批候选时会因为「签名没变」而不推状态
-      hintSigRef.current = "\u0000";
-      setHints(null);
-      setHintIndex(0);
+      dismissHints();
+      return;
+    }
+    // 人在行中间删改时一律不提示：补进去的那段会插到句子中间，
+    // 而且灰字的擦除只敢从光标往后抹 —— 那里有真字就会连真字一起抹掉
+    // （屏幕上看没了、shell 里还在，回车就又冒出来）。见 `cursorAtLineEnd`。
+    if (!cursorAtLineEnd(term)) {
+      dismissHints();
       return;
     }
 
@@ -285,7 +287,7 @@ export default function TerminalView({
     if (sig !== hintSigRef.current) {
       hintSigRef.current = sig;
       setHints(items.length ? items : null);
-      setHintIndex(0);
+      setActiveHint(0);
     }
 
     const room = term.cols - term.buffer.active.cursorX - 1;
@@ -320,8 +322,8 @@ export default function TerminalView({
     hintsRef.current = [];
     hintSigRef.current = "\u0000";
     setHints(null);
-    setHintIndex(0);
-  }, []);
+    setActiveHint(0);
+  }, [setActiveHint]);
 
   /** 按当前这半行重算候选：历史是本地同步缓存，不用等网络往返。 */
   const refreshHints = useCallback(
@@ -364,6 +366,12 @@ export default function TerminalView({
       const items = hintsRef.current;
       const term = termRef.current;
       if (!term || items.length === 0) return;
+      // 光标已经挪到行中间（人在改前面敲错的字）：这时补进去会插在句子中间，
+      // 收起下拉比硬补安全 —— 想继续补全，按 End 回到行尾即可。
+      if (!cursorAtLineEnd(term)) {
+        dismissHints();
+        return;
+      }
       const item = items[Math.min(index, items.length - 1)];
       if (!item.insert) {
         dismissHints();
@@ -524,10 +532,21 @@ export default function TerminalView({
     });
     const resizeSub = term.onResize(() => hl.refresh());
     const bufSub = term.buffer.onBufferChange(() => hl.refresh());
+    // 光标一挪就要复查：灰字是画在「当时的光标」之后的，
+    // 按 ← / Home 回到行中间之后，它还赖在原处就变成了插在句子里的半截命令，
+    // 而下一次擦除又会从新光标一路抹到行尾 —— 把后面真敲的字抹掉。
+    // 只在灰字真的画着时才查 buffer，挪动光标本身是很热的路径。
+    const cursorSub = term.onCursorMove(() => {
+      if (!ghostRef.current.active) return;
+      if (term.buffer.active.type !== "normal" || !cursorAtLineEnd(term)) {
+        dismissHints();
+      }
+    });
     cleanups.push(
       () => parsedSub.dispose(),
       () => resizeSub.dispose(),
       () => bufSub.dispose(),
+      () => cursorSub.dispose(),
       () => hl.dispose()
     );
 
@@ -542,11 +561,12 @@ export default function TerminalView({
       const items = hintsRef.current;
       const typed = lineRef.current.text;
       if (!items.length || !typed) return;
-      if (term.buffer.active.type !== "normal" || !cursorFollowsTyped(term, typed)) {
-        hintsRef.current = [];
-        hintSigRef.current = "\u0000";
-        setHints(null);
-        setHintIndex(0);
+      if (
+        term.buffer.active.type !== "normal" ||
+        !cursorAtLineEnd(term) ||
+        !cursorFollowsTyped(term, typed)
+      ) {
+        dismissHints();
         return;
       }
       const item = items[Math.min(hintIndexRef.current, items.length - 1)];
