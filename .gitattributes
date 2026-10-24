@@ -1,0 +1,32 @@
+# 统一行尾为 LF。
+#
+# 之前仓库里存在大量 CRLF 文件（main 上 64 个，含 src/api.ts、
+# src/components/*.tsx、src-tauri/src/*.rs 与整个 vendor/russh-sftp），
+# 和 LF 分支合并时 git 会把整个文件判成「重写」，冲突从 3 行膨胀成 1500 行。
+# 这里钉死规范化方式，之后 checkout / merge 都由 git 自己处理，不再靠人肉判断。
+* text=auto eol=lf
+
+# 真二进制：别让 git 去嗅探、更别做行尾转换
+*.png  binary
+*.ico  binary
+*.icns binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ttf  binary
+*.otf  binary
+*.woff binary
+*.woff2 binary
+*.pdf  binary
+*.zip  binary
+*.dmg  binary
+*.gz   binary
+*.mp4  binary
+
+# 给 GitHub 认的语法高亮（不影响上面的 text=auto）
+*.rs    text diff=rust
+*.ts    text diff=typescript
+*.tsx   text diff=typescript
+*.css   text diff=css
+*.md    text diff=markdown
