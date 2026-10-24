@@ -197,6 +197,12 @@ export default function TabBar({
                 dropBefore ? "drop-before" : "",
                 dropAfter ? "drop-after" : "",
               ].join(" ")}
+              // .tabbar 整体是 data-tauri-drag-region="deep"（空白处要能拖动窗口），
+              // 但标签本身是个普通 div，不像 BUTTON/INPUT 那样被 Tauri 自动排除在
+              // 拖动区之外 —— 于是点击标签会被当成「按下就开始拖窗口」，左键单击
+              // 偶发被吞、双击直接触发系统的最大化/还原。显式关掉即可，标签之间的
+              // 空隙仍然可以拖动窗口。
+              data-tauri-drag-region="false"
               onPointerDown={(e) => {
                 if (e.button !== 0 || renaming === t.id) return;
                 if ((e.target as HTMLElement).closest(".tab-close")) return;
