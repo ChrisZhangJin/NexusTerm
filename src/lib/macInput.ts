@@ -104,6 +104,21 @@ import type { Terminal } from "@xterm/xterm";
  * 把几颗键合并成一条。上一版把 data 逐字符过账本再补发，`". "` 里的 "." 没
  * 被认领 → 补发一个 "."，屏幕上就成了三个字符。这类 data 对应的 keydown
  * 早就各自发过了，**整条丢掉才是对的**。
+ *
+ * ## 第三轮：选候选的数字也被当成输入发了出去
+ *
+ * 和空格同源：`CompositionHelper.keydown` 只认 229，而选候选的「2」keyCode 是
+ * 50，于是「da」+「2」变成「大2」。组合一旦开着，键盘就不归 shell 管了 ——
+ * 拼音字母进预编辑、数字选候选、`, . - =` 翻页、空格 / 回车确认，**任何可打印
+ * 键都属于 IME**。所以判据从「确认键」扩成「组合态里被 IME 吃掉的键」
+ * （`isImeKey`），只有 229 那类放行 —— xterm 自己会对它们 return false，而且
+ * 顺带调 `_handleAnyTextareaChanges()` 刷新预编辑，抢过来反而让「da」不显示。
+ *
+ * 拦的方式只有 `stopPropagation`，**不能 preventDefault**：默认行为是 IME 选词
+ * 上屏，拦了候选就卡住。代价是那颗键可能仍被写进隐藏 textarea，而
+ * `_finalizeComposition(true)` 是 `substring(start)` 取到末尾 —— 所以在
+ * `compositionend` 时按 `ev.data`（IME 真正提交上去的文本）判定要不要把尾部
+ * 那个同款字符剥掉：上屏文本自己就以它结尾时（选了「第2」）不动。
  */
 
 /** xterm 5.x 挂在自己实例（不是 `_core`）上的私有状态 */
@@ -170,6 +185,37 @@ export function isPlainKeystroke(ev: {
  */
 export function isImeConfirmKey(ev: { key: string }): boolean {
   return ev.key === " " || ev.key === "Spacebar" || ev.key === "Enter";
+}
+
+/**
+ * 组合态里**被 IME 吃掉**的键：拼音字母、选候选的数字（1–9）、翻页用的
+ * `, . - =`、确认用的空格 / 回车。
+ *
+ * 判据刻意宽：组合一旦开着，键盘就不归 shell 管了 —— 任何可打印键都是先给
+ * 输入法，输入法决定它是进预编辑、选候选，还是上屏。交给 xterm 的唯一后果是
+ * 它把「选候选的那个 2」当成真输入发进 pty：`da` + `2` 得到「大2」。
+ *
+ * Enter 不是可打印字符，单独列出来（它同样是 IME 的确认键）。
+ */
+export function isImeKey(ev: { key: string }): boolean {
+  return ev.key === "Enter" || isPlainChar(ev.key);
+}
+
+/**
+ * xterm 会不会把这颗键**当成真输入发出去**。
+ *
+ * `CompositionHelper.keydown` 只对 229 提前返回，所以非 229 的可打印键在
+ * 组合态里都会被 `_keyDown` 走到 `triggerDataEvent` —— 那是我们要拦的对象。
+ *
+ * 229 那类（拼音字母）xterm 自己会 `return false`，而且它顺带调一句
+ * `_handleAnyTextareaChanges()` 刷新预编辑，**拦了反而可能让「da」敲出来不
+ * 显示**，所以放行。
+ *
+ * 确认键无条件算「会发出去」：空格 / 回车的 keyCode 在 WKWebView 上有时候是
+ * 229、有时候不是，两头都得拦（见 `isImeConfirmKey`）。
+ */
+export function xtermWouldEmit(ev: { key: string; keyCode?: number }): boolean {
+  return isImeConfirmKey(ev) || (isPlainChar(ev.key) && ev.keyCode !== 229);
 }
 
 /**
@@ -317,12 +363,12 @@ export function installMacKeyboard(
   // 与 compositionend 这对事件说的是事实。
   let composing = false;
   /**
-   * 组合期间按过确认键（空格/回车）。
+   * 本轮组合里被 IME 吃掉的那颗键（`isImeKey` 且被我们拦下的）。
    *
-   * 用途只有一个：`compositionend` 时决定要不要把 textarea 尾部的半角空格剥掉。
+   * 用途只有一个：`compositionend` 时决定要不要把 textarea 尾部的同款字符剥掉。
    * 见 `onComposeEnd`。
    */
-  let confirmDuringCompose = false;
+  let imeConsumedKey: string | null = null;
   /** 最近一次 `compositionend` 的时间戳，用于识别「同一次按键的两半」 */
   let composeEndedTs = -Infinity;
 
@@ -337,7 +383,7 @@ export function installMacKeyboard(
    * 同一次按键的两条事件几乎同时（几毫秒内），而人手下一次按键最快也在 80ms
    * 之外 —— 30ms 这个窗口足够把前者包住、又碰不到后者。
    */
-  const sameAsComposeEnd = (ev: KeyboardEvent): boolean =>
+  const sameAsComposeEnd = (ev: { timeStamp: number }): boolean =>
     ev.timeStamp - composeEndedTs < 30;
 
   const onComposeStart = () => {
@@ -348,25 +394,34 @@ export function installMacKeyboard(
     // 所以账本在组合期间根本不会被误用，没有任何理由清它。
     composing = true;
     // 上一轮如果因为异常路径没消费掉，别让它带到这一轮
-    confirmDuringCompose = false;
+    imeConsumedKey = null;
   };
 
   const onComposeEnd = (ev: CompositionEvent) => {
     composing = false;
     composeEndedTs = ev.timeStamp;
-    if (!confirmDuringCompose) return;
-    confirmDuringCompose = false;
-
-    // IME 用空格确认时，那颗空格**可能已经落进隐藏 textarea**（我们没法可靠地
-    // preventDefault 掉它 —— 按键先被 IME 消费）。而 xterm 的
-    // `_finalizeComposition(true)` 是在 setTimeout 里执行 `substring(start)`
-    // ——**取到末尾**，于是「拼」后面那个空格会被一起发进 pty。
-    //
-    // 上屏文本不可能以半角空格结尾（那是确认键，不是词的一部分），所以只在
-    // 「这一轮按过确认键」时把尾部空格剥掉。剥掉的只是显示缓冲里的影子文本，
-    // 不影响已经上屏的字。
+    const consumed = imeConsumedKey;
+    imeConsumedKey = null;
     const ta = internals.textarea;
-    if (ta && ta.value.endsWith(" ")) ta.value = ta.value.replace(/ +$/, "");
+    if (!ta || !consumed) return;
+
+    // 那颗键我们只 `stopPropagation`、**没有** `preventDefault`（拦默认行为会
+    // 让 IME 上不了屏），所以它可能照样被 WebKit 写进了隐藏 textarea。而 xterm
+    // 的 `_finalizeComposition` 是 `substring(start)` —— 一直取到末尾，多余的
+    // 那个字符就会跟着上屏文本一起发进 pty。
+    //
+    // `ev.data` 是 IME 真正提交上去的文本，拿它当判据就不用担心误伤：
+    // 上屏文本自己就以这个字符结尾（比如选了「第2」）时不碰它。
+    const committed = ev.data ?? "";
+    if (consumed === " " || consumed === "Spacebar") {
+      // 空格是确认键，不可能属于上屏文本 —— 尾部有几个都剥掉
+      if (ta.value.endsWith(" ")) ta.value = ta.value.replace(/ +$/, "");
+      return;
+    }
+    if (committed.endsWith(consumed)) return;
+    if (ta.value.endsWith(consumed)) {
+      ta.value = ta.value.slice(0, ta.value.length - consumed.length);
+    }
   };
 
   /**
@@ -394,24 +449,28 @@ export function installMacKeyboard(
   };
 
   const onKeyDown = (ev: KeyboardEvent) => {
-    // 组合期间的确认键：拦在这里，别让它走到 xterm 的 `_keyDown`。
-    // 详见 `isImeConfirmKey` —— 不拦的话「拼」上屏的同时会多一个空格。
-    if (isImeConfirmKey(ev)) {
+    // 组合态里被 IME 吃掉的键：拦在这里，别让它走到 xterm 的 `_keyDown`。
+    if (isImeKey(ev)) {
       if (composing || ev.isComposing) {
         // 组合还没结束：**不能 preventDefault** —— 上屏是 IME 的默认行为，
-        // 拦掉会把候选词卡住。代价是那颗空格照样会写进隐藏 textarea，所以
-        // 记一笔，等 compositionend 时把它剥掉（见 `onComposeEnd`）。
-        ev.stopPropagation();
-        markSent(); // 让 xterm 的 `_inputEvent` 也别去发上屏那一条（否则上屏两遍）
-        confirmDuringCompose = true;
+        // 拦掉会把候选词卡住。只 stopPropagation 掐断 xterm 那一路：
+        //   · 空格 / 回车（确认键）不拦就多一个空格，见 `isImeConfirmKey`；
+        //   · 数字（选候选的 1–9）同样不拦就多一个数字 —— 「da」+「2」变成「大2」。
+        // 代价是那颗键照样可能写进隐藏 textarea，所以记一笔，等 compositionend
+        // 时按 `ev.data` 判定要不要剥掉（见 `onComposeEnd`）。
+        if (xtermWouldEmit(ev)) {
+          ev.stopPropagation();
+          markSent(); // 让 xterm 的 `_inputEvent` 也别去发上屏那一条（否则上屏两遍）
+          imeConsumedKey = ev.key;
+        }
         return;
       }
       if (sameAsComposeEnd(ev)) {
         // 上屏已经完成，这颗只是同一次物理按键的另一半。这时候
-        // preventDefault 只会拦住「把空格插进 textarea」，动不了已经上屏的字，
+        // preventDefault 只会拦住「把字符插进 textarea」，动不了已经上屏的字，
         // 所以可以放心拦死 —— 不留残留，也就没有后续 substring 带走它的问题。
-        // 不要再置 confirmDuringCompose：那次 compositionend 早就过去了，
-        // 置了只会留到**下一次**上屏时才消费，把下一句结尾剥掉。
+        // 不要再记 imeConsumedKey：那次 compositionend 早就过去了，记了只会
+        // 留到**下一次**上屏时才消费，把下一句结尾剥掉。
         ev.preventDefault();
         ev.stopPropagation();
         markSent();
@@ -447,6 +506,9 @@ export function installMacKeyboard(
     // 输入法上下文残留时它会谎报 true，而那正是丢字发生的那一刻；
     // 是不是组合以我们自己的 compositionstart/end 为准。
     if (composing) return;
+    // 上屏刚过去就到的 insertText，是同一次 IME 操作的尾巴（选候选那颗键被
+    // WebKit 顺手当成普通输入派发出来的），不是新的输入 —— 发出去就成了「大2」。
+    if (sameAsComposeEnd(ev)) return;
     if (ev.inputType !== "insertText") return; // 粘贴 / 组合上屏不碰
     const data = ev.data;
     if (!data) return;

@@ -698,16 +698,29 @@ test("接管：中文上屏不动 textarea（xterm 要读它算上屏范围）",
 });
 
 test("接管：isComposing 谎报（非组合态）时交给 xterm，绝不自己发", () => {
-  // 我们没收到 compositionstart 就说明组合没真的开着。这种键交给 xterm 会因
-  // 229 丢掉，但 onInput 那条兜底刻意不看 isComposing，会补发。
+  // 我们没收到 compositionstart 就说明组合没真的开着。残留的特征恰恰是
+  // keyCode 229 —— 那种键 xterm 自己会 return false（顺带刷新预编辑），
+  // 交给它最安全，随后由 onInput 那条兜底补发出去。
   // 这里同样**不能清 textarea**：万一判断错了，清它就是把刚上屏的字抹掉。
   const { host, term, out, un } = rig();
   (term.textarea as { value: string }).value = "pin";
-  const ev = host.fire("keydown", plainKey("n", { isComposing: true }));
+  const ev = host.fire("keydown", plainKey("n", { keyCode: 229, isComposing: true }));
   assert.equal(ev.defaultPrevented, false);
   assert.equal(ev.propagationStopped, false, "交给 xterm 的组合路径");
   assert.equal(out.text, "");
   assert.equal((term.textarea as { value: string }).value, "pin", "textarea 一个字都不能动");
+  un();
+});
+
+test("接管：isComposing 谎报但 keyCode 不是 229 时，拦住 xterm 交给 input 兜底", () => {
+  // 这种键 xterm 会一路走到 triggerDataEvent —— 再让 onInput 补发一遍就成了
+  // 两个字符。既然浏览器自称在组合，这颗键归 IME，我们只能拦住 xterm 那一遍。
+  const { host, term, out, un } = rig();
+  const ev = host.fire("keydown", plainKey("n", { keyCode: 78, isComposing: true }));
+  assert.equal(ev.defaultPrevented, false);
+  assert.equal(ev.propagationStopped, true);
+  assert.equal(out.text, "");
+  assert.equal((term.textarea as { value: string }).value, "", "谎报态不能乱清 textarea 之外没有约束");
   un();
 });
 
@@ -798,6 +811,97 @@ test("接管：空格确认后 compositionend 剥掉 textarea 尾部空格", () 
   host.fire("compositionend", {});
   assert.equal((term.textarea as { value: string }).value, "拼");
   assert.equal(out.text, "");
+  un();
+});
+
+// ——— 第六轮：选候选的数字键（da + 2 → 大2） ———
+
+test("接管：组合态里按数字选候选，不能让它进 pty", () => {
+  // 和空格是同一个漏法：xterm 的 CompositionHelper.keydown 只对 229 提前返回，
+  // 数字键的 keyCode 是 50，于是 `_keyDown` 一路走到 triggerDataEvent("2") ——
+  // 「da」+「2」选第二个候选，屏幕上就成了「大2」。
+  const { host, out, un } = rig();
+  host.fire("compositionstart", {});
+  for (const ch of "da") host.fire("keydown", plainKey(ch, { keyCode: 229 }));
+  const ev = host.fire("keydown", plainKey("2", { keyCode: "2".charCodeAt(0) }));
+  assert.equal(ev.propagationStopped, true, "必须拦住 xterm 的 _keyDown");
+  assert.equal(ev.defaultPrevented, false, "不能 preventDefault，否则 IME 选不了候选");
+  assert.equal(out.text, "", "选候选的键一个字节都不发");
+  un();
+});
+
+test("接管：组合态里按其它数字 / 翻页键同样不进 pty", () => {
+  const { host, out, un } = rig();
+  for (const ch of ["1", "5", "9", ",", ".", "-", "="]) {
+    host.fire("compositionstart", {});
+    const ev = host.fire("keydown", plainKey(ch, { keyCode: ch.charCodeAt(0) }));
+    assert.equal(ev.propagationStopped, true, `${ch} 也该被拦`);
+    host.fire("compositionend", {});
+  }
+  assert.equal(out.text, "");
+  un();
+});
+
+test("接管：组合态里 keyCode 229 的数字交给 xterm（那还是拼音输入）", () => {
+  // 229 的键 xterm 自己会 return false，而且顺手调 _handleAnyTextareaChanges
+  // 刷新预编辑 —— 抢过来反而可能让「da」敲出来不显示。
+  const { host, out, un } = rig();
+  host.fire("compositionstart", {});
+  const ev = host.fire("keydown", plainKey("2", { keyCode: 229 }));
+  assert.equal(ev.propagationStopped, false);
+  assert.equal(out.text, "");
+  un();
+});
+
+test("接管：compositionend 先到时，选候选的数字照样拦掉", () => {
+  const { host, out, un } = rig();
+  host.fire("compositionstart", {});
+  host.fire("compositionend", { timeStamp: 5000 });
+  const ev = host.fire("keydown", plainKey("2", { keyCode: 50, timeStamp: 5006 }));
+  assert.equal(ev.propagationStopped, true);
+  assert.equal(ev.defaultPrevented, true, "上屏已完成，可以直接拦掉插入");
+  assert.equal(out.text, "");
+  un();
+});
+
+test("接管：上屏之后再敲的数字是真输入，不能吞", () => {
+  const { host, out, un } = rig();
+  host.fire("compositionstart", {});
+  host.fire("compositionend", { timeStamp: 5000 });
+  host.fire("keydown", plainKey("2", { keyCode: 50, timeStamp: 5150 }));
+  assert.equal(out.text, "2", "否则「大2」这种正常输入会变成「大」");
+  un();
+});
+
+test("接管：上屏刚过就到的 input 是同一次 IME 的尾巴，不发", () => {
+  // 选候选的键被 WebKit 当成普通输入再派发一条 input；那时候 composing 已经
+  // 翻回 false，只靠「离上屏多近」才能认出来。
+  const { host, out, un } = rig();
+  host.fire("compositionstart", {});
+  host.fire("compositionend", { timeStamp: 5000 });
+  host.fire("input", { data: "2", inputType: "insertText", isComposing: false, timeStamp: 5004 });
+  assert.equal(out.text, "");
+  un();
+});
+
+test("接管：数字选候选后 compositionend 剥掉 textarea 尾部的数字", () => {
+  const { host, term, out, un } = rig();
+  host.fire("compositionstart", {});
+  host.fire("keydown", plainKey("2", { keyCode: 50 }));
+  (term.textarea as { value: string }).value = "大2";
+  host.fire("compositionend", { data: "大", timeStamp: 6000 });
+  assert.equal((term.textarea as { value: string }).value, "大");
+  assert.equal(out.text, "");
+  un();
+});
+
+test("接管：上屏文本本身以那个数字结尾时不剥（比如选了「第2」）", () => {
+  const { host, term, un } = rig();
+  host.fire("compositionstart", {});
+  host.fire("keydown", plainKey("2", { keyCode: 50 }));
+  (term.textarea as { value: string }).value = "第2";
+  host.fire("compositionend", { data: "第2", timeStamp: 6000 });
+  assert.equal((term.textarea as { value: string }).value, "第2", "那是词的一部分，不能动");
   un();
 });
 
