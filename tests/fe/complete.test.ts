@@ -1178,3 +1178,30 @@ test("compositionend 漏发：自愈之后紧接着真的开始新组合，不�
   g.begin(6000);
   assert.equal(isImeKey(key({ key: "a", keyCode: 65, timeStamp: 6100 }), g), true);
 });
+
+// ——— 第七轮：中文输入法「智能全角标点」把逗号/分号等替换成全角，发了两遍 ———
+
+test("接管：热键上下文里按逗号，WebKit 把它替换成全角——只发全角那一条", () => {
+  const { host, out, un } = rig();
+  // keyCode 229：输入法上下文是热的，但没有真正的 composition（全角标点是单键直接替换）
+  host.fire("keydown", plainKey(",", { keyCode: 229 }));
+  assert.equal(out.text, "", "先别发，等 WebKit 真正写定的字符");
+  host.fire("input", { data: "，", inputType: "insertText", isComposing: false });
+  assert.equal(out.text, "，", "只应该有全角那一个字符，半角逗号不能跟着冒出来");
+  un();
+});
+
+test("接管：热键上下文里的标点其实没被替换——照样只发一次，不丢字", () => {
+  const { host, out, un } = rig();
+  host.fire("keydown", plainKey(";", { keyCode: 229 }));
+  host.fire("input", { data: ";", inputType: "insertText", isComposing: false });
+  assert.equal(out.text, ";");
+  un();
+});
+
+test("接管：非热键上下文的标点（keyCode 不是 229）照常立刻发送，不等 input", () => {
+  const { host, out, un } = rig();
+  host.fire("keydown", plainKey(",", { keyCode: ",".charCodeAt(0) }));
+  assert.equal(out.text, ",", "没有输入法热上下文信号，不该被按下不发");
+  un();
+});

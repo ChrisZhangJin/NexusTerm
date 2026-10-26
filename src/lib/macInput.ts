@@ -373,6 +373,36 @@ export function installMacKeyboard(
   let composeEndedTs = -Infinity;
 
   /**
+   * 第四轮：中文输入法「智能全角标点」把 `,` `;` 这类键换成 `，` `；`，两个都发了出去。
+   *
+   * 触发条件和丢字那一类一模一样：keyCode 229（输入法上下文是热的），但这次
+   * `composing`/`ev.isComposing` 都是 false —— 全角标点是**单键直接替换**，
+   * 不开一次真正的组合会话，所以压根没有 compositionstart/compositionend 可以
+   * 拦。于是这颗键会落进 `isPlainKeystroke` 判定为真的那条「普通按键」路径，
+   * 我们照常按 `ev.key`（也就是原始半角标点）`send` 了一遍；
+   * 但 WebKit 认的是输入法最终塞进 textarea 的字符，不是 `ev.key`——
+   * 它照样会派发一条 `input`（`data` 是真正上屏的全角标点），而我们自己的
+   * `onInput` 一看这是非 ASCII 字符，以为是中文组合上屏，直接放行给 xterm。
+   * 两条路各发一次，屏幕上就成了「，,」。
+   *
+   * 不能靠 keyCode === 229 整体改判据：229 在输入法热着的时候对**任何**键都
+   * 会出现，英文字母大多数时候根本不会被替换，真把它们也攥在手里等 input
+   * 就是在复刻最早那个丢字 bug。只能缩小范围——只对「中文输入法常自动转全角
+   * 的那几个标点」按下 229 时，暂不发送，等 WebKit 真正写定的字符（通过
+   * `input` 事件）来了再发，这样原样未被替换、或被替换成全角，都只发一次。
+   */
+  const PUNCT_RISK = new Set([",", ".", ";", ":", "'", '"', "!", "?", "(", ")", "[", "]", "<", ">", "$", "\\", "^", "_", "`", "~"]);
+  let pendingPunct: { key: string; at: number } | null = null;
+  let pendingTimer: number | undefined;
+  const clearPending = () => {
+    pendingPunct = null;
+    if (pendingTimer !== undefined) {
+      clearTimeout(pendingTimer);
+      pendingTimer = undefined;
+    }
+  };
+
+  /**
    * 这颗键是不是刚刚那次上屏的**同一个物理按键**。
    *
    * WebKit 上「空格确认候选」有两种到达顺序：
@@ -395,6 +425,7 @@ export function installMacKeyboard(
     composing = true;
     // 上一轮如果因为异常路径没消费掉，别让它带到这一轮
     imeConsumedKey = null;
+    clearPending();
   };
 
   const onComposeEnd = (ev: CompositionEvent) => {
@@ -488,6 +519,24 @@ export function installMacKeyboard(
     // 拦死默认行为：不产生 keypress / beforeinput，也不让 xterm 的 _keyDown 跑
     ev.preventDefault();
     ev.stopPropagation();
+    // 中文输入法「智能全角标点」：keyCode 229 说明输入法上下文是热的，这颗键
+    // 最终上屏的是原样还是全角，只有 WebKit 真正写进 textarea 的那条 input
+    // 才说得准——这里先别发，见上面 `pendingPunct` 的注释。
+    if (ev.keyCode === 229 && PUNCT_RISK.has(ev.key)) {
+      clearPending();
+      pendingPunct = { key: ev.key, at: nowMs() };
+      // 正常情况下 input 紧接着就到；万一这次没有（标点其实没被替换、
+      // WebKit 偏偏也没补发 input），兜底当普通键发出去，不能让它悄悄消失。
+      pendingTimer = setTimeout(() => {
+        if (pendingPunct?.key === ev.key) {
+          clearTextarea();
+          send(ev.key);
+          pendingPunct = null;
+        }
+        pendingTimer = undefined;
+      }, 80);
+      return;
+    }
     // 刻意**不在这里按长度差判断**：`_handleAnyTextareaChanges` 会拿长度变短
     // 判成一次退格（发 DEL 给 shell），那等于亲手删掉一个字符。清除动作只做
     // 「整段清空」，而且是在我们自己接管的分支里 —— xterm 自己清也是这么做的。
@@ -502,6 +551,16 @@ export function installMacKeyboard(
   };
 
   const onInput = (ev: InputEvent) => {
+    // 刚才有一颗「可能被全角标点替换」的键在等——不管这条 input 的 data 是
+    // 原样（没被替换）还是全角（被替换了），都是它唯一、最终的结果，发这一条
+    // 就够，xterm 不该再碰（它没拦住的话，非 ASCII 会被当成中文组合上屏再发一遍）。
+    if (pendingPunct && !composing && ev.data) {
+      clearPending();
+      ev.stopPropagation();
+      clearTextarea();
+      send(ev.data);
+      return;
+    }
     // 只有「真的在组合」才放手。这里**刻意不看 `ev.isComposing`** ——
     // 输入法上下文残留时它会谎报 true，而那正是丢字发生的那一刻；
     // 是不是组合以我们自己的 compositionstart/end 为准。
@@ -549,5 +608,6 @@ export function installMacKeyboard(
     host.removeEventListener("compositionstart", onComposeStart, true);
     host.removeEventListener("compositionend", onComposeEnd, true);
     ledger.clear();
+    clearPending();
   };
 }
