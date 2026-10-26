@@ -1,4 +1,4 @@
-/* 阅读窗口。外壳色取自主窗口主题（--bg / --text 等），正文用固定的浅色纸面，
+/* 浏览窗口。外壳色取自主窗口主题（--bg / --text 等），正文用固定的浅色纸面，
    保证 md/html 的排版效果与在浏览器里看到的一致，不受终端暗色主题影响。 */
 
 html, body, #root { height: 100%; margin: 0; }
@@ -129,6 +129,8 @@ body { overflow: hidden; }
 
 /* ——— 徽标颜色 ——— */
 .rd-badge.rd-image { background: #3a9d6a; }
+.rd-badge.rd-audio { background: #c7861b; }
+.rd-badge.rd-video { background: #c0392b; }
 .rd-badge.rd-code { background: #8a63c8; }
 
 /* ——— 二级工具条（图片 / 配置文件共用） ——— */
@@ -170,6 +172,18 @@ body { overflow: hidden; }
   background-size: 16px 16px;
   background-position: 0 0, 0 8px, 8px -8px, -8px 0;
 }
+
+/* ——— 音频 / 视频 ——— */
+.rd-audio-root {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.rd-audio { width: min(560px, 100%); }
+.rd-video-root {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: #15171b;
+}
+.rd-video { max-width: 100%; max-height: 100%; object-fit: contain; }
 
 /* ——— 配置文件 ——— */
 .rd-ok { color: #2da44e; font-size: 12px; }

@@ -1146,3 +1146,35 @@ test("229 也代表输入法占用（不只回车）", () => {
   const g = new ImeGuard();
   assert.equal(isImeKey(key({ key: "ArrowDown", keyCode: 229 }), g), true);
 });
+
+// ——— compositionend 漏发：composing 卡死自愈 ———
+// 真实故障：某些 Windows 输入法 / 窗口内切标签页（不触发 window blur）会让
+// compositionend 永远不来。composing 卡在 true 上之后，Tab / Enter / 方向键
+// 全部被 `captures()` 判成"输入法在处理"而放行给 shell——补全从此失灵，
+// 表现就是"灰字摆在那儿，按 Tab / Enter 却什么都没发生"。
+
+test("compositionend 漏发：组合活着的时候（有 touch 心跳）不会被误判成卡死", () => {
+  const g = new ImeGuard();
+  g.begin(0);
+  // 慢速拼音：每个字母间隔小一秒，但一直有 compositionupdate 心跳
+  for (let t = 500; t <= 3500; t += 500) g.touch(t);
+  assert.equal(isImeKey(key({ key: "a", keyCode: 65, timeStamp: 3600 }), g), true, "组合还在继续，不该被打断");
+});
+
+test("compositionend 漏发：心跳停了足够久之后，下一个真实按键自动解锁", () => {
+  const g = new ImeGuard();
+  g.begin(0);
+  g.touch(100); // 组合里敲过几个字母，随后 compositionend 没来
+  // 很久之后用户直接去按 Tab：这颗键本身就是物理键盘产生的证据
+  const ev = key({ key: "Tab", keyCode: 9, timeStamp: 100 + COMMIT_WINDOW_MS + 5000 });
+  assert.equal(isImeKey(ev, g), false, "卡死太久了，不能再把 Tab 当成输入法在处理");
+  assert.equal(g.isComposing, false, "顺手把状态也解开，后面的键不用再等一次超时");
+});
+
+test("compositionend 漏发：自愈之后紧接着真的开始新组合，不受影响", () => {
+  const g = new ImeGuard();
+  g.begin(0);
+  // 卡死很久后来了一次新的 compositionstart——不管旧状态，正常开始新的一轮
+  g.begin(6000);
+  assert.equal(isImeKey(key({ key: "a", keyCode: 65, timeStamp: 6100 }), g), true);
+});

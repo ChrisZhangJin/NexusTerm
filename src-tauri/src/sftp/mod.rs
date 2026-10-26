@@ -309,7 +309,7 @@ impl SftpManager {
         Ok(n)
     }
 
-    /// 把远端文件整个读进内存（阅读窗口用），超过 `max` 字节直接拒绝。
+    /// 把远端文件整个读进内存（浏览窗口用），超过 `max` 字节直接拒绝。
     pub async fn read(&self, id: &str, path: &str, max: usize) -> Result<Vec<u8>, SftpError> {
         use tokio::io::AsyncReadExt;
         let mut file = {
@@ -326,7 +326,7 @@ impl SftpManager {
             }
             if meta.size.unwrap_or(0) as usize > max {
                 return Err(SftpError::Remote(format!(
-                    "文件超过 {} MB，不适合阅读",
+                    "文件超过 {} MB，不适合浏览",
                     max / 1024 / 1024
                 )));
             }
@@ -342,7 +342,7 @@ impl SftpManager {
             .map_err(|e| SftpError::Remote(e.to_string()))?;
         let _ = file.close().await;
         if buf.len() > max {
-            return Err(SftpError::Remote("文件过大，不适合阅读".into()));
+            return Err(SftpError::Remote("文件过大，不适合浏览".into()));
         }
         Ok(buf)
     }

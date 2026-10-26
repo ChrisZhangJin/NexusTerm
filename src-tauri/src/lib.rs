@@ -13,7 +13,7 @@ mod agent;
 mod cmd;
 mod keys;
 mod local;
-mod reader;
+mod viewer;
 mod sftp;
 mod ssh;
 mod store;
@@ -130,8 +130,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        // 阅读窗口里 HTML iframe 的页面来源（带独立 CSP，默认禁脚本）
-        .register_uri_scheme_protocol("nxdoc", reader::protocol)
+        // 浏览窗口里 HTML iframe 的页面来源（带独立 CSP，默认禁脚本）
+        .register_uri_scheme_protocol("nxdoc", viewer::protocol)
         .setup(|app| {
             let dir = app_data_dir(app.handle());
             // 先起日志：下面每一步（建库、恢复会话）出错都需要留下记录
@@ -156,7 +156,7 @@ pub fn run() {
             // 否则设施齐全但全局默认关闭，feed 会一路短路
             let agent = agent::AgentManager::new();
             agent.apply_config(&agent::load_config(&store));
-            app.manage(reader::DocStore::default());
+            app.manage(viewer::DocStore::default());
             app.manage(AppState {
                 sessions,
                 sftp,
@@ -234,10 +234,10 @@ pub fn run() {
             cmd::local_write,
             cmd::local_resize,
             cmd::local_close,
-            reader::reader_open_sftp,
-            reader::reader_open_ssh,
-            reader::reader_open_local,
-            reader::reader_doc,
+            viewer::viewer_open_sftp,
+            viewer::viewer_open_ssh,
+            viewer::viewer_open_local,
+            viewer::viewer_doc,
             agent::cmd::agent_get_config,
             agent::cmd::agent_set_config,
             agent::cmd::agent_set_session,

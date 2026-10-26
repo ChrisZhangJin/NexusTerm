@@ -6,7 +6,7 @@ import { normalizeTimeout, toFriendlyError } from "../lib/errors";
 import { isWindows } from "../lib/platform";
 import { getPrefs } from "../lib/prefs";
 import type { AuthMethod, RemoteEntry, SessionRecord } from "../types";
-import { kindIcon, readableKind } from "../lib/readable";
+import { kindIcon, viewableKind } from "../lib/viewable";
 
 function formatSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -184,7 +184,7 @@ function Pane({
               onEntryContext(ev, e);
             }}
           >
-            <span className="fm-icon">{e.isDir ? "📁" : kindIcon(readableKind(e.name))}</span>
+            <span className="fm-icon">{e.isDir ? "📁" : kindIcon(viewableKind(e.name))}</span>
             <span className="fm-name">{e.name}</span>
             <span className="fm-size">
               {e.isDir ? "" : formatSize(e.size)}
@@ -388,9 +388,9 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
       setRemoteSel(null);
       setRemotePath(e.path);
       loadRemote(e.path);
-    } else if (readableKind(e.name)) {
-      // 双击可阅读文件（md / html / 图片 / 配置文件）直接打开
-      void doRead(e);
+    } else if (viewableKind(e.name)) {
+      // 双击可浏览文件（md / html / 图片 / 音视频 / 配置文件）直接打开
+      void doView(e);
     }
   };
 
@@ -430,19 +430,19 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
     }
   };
 
-  /** 在新窗口中阅读：md / html 渲染，图片查看，配置文件高亮 */
-  const doRead = async (entry: RemoteEntry) => {
+  /** 在新窗口中浏览：md / html 渲染，图片/音视频播放，配置文件高亮 */
+  const doView = async (entry: RemoteEntry) => {
     setCtx(null);
     setTransferMsg(`正在打开「${entry.name}」…`);
     try {
-      await api.readerOpenSftp(
+      await api.viewerOpenSftp(
         sftpId,
         entry.path,
         `${session.username}@${session.host}:${entry.path}`
       );
       setTransferMsg(null);
     } catch (e) {
-      setTransferMsg(`阅读失败：${e}`);
+      setTransferMsg(`浏览失败：${e}`);
     }
   };
 
@@ -580,15 +580,15 @@ export default function FileManager({ session, passphrase, onClose }: Props) {
             <>
               <button
                 className="ctx-item"
-                disabled={!readableKind(ctx.entry.name)}
+                disabled={!viewableKind(ctx.entry.name)}
                 title={
-                  readableKind(ctx.entry.name)
+                  viewableKind(ctx.entry.name)
                     ? "在新窗口中查看"
-                    : "支持 Markdown、HTML、图片、配置文件（json/yaml/toml/ini/conf/xml…）"
+                    : "支持 Markdown、HTML、图片、音频、视频、文本与配置文件（json/yaml/toml/ini/conf/xml/sql…）"
                 }
-                onClick={() => doRead(ctx.entry)}
+                onClick={() => doView(ctx.entry)}
               >
-                阅读
+                浏览
               </button>
               <button
                 className="ctx-item"

@@ -4,8 +4,8 @@ import { initPlatform } from "./lib/platform";
 
 declare global {
   interface Window {
-    /** 阅读窗口由后端注入文档 id；主窗口没有该字段 */
-    __NX_READER__?: string;
+    /** 浏览窗口由后端注入文档 id；主窗口没有该字段 */
+    __NX_VIEWER__?: string;
     /** 浮动 Agent 窗口由后端注入初始会话 id；主窗口没有该字段 */
     __NX_AGENT__?: string;
   }
@@ -13,20 +13,20 @@ declare global {
 
 const root = () => ReactDOM.createRoot(document.getElementById("root") as HTMLElement);
 
-if (window.__NX_READER__) {
-  // 阅读窗口：只加载阅读界面与它自己的样式，不挂主应用
-  const id = window.__NX_READER__;
-  import("./reader/Reader").then(({ default: Reader }) => {
+if (window.__NX_VIEWER__) {
+  // 浏览窗口：只加载浏览界面与它自己的样式，不挂主应用
+  const id = window.__NX_VIEWER__;
+  import("./viewer/Viewer").then(({ default: Viewer }) => {
     root().render(
       <React.StrictMode>
-        <Reader id={id} />
+        <Viewer id={id} />
       </React.StrictMode>
     );
   });
 } else if (window.__NX_AGENT__ !== undefined) {
   // 浮动 Agent 窗口：只渲染 AI 面板，不挂主应用
   const initialSession = window.__NX_AGENT__;
-  Promise.all([import("./reader/AgentWindow"), initPlatform().catch(() => null)]).then(
+  Promise.all([import("./viewer/AgentWindow"), initPlatform().catch(() => null)]).then(
     ([{ default: AgentWindow }]) => {
       root().render(
         <React.StrictMode>

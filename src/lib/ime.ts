@@ -47,17 +47,42 @@ export const COMMIT_WINDOW_MS = 50;
 const VK_PROCESS = 229;
 
 /**
+ * `composing` 卡死多久之后不再信它。
+ *
+ * `compositionend` 不一定会来——组合中途切走输入焦点（不触发 window blur，
+ * 比如在同一个窗口里切了个标签页）、或者某些 Windows 输入法本身就会漏发
+ * 这个事件。目前唯一的恢复路径是 `window blur`，真遇到上面这些情况就会
+ * 卡在 `composing=true` 上：之后所有的 Tab / Enter / 方向键都会被当成
+ * "输入法正在处理" 而直接放行给 shell，补全从此失灵，表现就是"灰字摆在
+ * 那儿，按 Tab / Enter 却什么都没发生"。
+ *
+ * 真实的拼音组合里，每敲一个字母都会触发一次 `compositionupdate`——
+ * 所以拿"离上一次组合活动过了多久"当门槛，而不是"组合开始了多久"：
+ * 慢打字的人也不会被打断，但真卡死的状态会在第一次真正的按键
+ * （用户早就放弃了那次组合，直接去按 Tab / Enter）时自动解开。
+ */
+const STALE_COMPOSE_MS = 4000;
+
+/**
  * 跟踪输入法状态。刻意做成普通对象而不是读 DOM：
  * 这样它能在 node 里被单测，也不会把组件状态搅进来。
  */
 export class ImeGuard {
   private composing = false;
   private endedAt: number | null = null;
+  /** 这次组合里最近一次活动（start 或 update）的时间戳，用来判断是不是卡死了 */
+  private lastActivity: number | null = null;
 
   /** compositionstart */
-  begin(): void {
+  begin(timeStamp = 0): void {
     this.composing = true;
     this.endedAt = null;
+    this.lastActivity = timeStamp;
+  }
+
+  /** compositionupdate：组合还活着，刷新一下「最近活动」时间戳 */
+  touch(timeStamp: number): void {
+    if (this.composing) this.lastActivity = timeStamp;
   }
 
   /**
@@ -75,6 +100,7 @@ export class ImeGuard {
   reset(): void {
     this.composing = false;
     this.endedAt = null;
+    this.lastActivity = null;
   }
 
   get isComposing(): boolean {
@@ -89,7 +115,17 @@ export class ImeGuard {
    */
   captures(ev: KeyLike): boolean {
     if (ev.isComposing) return true;
-    if (this.composing) return true;
+    if (this.composing) {
+      // 卡死自愈：这次「组合」已经比最近一次真实活动晚了老半天，
+      // 多半是 compositionend 漏发、状态再也等不到人清理。
+      // 真发生在这儿的按键本身也证明组合早就不在了——这是物理键盘产生的、
+      // 用户明确在操作界面的事件，不会是哪条真实组合的一部分。
+      if (this.lastActivity !== null && ev.timeStamp - this.lastActivity > STALE_COMPOSE_MS) {
+        this.reset();
+      } else {
+        return true;
+      }
+    }
     // 被输入法接管：物理键盘永远产生不了 229
     return ev.keyCode === VK_PROCESS;
   }

@@ -261,17 +261,19 @@ export const api = {
   /** 浮动窗口是否已打开 */
   agentWindowOpen: () => invoke<boolean>("agent_window_open"),
 
-  // ——— 阅读窗口（.md / .html 渲染查看） ———
-  readerOpenSftp: (sftpId: string, path: string, source: string) =>
-    invoke<void>("reader_open_sftp", { sftpId, path, source }),
-  readerOpenSsh: (id: string, path: string, source: string) =>
-    invoke<void>("reader_open_ssh", { id, path, source }),
-  readerOpenLocal: (path: string) => invoke<void>("reader_open_local", { path }),
-  readerDoc: (id: string) =>
-    invoke<{ name: string; source: string; kind: "markdown" | "html" | "image" | "code"; data: string }>(
-      "reader_doc",
-      { id }
-    ),
+  // ——— 浏览窗口（.md / .html 渲染查看、图片/音频/视频播放、文本高亮） ———
+  viewerOpenSftp: (sftpId: string, path: string, source: string) =>
+    invoke<void>("viewer_open_sftp", { sftpId, path, source }),
+  viewerOpenSsh: (id: string, path: string, source: string) =>
+    invoke<void>("viewer_open_ssh", { id, path, source }),
+  viewerOpenLocal: (path: string) => invoke<void>("viewer_open_local", { path }),
+  viewerDoc: (id: string) =>
+    invoke<{
+      name: string;
+      source: string;
+      kind: "markdown" | "html" | "image" | "audio" | "video" | "code";
+      data: string;
+    }>("viewer_doc", { id }),
 };
 
 /** base64 → Uint8Array。SSH 数据流必须走这条路径，不能 lossy 转字符串。 */

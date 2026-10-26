@@ -9,6 +9,7 @@ import bash from "highlight.js/lib/languages/bash";
 import nginx from "highlight.js/lib/languages/nginx";
 import dockerfile from "highlight.js/lib/languages/dockerfile";
 import makefile from "highlight.js/lib/languages/makefile";
+import sql from "highlight.js/lib/languages/sql";
 import plaintext from "highlight.js/lib/languages/plaintext";
 import "highlight.js/styles/github.css";
 import { api } from "../api";
@@ -22,6 +23,7 @@ hljs.registerLanguage("bash", bash);
 hljs.registerLanguage("nginx", nginx);
 hljs.registerLanguage("dockerfile", dockerfile);
 hljs.registerLanguage("makefile", makefile);
+hljs.registerLanguage("sql", sql);
 hljs.registerLanguage("plaintext", plaintext);
 
 /** 超过这个大小不做高亮（hljs 是同步的，几 MB 的日志会卡住窗口） */
@@ -57,10 +59,10 @@ export default function CodeView({
   zoom: number;
   onNotify: (msg: string) => void;
 }) {
-  const [wrap, setWrap] = useState(() => localStorage.getItem("nx.reader.wrap") === "1");
+  const [wrap, setWrap] = useState(() => localStorage.getItem("nx.viewer.wrap") === "1");
   const [pretty, setPretty] = useState(false);
 
-  useEffect(() => localStorage.setItem("nx.reader.wrap", wrap ? "1" : "0"), [wrap]);
+  useEffect(() => localStorage.setItem("nx.viewer.wrap", wrap ? "1" : "0"), [wrap]);
 
   const js = useMemo(() => (isJson ? checkJson(text) : null), [isJson, text]);
   const shown = pretty && js?.ok ? js.pretty : text;

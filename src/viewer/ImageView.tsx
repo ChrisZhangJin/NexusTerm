@@ -25,7 +25,7 @@ export default function ImageView({
   const [nat, setNat] = useState<{ w: number; h: number } | null>(null);
   const [view, setView] = useState({ s: 1, x: 0, y: 0 });
   const [fit, setFit] = useState(true);
-  const [bg, setBg] = useState<Bg>(() => (localStorage.getItem("nx.reader.imgbg") as Bg) || "checker");
+  const [bg, setBg] = useState<Bg>(() => (localStorage.getItem("nx.viewer.imgbg") as Bg) || "checker");
   const boxRef = useRef<HTMLDivElement>(null);
   const drag = useRef<{ x: number; y: number; vx: number; vy: number } | null>(null);
   const viewRef = useRef(view);
@@ -37,7 +37,7 @@ export default function ImageView({
     return () => URL.revokeObjectURL(u);
   }, [bytes, mime]);
 
-  useEffect(() => localStorage.setItem("nx.reader.imgbg", bg), [bg]);
+  useEffect(() => localStorage.setItem("nx.viewer.imgbg", bg), [bg]);
 
   /** 居中放置于给定缩放 */
   const place = useCallback(

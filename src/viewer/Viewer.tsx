@@ -4,20 +4,31 @@ import DOMPurify from "dompurify";
 import { api, base64ToBytes } from "../api";
 import { BUILTIN_THEMES, DEFAULT_THEME } from "../lib/theme";
 import { applyChromeVars } from "../lib/chrome";
-import { codeLang, imageMime, isJson, isSvg, kindLabel, type ReadableKind } from "../lib/readable";
+import {
+  audioMime,
+  codeLang,
+  imageMime,
+  isJson,
+  isSvg,
+  kindLabel,
+  videoMime,
+  type ViewableKind,
+} from "../lib/viewable";
 import ImageView from "./ImageView";
+import AudioView from "./AudioView";
+import VideoView from "./VideoView";
 import CodeView from "./CodeView";
-import "./reader.css";
+import "./viewer.css";
 
 /**
- * 阅读窗口：渲染 .md / .html；查看图片；高亮显示配置文件。
+ * 浏览窗口：渲染 .md / .html；查看图片；播放音频 / 视频；高亮显示文本与配置文件。
  * - Markdown：marked → DOMPurify 净化后直接插入（不执行任何脚本，外链在系统浏览器打开）。
  * - HTML：sandbox iframe，src 走 nxdoc 协议（后端带 CSP 头）。
  *   默认禁脚本；勾选「允许脚本」后改 sandbox + 换 URL 重新加载。
  *   无论哪种都不给 allow-same-origin：页面是不透明源，碰不到应用的 IPC 与存储。
  */
 
-type Doc = { name: string; source: string; kind: ReadableKind; bytes: Uint8Array };
+type Doc = { name: string; source: string; kind: ViewableKind; bytes: Uint8Array };
 
 /** UTF-8 优先；非法时回退 GBK（国内老文档常见） */
 function decode(bytes: Uint8Array): { text: string; enc: string } {
@@ -48,12 +59,12 @@ async function openExternal(href: string) {
   }
 }
 
-export default function Reader({ id }: { id: string }) {
+export default function Viewer({ id }: { id: string }) {
   const [doc, setDoc] = useState<Doc | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [mode, setMode] = useState<"render" | "source">("render");
   const [allowJs, setAllowJs] = useState(false);
-  const [zoom, setZoom] = useState(() => Number(localStorage.getItem("nx.reader.zoom")) || 100);
+  const [zoom, setZoom] = useState(() => Number(localStorage.getItem("nx.viewer.zoom")) || 100);
   const mdRef = useRef<HTMLDivElement>(null);
   const [imgInfo, setImgInfo] = useState("");
   const [toast, setToast] = useState<string | null>(null);
@@ -72,21 +83,22 @@ export default function Reader({ id }: { id: string }) {
 
   useEffect(() => {
     api
-      .readerDoc(id)
+      .viewerDoc(id)
       .then((d) => {
         setDoc({ ...d, bytes: base64ToBytes(d.data) });
-        document.title = `阅读 · ${d.name}`;
+        document.title = `浏览 · ${d.name}`;
       })
       .catch((e) => setErr(String(e)));
   }, [id]);
 
   useEffect(() => {
-    localStorage.setItem("nx.reader.zoom", String(zoom));
+    localStorage.setItem("nx.viewer.zoom", String(zoom));
   }, [zoom]);
 
-  // 图片（除 SVG 源码视图外）不需要解码成文本
+  // 图片（除 SVG 源码视图外）/ 音频 / 视频都是二进制内容，不需要解码成文本
   const decoded = useMemo(() => {
     if (!doc) return null;
+    if (doc.kind === "audio" || doc.kind === "video") return { text: "", enc: "" };
     if (doc.kind === "image" && !isSvg(doc.name)) return { text: "", enc: "" };
     return decode(doc.bytes);
   }, [doc]);
@@ -123,8 +135,10 @@ export default function Reader({ id }: { id: string }) {
 
   // Ctrl + 滚轮 / Ctrl +/- / Ctrl 0 缩放
   const isImage = doc?.kind === "image";
+  const isAudio = doc?.kind === "audio";
+  const isVideo = doc?.kind === "video";
   useEffect(() => {
-    if (isImage) return; // 图片查看器自己处理缩放
+    if (isImage || isAudio || isVideo) return; // 图片查看器自己处理缩放；音视频不需要字体缩放
     const clamp = (z: number) => Math.min(250, Math.max(50, z));
     const key = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey)) return;
@@ -145,7 +159,7 @@ export default function Reader({ id }: { id: string }) {
       window.removeEventListener("keydown", key);
       window.removeEventListener("wheel", wheel);
     };
-  }, [isImage]);
+  }, [isImage, isAudio, isVideo]);
 
   if (err) {
     return (
@@ -183,7 +197,7 @@ export default function Reader({ id }: { id: string }) {
         </span>
         <span className="rd-meta">
           {size}
-          {isImage ? (imgInfo ? ` · ${imgInfo}` : "") : ` · ${decoded.enc}`}
+          {isImage ? (imgInfo ? ` · ${imgInfo}` : "") : isAudio || isVideo ? "" : ` · ${decoded.enc}`}
         </span>
         <span className="rd-spacer" />
         {isHtml && viewMode === "render" && (
@@ -205,7 +219,7 @@ export default function Reader({ id }: { id: string }) {
             </button>
           </div>
         )}
-        {!(isImage && viewMode === "render") && (
+        {!((isImage || isAudio || isVideo) && viewMode === "render") && (
         <div className="rd-zoom">
           <button onClick={() => setZoom((z) => Math.max(50, z - 10))} title="缩小 (Ctrl -)">
             −
@@ -227,6 +241,10 @@ export default function Reader({ id }: { id: string }) {
           </pre>
         ) : isImage ? (
           <ImageView bytes={doc.bytes} mime={imageMime(doc.name)} onInfo={setImgInfo} />
+        ) : isAudio ? (
+          <AudioView bytes={doc.bytes} mime={audioMime(doc.name)} />
+        ) : isVideo ? (
+          <VideoView bytes={doc.bytes} mime={videoMime(doc.name)} />
         ) : isCode ? (
           <CodeView
             text={decoded.text}

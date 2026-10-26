@@ -16,7 +16,7 @@ import {
 } from "../lib/prefs";
 import { Highlighter, MARK_COLORS, bufferText, type MarkRule } from "../lib/highlight";
 import { parseProbe } from "../lib/context";
-import { readableKind } from "../lib/readable";
+import { viewableKind } from "../lib/viewable";
 import {
   buildCompletions,
   dropCompletion,
@@ -131,15 +131,49 @@ interface TermCtxMenu {
   y: number;
   /** 右键时的选区（菜单打开后选区可能被改，先存下来） */
   sel: string;
+  /** 「浏览」菜单项真正要用的目标：有能解析成文件的选区就用选区，
+   *  否则退化成鼠标落点所在的那个词（见 `wordAtPoint`） */
+  target: string;
 }
 
-/** 选区 → 可阅读的文件路径（md / html / 图片 / 配置文件）；否则返回 null */
-function readablePath(sel: string): string | null {
+/** 选区 / 词 → 可浏览的文件路径（md / html / 图片 / 音视频 / 文本配置）；否则返回 null */
+function viewablePath(sel: string): string | null {
   let s = sel.trim();
   if (!s || s.includes("\n")) return null;
   s = s.replace(/^['"`]+|['"`,;:]+$/g, ""); // 去掉 ls / 日志里常见的引号与尾随标点
   s = s.replace(/^file:\/\//i, "");
-  return readableKind(s) ? s : null;
+  return viewableKind(s) ? s : null;
+}
+
+/**
+ * 鼠标落点所在的「词」——右键浏览不再要求先完整选中文件名，停在上面点右键就行。
+ *
+ * 把像素坐标换算成终端的列/行（和 `CompletionOverlay` 定位用的是同一套
+ * `rect / cols|rows` 算法），读出那一行文本，再从落点列向左右扩到最近的
+ * 空白或括号类边界，取出点击处的词。
+ *
+ * 已知局限：按「1 字符 = 1 列」换算，行里有宽字符（中文等）会让列位置和
+ * 字符位置错位，命中可能不准；文件名中间带空格的话仍然只能靠手动选中——
+ * 这里只按空白切词，不去猜哪些空格其实是文件名的一部分。
+ */
+function wordAtPoint(term: Terminal, host: HTMLElement, clientX: number, clientY: number): string | null {
+  const r = host.getBoundingClientRect();
+  if (term.cols <= 0 || term.rows <= 0 || r.width <= 0 || r.height <= 0) return null;
+  const col = Math.floor(((clientX - r.left) / r.width) * term.cols);
+  const row = Math.floor(((clientY - r.top) / r.height) * term.rows);
+  if (col < 0 || row < 0 || col >= term.cols || row >= term.rows) return null;
+  const buf = term.buffer.active;
+  const line = buf.getLine(buf.viewportY + row);
+  if (!line) return null;
+  const text = line.translateToString(true);
+  if (col >= text.length || /\s/.test(text[col])) return null;
+  const isBoundary = (c: string) => /\s/.test(c) || "()[]{}<>".includes(c);
+  let start = col;
+  let end = col;
+  while (start > 0 && !isBoundary(text[start - 1])) start--;
+  while (end < text.length - 1 && !isBoundary(text[end + 1])) end++;
+  const word = text.slice(start, end + 1);
+  return word || null;
 }
 
 function debounce<A extends unknown[]>(fn: (...a: A) => void, ms: number) {
@@ -529,17 +563,23 @@ export default function TerminalView({
     // 输入法：xterm 自己会处理组合输入，这里只是旁观 —— 记下「组合开始/结束」
     // 就够了，键盘处理器据此决定回车该不该被补全接管。capture 是为了抢在
     // xterm 内部处理之前拿到（顺序无所谓，但能保证不漏）。
-    const onImeStart = () => imeRef.current.begin();
+    const onImeStart = (e: CompositionEvent) => imeRef.current.begin(e.timeStamp);
+    // 组合期间的每一次按键都会触发它：用来判断「组合是不是还活着」，
+    // 见 `lib/ime.ts` 的 `STALE_COMPOSE_MS`——没有这个心跳，卡死的
+    // compositionend 就永远等不到人清理。
+    const onImeUpdate = (e: CompositionEvent) => imeRef.current.touch(e.timeStamp);
     const onImeEnd = (e: CompositionEvent) => imeRef.current.finish(e.timeStamp);
     // 组合中被切走时 compositionend 不一定来，留着 composing=true 会把回车全吞掉
     const onImeReset = () => imeRef.current.reset();
     host.addEventListener("compositionstart", onImeStart, true);
+    host.addEventListener("compositionupdate", onImeUpdate, true);
     host.addEventListener("compositionend", onImeEnd, true);
     window.addEventListener("blur", onImeReset);
     cleanups.push(() => {
       host.removeEventListener("mousedown", onSelDown, true);
       window.removeEventListener("mouseup", onSelUp, true);
       host.removeEventListener("compositionstart", onImeStart, true);
+      host.removeEventListener("compositionupdate", onImeUpdate, true);
       host.removeEventListener("compositionend", onImeEnd, true);
       window.removeEventListener("blur", onImeReset);
     });
@@ -787,10 +827,19 @@ export default function TerminalView({
       if (zmodem.isActive()) return;
       const MENU_W = 190;
       const MENU_H = 372;
+      const sel = term.getSelection();
+      // 鼠标落点优先：xterm 的选区只在「左键按下」时才会清掉/重建，右键不会碰它——
+      // 所以 `sel` 完全可能是之前随手拖选、现在已经和鼠标位置毫无关系的旧选区。
+      // 落点能解析成文件就必须用落点，不能让一份过期的选区抢答；
+      // 只有落点那个词解析不出文件时（比如选中的是带空格的路径，单个词切不出扩展名）
+      // 才退回去看选区还有没有用。
+      const atPoint = wordAtPoint(term, host, e.clientX, e.clientY);
+      const target = atPoint && viewablePath(atPoint) ? atPoint : viewablePath(sel) ? sel : "";
       setCtxMenu({
         x: Math.min(e.clientX, window.innerWidth - MENU_W - 8),
         y: Math.min(e.clientY, window.innerHeight - MENU_H - 8),
-        sel: term.getSelection(),
+        sel,
+        target,
       });
     };
     host.addEventListener("contextmenu", onCtxMenu);
@@ -975,11 +1024,11 @@ export default function TerminalView({
     setCtxMenu(null);
     onDisconnect?.();
   }, [onDisconnect]);
-  /** 阅读选中的文件：相对路径按 shell 当前目录解析 */
-  const doRead = useCallback(
+  /** 浏览选中（或鼠标落点）的文件：相对路径按 shell 当前目录解析 */
+  const doView = useCallback(
     async (raw: string) => {
       setCtxMenu(null);
-      const p = readablePath(raw);
+      const p = viewablePath(raw);
       if (!p) return;
       const name = p.split(/[\\/]/).pop() ?? p;
       try {
@@ -989,7 +1038,7 @@ export default function TerminalView({
             onNotify?.("本地终端请选中完整路径（如 C:\\docs\\README.md）");
             return;
           }
-          await api.readerOpenLocal(p);
+          await api.viewerOpenLocal(p);
           return;
         }
         let full = p;
@@ -1003,9 +1052,9 @@ export default function TerminalView({
         }
         onNotify?.(`正在打开「${name}」…`);
         const where = peerHostRef.current ? `${peerHostRef.current}:` : "";
-        await api.readerOpenSsh(tabId, full, `${where}${full}`);
+        await api.viewerOpenSsh(tabId, full, `${where}${full}`);
       } catch (e) {
-        onNotify?.(`阅读失败：${String(e)}`);
+        onNotify?.(`浏览失败：${String(e)}`);
       }
     },
     [isLocal, tabId, onNotify]
@@ -1240,16 +1289,16 @@ export default function TerminalView({
             )}
             <div className="ctx-sep" />
             {(() => {
-              const p = readablePath(ctxMenu.sel);
+              const p = viewablePath(ctxMenu.target);
               const name = p?.split(/[\\/]/).pop();
               return (
                 <button
                   className="ctx-item"
                   disabled={!p || (!isLocal && status !== "connected")}
-                  title={p ? "在新窗口中渲染查看" : "先用鼠标选中一个 .md / .html 文件名或路径"}
-                  onClick={() => p && void doRead(ctxMenu.sel)}
+                  title={p ? "在新窗口中渲染查看" : "鼠标移到一个可预览的文件名上再右键"}
+                  onClick={() => p && void doView(ctxMenu.target)}
                 >
-                  <span className="ctx-ellipsis">{name ? `阅读「${name}」` : "阅读"}</span>
+                  <span className="ctx-ellipsis">{name ? `浏览「${name}」` : "浏览"}</span>
                 </button>
               );
             })()}

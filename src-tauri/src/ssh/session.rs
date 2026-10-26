@@ -576,7 +576,7 @@ impl SessionManager {
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
-    /// 在同一连接上开 exec 通道 `cat` 一个文件（阅读窗口用，不依赖 SFTP 子系统）。
+    /// 在同一连接上开 exec 通道 `cat` 一个文件（浏览窗口用，不依赖 SFTP 子系统）。
     /// `path` 为绝对路径或 `~/` 开头；超过 `max` 字节即中止。
     pub async fn read_file(
         &self,
@@ -610,7 +610,7 @@ impl SessionManager {
                         if out.len() > max {
                             let _ = ch.close().await;
                             return Err(SessionError::Channel(format!(
-                                "文件超过 {} MB，不适合阅读",
+                                "文件超过 {} MB，不适合浏览",
                                 max / 1024 / 1024
                             )));
                         }

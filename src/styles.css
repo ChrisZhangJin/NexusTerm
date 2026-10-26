@@ -1343,7 +1343,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .fm-path-input.invalid { border-color: var(--danger); animation: nx-shake .3s; }
 @keyframes nx-shake { 25% { transform: translateX(-3px); } 75% { transform: translateX(3px); } }
 
-/* 菜单项里过长的文件名截断（「阅读「xxx.md」」） */
+/* 菜单项里过长的文件名截断（「浏览「xxx.md」」） */
 .ctx-ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
 
 /* ——— AI 助手设置（AgentDialog）——— */
