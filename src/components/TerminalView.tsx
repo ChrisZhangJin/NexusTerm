@@ -204,6 +204,15 @@ export default function TerminalView({
   const historyPersistRef = useRef(historyPersist);
   historyPersistRef.current = historyPersist;
   const lineRef = useRef(newLineState());
+  /**
+   * 这一行有没有真的被回显过。
+   *
+   * 密码一类的输入（sudo、ssh、`passwd`……）远端会关掉回显，敲的字符
+   * 一个都不会被写回屏幕，`cursorFollowsTyped` 也就永远匹配不上。
+   * 拿它当「这行是不是密码」的判据：回了车却从没见过回显，就别记进历史——
+   * history 本是用来猜下一条命令的，密码混进去既没用又危险。
+   */
+  const lineEchoedRef = useRef(false);
   const ghostRef = useRef(new GhostText());
   /** 当前候选列表（null = 不显示下拉） */
   const [hints, setHints] = useState<CompletionItem[] | null>(null);
@@ -367,6 +376,11 @@ export default function TerminalView({
       const items = hintsRef.current;
       const term = termRef.current;
       if (!term || items.length === 0) return;
+      // 先擦掉灰字再判「光标是否在行尾」：灰字本身就是画在光标后面的真实字符，
+      // 不擦掉的话 `cursorAtLineEnd` 会把它当成「光标后面还有别的字」，
+      // 于是按 Tab 接受补全反而被当成「在行中间编辑」给收起了——
+      // 候选只有一条、灰字立刻画满光标后那几格时最容易踩到。
+      ghostRef.current.clear(term);
       // 光标已经挪到行中间（人在改前面敲错的字）：这时补进去会插在句子中间，
       // 收起下拉比硬补安全 —— 想继续补全，按 End 回到行尾即可。
       if (!cursorAtLineEnd(term)) {
@@ -422,7 +436,8 @@ export default function TerminalView({
     // 走的是与「自己敲回车」同一条记账路径：行状态提交 + 进历史，再发 \r。
     const committed = feedKeys(lineRef.current, "\r");
     if (committed) {
-      recordCommand(historyKeyRef.current, committed, historyPersistRef.current);
+      if (lineEchoedRef.current) recordCommand(historyKeyRef.current, committed, historyPersistRef.current);
+      lineEchoedRef.current = false;
     }
     sendRef.current("\r");
   }, [acceptHintAt, dismissHints]);
@@ -528,7 +543,13 @@ export default function TerminalView({
       host.removeEventListener("compositionend", onImeEnd, true);
       window.removeEventListener("blur", onImeReset);
     });
-    const resizeSub = term.onResize(() => hl.refresh());
+    // resize 会让列数、也可能让光标所在的物理行都变掉：灰字记的 atX/atY
+    // 立刻过时，`clear` 的 `sameSpot` 检查从此永远对不上——擦不掉的灰字就会
+    // 当真字一样赖在屏幕上。索性收起，下一次按键会按新尺寸重新算一遍。
+    const resizeSub = term.onResize(() => {
+      hl.refresh();
+      dismissHints();
+    });
     const bufSub = term.buffer.onBufferChange(() => hl.refresh());
     // 光标一挪就要复查：灰字是画在「当时的光标」之后的，
     // 按 ← / Home 回到行中间之后，它还赖在原处就变成了插在句子里的半截命令，
@@ -597,6 +618,17 @@ export default function TerminalView({
     const writeOut = (data: string | Uint8Array) => {
       ghostRef.current.clear(term);
       term.write(data);
+      // 这一行是不是真被回显过——门槛判据与灰字重画共用一套
+      // （见 `lib/ghost.ts` 的 `cursorFollowsTyped`），但这里当安全边界用，
+      // 不能按它默认的「1 个字符就算」：密码的第一个字符恰好撞上提示符
+      // 末尾或者上一行的残留字符，1 个字符的巧合匹配就会把没回显的密码
+      // 误判成「回显过」而记进历史。至少连续匹配 3 个字符才采信。
+      if (
+        lineRef.current.text &&
+        cursorFollowsTyped(term, lineRef.current.text, Math.min(3, lineRef.current.text.length))
+      ) {
+        lineEchoedRef.current = true;
+      }
       scheduleGhostPaint();
     };
 
@@ -665,9 +697,15 @@ export default function TerminalView({
       // 旁路监听（宏录制、宏回放时「用户插了一脚就中止」）。发不发送由这里决定，监听方只读
       emitInput(tabId, d);
       send(d).catch(() => {});
+      // 新的一行开始：清掉上一行留下的回显标记，不然刚敲完一条密码、
+      // 紧接着正常敲的命令会被上一行"已回显过"的旧状态蹭到历史里。
+      if (!lineRef.current.text) lineEchoedRef.current = false;
       // 补全：喂键攒行（同步、纯字符串运算），候选留到下一帧再算
       const committed = feedKeys(lineRef.current, d);
-      if (committed) recordCommand(historyKeyRef.current, committed, historyPersistRef.current);
+      if (committed) {
+        if (lineEchoedRef.current) recordCommand(historyKeyRef.current, committed, historyPersistRef.current);
+        lineEchoedRef.current = false;
+      }
       refreshHintsSoon();
     };
 

@@ -52,8 +52,14 @@ const ECHO_LOOKBACK = 32;
  *
  * 所以判据放宽成：光标前的文本结尾是 `text` 的**某一段前缀**。
  * 屏幕上显示的是我们敲过的东西的某一段，就说明这一行还是输入行。
+ *
+ * @param minMatch 至少要匹配到多长才算数（默认 1，贴合灰字重画「宁可信
+ *   其有」的用法）。调用方若拿这个判据当**安全边界**用（比如判断一行是不是
+ *   被回显过、要不要记进历史），1 个字符的巧合匹配太容易撞上——密码的第一个
+ *   字符恰好和提示符结尾、或者上一行残留的字符相同，就会被误判成「回显过」。
+ *   这种场景应该传一个更大的下限。
  */
-export function cursorFollowsTyped(term: Terminal, text: string): boolean {
+export function cursorFollowsTyped(term: Terminal, text: string, minMatch = 1): boolean {
   if (!text) return false;
   const buf = term.buffer.active;
   // 光标那一行的绝对下标。与 termRegistry.textBeforeCursor 用的是同一个式子 ——
@@ -70,7 +76,8 @@ export function cursorFollowsTyped(term: Terminal, text: string): boolean {
     if (ch) seen = ch + seen;
   }
 
-  for (let k = Math.min(need, seen.length); k >= 1; k--) {
+  const floor = Math.max(1, Math.min(minMatch, need));
+  for (let k = Math.min(need, seen.length); k >= floor; k--) {
     if (seen.endsWith(text.slice(0, k))) return true;
   }
   return false;
@@ -156,19 +163,21 @@ export class GhostText {
    * @returns 真正画出来的那部分文本
    */
   show(term: Terminal, suggestion: string, room: number): string {
-    // 光标后面还有真字：一个字节都别写（理由见 `cursorAtLineEnd`）。
-    // 放在最前面是故意的 —— 它是唯一能让「擦除」这件事变安全的前提，
-    // 不能指望每个调用方都记得先问一句。
-    if (!cursorAtLineEnd(term)) {
-      this.clear(term);
-      return "";
-    }
     const { text: used, cols } = this.fit(suggestion, room);
-    // 屏幕上已经是这一段：一个字节都不用写。
+    // 屏幕上已经是这一段：一个字节都不用写，也不去问 `cursorAtLineEnd`。
     // 打字时每一次按键、每一次回显都会来问一遍，而绝大多数时候答案是「没变」——
     // 重画一遍既白烧一帧渲染，又会让整行闪一下。
+    //
+    // 这个判断必须排在 `cursorAtLineEnd` **之前**：灰字自己就是画在光标后面的
+    // 真实字符，它还在屏幕上的时候 `cursorAtLineEnd` 永远会判成「光标后面还有
+    // 别的字」。顺序反了的话，只要灰字已经画出来过，这条「没变就不动」的快路径
+    // 永远走不到——每次调用都先被当成「在行中间」擦掉、再也画不回来。
     if (used === this.shown) return this.shown;
+    // 换内容之前先擦掉旧的：既是为了不留残影，也是让下面的 `cursorAtLineEnd`
+    // 看到的是真实内容，不会把我们自己上一轮画的灰字误判成「别的字」。
     this.clear(term);
+    // 光标后面还有真字：一个字节都别写（理由见 `cursorAtLineEnd`）。
+    if (!cursorAtLineEnd(term)) return "";
     if (!used) return "";
 
     const buf = term.buffer.active;

@@ -195,7 +195,9 @@ export function predictHistory(key: string, line: string): string | null {
 /** 历史里所有以 prefix 开头的命令（最近用过的在前）。给下拉列表用。 */
 export function historyMatches(key: string, prefix: string): string[] {
   const items = histories.get(key)?.items;
-  if (!items || prefix.length < 1) return [];
+  // 门槛与 `predictHistory` 保持一致：敲一个字符就弹一条完整历史，
+  // 噪声远大于帮助——真正想要的是「接着敲了几个字，像是在找这条」。
+  if (!items || prefix.length < MIN_PREDICT_CHARS) return [];
   const out: string[] = [];
   for (let i = items.length - 1; i >= 0; i--) {
     const cmd = items[i];
