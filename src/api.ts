@@ -117,10 +117,12 @@ export const api = {
   sftpList: (id: string, path: string) =>
     invoke<RemoteEntry[]>("sftp_list", { id, path }),
   sftpHome: (id: string) => invoke<string>("sftp_home", { id }),
-  sftpDownload: (id: string, remote: string, local: string) =>
-    invoke<number>("sftp_download", { id, remote, local }),
-  sftpUpload: (id: string, local: string, remote: string) =>
-    invoke<number>("sftp_upload", { id, local, remote }),
+  sftpDownload: (id: string, remote: string, local: string, transferId: string) =>
+    invoke<number>("sftp_download", { id, remote, local, transferId }),
+  sftpUpload: (id: string, local: string, remote: string, transferId: string) =>
+    invoke<number>("sftp_upload", { id, local, remote, transferId }),
+  sftpCancelTransfer: (transferId: string) =>
+    invoke<void>("sftp_cancel_transfer", { transferId }),
   sftpMkdir: (id: string, path: string) =>
     invoke<void>("sftp_mkdir", { id, path }),
   sftpRemove: (id: string, path: string, isDir: boolean) =>
@@ -300,6 +302,16 @@ export function bytesToBase64(bytes: ArrayLike<number>): string {
 
 export function stringToBytes(s: string): number[] {
   return Array.from(new TextEncoder().encode(s));
+}
+
+/** SFTP 上传/下载进度：全局事件，按 payload 里的 transferId 分发给对应的传输行 */
+export async function onSftpProgress(
+  handler: (p: { transferId: string; transferred: number; total: number }) => void
+): Promise<UnlistenFn> {
+  return listen<{ transferId: string; transferred: number; total: number }>(
+    "nx://sftp/progress",
+    (ev) => handler(ev.payload)
+  );
 }
 
 /** 订阅某个会话的远端输出 */

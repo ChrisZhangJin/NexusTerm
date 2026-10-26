@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::agent::StreamKind;
 use crate::keys;
@@ -273,11 +273,31 @@ pub fn ssh_set_sidecar(id: String, on: bool, state: State<'_, AppState>) {
 // WebView2 里 navigator.clipboard.readText 会被权限策略拦截（静默失败），
 // 统一走后端读写系统剪贴板。
 
+/// 剪贴板里是图片（截图工具「复制」放的就是位图，没有文本）时，落盘成临时 PNG，
+/// 把路径当文本粘贴进终端——这是 iTerm2「粘贴图片」的同一套做法：pty 只能传字节流，
+/// 没有「粘贴一张图」这个概念，大家都是靠这条路子让终端里跑的程序能认出图片。
+/// Claude Code 这类 CLI 能「识别粘贴的图片」，识别的就是这种指向真实文件的路径文本，
+/// 不是直接去读系统剪贴板。
+fn write_clipboard_image_to_temp() -> Result<String, String> {
+    let img = arboard::Clipboard::new()
+        .and_then(|mut c| c.get_image())
+        .map_err(|e| e.to_string())?;
+    let buf = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())
+        .ok_or_else(|| "剪贴板图片数据尺寸不对，无法解码".to_string())?;
+    let path = std::env::temp_dir().join(format!("nexusterm-paste-{}.png", uuid::Uuid::new_v4().simple()));
+    buf.save(&path).map_err(|e| format!("无法写入临时文件：{e}"))?;
+    Ok(path.display().to_string())
+}
+
 #[tauri::command]
 pub fn clipboard_read() -> Result<String, String> {
-    arboard::Clipboard::new()
-        .and_then(|mut c| c.get_text())
-        .map_err(|e| e.to_string())
+    match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+        Ok(t) if !t.is_empty() => Ok(t),
+        // 没有文本：可能是空剪贴板，也可能是图片——试一把图片再说
+        text_result => write_clipboard_image_to_temp().map_err(|img_err| {
+            text_result.err().map(|e| e.to_string()).unwrap_or(img_err)
+        }),
+    }
 }
 
 #[tauri::command]
@@ -749,9 +769,11 @@ pub async fn sftp_download(
     id: String,
     remote: String,
     local: String,
+    transfer_id: String,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<u64, SftpError> {
-    state.sftp.download(&id, &remote, &local).await
+    state.sftp.download(&id, &remote, &local, &transfer_id, &app).await
 }
 
 #[tauri::command]
@@ -759,9 +781,17 @@ pub async fn sftp_upload(
     id: String,
     local: String,
     remote: String,
+    transfer_id: String,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<u64, SftpError> {
-    state.sftp.upload(&id, &local, &remote).await
+    state.sftp.upload(&id, &local, &remote, &transfer_id, &app).await
+}
+
+#[tauri::command]
+pub fn sftp_cancel_transfer(transfer_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.sftp.cancel_transfer(&transfer_id);
+    Ok(())
 }
 
 #[tauri::command]

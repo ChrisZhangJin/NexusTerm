@@ -87,8 +87,11 @@ export default function App() {
     "appearance" | "behavior" | "shortcuts" | "keys" | "agent" | null
   >(null);
   const settingsOpen = settingsWin !== null;
-  // 非空时展示该会话的 SFTP 文件管理器
-  const [fmSession, setFmSession] = useState<SessionRecord | null>(null);
+  // 按 tabId 索引：哪些标签开着 SFTP 文件管理器、连的是哪个 session。
+  // 用 map 而不是单个值，是因为面板必须「只在自己所属的标签前台时展示」——
+  // 单个全局值做不到这件事：切标签页时它既不隐藏也不跟着换，表现就是不管
+  // 切到哪个标签，看到的都是最初那个 session 的面板。
+  const [sftpTabs, setSftpTabs] = useState<Record<string, SessionRecord>>({});
   /**
    * AI 助手侧栏是否展开。
    * 与「面板是否挂载」是两件事：面板始终挂载、只切 visible，
@@ -301,6 +304,23 @@ export default function App() {
   const patchTab = useCallback((id: string, patch: Partial<TerminalTab>) => {
     setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
   }, []);
+
+  /**
+   * 后台标签收到新输出：点亮标签栏的提醒动效。
+   *
+   * `TerminalView` 已经在「自己不是前台标签」时才调它，这里只再做一次幂等检查——
+   * 真正高频的是日志刷屏（tmux/docker 这类场景一秒钟能触发几十次 onWriteParsed），
+   * 已经点亮了就不用再 `setTabs` 一次，否则整个标签栏跟着空刷新。
+   */
+  const markTabActivity = useCallback((tabId: string) => {
+    if (tabsRef.current.find((t) => t.id === tabId)?.hasActivity) return;
+    patchTab(tabId, { hasActivity: true });
+  }, [patchTab]);
+
+  // 标签一旦被看到就清掉提醒——不管是点出来的还是快捷键切过去的，统一在这收口
+  useEffect(() => {
+    if (activeTab) patchTab(activeTab, { hasActivity: false });
+  }, [activeTab, patchTab]);
 
   /** 新标签插到 afterId 右侧；没给就追加到末尾 */
   const insertTab = useCallback((tab: TerminalTab, afterId?: string | null) => {
@@ -893,6 +913,13 @@ export default function App() {
     // 标签在等验证码时被关掉：后端 close() 会解除挂起，弹窗也得跟着消失，
     // 否则它会一直杵在那儿等一个已经不存在的连接。
     setAuthPrompts((prev) => prev.filter((p) => p.sessionId !== tabId));
+    // 标签带走它自己的 SFTP 面板，不然连接/状态会悄悄留着
+    setSftpTabs((prev) => {
+      if (!(tabId in prev)) return prev;
+      const next = { ...prev };
+      delete next[tabId];
+      return next;
+    });
     setTabs((prev) => {
       const t = prev.find((x) => x.id === tabId);
       if (t?.local) api.localClose(tabId).catch(() => {});
@@ -1417,10 +1444,20 @@ export default function App() {
       const s = sessions.find((x) => x.id === sid);
       if (!s) return;
       setActiveTab(tabId);
-      setFmSession(s);
+      setSftpTabs((prev) => ({ ...prev, [tabId]: s }));
     },
     [sessions, tabs]
   );
+
+  /** 关掉某个标签的 SFTP 面板（面板自己的卸载 effect 会去断开连接） */
+  const closeSftpTab = useCallback((tabId: string) => {
+    setSftpTabs((prev) => {
+      if (!(tabId in prev)) return prev;
+      const next = { ...prev };
+      delete next[tabId];
+      return next;
+    });
+  }, []);
 
   const activeTabState = tabs.find((t) => t.id === activeTab) ?? null;
   const activeSession = activeTabState?.sessionId
@@ -1501,6 +1538,7 @@ export default function App() {
                 lineHeight={lineHeight}
                 onDisconnect={() => (t.local ? closeTab(t.id) : disconnectTab(t.id))}
                 onOpenSftp={() => openSftp(t.id)}
+                onBackgroundOutput={() => markTabActivity(t.id)}
                 peerHost={sessions.find((x) => x.id === t.sessionId)?.host}
                 status={t.status}
                 reconnectAttempt={t.reconnectAttempt}
@@ -1546,14 +1584,16 @@ export default function App() {
               />
             )}
 
-            {fmSession && (
+            {Object.entries(sftpTabs).map(([tabId, s]) => (
               <FileManager
-                key={fmSession.id}
-                session={fmSession}
-                passphrase={passphraseRef.current.get(fmSession.id)}
-                onClose={() => setFmSession(null)}
+                key={tabId}
+                tabId={tabId}
+                active={tabId === activeTab}
+                session={s}
+                passphrase={passphraseRef.current.get(s.id)}
+                onClose={() => closeSftpTab(tabId)}
               />
-            )}
+            ))}
 
             {/* 宏回放 / 录制：贴在终端右上角，点一下即中止 */}
             {macroRun && macroRun.tabId === activeTab && (
@@ -1579,7 +1619,7 @@ export default function App() {
               </div>
             )}
 
-            {tabs.length === 0 && !fmSession && (
+            {tabs.length === 0 && Object.keys(sftpTabs).length === 0 && (
               <div className="welcome">
                 <h1>NexusTerm</h1>
                 <p>跨平台 SSH / SFTP 客户端 · Rust + TypeScript</p>

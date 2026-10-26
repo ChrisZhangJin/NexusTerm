@@ -123,6 +123,8 @@ interface Props {
   onDisconnect?: () => void;
   /** 打开 SFTP 文件管理器（仅 SSH） */
   onOpenSftp?: () => void;
+  /** 不在前台时收到新输出——标签栏据此点亮提醒动效。只在非活跃时调用。 */
+  onBackgroundOutput?: () => void;
 }
 
 /** 终端区域右键菜单状态 */
@@ -198,6 +200,7 @@ export default function TerminalView({
   onNotify,
   onDisconnect,
   onOpenSftp,
+  onBackgroundOutput,
   peerHost,
   status,
   reconnectAttempt,
@@ -208,6 +211,8 @@ export default function TerminalView({
   onClosedRef.current = onClosed;
   const peerHostRef = useRef(peerHost);
   peerHostRef.current = peerHost;
+  const onBackgroundOutputRef = useRef(onBackgroundOutput);
+  onBackgroundOutputRef.current = onBackgroundOutput;
   const isLocal = kind === "local";
   const hostRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -538,6 +543,8 @@ export default function TerminalView({
     // 新输出写完后：记录活跃时间（还原命令等提示符用），并重扫标记高亮
     const parsedSub = term.onWriteParsed(() => {
       markOutput(tabId);
+      // 不在前台时才需要点亮标签——自己正盯着看的标签没必要提醒自己
+      if (!activeRef.current) onBackgroundOutputRef.current?.();
       hl.refresh();
     });
     // 选中即复制：只在「鼠标在本终端按下 → 松开」时触发。

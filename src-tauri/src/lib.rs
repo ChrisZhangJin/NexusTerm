@@ -223,6 +223,7 @@ pub fn run() {
             cmd::sftp_home,
             cmd::sftp_download,
             cmd::sftp_upload,
+            cmd::sftp_cancel_transfer,
             cmd::sftp_mkdir,
             cmd::sftp_remove,
             cmd::sftp_rename,

@@ -29,3 +29,8 @@ export const writes: { tabId: string; data: number[] }[] = [];
 export function stringToBytes(s: string): number[] {
   return Array.from(new TextEncoder().encode(s));
 }
+
+/** FileManager 订阅用；自测里没有真实的后端事件流，给个 no-op unlisten */
+export function onSftpProgress(): Promise<() => void> {
+  return Promise.resolve(() => {});
+}

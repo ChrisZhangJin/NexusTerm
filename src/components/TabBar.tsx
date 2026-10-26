@@ -227,6 +227,8 @@ export default function TabBar({
                 "tab",
                 t.id === activeTab ? "active" : "",
                 t.status === "error" ? "tab-error" : "",
+                // 不在前台时收到过新输出：点亮提醒动效。已经是当前标签就不用再提醒自己。
+                t.hasActivity && t.id !== activeTab ? "tab-activity" : "",
                 isDragging ? "tab-dragging" : "",
                 dropBefore ? "drop-before" : "",
                 dropAfter ? "drop-after" : "",

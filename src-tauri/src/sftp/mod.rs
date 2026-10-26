@@ -1,14 +1,32 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use russh::client::Handle;
 use russh_sftp::client::SftpSession;
 use serde::Serialize;
-use tokio::io::{self, AsyncWriteExt};
+use tauri::{AppHandle, Emitter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::ssh::session::{ConnectRequest, SharedConns};
 use crate::ssh::{ClientHandler, KnownHosts};
+
+/// 单次读写的块大小：够大以摊薄每次系统调用/IPC 开销，又不至于让一次 `read`
+/// 读太久才检查一次取消标志。
+const CHUNK_SIZE: usize = 256 * 1024;
+/// 进度事件节流：传输期间最多每隔这么久往前端推一次，避免几十万次 IPC。
+const PROGRESS_INTERVAL_MS: u128 = 120;
+
+/// 推给前端的传输进度；`transferId` 由前端生成，贯穿一次上传/下载的始终。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferProgress {
+    pub transfer_id: String,
+    pub transferred: u64,
+    pub total: u64,
+}
 
 /// 单个远端目录项。尺寸/时间统一成可空数字，避免前端处理 undefined。
 #[derive(Debug, Clone, Serialize)]
@@ -35,6 +53,9 @@ pub enum SftpError {
     Remote(String),
     #[error("会话不存在: {0}")]
     NotFound(String),
+    /// 用户主动取消，不是真正的传输失败——调用方据此区分"已取消"与"出错"
+    #[error("已取消")]
+    Canceled,
 }
 
 impl Serialize for SftpError {
@@ -63,6 +84,10 @@ pub struct SftpManager {
     /// 里的 Arc 被释放，若文件面板还开着，连接会连带被回收 —— 传输到一半就断。
     /// 句柄在这里活到 SFTP 会话自己 close 为止。
     held: parking_lot::Mutex<HashMap<String, Arc<Handle<ClientHandler>>>>,
+    /// 进行中传输的取消标志，按前端生成的 transfer id 登记。
+    /// 置位由 `cancel_transfer` 做；拷贝循环每轮检查一次；传输结束（无论成败）
+    /// 都要 `end_transfer` 清掉，不然标志会无限堆积。
+    transfers: parking_lot::Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 /// 复用已认证连接时的两种失败，处理方式完全不同。
@@ -86,6 +111,7 @@ impl SftpManager {
             auth_prompts,
             shared,
             held: parking_lot::Mutex::new(HashMap::new()),
+            transfers: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -278,40 +304,120 @@ impl SftpManager {
         Ok(entries)
     }
 
+    /// 登记一次传输的取消标志；调用方全程持有返回的 `Arc` 在拷贝循环里轮询。
+    fn register_transfer(&self, transfer_id: &str) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.transfers.lock().insert(transfer_id.to_string(), flag.clone());
+        flag
+    }
+
+    /// 取消一次正在进行的传输；对已经结束/不存在的 id 是no-op。
+    pub fn cancel_transfer(&self, transfer_id: &str) {
+        if let Some(flag) = self.transfers.lock().get(transfer_id) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// 传输结束（成功/失败/取消）都要调用，否则取消标志会无限堆积。
+    fn end_transfer(&self, transfer_id: &str) {
+        self.transfers.lock().remove(transfer_id);
+    }
+
+    /// 按节流间隔把进度推给前端；`force` 用于第一帧和最后一帧，不受节流限制。
+    fn emit_progress(
+        app: &AppHandle,
+        transfer_id: &str,
+        transferred: u64,
+        total: u64,
+        last_emit: &mut Instant,
+        force: bool,
+    ) {
+        if !force && last_emit.elapsed().as_millis() < PROGRESS_INTERVAL_MS {
+            return;
+        }
+        *last_emit = Instant::now();
+        let _ = app.emit(
+            "nx://sftp/progress",
+            TransferProgress { transfer_id: transfer_id.to_string(), transferred, total },
+        );
+    }
+
     /// 下载远端文件到本地路径，返回写入字节数。
-    pub async fn download(&self, id: &str, remote: &str, local: &str) -> Result<u64, SftpError> {
-        // File 内部持有 Arc<RawSftpSession>，不借用 &self，因此拿到手就能释放锁
-        let mut file = {
-            let map = self.inner.lock().await;
-            let s = map
-                .get(id)
-                .ok_or_else(|| SftpError::NotFound(id.to_string()))?;
-            s.open(remote.to_string())
+    ///
+    /// 分块拷贝而不是整体 `io::copy`：一是能按 `transfer_id` 周期性推进度事件，
+    /// 二是每轮能检查一次取消标志及时中止——两者都要求拷贝循环自己掌控节奏。
+    pub async fn download(
+        &self,
+        id: &str,
+        remote: &str,
+        local: &str,
+        transfer_id: &str,
+        app: &AppHandle,
+    ) -> Result<u64, SftpError> {
+        let cancel = self.register_transfer(transfer_id);
+        let result: Result<u64, SftpError> = async {
+            // File 内部持有 Arc<RawSftpSession>，不借用 &self，因此拿到手就能释放锁，
+            // 之后的分块读写不会卡住其他 SFTP 操作（列目录等）。
+            let (mut file, total) = {
+                let map = self.inner.lock().await;
+                let s = map
+                    .get(id)
+                    .ok_or_else(|| SftpError::NotFound(id.to_string()))?;
+                let meta = s
+                    .metadata(remote.to_string())
+                    .await
+                    .map_err(|e| SftpError::Remote(e.to_string()))?;
+                let total = meta.size.unwrap_or(0);
+                let file = s
+                    .open(remote.to_string())
+                    .await
+                    .map_err(|e| SftpError::Remote(e.to_string()))?;
+                (file, total)
+            };
+
+            let mut out = tokio::fs::File::create(local)
                 .await
-                .map_err(|e| SftpError::Remote(e.to_string()))?
-        };
+                .map_err(|e| SftpError::Remote(format!("无法创建本地文件 {}: {}", local, e)))?;
 
-        let mut out = tokio::fs::File::create(local)
-            .await
-            .map_err(|e| SftpError::Remote(format!("无法创建本地文件 {}: {}", local, e)))?;
+            let mut buf = vec![0u8; CHUNK_SIZE];
+            let mut transferred = 0u64;
+            let mut last_emit = Instant::now();
+            Self::emit_progress(app, transfer_id, 0, total, &mut last_emit, true);
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(SftpError::Canceled);
+                }
+                let n = file
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| SftpError::Remote(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&buf[..n])
+                    .await
+                    .map_err(|e| SftpError::Remote(e.to_string()))?;
+                transferred += n as u64;
+                Self::emit_progress(app, transfer_id, transferred, total, &mut last_emit, false);
+            }
+            Self::emit_progress(app, transfer_id, transferred, total, &mut last_emit, true);
 
-        let n = io::copy(&mut file, &mut out)
-            .await
-            .map_err(|e| SftpError::Remote(e.to_string()))?;
+            out.flush()
+                .await
+                .map_err(|e| SftpError::Remote(e.to_string()))?;
+            file.close()
+                .await
+                .map_err(|e| SftpError::Remote(e.to_string()))?;
 
-        out.flush()
-            .await
-            .map_err(|e| SftpError::Remote(e.to_string()))?;
-        file.close()
-            .await
-            .map_err(|e| SftpError::Remote(e.to_string()))?;
-
-        Ok(n)
+            Ok(transferred)
+        }
+        .await;
+        self.end_transfer(transfer_id);
+        result
     }
 
     /// 把远端文件整个读进内存（浏览窗口用），超过 `max` 字节直接拒绝。
     pub async fn read(&self, id: &str, path: &str, max: usize) -> Result<Vec<u8>, SftpError> {
-        use tokio::io::AsyncReadExt;
         let mut file = {
             let map = self.inner.lock().await;
             let s = map
@@ -347,31 +453,68 @@ impl SftpManager {
         Ok(buf)
     }
 
-    /// 上传本地文件到远端路径，返回写入字节数。
-    pub async fn upload(&self, id: &str, local: &str, remote: &str) -> Result<u64, SftpError> {
-        let mut file = {
-            let map = self.inner.lock().await;
-            let s = map
-                .get(id)
-                .ok_or_else(|| SftpError::NotFound(id.to_string()))?;
-            s.create(remote.to_string())
+    /// 上传本地文件到远端路径，返回写入字节数。分块拷贝的理由同 `download`。
+    pub async fn upload(
+        &self,
+        id: &str,
+        local: &str,
+        remote: &str,
+        transfer_id: &str,
+        app: &AppHandle,
+    ) -> Result<u64, SftpError> {
+        let cancel = self.register_transfer(transfer_id);
+        let result: Result<u64, SftpError> = async {
+            let mut src = tokio::fs::File::open(local)
+                .await
+                .map_err(|e| SftpError::Remote(format!("无法读取本地文件 {}: {}", local, e)))?;
+            let total = src
+                .metadata()
                 .await
                 .map_err(|e| SftpError::Remote(e.to_string()))?
-        };
+                .len();
 
-        let mut src = tokio::fs::File::open(local)
-            .await
-            .map_err(|e| SftpError::Remote(format!("无法读取本地文件 {}: {}", local, e)))?;
+            let mut file = {
+                let map = self.inner.lock().await;
+                let s = map
+                    .get(id)
+                    .ok_or_else(|| SftpError::NotFound(id.to_string()))?;
+                s.create(remote.to_string())
+                    .await
+                    .map_err(|e| SftpError::Remote(e.to_string()))?
+            };
 
-        let n = io::copy(&mut src, &mut file)
-            .await
-            .map_err(|e| SftpError::Remote(e.to_string()))?;
+            let mut buf = vec![0u8; CHUNK_SIZE];
+            let mut transferred = 0u64;
+            let mut last_emit = Instant::now();
+            Self::emit_progress(app, transfer_id, 0, total, &mut last_emit, true);
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(SftpError::Canceled);
+                }
+                let n = src
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| SftpError::Remote(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n])
+                    .await
+                    .map_err(|e| SftpError::Remote(e.to_string()))?;
+                transferred += n as u64;
+                Self::emit_progress(app, transfer_id, transferred, total, &mut last_emit, false);
+            }
+            Self::emit_progress(app, transfer_id, transferred, total, &mut last_emit, true);
 
-        file.close()
-            .await
-            .map_err(|e| SftpError::Remote(e.to_string()))?;
+            file.close()
+                .await
+                .map_err(|e| SftpError::Remote(e.to_string()))?;
 
-        Ok(n)
+            Ok(transferred)
+        }
+        .await;
+        self.end_transfer(transfer_id);
+        result
     }
 
     pub async fn mkdir(&self, id: &str, path: &str) -> Result<(), SftpError> {
@@ -423,5 +566,57 @@ impl SftpManager {
 impl From<crate::ssh::session::SessionError> for SftpError {
     fn from(e: crate::ssh::session::SessionError) -> Self {
         SftpError::Auth(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造一个不连任何东西的 `SftpManager`：三个依赖都能零 I/O 造出来，
+    /// 足够单测 `register_transfer`/`cancel_transfer`/`end_transfer` 这套
+    /// 纯内存登记表的行为，不需要真实的 SSH/SFTP 连接。
+    fn make_manager() -> SftpManager {
+        SftpManager::new(
+            Arc::new(KnownHosts::new()),
+            Arc::new(crate::ssh::prompt::AuthPrompts::new()),
+            Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        )
+    }
+
+    #[test]
+    fn transfer_registry_tracks_and_clears_cancel_flags() {
+        let mgr = make_manager();
+        let flag = mgr.register_transfer("t1");
+        assert!(!flag.load(Ordering::Relaxed), "刚登记不该是已取消状态");
+
+        mgr.cancel_transfer("t1");
+        assert!(flag.load(Ordering::Relaxed), "取消要能让调用方已经拿到手的 Arc 看到置位");
+
+        mgr.end_transfer("t1");
+        assert!(
+            mgr.transfers.lock().get("t1").is_none(),
+            "传输结束要把登记表里的条目清掉，否则取消标志会无限堆积"
+        );
+    }
+
+    #[test]
+    fn cancel_unknown_transfer_is_noop() {
+        let mgr = make_manager();
+        // 不存在的 id：不能 panic，也不能凭空插入一条新记录
+        mgr.cancel_transfer("ghost");
+        assert!(mgr.transfers.lock().is_empty());
+    }
+
+    #[test]
+    fn two_transfers_have_independent_cancel_flags() {
+        let mgr = make_manager();
+        let a = mgr.register_transfer("a");
+        let b = mgr.register_transfer("b");
+        mgr.cancel_transfer("a");
+        assert!(a.load(Ordering::Relaxed));
+        assert!(!b.load(Ordering::Relaxed), "取消一个不该连带取消另一个");
+        mgr.end_transfer("a");
+        assert!(mgr.transfers.lock().contains_key("b"), "结束 a 不该带走 b 的登记");
     }
 }

@@ -199,6 +199,9 @@ export interface TerminalTab {
     ok: boolean;
     at: number;
   };
+  /** 这个标签不在前台时收到过新输出（tmux/docker 等后台任务常见）——
+   *  标签栏据此显示提醒动效；切到它身上就清掉。 */
+  hasActivity?: boolean;
 }
 
 /** 会话结束原因（后端 ClosedInfo 的镜像） */
