@@ -480,6 +480,32 @@ export function installMacKeyboard(
   };
 
   const onKeyDown = (ev: KeyboardEvent) => {
+    // 中文输入法「智能全角标点」：必须排在最前面、且**不看 `ev.isComposing`**——
+    // 和丢字那条 bug 同源，这个状态在输入法上下文残留时会谎报 true，这里要是
+    // 跟着走下面 `isImeKey`/`ev.isComposing` 那几条分支，要么被当成"组合态里的
+    // 确认键"直接吞掉、要么在 517 行提前 return，都轮不到下面处理标点的代码。
+    // 真实有没有在组合只认 `composing`（由 compositionstart/end 亲自维护）。
+    if (
+      !composing &&
+      !ev.ctrlKey && !ev.altKey && !ev.metaKey &&
+      ev.keyCode === 229 &&
+      PUNCT_RISK.has(ev.key)
+    ) {
+      // 不能 preventDefault：要让 WebKit 按它自己的判断正常插入（原样或替换成
+      // 全角），我们只负责别让 xterm 也掺和进来抢着发一遍。
+      ev.stopPropagation();
+      clearPending();
+      pendingPunct = { key: ev.key, at: nowMs() };
+      pendingTimer = setTimeout(() => {
+        if (pendingPunct?.key === ev.key) {
+          clearTextarea();
+          send(ev.key);
+          pendingPunct = null;
+        }
+        pendingTimer = undefined;
+      }, 80);
+      return;
+    }
     // 组合态里被 IME 吃掉的键：拦在这里，别让它走到 xterm 的 `_keyDown`。
     if (isImeKey(ev)) {
       if (composing || ev.isComposing) {
@@ -519,24 +545,6 @@ export function installMacKeyboard(
     // 拦死默认行为：不产生 keypress / beforeinput，也不让 xterm 的 _keyDown 跑
     ev.preventDefault();
     ev.stopPropagation();
-    // 中文输入法「智能全角标点」：keyCode 229 说明输入法上下文是热的，这颗键
-    // 最终上屏的是原样还是全角，只有 WebKit 真正写进 textarea 的那条 input
-    // 才说得准——这里先别发，见上面 `pendingPunct` 的注释。
-    if (ev.keyCode === 229 && PUNCT_RISK.has(ev.key)) {
-      clearPending();
-      pendingPunct = { key: ev.key, at: nowMs() };
-      // 正常情况下 input 紧接着就到；万一这次没有（标点其实没被替换、
-      // WebKit 偏偏也没补发 input），兜底当普通键发出去，不能让它悄悄消失。
-      pendingTimer = setTimeout(() => {
-        if (pendingPunct?.key === ev.key) {
-          clearTextarea();
-          send(ev.key);
-          pendingPunct = null;
-        }
-        pendingTimer = undefined;
-      }, 80);
-      return;
-    }
     // 刻意**不在这里按长度差判断**：`_handleAnyTextareaChanges` 会拿长度变短
     // 判成一次退格（发 DEL 给 shell），那等于亲手删掉一个字符。清除动作只做
     // 「整段清空」，而且是在我们自己接管的分支里 —— xterm 自己清也是这么做的。

@@ -1205,3 +1205,14 @@ test("接管：非热键上下文的标点（keyCode 不是 229）照常立刻�
   assert.equal(out.text, ",", "没有输入法热上下文信号，不该被按下不发");
   un();
 });
+
+test("接管：标点替换键的 isComposing 谎报 true 时，照样只发一次（之前这条漏网）", () => {
+  const { host, out, un } = rig();
+  // 残留态下 keyCode 229 的键 WebKit 经常连 isComposing 都一起谎报成 true，
+  // 但真正的 compositionstart 从没发过——composing 判据必须认后者，不认前者。
+  host.fire("keydown", plainKey(",", { keyCode: 229, isComposing: true }));
+  assert.equal(out.text, "", "先别发，等 input 揭晓");
+  host.fire("input", { data: "，", inputType: "insertText", isComposing: true });
+  assert.equal(out.text, "，", "只发一次，半角逗号不能跟着冒出来");
+  un();
+});
