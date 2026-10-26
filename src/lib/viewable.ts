@@ -91,11 +91,18 @@ function extOf(name: string): string | null {
   return name.slice(i + 1);
 }
 
-export function viewableKind(path: string): ViewableKind | null {
+/**
+ * @param opts.requireExt 为 true 时，没有扩展名一律当不可浏览处理（不走纯文本兜底）。
+ *   给「鼠标落点自动取词」这类低置信度来源用——提示符这种整行没有空格的文本
+ *   会被当成一整个词，`README` 式的兜底会让它也被误判成「可浏览的文本文件」，
+ *   拼出一个本不存在的路径发去 `cat`。真正选中文字（用户的明确意图）仍然走宽松判断。
+ */
+export function viewableKind(path: string, opts?: { requireExt?: boolean }): ViewableKind | null {
   const name = baseName(path);
   if (name in CODE_NAMES || name.startsWith(".env.")) return "code";
   const ext = extOf(name);
   if (!ext) {
+    if (opts?.requireExt) return null;
     // `extOf` 对两种情况都返回 null：真的没有扩展名（README、日志），
     // 和 ".hidden" 这种只有开头一个点、点后再没内容的隐藏文件——
     // 这两者不能一视同仁。只有前者才按纯文本兜底；后者维持不可浏览，

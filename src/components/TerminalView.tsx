@@ -138,13 +138,20 @@ interface TermCtxMenu {
   target: string;
 }
 
-/** 选区 / 词 → 可浏览的文件路径（md / html / 图片 / 音视频 / 文本配置）；否则返回 null */
-function viewablePath(sel: string): string | null {
+/**
+ * 选区 / 词 → 可浏览的文件路径（md / html / 图片 / 音视频 / 文本配置）；否则返回 null。
+ *
+ * @param requireExt 鼠标落点自动取词（没有用户明确选中）时传 true：提示符那种整行
+ *   没有空格的文本会被 `wordAtPoint` 当成一整个词，若再放行「没扩展名当纯文本」
+ *   的兜底，就会把 `user@host:~/path$` 这种东西当成文件去 `cat`，拼出一个根本
+ *   不存在的路径。真正选中文字是用户的明确意图，不受此限制。
+ */
+function viewablePath(sel: string, requireExt?: boolean): string | null {
   let s = sel.trim();
   if (!s || s.includes("\n")) return null;
   s = s.replace(/^['"`]+|['"`,;:]+$/g, ""); // 去掉 ls / 日志里常见的引号与尾随标点
   s = s.replace(/^file:\/\//i, "");
-  return viewableKind(s) ? s : null;
+  return viewableKind(s, { requireExt }) ? s : null;
 }
 
 /**
@@ -841,7 +848,7 @@ export default function TerminalView({
       // 只有落点那个词解析不出文件时（比如选中的是带空格的路径，单个词切不出扩展名）
       // 才退回去看选区还有没有用。
       const atPoint = wordAtPoint(term, host, e.clientX, e.clientY);
-      const target = atPoint && viewablePath(atPoint) ? atPoint : viewablePath(sel) ? sel : "";
+      const target = atPoint && viewablePath(atPoint, true) ? atPoint : viewablePath(sel) ? sel : "";
       setCtxMenu({
         x: Math.min(e.clientX, window.innerWidth - MENU_W - 8),
         y: Math.min(e.clientY, window.innerHeight - MENU_H - 8),
@@ -1050,9 +1057,21 @@ export default function TerminalView({
         }
         let full = p;
         if (!p.startsWith("/") && p !== "~" && !p.startsWith("~/")) {
-          const ctx = parseProbe(await api.sshProbe(tabId).catch(() => ({})));
+          let ctx: ReturnType<typeof parseProbe> = null;
+          let probeErr: string | undefined;
+          try {
+            ctx = parseProbe(await api.sshProbe(tabId));
+          } catch (e) {
+            probeErr = String(e);
+          }
           if (!ctx?.cwd) {
-            onNotify?.("无法确定远端当前目录，请选中完整路径（/… 或 ~/…）");
+            // 兼容模式（堡垒机只放行一条通道）下探测目录本来就会被拒绝——
+            // 不是这次操作本身出了问题，说清楚原因，别让人以为是 bug。
+            onNotify?.(
+              probeErr?.includes("兼容模式")
+                ? "该连接处于兼容模式（服务器不支持并行通道），无法自动获取远端目录，请选中完整路径（/… 或 ~/…）"
+                : "无法确定远端当前目录，请选中完整路径（/… 或 ~/…）"
+            );
             return;
           }
           full = (ctx.cwd.endsWith("/") ? ctx.cwd : ctx.cwd + "/") + p.replace(/^\.\//, "");
