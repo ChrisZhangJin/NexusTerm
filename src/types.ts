@@ -363,7 +363,7 @@ export interface AgentRunRequest {
  * 刻意是「扁平结构 + kind」而不是判别联合：多数字段本就可选，渲染时不用做类型收窄。
  */
 export interface AgentStep {
-  /** plan | tool | exec | result | skip | note | answer | open | export | tab */
+  /** plan | tool | exec | result | skip | note | answer | open | export | tab | waiting */
   kind: string;
   step: number;
   /** kind:"tool" 专用：模型调用的工具名（原始，如 nx_tab） */
@@ -378,6 +378,8 @@ export interface AgentStep {
   output?: string;
   text?: string;
   reasons?: string[];
+  /** kind:"waiting" 专用：命令发出去之后已经等了多少秒，还没收到结果 */
+  elapsedSecs?: number;
 }
 
 /** `nx://agent/approve/{sessionId}` 的载荷：请人点头 */

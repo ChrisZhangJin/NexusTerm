@@ -469,6 +469,10 @@ pub struct StepPayload {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasons: Option<Vec<String>>,
+    /// `kind:"waiting"` 专用：命令发出去之后已经等了多少秒，还没收到结果。
+    /// 纯展示用，让面板上的「执行中」卡片能看出还活着、不是卡死。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_secs: Option<u64>,
 }
 
 impl StepPayload {
@@ -485,6 +489,7 @@ impl StepPayload {
             output: None,
             text: None,
             reasons: None,
+            elapsed_secs: None,
         }
     }
 }
@@ -1067,6 +1072,11 @@ fn feedback_for(command: &str, label: &str, outcome: &ExecOutcome) -> String {
     s
 }
 
+/// 写入超时的提示文案。独立于 `is_channel_closed`：只是一次写超时，
+/// 命令可能根本没发出去也可能发出去了但没收到确认，不等于连接已经报废，
+/// 不升级成「别再重试」那套更严厉的措辞。
+const WRITE_TIMEOUT_MSG: &str = "写入超时（15 秒内未发出）：连接可能暂时不稳定";
+
 /// 也有可能执行本身就没跑起来（会话关了、拒绝-ID 不存在）。
 fn failure_feedback(command: &str, label: &str, why: &str) -> String {
     let mut out = format!(
@@ -1083,6 +1093,12 @@ fn failure_feedback(command: &str, label: &str, why: &str) -> String {
              拿不到工具就用围栏写 {{\"action\":\"tab\",\"op\":\"reconnect\",\"target\":\"<该会话id>\"}}。\n\
              不需要它了就直接给结论：标签页本身还在，用户随时能自己点右键重连。\n"
         ));
+    } else if is_write_timeout(why) {
+        out.push_str(
+            "注意：不确定这条命令有没有真正发出去。可以先换一条无副作用的命令\
+             （比如 `pwd`）确认连接还活着，再决定要不要重试；\
+             如果连续超时，说明连接确实有问题，请用上面说的 tab 工具 reconnect，不要反复硬发。\n",
+        );
     }
     out
 }
@@ -1090,6 +1106,11 @@ fn failure_feedback(command: &str, label: &str, why: &str) -> String {
 /// 这条失败是不是「会话通道已关闭」。
 fn is_channel_closed(why: &str) -> bool {
     why.contains("通道") && (why.contains("关闭") || why.contains("失效") || why.contains("断开"))
+}
+
+/// 这条失败是不是「写入超时」（见 `WRITE_TIMEOUT_MSG`）。
+fn is_write_timeout(why: &str) -> bool {
+    why.contains("写入超时")
 }
 
 /// 按**字符**截断并给出提示。按 `char` 而不是字节，否则中文会切出半个字。
@@ -1122,15 +1143,23 @@ fn sink_of(state: &AppState, id: &str) -> Option<Sink> {
     None
 }
 
+/// `SessionManager::write` 本身没有超时（队列满了就老实等，这是正常键入/粘贴
+/// 需要的背压）。但 Agent 这里是「发一条命令、等它跑完」，连接已经建立，
+/// 正常几毫秒就该写完——如果迟迟写不进去，十有八九是连接半死，不该无限期挂起
+/// 等一次重连才可能解套（且重连也未必来得及，见 `SessionRuntime.task`）。
+const AGENT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// 往任意一种会话写字节。会话不存在时才报错。
 async fn write_to(state: &AppState, id: &str, data: &[u8]) -> Result<(), String> {
     match sink_of(state, id) {
         Some(Sink::Local) => state.local.write(id, data),
-        Some(Sink::Ssh) => state
-            .sessions
-            .write(id, data.to_vec())
-            .await
-            .map_err(|e| e.to_string()),
+        Some(Sink::Ssh) => tokio::time::timeout(
+            AGENT_WRITE_TIMEOUT,
+            state.sessions.write(id, data.to_vec()),
+        )
+        .await
+        .map_err(|_| WRITE_TIMEOUT_MSG.to_string())?
+        .map_err(|e| e.to_string()),
         None => Err(format!("会话不存在或已关闭：{id}")),
     }
 }
@@ -1200,7 +1229,11 @@ pub async fn run_one(
     state.agent.set_enabled(session_id, true);
 
     let payload = format!("{cmd}\n");
-    write_to(state, session_id, payload.as_bytes()).await?;
+    let write_started = std::time::Instant::now();
+    write_to(state, session_id, payload.as_bytes()).await.inspect_err(|e| {
+        tracing::debug!(session_id, command = cmd, error = %e, elapsed_ms = write_started.elapsed().as_millis() as u64, "agent exec: 写入失败");
+    })?;
+    tracing::debug!(session_id, command = cmd, elapsed_ms = write_started.elapsed().as_millis() as u64, "agent exec: 写入完成，开始等待输出");
     // 喂的是实际发出去的原始字节：这样 pty 的回显才能被 pending_echo 逐字节抵消干净
     state.agent.feed(session_id, payload.as_bytes(), StreamKind::In);
 
@@ -1234,15 +1267,48 @@ pub async fn run_one(
             None => Box::pin(async { Liveness::Unknown }),
         }
     };
-    let mut outcome = wait_for_end(
+    let wait_started = std::time::Instant::now();
+    let mut wait_fut = Box::pin(wait_for_end(
         WaitConfig::default(),
         delta,
         || cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false),
         |d| Box::pin(tokio::time::sleep(d)) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
         liveness,
-    )
-    .await;
+    ));
+    // 定期报一下「还在等」，而不是让面板上的卡片一动不动——用户没法分清
+    // 「正常在跑」和「卡死了」。`wait_for_end` 本身保持纯逻辑不碰 Tauri
+    // （便于单测），进度提示在这里用 select! 旁路加，不改它的签名。
+    const WAITING_TICK: Duration = Duration::from_secs(5);
+    let mut ticker = tokio::time::interval(WAITING_TICK);
+    ticker.tick().await; // 吃掉 interval 立即触发的第一下
+    let mut elapsed_secs = 0u64;
+    let mut outcome = loop {
+        tokio::select! {
+            o = &mut wait_fut => break o,
+            _ = ticker.tick() => {
+                elapsed_secs += WAITING_TICK.as_secs();
+                if announce {
+                    emit_step(
+                        app,
+                        session_id,
+                        StepPayload {
+                            target: Some(target_id.into()),
+                            target_label: Some(label.into()),
+                            command: Some(cmd.into()),
+                            elapsed_secs: Some(elapsed_secs),
+                            ..StepPayload::new("waiting", step)
+                        },
+                    );
+                }
+            }
+        }
+    };
     outcome.output = outcome.output.trim().to_string();
+    tracing::debug!(
+        session_id, command = cmd, reason = ?outcome.reason,
+        elapsed_ms = wait_started.elapsed().as_millis() as u64,
+        "agent exec: 等待结束"
+    );
 
     if announce {
         emit_step(

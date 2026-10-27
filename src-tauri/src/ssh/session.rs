@@ -142,6 +142,11 @@ struct SessionRuntime {
     /// 最后一次旁路通道尝试的时刻（epoch ms）。断线时对比它，
     /// 就能在日志里看出「是不是这次旁路操作把连接弄死的」。
     last_sidecar: Arc<std::sync::atomic::AtomicI64>,
+    /// `read_loop` 任务的中断句柄。重连/关闭时必须主动 abort——它可能正卡在
+    /// 一个已经半死但还没被操作系统判定断开的 TCP 写入上，不会自己退出，
+    /// 而卡在这里的话，任何等着往它的 `data_tx` 发数据的调用都会跟着无限期挂起
+    /// （见 Agent 执行命令「写完立刻执行、面板却要等几分钟」那个 bug）。
+    task: tokio::task::AbortHandle,
 }
 
 /// 探测脚本：在同一 SSH 连接上开 exec 通道执行（stdin 喂给 `sh -s`，不依赖用户登录 shell 类型）。
@@ -305,6 +310,11 @@ impl SessionManager {
         if let Some(rt) = self.inner.lock().remove(id) {
             // 走控制通道：数据队列可能正被上传堵满，Close 不能排在它后面
             let _ = rt.ctrl_tx.send(SessionInput::Close);
+            // Close 消息要等 read_loop 的 select! 轮到它才生效——任务卡在某个
+            // .await 里（比如写一个已经半死的 TCP 连接）根本轮不到。abort()
+            // 才是真正保证它在合理时间内退出的那道闸；对已经正常退出的任务
+            // 是安全的空操作。
+            rt.task.abort();
         }
     }
 
@@ -424,16 +434,38 @@ impl SessionManager {
         let sidecar = req.sidecar.unwrap_or(true);
         let last_sidecar = Arc::new(std::sync::atomic::AtomicI64::new(0));
 
-        self.inner.lock().insert(
+        let task = tokio::spawn(read_loop(
+            app,
             id.clone(),
-            SessionRuntime {
-                handle: handle.clone(),
-                data_tx,
-                ctrl_tx,
-                sidecar,
-                last_sidecar: last_sidecar.clone(),
-            },
-        );
+            channel,
+            data_rx,
+            ctrl_rx,
+            sidecar,
+            last_sidecar.clone(),
+        ))
+        .abort_handle();
+
+        {
+            let mut map = self.inner.lock();
+            // 正常重连流程 close() 已经摘过一次旧条目；这里再兜一道底，防止将来
+            // 有路径绕开 close() 直接 connect 同一个 id——旧的 read_loop 任务绝不能
+            // 被静默遗弃（见 SessionRuntime.task 的说明）。一把锁做完摘旧+插新，
+            // 不给其他调用方留下「这个 id 暂时查不到」的空隙。
+            if let Some(old) = map.remove(&id) {
+                old.task.abort();
+            }
+            map.insert(
+                id.clone(),
+                SessionRuntime {
+                    handle: handle.clone(),
+                    data_tx,
+                    ctrl_tx,
+                    sidecar,
+                    last_sidecar,
+                    task,
+                },
+            );
+        }
 
         // 登记给 SFTP 复用：同一配置下任意一条活连接都能开 sftp 子系统，
         // 这样文件面板不必再走一次认证（对 OTP 服务器就是省一次验证码）。
@@ -450,16 +482,6 @@ impl SessionManager {
                 },
             );
         }
-
-        tokio::spawn(read_loop(
-            app,
-            id,
-            channel,
-            data_rx,
-            ctrl_rx,
-            sidecar,
-            last_sidecar,
-        ));
 
         Ok(ConnectOutcome { legacy_crypto })
     }

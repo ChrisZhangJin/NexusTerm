@@ -165,6 +165,26 @@ function withStep(c: Conversation, step: AgentStep): Conversation {
       }
     }
   }
+  // 纯展示用的「还在等」心跳：合并进对应的 exec 卡片，不单独起一张卡；
+  // 对应的卡片已经收尾（或从没出现过，比如面板是后打开的）就直接丢弃，
+  // 不能退化成下面的"推一条新消息"，那样会在对话里冒出一张没头没尾的孤卡。
+  if (step.kind === "waiting") {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      const s = m.step;
+      if (
+        s &&
+        s.kind === "exec" &&
+        s.output === undefined &&
+        s.target === step.target &&
+        s.command === step.command
+      ) {
+        msgs[i] = { ...m, step: { ...s, elapsedSecs: step.elapsedSecs } };
+        return { ...c, messages: msgs };
+      }
+    }
+    return c;
+  }
   msgs.push({ id: uid(), role: "assistant", text: "", ts: Date.now(), step });
   return { ...c, messages: msgs };
 }
@@ -1002,7 +1022,7 @@ function StepCard({ step }: { step: AgentStep }) {
             <i />
             <i />
           </span>
-          等待输出…
+          等待输出…{step.elapsedSecs ? `（已等待 ${step.elapsedSecs} 秒）` : ""}
         </div>
       )}
     </div>
