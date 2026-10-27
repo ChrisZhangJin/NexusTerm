@@ -1226,9 +1226,9 @@ export default function App() {
     async (s: SessionRecord) => {
       const { save } = await import("@tauri-apps/plugin-dialog");
       const target = await save({
-        title: "导出为 Xshell 会话",
+        title: "导出为 Xshell 连接",
         defaultPath: `${s.name}.xsh`,
-        filters: [{ name: "Xshell 会话", extensions: ["xsh"] }],
+        filters: [{ name: "Xshell 连接", extensions: ["xsh"] }],
       });
       if (!target) return;
       try {
@@ -1361,8 +1361,8 @@ export default function App() {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const picked = await open({
       multiple: true,
-      title: "选择 Xshell 会话文件",
-      filters: [{ name: "Xshell 会话", extensions: ["xsh"] }],
+      title: "选择 Xshell 连接文件",
+      filters: [{ name: "Xshell 连接", extensions: ["xsh"] }],
     });
     if (!picked) return;
     const paths = Array.isArray(picked) ? picked : [picked];
@@ -1374,9 +1374,9 @@ export default function App() {
       await refresh();
       const parts: string[] = [];
       if (pwOk.length > 0) {
-        parts.push(`成功导入 ${ok.length} 个会话（${pwOk.length} 个已自动导入密码）`);
+        parts.push(`成功导入 ${ok.length} 个连接（${pwOk.length} 个已自动导入密码）`);
       } else {
-        parts.push(`成功导入 ${ok.length} 个会话`);
+        parts.push(`成功导入 ${ok.length} 个连接`);
       }
       if (bad.length > 0) {
         parts.push(`失败 ${bad.length} 个：${bad.map((b) => `${b.label}（${b.error}）`).join("；")}`);
@@ -1394,9 +1394,9 @@ export default function App() {
     if (!s) return;
     const { save } = await import("@tauri-apps/plugin-dialog");
     const target = await save({
-      title: "导出为 Xshell 会话",
+      title: "导出为 Xshell 连接",
       defaultPath: `${s.name}.xsh`,
-      filters: [{ name: "Xshell 会话", extensions: ["xsh"] }],
+      filters: [{ name: "Xshell 连接", extensions: ["xsh"] }],
     });
     if (!target) return;
     try {
@@ -1413,7 +1413,7 @@ export default function App() {
     if (!dir || Array.isArray(dir)) return;
     try {
       const n = await api.exportAllXsh(dir);
-      showToast(`已导出 ${n} 个会话到 ${dir}（不含密码）`);
+      showToast(`已导出 ${n} 个连接到 ${dir}（不含密码）`);
     } catch (e) {
       showToast(`导出失败：${String(e)}`);
     }

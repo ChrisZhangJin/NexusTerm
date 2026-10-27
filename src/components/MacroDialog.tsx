@@ -443,7 +443,7 @@ export default function MacroDialog({
               连接后自动运行
               <em>
                 {!sessionId
-                  ? "当前标签没有对应的会话配置，无法绑定"
+                  ? "当前标签没有对应的连接配置，无法绑定"
                   : bound === sel
                     ? `「${sessionName}」每次连上都会先执行这条宏（重连也算）`
                     : `勾选后，「${sessionName}」每次连上会先执行这条宏`}

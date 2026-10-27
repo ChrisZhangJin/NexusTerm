@@ -169,7 +169,7 @@ export default function AuthPromptDialog({
             />
             <span>
               记住口令
-              <em>保存在本机会话配置里，下次连接不必再输</em>
+              <em>保存在本机连接配置里，下次连接不必再输</em>
             </span>
           </label>
         )}

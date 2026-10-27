@@ -308,27 +308,25 @@ impl SessionManager {
         }
     }
 
-    /// 建立 SSH 连接并启动读写循环
-    pub async fn connect(
+    /// 握手 + 认证，不建通道/PTY —— `connect` 和 `test_connect` 共用，避免两份认证
+    /// 逻辑各自维护、日后改动漂移。
+    async fn authed(
         &self,
-        app: AppHandle,
-        id: String,
-        req: ConnectRequest,
-    ) -> Result<ConnectOutcome, SessionError> {
+        app: &AppHandle,
+        id: &str,
+        req: &ConnectRequest,
+    ) -> Result<super::Opened, SessionError> {
         let port = req.port.unwrap_or(22);
-
-        // 内核默认的 TCP 超时约 75 秒，用户会以为软件卡死。显式给上限，
-        // 超时后立刻返回可读的中文提示，而不是干等。
         let timeout = errors::resolve_timeout(req.connect_timeout_secs);
 
         // 握手 + 认证统一走 ssh::open_authenticated：算法协商（含老服务器自动降级）、
         // keepalive、以及二次验证的「重连后以 KBI 重试」都在那里处理，
         // SFTP 通道复用同一套逻辑。
         let auth = req.auth.as_ref().ok_or_else(|| {
-            SessionError::Auth("这条连接没有可用的登录凭据，请编辑会话并填写密码或私钥".into())
+            SessionError::Auth("这条连接没有可用的登录凭据，请编辑连接并填写密码或私钥".into())
         })?;
 
-        let opened = super::open_authenticated(
+        super::open_authenticated(
             &req.host,
             port,
             self.known_hosts.clone(),
@@ -337,9 +335,9 @@ impl SessionManager {
             super::keepalive_interval(),
             &req.username,
             auth,
-            &id,
+            id,
             AuthContext {
-                app: &app,
+                app,
                 prompts: &self.auth_prompts,
             },
         )
@@ -354,8 +352,31 @@ impl SessionManager {
                 errors::handshake_error(&req.host, port, &err, legacy_tried),
             ),
             super::OpenError::Auth(msg) => SessionError::Auth(msg),
-        })?;
+        })
+    }
 
+    /// 只测连通性：握手 + 认证成功就主动断开，不占用「同账号并发会话数」配额，
+    /// 不建通道/PTY，不在 `inner` 里登记——不会在连接列表或标签栏留下任何痕迹。
+    pub async fn test_connect(
+        &self,
+        app: AppHandle,
+        id: String,
+        req: ConnectRequest,
+    ) -> Result<ConnectOutcome, SessionError> {
+        let opened = self.authed(&app, &id, &req).await?;
+        super::abort_session(&opened.session, "测试连接").await;
+        Ok(ConnectOutcome { legacy_crypto: opened.legacy })
+    }
+
+    /// 建立 SSH 连接并启动读写循环
+    pub async fn connect(
+        &self,
+        app: AppHandle,
+        id: String,
+        req: ConnectRequest,
+    ) -> Result<ConnectOutcome, SessionError> {
+        let port = req.port.unwrap_or(22);
+        let opened = self.authed(&app, &id, &req).await?;
         let legacy_crypto = opened.legacy;
         let session = opened.session;
 

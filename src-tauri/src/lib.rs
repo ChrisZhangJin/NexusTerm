@@ -175,6 +175,7 @@ pub fn run() {
             cmd::health,
             cmd::host_info,
             cmd::ssh_connect,
+            cmd::ssh_test_connect,
             cmd::ssh_write,
             cmd::ssh_resize,
             cmd::ssh_close,

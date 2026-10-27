@@ -153,6 +153,18 @@ pub async fn ssh_connect(
     state.sessions.connect(app, id, req).await
 }
 
+/// 连接编辑弹窗的「测试连接」：只验证能不能握手+认证，不开通道/PTY，
+/// 不在连接列表或标签栏留下任何痕迹。
+#[tauri::command]
+pub async fn ssh_test_connect(
+    req: ConnectRequest,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<ConnectOutcome, SessionError> {
+    let id = format!("test-{}", uuid::Uuid::new_v4().simple());
+    state.sessions.test_connect(app, id, req).await
+}
+
 #[tauri::command]
 pub async fn ssh_write(
     id: String,

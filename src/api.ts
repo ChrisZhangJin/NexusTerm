@@ -29,6 +29,9 @@ export const api = {
 
   sshConnect: (id: string, req: ConnectRequest) =>
     invoke<ConnectOutcome>("ssh_connect", { id, req }),
+  /** 连接编辑弹窗的「测试连接」：只验证能不能连上，不开标签、不留痕迹 */
+  sshTestConnect: (req: ConnectRequest) =>
+    invoke<ConnectOutcome>("ssh_test_connect", { req }),
   sshWrite: (id: string, data: number[]) =>
     invoke<void>("ssh_write", { id, data }),
   /** 二进制大块写入（base64），ZMODEM 上传用 */

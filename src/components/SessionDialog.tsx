@@ -2,11 +2,11 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import { normalizeTimeout } from "../lib/errors";
 import { getExtras, updateExtras } from "../lib/sessionExtras";
-import type { KeyInfo, MacroRecord, NewSession, SessionRecord } from "../types";
+import type { AuthMethod, KeyInfo, MacroRecord, NewSession, SessionRecord } from "../types";
 
 interface Props {
   editing: SessionRecord | null;
-  /** 会话可绑定的宏（连接后自动执行） */
+  /** 连接可绑定的宏（连接后自动执行） */
   macros: MacroRecord[];
   onSave: (
     payload: NewSession,
@@ -28,7 +28,7 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
   const [keyPath, setKeyPath] = useState("");
   const [passphrase, setPassphrase] = useState("");
   /**
-   * 用户是否动过口令输入框。编辑会话时口令是异步读回来的，手快在读回前点保存，
+   * 用户是否动过口令输入框。编辑连接时口令是异步读回来的，手快在读回前点保存，
    * 空字符串会把已保存的口令覆盖掉 —— 只有真正编辑过才落库。
    */
   const [passphraseTouched, setPassphraseTouched] = useState(false);
@@ -38,6 +38,8 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
   const [keys, setKeys] = useState<KeyInfo[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
   useEffect(() => {
     api.listKeys().then(setKeys).catch(() => {});
@@ -105,6 +107,42 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
     }
   };
 
+  const testConnection = async () => {
+    setTestResult(null);
+    if (!host.trim()) return setTestResult({ ok: false, msg: "主机不能为空" });
+    if (!username.trim()) return setTestResult({ ok: false, msg: "用户名不能为空" });
+    if (authType === "key" && !keyPath) return setTestResult({ ok: false, msg: "请选择私钥" });
+
+    const auth: AuthMethod =
+      authType === "password"
+        ? { kind: "password", password }
+        : authType === "key"
+          ? { kind: "privateKey", path: keyPath, passphrase: passphrase || undefined }
+          : { kind: "agent" };
+
+    setTesting(true);
+    try {
+      const outcome = await api.sshTestConnect({
+        host: host.trim(),
+        port: Number(port) || 22,
+        username: username.trim(),
+        auth,
+        // 测试路径不建 PTY，这两个字段用不上，填个占位值
+        cols: 80,
+        rows: 24,
+        connectTimeoutSecs: normalizeTimeout(Number(connectTimeout)),
+      });
+      setTestResult({
+        ok: true,
+        msg: outcome.legacyCrypto ? "连接成功（服务器仅支持旧版密钥交换算法）" : "连接成功",
+      });
+    } catch (e) {
+      setTestResult({ ok: false, msg: String(e) });
+    } finally {
+      setTesting(false);
+    }
+  };
+
   const submit = async () => {
     setError(null);
     if (!host.trim()) return setError("主机不能为空");
@@ -129,7 +167,7 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
           connectTimeout: normalizeTimeout(Number(connectTimeout)),
         },
         authType === "password" ? password : "",
-        // null 表示「没动过」：编辑会话时不能拿空串覆盖已保存的口令
+        // null 表示「没动过」：编辑连接时不能拿空串覆盖已保存的口令
         authType === "key" && passphraseTouched ? passphrase : null
       );
       onClose();
@@ -143,7 +181,7 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2>{editing ? "编辑会话" : "新建会话"}</h2>
+        <h2>{editing ? "编辑连接" : "新建连接"}</h2>
 
         <div className="row">
           <label>名称</label>
@@ -257,6 +295,16 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
 
         {authType === "agent" && (
           <p className="hint">使用系统 ssh-agent 中的凭据。需先在终端执行 ssh-add。</p>
+        )}
+
+        <div className="row">
+          <label />
+          <button className="btn" onClick={testConnection} disabled={testing || saving}>
+            {testing ? "测试中…" : "测试连接"}
+          </button>
+        </div>
+        {testResult && (
+          <p className={testResult.ok ? "hint" : "error"}>{testResult.msg}</p>
         )}
 
         {error && <p className="error">{error}</p>}

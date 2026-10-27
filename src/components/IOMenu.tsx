@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 
 interface Props {
   canExportSession: boolean;
-  /** 「导出当前会话」置灰时的说明 */
+  /** 「导出当前连接」置灰时的说明 */
   exportSessionHint?: string;
   onImport: () => void;
   onExportSession: () => void;
@@ -84,7 +84,7 @@ export default function IOMenu({
           <button className="io-item" role="menuitem" onClick={pick(onImport)}>
             <span className="io-glyph">⤓</span>
             <span className="io-text">
-              导入 Xshell 会话 (.xsh)…
+              导入 Xshell 连接 (.xsh)…
               <small>支持多选；同机同用户的密码会自动解密导入</small>
             </span>
           </button>
@@ -100,7 +100,7 @@ export default function IOMenu({
           >
             <span className="io-glyph">⤒</span>
             <span className="io-text">
-              导出当前标签的会话为 .xsh…
+              导出当前标签的连接为 .xsh…
               <small>{canExportSession ? "不包含密码" : exportSessionHint ?? "不包含密码"}</small>
             </span>
           </button>
@@ -108,8 +108,8 @@ export default function IOMenu({
           <button className="io-item" role="menuitem" onClick={pick(onExportAll)}>
             <span className="io-glyph">⤒</span>
             <span className="io-text">
-              导出全部会话到文件夹…
-              <small>每个会话一个 .xsh 文件；单个连接/分组可在列表里右键导出</small>
+              导出全部连接到文件夹…
+              <small>每个连接一个 .xsh 文件；单个连接/分组可在列表里右键导出</small>
             </span>
           </button>
         </div>
