@@ -538,8 +538,8 @@ function rig() {
   const send = (d: string) => {
     out.text += d;
   };
-  const un = installMacKeyboard(host as never, term as never, send, true);
-  return { host, term, out, send, un };
+  const { uninstall: un, arbitrate } = installMacKeyboard(host as never, term as never, send, true);
+  return { host, term, out, send, un, arbitrate };
 }
 
 test("接管：keydown 直接把字符发出，并拦下默认行为与冒泡", () => {
@@ -935,7 +935,7 @@ test("接管：卸载后监听器全部撤掉", () => {
 test("接管：非 macOS 空转（Windows / Linux 不走自绘发送路径）", () => {
   const host = fakeHost();
   const out = { text: "" };
-  const un = installMacKeyboard(host as never, {} as never, (d) => (out.text += d), false);
+  const { uninstall: un } = installMacKeyboard(host as never, {} as never, (d) => (out.text += d), false);
   host.fire("keydown", plainKey("c"));
   assert.equal(out.text, "");
   un();
@@ -1232,12 +1232,17 @@ test("接管：同一个键码 188 但没被替换（英文输入法）也只发
 //   keyup       key="，" kc=188
 
 test("接管：真机顺序——input 先到、keydown 的 key 已是全角且键码 229", () => {
-  const { host, out, un } = rig();
+  const { host, out, un, arbitrate } = rig();
   host.fire("input", { data: "，", inputType: "insertText", isComposing: false });
+  // 这条以前断言的是「接管层一个字节都不发，那一个『，』由 xterm 的 _inputEvent
+  // 发」。后来发现靠不住：同样是全角标点，`？` 一个都出不来——keyCode 229 下
+  // xterm 的 `_keyDown` 什么都不发，随后的 input 又被 `_keyDownSeen` 门丢掉。
+  // 现在倒过来：单字符一律由接管层发，xterm 那一份交给仲裁闸挡。
+  assert.equal(out.text, "，", "全角结果必须由接管层发出，不能指望 xterm");
+  assert.equal(arbitrate("，"), false, "xterm 若也发一份，必须被仲裁挡掉");
+  // 迟到的 keydown（key 已是全角、键码 229）不该再补一个字节
   host.fire("keydown", plainKey("，", { keyCode: 229 }));
-  // 全角字符既过不了 isPlainKeystroke、也不在 PUNCT_RISK 里：接管层一个字节
-  // 都不该加。真机上那一个「，」是 xterm 自己的 _inputEvent 发的。
-  assert.equal(out.text, "", "全角结果由 xterm 发，接管层不能再补一份");
+  assert.equal(out.text, "，", "keydown 姗姗来迟，不能再补一份");
   un();
 });
 

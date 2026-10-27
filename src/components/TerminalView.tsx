@@ -783,20 +783,33 @@ export default function TerminalView({
       refreshHintsSoon();
     };
 
+    // macOS(WKWebView) 上普通字符改由我们在捕获阶段发 —— 详见 lib/macInput。
+    // 必须挂在 host 上：xterm 的监听在 textarea 上，捕获阶段我们先到。
+    // 包在可重装的壳里是为了 ⌘⌥⇧K 能当场开关对比，不必重建终端。
+    let macUninstall: () => void = () => {};
+    /** 接管层开着时，xterm 自己要发的字节先过一道闸，见 macInput 的 OnceGuard */
+    let macArbitrate: (d: string) => boolean = () => true;
+
     const dataSub = term.onData((d) => {
+      // 同一颗键 xterm 和接管层可能各发一份（WKWebView 的事件序列按输入法而变），
+      // 这里是两条路唯一的汇合点，重复只能在这儿掐。
+      if (!macArbitrate(d)) return;
       // 记 via 是为了在日志里把「我们发的」和「xterm 发的」分开 —— 标点重复
       // 这类问题只有看到 via 才知道多出来的那一下是谁干的
       traceSend(d, "xterm");
       handleInput(d);
     });
 
-    // macOS(WKWebView) 上普通字符改由我们在捕获阶段发 —— 详见 lib/macInput。
-    // 必须挂在 host 上：xterm 的监听在 textarea 上，捕获阶段我们先到。
-    // 包在可重装的壳里是为了 ⌘⌥⇧K 能当场开关对比，不必重建终端。
-    let macUninstall: () => void = () => {};
     const applyMacInput = () => {
       macUninstall();
-      macUninstall = macLayerOn() ? installMacKeyboard(host, term, handleInput, isMacOS()) : () => {};
+      if (macLayerOn()) {
+        const mac = installMacKeyboard(host, term, handleInput, isMacOS());
+        macUninstall = mac.uninstall;
+        macArbitrate = mac.arbitrate;
+      } else {
+        macUninstall = () => {};
+        macArbitrate = () => true;
+      }
     };
     applyMacInput();
     cleanups.push(() => macUninstall());

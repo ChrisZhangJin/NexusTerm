@@ -27,6 +27,11 @@ import { api } from "../api";
  *    在被我们拦掉的 `_keyDown` 里置的，于是 xterm 照发一份。中文输入法下有
  *    composition 事件岔开，英文输入法下没有，每个标点必重复。见
  *    `keydownStoppedWithoutDefault`。
+ *
+ * 上面四条都是「猜 xterm 这一路会不会也发」，每条对应一次真机翻车。猜不完：
+ * 发送方有两个（xterm 的 `onData` 和这一层），而 WKWebView 的事件序列按输入法
+ * 变，换一种输入法就多一条没覆盖的路。所以**最后兜底的不是分支，是出口**——
+ * 见 [`OnceGuard`]：一颗键只许放一个可见字符出去，谁先到算谁的。
  */
 
 /** xterm 5.x 挂在自己实例（不是 `_core`）上的私有状态 */
@@ -166,6 +171,62 @@ export class KeyLedger {
   }
 }
 
+/**
+ * 单个「看得见的字符」：恰好一个码点，且不是控制字符。
+ *
+ * 转义序列（方向键）、`\r`、`\x03`、粘贴来的整段文本都不算 —— 那些**本来就该**
+ * 原样放行，一个字节都不能去重。
+ */
+export function isSingleVisible(d: string): boolean {
+  if (Array.from(d).length !== 1) return false;
+  const c = d.codePointAt(0) ?? 0;
+  return c >= 0x20 && c !== 0x7f;
+}
+
+/**
+ * **一颗键只许产生一个可见字符。** 整个接管层唯一靠得住的不变量，也是最后一道闸。
+ *
+ * 前面那四条缺陷的修法都是「预测 xterm 这一路会不会也发一份」，而发送方有两个：
+ * xterm 自己的 `onData`，和这一层。WKWebView 给每种输入法派的事件序列都不一样
+ * （`input` 有时早于 `keydown`、组合事件有时凭空多一对、`keyCode` 时而 229），
+ * 预测一定漏，于是「英文标点修好了换中文标点又重复」。
+ *
+ * 这里换个方向：不管字节是从哪条路来的，同一颗键里**同一个字符只放第一份过去**。
+ * 账以 `keydown` 为界清空 —— 一次物理按键对应一颗 keydown，这是浏览器保证的，
+ * 所以连打 `..` 或按住自动重复都不会被误吞（各自有各自的 keydown）。
+ *
+ * TTL 只是兜底，防的是「完全没有 keydown 的提交」（鼠标点候选词）把账留到下一次。
+ *
+ * 放行的判据刻意只有「单个可见字符」：多字符、控制字节、转义序列一律直通，
+ * 这一层永远不会去动回车、Ctrl 组合、方向键和粘贴。
+ *
+ * **边界**：挡得住的是「重复那一份在下一颗 keydown 之前到」。`input` 早于
+ * keydown 的那条真机路径上（WebKit bug 165004），迟到的 keydown 会把账清掉，
+ * 之后再冒出来的重复就挡不住了。实际够用：那条路上 `onInput` 已经
+ * `stopPropagation`，xterm 根本收不到 input，而迟到的 keydown 带着 keyCode 229
+ * ——xterm 的 `_keyDown` 在 229 下什么都不发。换成按时间续命会更糟：按住自动
+ * 重复时两次按键只隔十几毫秒，那样会把第二下吞掉，从多字变成丢字。
+ */
+export class OnceGuard {
+  private seen: Array<{ ch: string; at: number }> = [];
+
+  constructor(private readonly ttlMs = 200) {}
+
+  /** 新的输入单元开始（每颗 keydown），上一颗键的账一笔勾销 */
+  reset(): void {
+    this.seen = [];
+  }
+
+  /** 这段字节该不该真的发出去。false = 同一颗键里已经发过一模一样的字符了 */
+  allow(d: string, now: number): boolean {
+    if (!isSingleVisible(d)) return true;
+    this.seen = this.seen.filter((e) => now - e.at <= this.ttlMs);
+    if (this.seen.some((e) => e.ch === d)) return false;
+    this.seen.push({ ch: d, at: now });
+    return true;
+  }
+}
+
 /** `performance.now()` 在正常环境都有；测试与 node 里退回 Date.now 也无所谓 */
 const nowMs = (): number =>
   typeof performance !== "undefined" && typeof performance.now === "function"
@@ -296,8 +357,21 @@ export function setInputTrace(on: boolean, toFile = false): void {
   }
 }
 
+/** [`installMacKeyboard`] 的返回值 */
+export interface MacKeyboard {
+  /** 卸下所有监听 */
+  uninstall: () => void;
+  /**
+   * xterm 自己（`term.onData`）要发的这段字节，该不该放行。
+   *
+   * 调用方必须把 `term.onData` 接到这里 —— 否则 xterm 那一路绕过了 [`OnceGuard`]，
+   * 重复字符的闸门就只剩「逐分支预测」那半套，也就回到了修不完的状态。
+   */
+  arbitrate: (data: string) => boolean;
+}
+
 /**
- * 挂上接管逻辑，返回卸载函数。
+ * 挂上接管逻辑。
  *
  * @param host   终端容器（xterm 的 textarea 是它的后代，捕获阶段先到这里）
  * @param term   已 `open()` 的终端
@@ -310,15 +384,28 @@ export function installMacKeyboard(
   term: Terminal,
   send: (data: string) => void,
   isMac: boolean
-): () => void {
-  if (!isMac) return () => {};
+): MacKeyboard {
+  if (!isMac) return { uninstall: () => {}, arbitrate: () => true };
   const internals = term as unknown as TerminalInternals;
   const ledger = new KeyLedger();
+  /** 两个发送方共用的最后一道闸，见 `OnceGuard` */
+  const guard = new OnceGuard();
 
   /** 发字节的唯一出口（本层内部）。顺手记一笔「谁发的、发了什么」。 */
   const out = (data: string, via: "mac" | "xterm" = "mac"): void => {
+    if (!guard.allow(data, nowMs())) {
+      trace({ ev: "send", act: "drop", sent: data, via });
+      return;
+    }
     traceSend(data, via);
     send(data);
+  };
+
+  /** xterm 那一路的入口，见 `MacKeyboard.arbitrate` */
+  const arbitrate = (data: string): boolean => {
+    if (guard.allow(data, nowMs())) return true;
+    trace({ ev: "send", act: "drop", sent: data, via: "xterm" });
+    return false;
   };
 
   // 组合状态由我们自己跟：`ev.isComposing` 在「输入法上下文残留」时是假的
@@ -453,6 +540,9 @@ export function installMacKeyboard(
   };
 
   const onKeyDown = (ev: KeyboardEvent) => {
+    // 一颗物理按键 = 一颗 keydown = 一个新的输入单元，上一颗的账到此为止。
+    // 连打 `..` 和按住自动重复都各有各的 keydown，所以不会被 guard 误吞。
+    guard.reset();
     // 每颗键重置：keypress 紧跟着它自己的 keydown 来，不会隔着下一颗键
     keydownStoppedWithoutDefault = false;
     // 中文输入法「智能全角标点」：必须排在最前面、且**不看 `ev.isComposing`**——
@@ -603,12 +693,23 @@ export function installMacKeyboard(
       trace(seen);
       return;
     }
-    // 含非 ASCII 就整条不碰：中文 / emoji 上屏要走 xterm 的组合路径，
-    // 连 textarea 都不能清（见 clearTextarea）。
-    for (const ch of data) {
-      if (!isPlainChar(ch)) {
-        trace(seen);
-        return;
+    // **单个**字符一律由我们发，全角标点也不例外（`？` `、` `。` `，` `《》`）。
+    //
+    // 以前这里见到非 ASCII 就整条交回 xterm，结果全角标点被吞：它不经过组合，
+    // WebKit 给的 keydown 却带着 keyCode 229，xterm 的 `_keyDown` 置完
+    // `_keyDownSeen=true` 就被 `CompositionHelper.keydown` 提前返回（什么都没发），
+    // 随后这条 input 又被 `_inputEvent` 的 `!this._keyDownSeen` 门整条丢掉
+    // —— 就是模块开头第 1 类缺陷，只不过换了个字符集。
+    //
+    // 真正要留给 xterm 组合路径的是**多字符**上屏（听写整句、一次上屏一个词）：
+    // 那种连 textarea 都不能清，见 `clearTextarea`。
+    const single = Array.from(data).length === 1;
+    if (!single) {
+      for (const ch of data) {
+        if (!isPlainChar(ch)) {
+          trace(seen);
+          return;
+        }
       }
     }
 
@@ -621,7 +722,7 @@ export function installMacKeyboard(
     // **一颗键只该产生一个字符。** 多字符的 insertText 都不是「一颗键」
     //（macOS 双空格变 ". "、WebKit 合并快打、输入法上屏整个单词），它们的
     // keydown 早就各自发过了，逐字重放只会多出字节："  " → ". " → "  . "。
-    const rest = data.length === 1 ? ledger.input(data, nowMs()) : "";
+    const rest = single ? ledger.input(data, nowMs()) : "";
     const ok = rest !== "";
     if (ok) out(rest);
     trace({ ev: "input", act: ok ? "send" : "drop", it: ev.inputType, data, ic: ev.isComposing, comp: composing, ta: taBefore, sent: ok ? rest : undefined, via: ok ? "mac" : undefined });
@@ -651,7 +752,7 @@ export function installMacKeyboard(
   host.addEventListener("beforeinput", onPassive, true);
   host.addEventListener("compositionupdate", onPassive, true);
 
-  return () => {
+  const uninstall = () => {
     host.removeEventListener("keydown", onKeyDown, true);
     host.removeEventListener("keypress", onKeyPress, true);
     host.removeEventListener("input", onInput as unknown as EventListener, true);
@@ -661,6 +762,9 @@ export function installMacKeyboard(
     host.removeEventListener("beforeinput", onPassive, true);
     host.removeEventListener("compositionupdate", onPassive, true);
     ledger.clear();
+    guard.reset();
     clearPending();
   };
+
+  return { uninstall, arbitrate };
 }
