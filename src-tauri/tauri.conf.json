@@ -26,7 +26,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data: blob: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; frame-src nxdoc: http://nxdoc.localhost https://nxdoc.localhost"
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data: blob: https:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; frame-src nxdoc: http://nxdoc.localhost https://nxdoc.localhost"
     }
   },
   "bundle": {
