@@ -66,7 +66,7 @@ const SOFT_NEWLINE = "\x1b\r";
  * - `nx.inputTrace` = "1"：开始记录（默认关 —— 终端里敲的东西含密码，不该默认落盘）
  * - `nx.macInput`   = "0"：关掉 mac 输入接管层
  *
- * 快捷键：⌘⌥⇧L 切日志，⌘⌥⇧K 切接管层。
+ * 快捷键：⌘⌃⌥L 切日志，⌘⌃⌥K 切接管层。
  */
 const LS_INPUT_TRACE = "nx.inputTrace";
 const LS_MAC_INPUT = "nx.macInput";
@@ -226,7 +226,7 @@ export default function TerminalView({
   onClosedRef.current = onClosed;
   const onNotifyRef = useRef(onNotify);
   onNotifyRef.current = onNotify;
-  /** 由终端 mount 时填好：⌘⌥⇧K / ⌘⌥⇧L 两个调试开关的实际动作 */
+  /** 由终端 mount 时填好：⌘⌃⌥K / ⌘⌃⌥L 两个调试开关的实际动作 */
   const toggleMacInputRef = useRef<(() => void) | null>(null);
   const toggleInputTraceRef = useRef<(() => void) | null>(null);
   const peerHostRef = useRef(peerHost);
@@ -264,7 +264,7 @@ export default function TerminalView({
       if (alive) {
         onNotifyRef.current?.(
           next
-            ? `正在记录输入日志 → ${INPUT_LOG_HINT}；再按 ⌘⌥⇧L 停止`
+            ? `正在记录输入日志 → ${INPUT_LOG_HINT}；再按 ⌘⌃⌥L 停止`
             : `输入日志已停止（文件：${INPUT_LOG_HINT}）`
         );
       }
@@ -277,7 +277,8 @@ export default function TerminalView({
     };
   }, []);
 
-  // 两个开关都用 ⌘⌥⇧ 打头：⌥ 会把 e.key 变成 ¬ ˚ 之类，只能按物理键 e.code 判
+  // 两个开关都用 ⌘⌃⌥ 打头（⌃ 是 Control，不是 Shift —— 文案写错过一次，
+  // 照着按不动）：⌥ 会把 e.key 变成 ¬ ˚ 之类，只能按物理键 e.code 判
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!e.metaKey || !e.ctrlKey || !e.altKey) return;
@@ -785,7 +786,7 @@ export default function TerminalView({
 
     // macOS(WKWebView) 上普通字符改由我们在捕获阶段发 —— 详见 lib/macInput。
     // 必须挂在 host 上：xterm 的监听在 textarea 上，捕获阶段我们先到。
-    // 包在可重装的壳里是为了 ⌘⌥⇧K 能当场开关对比，不必重建终端。
+    // 包在可重装的壳里是为了 ⌘⌃⌥K 能当场开关对比，不必重建终端。
     let macUninstall: () => void = () => {};
     /** 接管层开着时，xterm 自己要发的字节先过一道闸，见 macInput 的 OnceGuard */
     let macArbitrate: (d: string) => boolean = () => true;
@@ -818,7 +819,7 @@ export default function TerminalView({
       localStorage.setItem(LS_MAC_INPUT, next ? "1" : "0");
       applyMacInput();
       onNotifyRef.current?.(
-        next ? "已开启 mac 输入接管层（⌘⌥⇧K 可再关）" : "已关闭 mac 输入接管层，走 xterm 原生路径（⌘⌥⇧K 恢复）"
+        next ? "已开启 mac 输入接管层（⌘⌃⌥K 可再关）" : "已关闭 mac 输入接管层，走 xterm 原生路径（⌘⌃⌥K 恢复）"
       );
     };
 
