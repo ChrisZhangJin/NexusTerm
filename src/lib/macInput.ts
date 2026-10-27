@@ -21,6 +21,12 @@ import { api } from "../api";
  *    任何可打印键都属于 IME，见 `isImeKey`。拦法只能是 `stopPropagation`，
  *    `preventDefault` 会卡住候选上屏；代价是该键仍可能写进 textarea，故在
  *    `compositionend` 按 `ev.data` 决定是否剥掉尾部字符。
+ * 4. **标点重复**（英文输入法敲 `.` 出两个）：上面第 3 类的拦法是「只
+ *    `stopPropagation` 不 `preventDefault`」，而 xterm 的 `keypress` 监听独立挂在
+ *    textarea 上 —— 拦掉 keydown 拦不住它。它的自保标志 `_keyDownHandled` 恰恰是
+ *    在被我们拦掉的 `_keyDown` 里置的，于是 xterm 照发一份。中文输入法下有
+ *    composition 事件岔开，英文输入法下没有，每个标点必重复。见
+ *    `keydownStoppedWithoutDefault`。
  */
 
 /** xterm 5.x 挂在自己实例（不是 `_core`）上的私有状态 */
@@ -348,6 +354,25 @@ export function installMacKeyboard(
   let pendingPunct: { key: string; at: number } | null = null;
   let pendingTimer: number | undefined;
   /**
+   * 上一颗 keydown 被我们 `stopPropagation` 了、但**没有** `preventDefault`。
+   *
+   * 这种键 WebKit 会照常派发 `keypress`，而 xterm 的 `keypress` 监听在 textarea 上，
+   * 捕获阶段的我们拦的是 keydown —— 两者各走各的，keypress 照样到得了 xterm：
+   *
+   * ```
+   * _keyPress(e){ this._keyPressHandled=false; if(this._keyDownHandled) return false; … triggerDataEvent(key) }
+   * ```
+   *
+   * `_keyDownHandled` 是在 `_keyDown` 里置的，而 `_keyDown` 正是被我们拦掉的那个，
+   * 于是它停在上一次的 `false`，xterm 原样发一份；我们在 `onInput` 里又发一份
+   * —— 每个标点两个字符。mac 中文输入法下有 composition 事件把这条路岔开，
+   * **英文输入法下没有**，所以是「英文输入法敲标点必重复」。
+   *
+   * 修法是把 `keypress` 也在捕获阶段掐掉：xterm 的 `_keyPress` 除了发字节只剩
+   * `onKey` 事件和重置光标闪烁，前者没人订阅，后者无关紧要。
+   */
+  let keydownStoppedWithoutDefault = false;
+  /**
    * 最近一次 insertText 的时刻：标点那颗键的 input 可能**已经先到**（见上面的
    * 真机日志），此时再等一轮、再补发就是第二个字符的来历。200ms 内有过
    * insertText 就认定结果已交出，接管层闭嘴。
@@ -428,6 +453,8 @@ export function installMacKeyboard(
   };
 
   const onKeyDown = (ev: KeyboardEvent) => {
+    // 每颗键重置：keypress 紧跟着它自己的 keydown 来，不会隔着下一颗键
+    keydownStoppedWithoutDefault = false;
     // 中文输入法「智能全角标点」：必须排在最前面、且**不看 `ev.isComposing`**——
     // 它在输入法上下文残留时会谎报 true，跟着走下面 `isImeKey` / `ev.isComposing`
     // 那几条分支的话，这颗键要么被当成「组合态里的确认键」吞掉、要么提前 return，
@@ -440,6 +467,8 @@ export function installMacKeyboard(
       // 不能 preventDefault：要让 WebKit 按它自己的判断正常插入（原样或替换成
       // 全角），我们只负责别让 xterm 也掺和进来抢着发一遍。
       ev.stopPropagation();
+      // 没 preventDefault → 随后的 keypress 还会去找 xterm，必须一并掐掉
+      keydownStoppedWithoutDefault = true;
       // 刚刚才有 insertText 交出过字符 → 这颗键的结果已经发出去了，绝不再补。
       // 少了这一句，「input 先到」的机型上每敲一个标点都会多出一个字符。
       if (nowMs() - lastTextInputAt < 200) {
@@ -453,6 +482,9 @@ export function installMacKeyboard(
           clearTextarea();
           // 80ms 都没等到 input：说明 WebKit 根本没替换（preventDefault 生效了
           // 或这颗键根本没进 textarea），那就按原始半角发，不能把它吞了。
+          // 必须记进账本：这条 input 可能只是**迟到**（机器卡一下就会），
+          // 到了之后会走下面的通用分支，账本里没有就又发一遍。
+          ledger.keyDown(ev.key, nowMs());
           out(ev.key);
           pendingPunct = null;
         }
@@ -470,6 +502,7 @@ export function installMacKeyboard(
         // textarea，所以记一笔留给 `onComposeEnd` 判定要不要剥掉。
         if (xtermWouldEmit(ev)) {
           ev.stopPropagation();
+          keydownStoppedWithoutDefault = true; // 同上：keypress 也要掐
           markSent(); // 让 xterm 的 `_inputEvent` 也别去发上屏那一条（否则上屏两遍）
           imeConsumedKey = ev.key;
           trace({ ev: "keydown", act: "stop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) });
@@ -517,6 +550,21 @@ export function installMacKeyboard(
     const fresh = ledger.keyDown(ev.key, nowMs());
     if (fresh) out(ev.key); // fresh=false 说明 input 已经先发过这一颗
     trace({ ev: "keydown", act: fresh ? "send" : "drop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taBefore, sent: fresh ? ev.key : undefined, via: fresh ? "mac" : undefined });
+  };
+
+  /**
+   * 拦住「上一颗 keydown 我们只 stopPropagation、没 preventDefault」时漏给 xterm
+   * 的那条 keypress。详见 `keydownStoppedWithoutDefault`。
+   */
+  const onKeyPress = (ev: KeyboardEvent) => {
+    if (!keydownStoppedWithoutDefault) {
+      trace({ ev: "keypress", act: "pass", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) });
+      return;
+    }
+    keydownStoppedWithoutDefault = false;
+    // 只拦 xterm 这一路。**不 preventDefault**：全角替换和候选上屏都靠默认行为
+    ev.stopPropagation();
+    trace({ ev: "keypress", act: "stop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) });
   };
 
   const onInput = (ev: InputEvent) => {
@@ -593,6 +641,7 @@ export function installMacKeyboard(
   };
 
   host.addEventListener("keydown", onKeyDown, true);
+  host.addEventListener("keypress", onKeyPress, true);
   // lib.dom 把 "input" 的事件类型标成 Event（没有 data/isComposing），显式转一次
   host.addEventListener("input", onInput as unknown as EventListener, true);
   host.addEventListener("compositionstart", onComposeStart, true);
@@ -604,6 +653,7 @@ export function installMacKeyboard(
 
   return () => {
     host.removeEventListener("keydown", onKeyDown, true);
+    host.removeEventListener("keypress", onKeyPress, true);
     host.removeEventListener("input", onInput as unknown as EventListener, true);
     host.removeEventListener("compositionstart", onComposeStart, true);
     host.removeEventListener("compositionend", onComposeEnd, true);
