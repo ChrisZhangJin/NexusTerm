@@ -865,7 +865,9 @@ pub const ACTION_PROTOCOL: &str = concat!(
     "`reconnect`（SSH 断线后重连）。后四个都要带 `target`：\n",
     "```nx-exec\n{\"action\":\"tab\",\"op\":\"focus\",\"target\":\"<标签页id>\"}\n```\n",
     "```nx-exec\n{\"action\":\"tab\",\"op\":\"rename\",\"target\":\"<标签页id>\",\"name\":\"<新名字>\"}\n```\n",
-    "标签页 id 与 exec 的 target 是同一套会话 id。你**不能**关闭自己所在的那个标签页。\n\n",
+    "标签页 id 与 exec 的 target 是同一套会话 id。关掉自己当前所在的那个标签页也是允许的，\n",
+    "但注意：关掉之后它就不在了，这一轮里后面再有 exec 动作省略 target、想隐式落到",
+    "这个会话上会失败，需要的话换一个明确的 target。\n\n",
     "【规则】\n",
     "1) exec 的 command 必须是**单条单行**命令，不许用换行或 && 串联互不相关的操作；",
     "需要分几步就分几轮，每轮都会收到上一条的真实输出；\n",
@@ -2020,25 +2022,6 @@ pub async fn run(
                 }
 
                 AgentAction::Tab { op, target, name } => {
-                    // 不许关掉 Agent 自己脚下的那块地板：会话没了，面板绑定的东西
-                    // 也跟着没了，用户只会看到「终端自己消失了」。
-                    if op == TabOp::Close && target.as_deref() == Some(session.as_str()) {
-                        let why = "不能关闭 Agent 自己所在的标签页";
-                        emit_step(
-                            app,
-                            &session,
-                            StepPayload {
-                                target: target.clone(),
-                                target_label: Some("当前会话".into()),
-                                command: Some(op.label().into()),
-                                reasons: Some(vec![why.into()]),
-                                ..StepPayload::new("skip", step)
-                            },
-                        );
-                        feedback.push_str(&format!("{why}。要关它请让用户自己点。\n"));
-                        continue;
-                    }
-
                     let where_ = target
                         .as_deref()
                         .map(|id| {

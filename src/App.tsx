@@ -1133,11 +1133,6 @@ export default function App() {
           return;
         }
         case "close": {
-          // 与后端同一条护栏：关掉它等于把 Agent 自己的会话也收了
-          if (target.id === req.sessionId) {
-            await ack(false, "不能关闭 Agent 自己所在的标签页");
-            return;
-          }
           const name = nameOf(target);
           closeTabNow(target.id);
           await ack(true, `已关闭「${name}」及其中的进程`);
