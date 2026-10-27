@@ -1415,6 +1415,58 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 @keyframes nx-fade-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes nx-bob { 50% { transform: translateY(-4px); } }
 
+/* ——— 首次连接等待动画：方块光标沿扫描线跑，灵感来自 Chrome 离线小恐龙 ——— */
+.connecting-badge {
+  position: absolute; inset: 6px; z-index: 25;
+  display: flex; align-items: center; justify-content: center;
+  pointer-events: none;
+  animation: nx-fade-in .15s ease-out;
+}
+.connecting-box {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  padding: 22px 32px; border-radius: 10px;
+  background: var(--bg-elev); color: var(--text);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .35);
+}
+.runner { position: relative; width: 76px; height: 36px; }
+.runner-body {
+  position: absolute; left: 30px; bottom: 9px;
+  width: 14px; height: 17px; border-radius: 3px;
+  background: var(--accent);
+  animation: nx-run-bob .3s ease-in-out infinite;
+}
+.runner-leg {
+  position: absolute; bottom: 5px; width: 4px; height: 8px;
+  background: var(--accent); border-radius: 1px;
+  transform-origin: top center;
+}
+.runner-leg-a { left: 31px; animation: nx-run-leg-a .3s ease-in-out infinite; }
+.runner-leg-b { left: 38px; animation: nx-run-leg-b .3s ease-in-out infinite; }
+.runner-ground {
+  position: absolute; left: 0; right: 0; bottom: 3px; height: 2px;
+  background-image: repeating-linear-gradient(90deg, var(--border) 0 6px, transparent 6px 12px);
+  animation: nx-run-ground .5s linear infinite;
+}
+.runner-packet {
+  position: absolute; top: 7px; left: 0; width: 5px; height: 5px; border-radius: 50%;
+  background: color-mix(in srgb, var(--accent) 70%, transparent);
+  animation: nx-run-packet 1.2s linear infinite;
+}
+.runner-packet:nth-child(2) { animation-delay: .4s; }
+.runner-packet:nth-child(3) { animation-delay: .8s; }
+@keyframes nx-run-bob { 50% { transform: translateY(-2px); } }
+@keyframes nx-run-leg-a { 0%, 100% { transform: rotate(24deg); } 50% { transform: rotate(-24deg); } }
+@keyframes nx-run-leg-b { 0%, 100% { transform: rotate(-24deg); } 50% { transform: rotate(24deg); } }
+@keyframes nx-run-ground { from { background-position-x: 0; } to { background-position-x: -12px; } }
+@keyframes nx-run-packet {
+  0% { transform: translateX(70px); opacity: 0; }
+  15% { opacity: 1; }
+  85% { opacity: 1; }
+  100% { transform: translateX(-4px); opacity: 0; }
+}
+.connecting-title { font-size: 14px; font-weight: 600; }
+.connecting-sub { font-size: 12px; color: var(--text-dim); }
+
 /* ——— SFTP 可编辑路径栏 ——— */
 .fm-path-input {
   flex: 1; min-width: 0;

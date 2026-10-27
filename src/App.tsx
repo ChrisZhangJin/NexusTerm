@@ -1531,6 +1531,13 @@ export default function App() {
               />
             ))}
 
+            {/* 首次建立连接：标签页刚创建、握手/认证还没完成，终端还是空的，
+                这期间给个跑动动画，别让人盯着一片黑以为卡死了。本地终端起
+                pty 是毫秒级的，不值得为这一下闪烁加动画，排除掉。 */}
+            {activeTabState?.status === "connecting" && !activeTabState.local && (
+              <ConnectingBadge host={activeSession?.host ?? ""} />
+            )}
+
             {/* 重连进度：右上角浮层，不遮挡终端内容 */}
             {activeTabState?.status === "reconnecting" && (
               <ReconnectBadge
@@ -1832,6 +1839,31 @@ export default function App() {
           }}
         />
       )}
+    </div>
+  );
+}
+
+/**
+ * 首次连接等待动画：终端区域居中的小跑者，灵感来自 Chrome 离线小恐龙——
+ * 用现有的方块光标造型（终端最熟悉的符号）代替恐龙，沿着扫描线跑，
+ * 旁边飘几个"包"表示正在握手/收发数据，纯 CSS，不需要额外图片资源。
+ */
+function ConnectingBadge({ host }: { host: string }) {
+  return (
+    <div className="connecting-badge">
+      <div className="connecting-box">
+        <div className="runner">
+          <span className="runner-packet" />
+          <span className="runner-packet" />
+          <span className="runner-packet" />
+          <div className="runner-body" />
+          <div className="runner-leg runner-leg-a" />
+          <div className="runner-leg runner-leg-b" />
+          <div className="runner-ground" />
+        </div>
+        <div className="connecting-title">正在连接{host ? ` ${host}` : ""}…</div>
+        <div className="connecting-sub">握手 / 认证中，请稍候</div>
+      </div>
     </div>
   );
 }
