@@ -84,6 +84,11 @@ rustls = { version = "0.23", default-features = false, features = [
     "tls12",
 ] }
 
+[dev-dependencies]
+# 单测里暂停 tokio 时钟（`#[tokio::test(start_paused = true)]`），
+# 让 executor 那些按真实时间计的等待逻辑瞬间跑完且结果确定。
+tokio = { version = "1", features = ["full", "test-util"] }
+
 # 凭据存储后端随平台切换。keyring 的通用 API 三端一致，
 # 只是 native backend 要按目标选择，否则在别的平台上编译不过或退化到 secret-service。
 [target.'cfg(target_os = "macos")'.dependencies]

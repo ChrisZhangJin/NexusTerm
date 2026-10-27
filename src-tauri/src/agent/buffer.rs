@@ -29,6 +29,9 @@ const MAX_CHUNKS: usize = 128;
 /// 才会滞留。设上限是为了防止一大段粘贴 / 恶意输入把队列堆死。
 /// 超限即整体作废 —— 代价是快照里可能出现一次重复，但缓冲不可能因此膨胀。
 const MAX_PENDING_ECHO: usize = 4096;
+/// [`SessionBuffer::last_line`] 往回扫多少字节。提示符再长也不会有这么长，
+/// 而全量扫一遍长会话（256KB）要在持锁状态下做，会拖慢 pty 读线程。
+const LAST_LINE_SCAN_BYTES: usize = 2048;
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -67,12 +70,14 @@ struct Chunk {
 impl Chunk {
     /// lossy 解码 + 剥离 ANSI，得到可以当模型输入的纯文本。
     fn text(&self) -> String {
-        let (head, tail) = self.data.as_slices();
+        self.text_from(0)
+    }
+
+    /// 同 [`Self::text`]，但跳过开头 `skip` 个原始字节。
+    fn text_from(&self, skip: usize) -> String {
         // VecDeque 是环形数组，两段切片都不保证覆盖完整内容，
         // 且转义序列可能正好横跨接缝 —— 必须先拼成连续内存再解码。
-        let mut bytes = Vec::with_capacity(head.len() + tail.len());
-        bytes.extend_from_slice(head);
-        bytes.extend_from_slice(tail);
+        let bytes: Vec<u8> = self.data.iter().skip(skip).copied().collect();
         strip_ansi(&String::from_utf8_lossy(&bytes))
     }
 }
@@ -83,6 +88,12 @@ pub struct SessionBuffer {
     capacity: usize,
     bytes: usize,
     dropped: u64,
+    /// 有史以来写进过缓冲的原始字节总数，只增不减（`clear` 也不归零）。
+    ///
+    /// Agent 判断「命令还有没有新输出」看的是它，而不是快照长度——缓冲写满以后
+    /// 新进一截、老丢一截，快照长度几乎不变，会把还在刷屏的命令误判成静默。
+    /// 同时它也是 [`Self::since`] 的坐标：当前缓冲里存的是 `[pushed - bytes, pushed)` 这一段。
+    pushed: u64,
     /// 已喂进输入段、但还没在输出流里等到对应回显的字节。
     ///
     /// pty 处于 canonical 模式时会把人敲的每个字符回显一遍，于是同一段文本
@@ -105,6 +116,7 @@ impl SessionBuffer {
             capacity,
             bytes: 0,
             dropped: 0,
+            pushed: 0,
             pending_echo: VecDeque::new(),
             enabled: true,
         }
@@ -205,6 +217,7 @@ impl SessionBuffer {
             };
             back.data.extend(rest[..take].iter().copied());
             self.bytes += take;
+            self.pushed += take as u64;
             rest = &rest[take..];
         }
         self.cap_chunks();
@@ -264,6 +277,32 @@ impl SessionBuffer {
         out
     }
 
+    /// 写进过缓冲的原始字节总数（只增不减），见 `pushed` 字段。
+    pub fn pushed(&self) -> u64 {
+        self.pushed
+    }
+
+    /// 从位置 `mark`（某一时刻的 [`Self::pushed`]）往后写进来的内容，格式同 [`Self::snapshot`]。
+    ///
+    /// `mark` 之后的开头一截已经被环形缓冲丢掉时，就从现存最老的字节开始——
+    /// 只会少，不会把 `mark` 之前的旧内容混进来。
+    pub fn since(&self, mark: u64) -> String {
+        let start = self.pushed - self.bytes as u64;
+        let mut skip = mark.saturating_sub(start).min(self.bytes as u64) as usize;
+        let mut out = String::new();
+        let mut at_line_start = true;
+        for chunk in &self.chunks {
+            let len = chunk.data.len();
+            if skip >= len {
+                skip -= len;
+                continue;
+            }
+            push_transcript(&mut out, &chunk.text_from(skip), chunk.kind, &mut at_line_start);
+            skip = 0;
+        }
+        out
+    }
+
     /// 只取最近 `max_bytes`（按清洗后的字节计）的内容 —— **这是实际发给模型的东西**。
     ///
     /// 为什么不清全量再截：长会话的缓冲清一遍要扫满 256KB，
@@ -291,6 +330,20 @@ impl SessionBuffer {
             push_transcript(&mut out, &text, kind, &mut at_line_start);
         }
         trim_front(&out, max_bytes)
+    }
+
+    /// 缓冲尾部最后一个非空行，去掉行尾空白。
+    ///
+    /// shell 停在提示符时，这就是提示符本身——Agent 靠「提示符有没有回来」判定
+    /// 命令是否结束（见 `executor.rs` 顶部），发命令前后各取一次做比对。
+    pub fn last_line(&self) -> String {
+        self.take_tail(LAST_LINE_SCAN_BYTES)
+            .lines()
+            .rev()
+            .map(str::trim_end)
+            .find(|l| !l.is_empty())
+            .unwrap_or_default()
+            .to_string()
     }
 
     /// 清空并归零统计（用户手动「遗忘上下文」时调用）。
@@ -834,6 +887,71 @@ mod tests {
         // 清空后不再有回显可抵消：这段输出必须原样进来
         b.feed(b"ls\r\n", StreamKind::Out);
         assert_eq!(b.snapshot(), "ls\n");
+    }
+
+    #[test]
+    fn since_returns_only_what_came_after_the_mark() {
+        let mut b = buf(1024);
+        b.feed(b"old output\n", StreamKind::Out);
+        b.feed(b"ls\n", StreamKind::In);
+        let mark = b.pushed();
+        b.feed(b"a.txt\n", StreamKind::Out);
+        assert_eq!(b.since(mark), "a.txt\n");
+        // mark 落在一段的中间（同类型续写进了同一段）
+        let mark = b.pushed();
+        b.feed(b"b.txt\n", StreamKind::Out);
+        assert_eq!(b.since(mark), "b.txt\n");
+    }
+
+    #[test]
+    fn since_never_leaks_old_content_after_wraparound() {
+        let mut b = buf(16);
+        b.feed(b"history-before\n", StreamKind::Out);
+        let mark = b.pushed();
+        b.feed(b"0123456789abcdefXYZ", StreamKind::Out);
+        // mark 之后的开头已经被挤掉：只剩最后 16 字节，且绝不混入 mark 之前的旧内容
+        assert_eq!(b.since(mark), "3456789abcdefXYZ");
+    }
+
+    /// 缓冲满了以后快照长度不再变化，但 `pushed` 必须照样增长——
+    /// Agent 靠它判断「命令还在不在出输出」。
+    #[test]
+    fn pushed_keeps_growing_when_the_buffer_is_full() {
+        let mut b = buf(8);
+        b.feed(b"12345678", StreamKind::Out);
+        let (len, pushed) = (b.snapshot().len(), b.pushed());
+        b.feed(b"abcdefgh", StreamKind::Out);
+        assert_eq!(b.snapshot().len(), len);
+        assert_eq!(b.pushed(), pushed + 8);
+    }
+
+    #[test]
+    fn pushed_survives_clear() {
+        let mut b = buf(1024);
+        b.feed(b"abc", StreamKind::Out);
+        let mark = b.pushed();
+        b.clear();
+        assert_eq!(b.pushed(), mark);
+        assert_eq!(b.since(mark), "");
+        b.feed(b"new", StreamKind::Out);
+        assert_eq!(b.since(mark), "new");
+    }
+
+    #[test]
+    fn last_line_is_the_prompt_sitting_at_the_tail() {
+        let mut b = buf(1024);
+        b.feed(b"total 8\nfile.txt\n", StreamKind::Out);
+        // 提示符没有行尾换行，就停在缓冲末尾
+        b.feed(b"(base) chris@HOST:~$ ", StreamKind::Out);
+        assert_eq!(b.last_line(), "(base) chris@HOST:~$");
+    }
+
+    #[test]
+    fn last_line_skips_blank_tail_and_is_empty_when_nothing_captured() {
+        let mut b = buf(1024);
+        assert_eq!(b.last_line(), "");
+        b.feed(b"done\n\n  \n", StreamKind::Out);
+        assert_eq!(b.last_line(), "done");
     }
 
     #[test]

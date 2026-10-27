@@ -59,12 +59,12 @@ use tauri::{AppHandle, Emitter};
 
 use super::capture;
 use super::danger::assess;
-use super::executor::{wait_for_end, ExecEnd, ExecOutcome, Liveness, WaitConfig};
+use super::executor::{wait_for_end, ExecEnd, ExecOutcome, WaitConfig};
 use super::llm::{self, ChatMessage, CONTEXT_BEGIN, CONTEXT_END};
 use super::{AgentConfig, AgentError};
 use crate::agent::StreamKind;
 use crate::cmd::AppState;
-use crate::ssh::session::{AuthMethod, ConnectRequest, SessionError};
+use crate::ssh::session::{AuthMethod, ConnectRequest};
 use crate::store;
 
 /// 一次 run 最多允许多少轮「思考 → 动作 → 再思考」。
@@ -1064,7 +1064,7 @@ fn feedback_for(command: &str, label: &str, outcome: &ExecOutcome) -> String {
     let mut s = String::new();
     s.push_str(&format!("在会话「{label}」执行：`{}`\n", command.trim()));
     match outcome.reason {
-        ExecEnd::Confirmed => s.push_str("状态：已确认执行完毕（该会话已没有前台进程在跑）\n"),
+        ExecEnd::Confirmed => s.push_str("状态：已确认执行完毕（提示符已回到终端）\n"),
         ExecEnd::Silence => s.push_str("状态：长时间没有新输出，按执行完毕处理（未能确认是否真的结束）\n"),
         ExecEnd::Timeout => s.push_str("状态：等待超时，命令可能仍在运行\n"),
         ExecEnd::Cancelled => return format!("{s}结果：已被用户取消，不要重试这条命令。\n"),
@@ -1151,6 +1151,10 @@ fn sink_of(state: &AppState, id: &str) -> Option<Sink> {
 /// 等一次重连才可能解套（且重连也未必来得及，见 `SessionRuntime.task`）。
 const AGENT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// 提示符基线的长度上限（字符）。超过这么长的末行多半不是提示符，而是一行正文
+/// （上一条命令的输出残留），拿它当基线只会永远对不上。
+const MAX_PROMPT_CHARS: usize = 200;
+
 /// 往任意一种会话写字节。会话不存在时才报错。
 async fn write_to(state: &AppState, id: &str, data: &[u8]) -> Result<(), String> {
     match sink_of(state, id) {
@@ -1167,39 +1171,6 @@ async fn write_to(state: &AppState, id: &str, data: &[u8]) -> Result<(), String>
 }
 
 // ——————————————————————————————— 活体确认 ———————————————————————————————
-
-/// 问一句「这个 SSH 会话的 shell 现在还有没有前台子进程」。
-///
-/// 复用 `SessionManager::probe`（控制台补全本来就在用）。`SHELL_CWD`/`TTY` 有值 =
-/// 远端 /proc 里定位到了这条会话的交互 shell；此时 `FG_COMM` 有无，就是
-/// 「shell 自己是前台」还是「有子进程占着前台」的区别。
-///
-/// 远端没有 /proc、定位不到 shell、旁路被堡垒机拒、超时 —— 一律 `Unknown` 交给静默兜底，
-/// 绝不能误判成「确认空闲」。
-async fn ssh_liveness(state: &AppState, session_id: &str) -> Liveness {
-    match state.sessions.probe(session_id).await {
-        Ok(info) if info.contains_key("FG_COMM") => Liveness::Busy,
-        Ok(info) if info.contains_key("SHELL_CWD") || info.contains_key("TTY") => Liveness::Idle,
-        // 探测脚本没能定位到 shell（空 map）：问不出来，不是「确认空闲」
-        Ok(_) => Liveness::Unknown,
-        // 会话已经不存在了——没什么可忙的了，等同于确认结束
-        Err(SessionError::NotFound(_)) => Liveness::Idle,
-        Err(_) => Liveness::Unknown,
-    }
-}
-
-/// 问一句「这个本地会话的 shell 现在还有没有前台子进程」。
-async fn local_liveness(state: &AppState, session_id: &str) -> Liveness {
-    if !state.local.contains(session_id) {
-        // 会话已经不存在了——没什么可忙的了，等同于确认结束
-        return Liveness::Idle;
-    }
-    match state.local.has_live_child(session_id).await {
-        Some(true) => Liveness::Busy,
-        Some(false) => Liveness::Idle,
-        None => Liveness::Unknown,
-    }
-}
 
 // ——————————————————————————————— 单条命令执行 ———————————————————————————————
 
@@ -1224,11 +1195,18 @@ pub async fn run_one(
         return Err(why.to_string());
     }
     let cmd = command.trim();
-    let sink = sink_of(state, session_id);
 
     // 要让这条命令的输出进得了旁路，缓冲必须是开着的。
     // 这里是「Agent 主动要用某个会话」，与全局 autoAttach 无关，故显式打开。
     state.agent.set_enabled(session_id, true);
+
+    // 发命令之前记下提示符：此刻 shell 正停在它那儿等输入，缓冲末行就是它。
+    // 命令跑完提示符会重新出现，这就是判定结束的依据（见 `executor.rs` 顶部）。
+    let prompt = state
+        .agent
+        .last_line(session_id)
+        .filter(|l| !l.is_empty() && l.chars().count() <= MAX_PROMPT_CHARS);
+    tracing::debug!(session_id, command = cmd, prompt = ?prompt, "agent exec: 提示符基线");
 
     let payload = format!("{cmd}\n");
     let write_started = std::time::Instant::now();
@@ -1252,30 +1230,16 @@ pub async fn run_one(
         );
     }
 
-    let baseline = state.agent.snapshot(session_id).unwrap_or_default();
-    let delta = || {
-        let now = state.agent.snapshot(session_id).unwrap_or_default();
-        match now.strip_prefix(baseline.as_str()) {
-            Some(rest) => rest.to_string(),
-            // 环形缓冲把开头丢掉了（超长输出）：基线不再是前缀，退回整份快照。
-            None => now,
-        }
-    };
-    let liveness = || -> std::pin::Pin<Box<dyn std::future::Future<Output = Liveness> + Send>> {
-        match sink {
-            Some(Sink::Local) => Box::pin(local_liveness(state, session_id)),
-            Some(Sink::Ssh) => Box::pin(ssh_liveness(state, session_id)),
-            // 会话都不存在了，写入那一步应该已经报过错；这里只是兜底，不阻塞。
-            None => Box::pin(async { Liveness::Unknown }),
-        }
-    };
+    // 命令本身刚刚喂进缓冲，从这里往后的才是它的输出
+    let mark = state.agent.pushed(session_id).unwrap_or_default();
     let wait_started = std::time::Instant::now();
     let mut wait_fut = Box::pin(wait_for_end(
         WaitConfig::default(),
-        delta,
+        prompt.as_deref(),
+        || state.agent.pushed(session_id).unwrap_or_default(),
+        || state.agent.last_line(session_id).unwrap_or_default(),
+        || state.agent.since(session_id, mark).unwrap_or_default(),
         || cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false),
-        |d| Box::pin(tokio::time::sleep(d)) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-        liveness,
     ));
     // 定期报一下「还在等」，而不是让面板上的卡片一动不动——用户没法分清
     // 「正常在跑」和「卡死了」。`wait_for_end` 本身保持纯逻辑不碰 Tauri

@@ -21,9 +21,6 @@ struct LocalSession {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: SharedChild,
-    /// 本地 shell 自身的 pid，供 `has_live_child` 查活体子进程。
-    /// 极少数平台 `Child::process_id()` 拿不到时为 `None`。
-    pid: Option<u32>,
 }
 
 pub struct LocalManager {
@@ -80,8 +77,6 @@ impl LocalManager {
             .take_writer()
             .map_err(|e| format!("获取 PTY 写端失败：{}", e))?;
 
-        // 必须在 Arc<Mutex<>> 包装之前取 —— trait 对象本身就有这个方法，不需要等包装。
-        let pid = child.process_id();
         let child = Arc::new(Mutex::new(child));
         {
             let mut guard = self.sessions.lock().unwrap();
@@ -91,7 +86,6 @@ impl LocalManager {
                     master: pair.master,
                     writer,
                     child: Arc::clone(&child),
-                    pid,
                 },
             );
         }
@@ -165,67 +159,6 @@ impl LocalManager {
         let _ = s.child.lock().unwrap().kill();
         Ok(())
     }
-
-    /// 这个本地 shell 现在是否还有活着的前台子进程，供 Agent 判断命令是否跑完。
-    ///
-    /// `None` = 问不出来（拿不到 pid，或平台查询失败），调用方要静默兜底，
-    /// **不能**当成「确认没有子进程」处理。
-    pub async fn has_live_child(&self, id: &str) -> Option<bool> {
-        let pid = {
-            let guard = self.sessions.lock().unwrap();
-            guard.get(id)?.pid
-        }?;
-        tokio::task::spawn_blocking(move || platform_has_child(pid))
-            .await
-            .ok()
-            .flatten()
-    }
-}
-
-/// 查某个 pid 当前是否还有直接子进程存活（不含整棵子树）——与 SSH 那边 tpgid
-/// 前台进程组判定同一口径：`nohup xxx &` 丢出去的孙进程不算数。
-#[cfg(unix)]
-fn platform_has_child(pid: u32) -> Option<bool> {
-    // pgrep -P：退出码 0=匹配到，1=未匹配，其余=查询出错。
-    // procps 与 macOS/BSD 的 pgrep 对这个约定一致，不像 `ps --ppid` 那样方言打架。
-    let status = std::process::Command::new("pgrep")
-        .arg("-P")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?;
-    match status.code() {
-        Some(0) => Some(true),
-        Some(1) => Some(false),
-        _ => None,
-    }
-}
-
-/// Windows 没有 `pgrep`。`wmic` 已弃用但仍随系统安装，先用它；查不到时一律 `None`，
-/// 交给调用方静默兜底。未在真实 Windows 上跑过，下次有环境应补一次手测。
-#[cfg(windows)]
-fn platform_has_child(pid: u32) -> Option<bool> {
-    let out = std::process::Command::new("wmic")
-        .args([
-            "process",
-            "where",
-            &format!("(ParentProcessId={pid})"),
-            "get",
-            "ProcessId",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    // 表头 `ProcessId` 后跟零或多行纯数字 pid；没有子进程时全是空行。
-    let has_child = text
-        .lines()
-        .map(str::trim)
-        .any(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit()));
-    Some(has_child)
 }
 
 /// 各平台的默认登录 shell。`$SHELL` / `/bin/zsh` 在 Windows 上不存在，必须按平台分支。

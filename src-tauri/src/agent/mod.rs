@@ -429,6 +429,23 @@ impl AgentManager {
         Some(buf.snapshot())
     }
 
+    /// 这个会话有史以来写进缓冲的原始字节总数（只增不减）。
+    ///
+    /// 很便宜（不解码、不剥 ANSI），供 Agent 每隔几十毫秒轮询「有没有新输出」。
+    pub fn pushed(&self, session_id: &str) -> Option<u64> {
+        self.sessions.lock().get(session_id).map(|b| b.pushed())
+    }
+
+    /// 从 `mark`（之前某次 [`Self::pushed`] 的返回值）往后的内容，格式同 [`Self::snapshot`]。
+    pub fn since(&self, session_id: &str, mark: u64) -> Option<String> {
+        self.sessions.lock().get(session_id).map(|b| b.since(mark))
+    }
+
+    /// 缓冲尾部最后一个非空行——shell 停在提示符时就是提示符本身。
+    pub fn last_line(&self, session_id: &str) -> Option<String> {
+        self.sessions.lock().get(session_id).map(|b| b.last_line())
+    }
+
     /// 丢弃已缓冲的内容，但保留开关状态（用户「让 agent 忘掉刚才的事」）。
     pub fn clear(&self, session_id: &str) {
         if let Some(buf) = self.sessions.lock().get_mut(session_id) {
