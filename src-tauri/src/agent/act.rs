@@ -2889,3 +2889,58 @@ mod tests {
         assert!(!out.contains("reconnect"), "不该误报：{out}");
     }
 }
+
+/// 端到端（缓冲 → 末行 → 提示符判定）：`executor` 的单测喂的是理想化的末行字符串，
+/// 这里喂真实字节流——带 OSC 改标题、带色、回显用 `\r\n`——确认 ANSI 剥离和回显抵消
+/// 之后，末行真的还是那个提示符。
+#[cfg(test)]
+mod prompt_e2e {
+    use crate::agent::buffer::{SessionBuffer, StreamKind};
+    use crate::agent::executor::same_prompt;
+
+    /// Ubuntu 默认 PS1：先一条 OSC 改窗口标题，再带色的 user@host:cwd$
+    fn ubuntu_prompt(cwd: &str) -> Vec<u8> {
+        format!(
+            "\x1b]0;chris@chris-Latitude-3490: {cwd}\x07\
+             \x1b[01;32mchris@chris-Latitude-3490\x1b[00m:\x1b[01;34m{cwd}\x1b[00m$ "
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn cd_workspace_round_trip() {
+        let mut b = SessionBuffer::new();
+        b.feed(&ubuntu_prompt("~"), StreamKind::Out);
+        let base = b.last_line();
+        eprintln!("baseline = {base:?}");
+
+        b.feed(b"cd workspace\n", StreamKind::In);
+        b.feed(b"cd workspace\r\n", StreamKind::Out);
+        b.feed(&ubuntu_prompt("~/workspace"), StreamKind::Out);
+        let now = b.last_line();
+        eprintln!("now      = {now:?}");
+        eprintln!("transcript tail = {:?}", b.take_tail(300));
+        assert!(same_prompt(&base, &now), "提示符没认出来");
+    }
+
+    /// 真实情况：`cd` 是瞬时的，远端把「回显 + 新提示符」放在同一个包里发回来。
+    #[test]
+    fn echo_and_new_prompt_in_one_packet() {
+        let mut b = SessionBuffer::new();
+        b.feed(&ubuntu_prompt("~"), StreamKind::Out);
+        let base = b.last_line();
+
+        // agent 写下去的原始字节（注意是 \n，不是 \r\n）
+        b.feed(b"cd workspace\n", StreamKind::In);
+        // 远端一个包：回显用 \r\n，紧跟着新提示符
+        let mut packet = b"cd workspace\r\n".to_vec();
+        packet.extend_from_slice(&ubuntu_prompt("~/workspace"));
+        b.feed(&packet, StreamKind::Out);
+
+        let now = b.last_line();
+        eprintln!("base = {base:?}");
+        eprintln!("now  = {now:?}");
+        eprintln!("tail = {:?}", b.take_tail(300));
+        assert!(same_prompt(&base, &now), "提示符没认出来: {now:?}");
+    }
+}
