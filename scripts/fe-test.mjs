@@ -68,5 +68,20 @@ for (const entry of entries) {
   outs.push(out);
 }
 
+/**
+ * 把子进程固定跑在 UTC 上。
+ *
+ * `formatTime` 按**本地时区**格式化（界面上就该这么显示），而用例断言的是
+ * 绝对时间串（`formatTime(0) === "1970-01-01 00:00"`）。写死的那串只在 UTC
+ * 成立 —— 在东八区跑就是 `08:00`，于是同一份代码在不同机器上红绿不一致。
+ *
+ * 与其把断言改成「拿被测函数自己的算法再算一遍」（那就成了恒真断言），
+ * 不如把时区钉死：断言仍然在验真实输出，且谁跑都一样。
+ *
+ * Node 上 `process.env.TZ` 赋值会即时生效（会通知 V8 重置时区缓存），
+ * 子进程继承 env，所以在这里设就够了。
+ */
+process.env.TZ = "UTC";
+
 const r = spawnSync(process.execPath, ["--test", ...outs], { stdio: "inherit" });
 process.exit(r.status ?? 1);

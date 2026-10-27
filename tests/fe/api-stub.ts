@@ -20,6 +20,11 @@ export const api = {
   historyList(): Promise<string[]> {
     return Promise.resolve([]);
   },
+
+  /** 输入日志落盘用（`lib/macInput` 的现场记录）。自测里没有后端，直接吞掉 */
+  appendInputLog(): Promise<void> {
+    return Promise.resolve();
+  },
 };
 
 /** 宏回放记录：每次 sshWrite 一条 */

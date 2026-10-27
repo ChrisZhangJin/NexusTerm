@@ -46,6 +46,32 @@ pub fn write_file_b64(path: String, data: String) -> Result<(), String> {
     std::fs::write(&path, &bytes).map_err(|e| format!("写入失败：{}", e))
 }
 
+/// 输入诊断日志落盘（排查 macOS 中文输入法用）。
+///
+/// 为什么不复用 `append_file_b64`：那条要前端自己给绝对路径，而前端拿不到 home
+/// —— `@tauri-apps/api/path` 走的是 `path` 插件，本项目没装，调用会直接失败。
+/// 后端本来就知道 app_data 在哪，写进 `<app_data>/logs/input.log` 最省事，
+/// 也和 `nexus.log` 待在一起，现场排查时不会找不着。
+///
+/// 内容由 `lib/macInput` 的现场记录产出：每个输入事件的 keyCode / isComposing /
+/// data / textarea，以及每一个真正发往 pty 的字节是谁发的。输入法那几类症状
+/// （丢字 / 多空格 / 选候选多一个数字 / 标点重复）在用户机器上只闪一下，
+/// 光靠描述猜不出来，只能靠这份记录。
+#[tauri::command]
+pub fn append_input_log(app: AppHandle, lines: String) -> Result<(), String> {
+    use std::io::Write as _;
+    let dir = crate::app_data_dir(&app).join("logs");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败：{e}"))?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("input.log"))
+        .map_err(|e| format!("打开 input.log 失败：{e}"))?;
+    f.write_all(lines.as_bytes())
+        .map_err(|e| format!("写入失败：{e}"))?;
+    Ok(())
+}
+
 /// 追加写（ZMODEM 下载流式落盘）：每来一 MB 就写一次，内存不随文件大小增长。
 ///
 /// `truncate = true` 时用 `create`（清空重建），之后一律 `append`。

@@ -41,7 +41,7 @@ import {
 } from "../api";
 import { themeToXterm } from "../lib/theme";
 import { isMacOS } from "../lib/platform";
-import { installMacKeyboard } from "../lib/macInput";
+import { installMacKeyboard, setInputTrace, traceSend } from "../lib/macInput";
 import { attachZmodem, type ZmodemGate } from "../lib/zmodem";
 import type { ClosedInfo, TerminalTab, Theme } from "../types";
 
@@ -54,6 +54,35 @@ export function clock(ts: number): string {
 
 /** xterm.js 原生 Alt+Enter 的字节序列（ESC + CR），软换行沿用它 */
 const SOFT_NEWLINE = "\x1b\r";
+
+/**
+ * 排查 mac 中文输入法用的两个开关（存 localStorage，重启保持）。
+ *
+ * 为什么非得有它们：输入法那几类症状（丢字 / 多空格 / 选候选多一个数字 /
+ * 标点重复）在别人机器上只闪一下，光靠口头描述连着猜错了三轮 —— 每一轮都以为
+ * 找到了原因，构建出来还是错的。现在能做的最有用的两件事是
+ *
+ *  ① **把真值记下来**：每个输入事件的 keyCode / isComposing / inputType /
+ *     data / textarea 内容，以及**每一个真正发往 pty 的字节和是谁发的**，
+ *     追加写到 `~/.nexus-term-input.log`。凭描述猜不出来的东西，看一眼日志就有答案。
+ *  ② **让接管层能当场关掉**：关掉之后走的就是 xterm 原生路径。同一次操作在
+ *     「开 / 关」两种状态下的差别，直接说明问题出在我们这一层还是 xterm 那一层。
+ *
+ * - `nx.inputTrace` = "1"：开始记录（默认关 —— 终端里敲的东西含密码，不该默认落盘）
+ * - `nx.macInput`   = "0"：关掉 mac 输入接管层
+ *
+ * 快捷键：⌘⌥⇧L 切日志，⌘⌥⇧K 切接管层。
+ */
+const LS_INPUT_TRACE = "nx.inputTrace";
+const LS_MAC_INPUT = "nx.macInput";
+const macLayerOn = (): boolean => localStorage.getItem(LS_MAC_INPUT) !== "0";
+
+/**
+ * 输入日志写到哪由后端决定（`<app_data>/logs/input.log`，和 `nexus.log` 一起）。
+ * 前端不给路径是有原因的：`@tauri-apps/api/path` 依赖没装的 `path` 插件，
+ * 前端拿不到 home。这里只给一句给人看的位置说明。
+ */
+const INPUT_LOG_HINT = "~/Library/Application Support/com.nexus-term.app/logs/input.log";
 
 /**
  * 让 macOS 也支持按住 Shift 拖选文本（绕过 tmux 等程序的鼠标捕获）。
@@ -216,6 +245,11 @@ export default function TerminalView({
   // 事件回调在 mount 时注册一次，用 ref 拿最新的 props
   const onClosedRef = useRef(onClosed);
   onClosedRef.current = onClosed;
+  const onNotifyRef = useRef(onNotify);
+  onNotifyRef.current = onNotify;
+  /** 由终端 mount 时填好：⌘⌥⇧K / ⌘⌥⇧L 两个调试开关的实际动作 */
+  const toggleMacInputRef = useRef<(() => void) | null>(null);
+  const toggleInputTraceRef = useRef<(() => void) | null>(null);
   const peerHostRef = useRef(peerHost);
   peerHostRef.current = peerHost;
   const onBackgroundOutputRef = useRef(onBackgroundOutput);
@@ -238,6 +272,50 @@ export default function TerminalView({
   const dragDepth = useRef(0);
   const statusRef = useRef(status);
   statusRef.current = status;
+
+  // ——— 输入法排查开关（见上面的常量说明）———
+  useEffect(() => {
+    let alive = true;
+    // 默认**关**：终端里敲的东西包含密码，没有明确开记录就不该往磁盘上落。
+    // 要记的时候按 ⌘⌥⇧L（再按一次停），状态存在 localStorage 里，重启保持。
+    let on = localStorage.getItem(LS_INPUT_TRACE) === "1";
+    const apply = (next: boolean) => {
+      on = next;
+      localStorage.setItem(LS_INPUT_TRACE, next ? "1" : "0");
+      setInputTrace(next, true);
+      if (alive) {
+        onNotifyRef.current?.(
+          next
+            ? `正在记录输入日志 → ${INPUT_LOG_HINT}；再按 ⌘⌥⇧L 停止`
+            : `输入日志已停止（文件：${INPUT_LOG_HINT}）`
+        );
+      }
+    };
+    toggleInputTraceRef.current = () => apply(!on);
+    if (on) apply(true);
+    return () => {
+      alive = false;
+      setInputTrace(false);
+    };
+  }, []);
+
+  // 两个开关都用 ⌘⌥⇧ 打头：⌥ 会把 e.key 变成 ¬ ˚ 之类，只能按物理键 e.code 判
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.metaKey || !e.ctrlKey || !e.altKey) return;
+      if (e.code === "KeyL") {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleInputTraceRef.current?.();
+      } else if (e.code === "KeyK") {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleMacInputRef.current?.();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, []);
 
   activeRef.current = active;
 
@@ -763,11 +841,34 @@ export default function TerminalView({
       refreshHintsSoon();
     };
 
-    const dataSub = term.onData(handleInput);
+    const dataSub = term.onData((d) => {
+      // xterm 自己发出的字节（回车、Ctrl 组合、方向键、输入法上屏、粘贴）。
+      // 记一笔是为了在日志里能把「我们发的」和「xterm 发的」分开 —— 「，,」
+      // 这种重复只有看到 via 才知道多出来的那一下是谁干的。
+      traceSend(d, "xterm");
+      handleInput(d);
+    });
 
     // macOS(WKWebView) 上普通字符改由我们自己在捕获阶段发 —— 详见 lib/macInput。
     // 必须挂在 host 上：xterm 的监听在 textarea 上，捕获阶段我们先到。
-    cleanups.push(installMacKeyboard(host, term, handleInput, isMacOS()));
+    //
+    // 装在可重装的壳里：排查输入问题时要能在「接管层开 / 关」之间当场切换对比
+    // （⌘⌥⇧K）。重装只是摘挂几个 DOM 监听，不能为此重建终端。
+    let macUninstall: () => void = () => {};
+    const applyMacInput = () => {
+      macUninstall();
+      macUninstall = macLayerOn() ? installMacKeyboard(host, term, handleInput, isMacOS()) : () => {};
+    };
+    applyMacInput();
+    cleanups.push(() => macUninstall());
+    toggleMacInputRef.current = () => {
+      const next = !macLayerOn();
+      localStorage.setItem(LS_MAC_INPUT, next ? "1" : "0");
+      applyMacInput();
+      onNotifyRef.current?.(
+        next ? "已开启 mac 输入接管层（⌘⌥⇧K 可再关）" : "已关闭 mac 输入接管层，走 xterm 原生路径（⌘⌥⇧K 恢复）"
+      );
+    };
 
     // 快捷键全部来自「设置 → 快捷键」（lib/prefs），改了立即生效。
     // 默认 Windows / Linux 用 Ctrl+Shift+C/V/F：Ctrl+C 必须留给中断信号（^C）。

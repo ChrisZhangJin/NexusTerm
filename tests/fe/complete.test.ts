@@ -1199,10 +1199,55 @@ test("接管：热键上下文里的标点其实没被替换——照样只发�
   un();
 });
 
-test("接管：非热键上下文的标点（keyCode 不是 229）照常立刻发送，不等 input", () => {
+test("接管：真机场景——中文输入法下逗号给的是自己的键码 188，不是 229", () => {
+  // 这才是真机上发生的事：没有组合会话，keyCode 就是这颗键自己的键码，
+  // 但 IME 照样把它换成全角。9d4d3aa 要求 keyCode === 229，恰好把要修的
+  // 这个场景排除在外——半角先发一遍，全角那条 input 再被 xterm 发一遍。
   const { host, out, un } = rig();
-  host.fire("keydown", plainKey(",", { keyCode: ",".charCodeAt(0) }));
-  assert.equal(out.text, ",", "没有输入法热上下文信号，不该被按下不发");
+  host.fire("keydown", plainKey(",", { keyCode: 188 }));
+  assert.equal(out.text, "", "先别发，等 WebKit 真正写定的字符");
+  host.fire("input", { data: "，", inputType: "insertText", isComposing: false });
+  assert.equal(out.text, "，", "只应该有全角那一个，半角逗号不能跟着冒出来");
+  un();
+});
+
+test("接管：同一个键码 188 但没被替换（英文输入法）也只发一次", () => {
+  // 去掉 229 判据后英文标点也走「等 input」这条路：input 带来的就是最终字符。
+  const { host, out, un } = rig();
+  host.fire("keydown", plainKey(",", { keyCode: 188 }));
+  host.fire("input", { data: ",", inputType: "insertText", isComposing: false });
+  assert.equal(out.text, ",", "只发一次，不能重复也不能丢");
+  un();
+});
+
+// ——— 第八轮：照着真机日志改（前三轮都是猜的，猜错三次）———
+//
+// 真机（macOS + WKWebView + 系统拼音）敲一个中文逗号，<app_data>/logs/input.log
+// 里记到的顺序**和之前所有假设都不一样**：
+//
+//   beforeinput insertText data="，"   ← 全角结果先到
+//   input       insertText data="，"
+//   send "，"   via=xterm              ← xterm 的 _inputEvent 只发了一次
+//   keydown     key="，" kc=229        ← 键事件后到，且 key 已经是全角
+//   keyup       key="，" kc=188
+
+test("接管：真机顺序——input 先到、keydown 的 key 已是全角且键码 229", () => {
+  const { host, out, un } = rig();
+  host.fire("input", { data: "，", inputType: "insertText", isComposing: false });
+  host.fire("keydown", plainKey("，", { keyCode: 229 }));
+  // 全角字符既过不了 isPlainKeystroke、也不在 PUNCT_RISK 里：接管层一个字节
+  // 都不该加。真机上那一个「，」是 xterm 自己的 _inputEvent 发的。
+  assert.equal(out.text, "", "全角结果由 xterm 发，接管层不能再补一份");
+  un();
+});
+
+test("接管：input 比 keydown 先到时，半角标点的兜底定时器必须闭嘴", () => {
+  // 这条就是「，,」里第二个字符的来源：input 已经把结果交出去了，keydown 才
+  // 姗姗来迟，于是「等 input」的逻辑启动 80ms 兜底，又补发了一个半角。
+  const { host, out, un } = rig();
+  host.fire("input", { data: ",", inputType: "insertText", isComposing: false });
+  host.fire("keydown", plainKey(",", { keyCode: 188 }));
+  assert.equal(out.text, ",", "刚刚已经有 input 交出过字符，不能再补第二个");
   un();
 });
 

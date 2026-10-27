@@ -150,6 +150,8 @@ export const api = {
   /** 下载流式落盘：每 MB 追加一次，内存不随文件大小增长（truncate 只在第一次） */
   appendFileB64: (path: string, data: string, truncate: boolean) =>
     invoke<void>("append_file_b64", { path, data, truncate }),
+  /** 输入诊断日志（排查 mac 输入法）：后端直接写到 `<app_data>/logs/input.log` */
+  appendInputLog: (lines: string) => invoke<void>("append_input_log", { lines }),
 
   // ——— AI Agent 旁路（终端输出旁路喂给 LLM） ———
 

@@ -20,7 +20,7 @@ mod store;
 mod sysstat;
 mod xsh;
 
-fn app_data_dir(app: &tauri::AppHandle) -> PathBuf {
+pub(crate) fn app_data_dir(app: &tauri::AppHandle) -> PathBuf {
     app.path()
         .app_data_dir()
         .expect("无法定位应用数据目录")
@@ -231,6 +231,7 @@ pub fn run() {
             cmd::write_file,
             cmd::write_file_b64,
             cmd::append_file_b64,
+            cmd::append_input_log,
             cmd::local_spawn,
             cmd::local_write,
             cmd::local_resize,
