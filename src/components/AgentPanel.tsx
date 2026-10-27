@@ -263,10 +263,25 @@ export function AgentPanel({
   /** 输入框。`@` 联想要在选中一项之后把光标放回原处，所以得拿得到它 */
   const taRef = useRef<HTMLTextAreaElement>(null);
   /**
+   * 上下键翻历史输入。-1 = 没在翻；0 = 最近一条，1 = 倒数第二条，依此类推。
+   * `draftRef` 存的是刚开始翻之前那行还没发出去的草稿，翻到底再按下键要能回得去，
+   * 不能让一次手滑把正在写的东西弄丢。
+   */
+  const historyIndexRef = useRef(-1);
+  const draftRef = useRef("");
+  /** 翻历史之后光标要落在新文本末尾，而不是停在原来那个（可能已经不存在的）位置 */
+  const recallCaretToEndRef = useRef(false);
+  /**
    * 输入法状态。macOS(WKWebView) 上 `isComposing` 不可信 —— Safari 把
    * compositionend 派发在确认回车的 keydown 之前，详见 `lib/ime.ts`。
    */
   const imeRef = useRef<ImeGuard>(new ImeGuard());
+  useEffect(() => {
+    if (!recallCaretToEndRef.current) return;
+    recallCaretToEndRef.current = false;
+    const ta = taRef.current;
+    if (ta) ta.selectionStart = ta.selectionEnd = input.length;
+  }, [input]);
   const [err, setErr] = useState<string | null>(null);
   /**
    * 这一轮实际发起的会话。事件订阅挂在它上面，而**不跟随 sessionId** ——
@@ -449,6 +464,8 @@ export function AgentPanel({
    */
   const startRun = (q: string) => {
     setInput("");
+    historyIndexRef.current = -1;
+    draftRef.current = "";
     setErr(null);
     stickRef.current = true;
     patch((c) => ({
@@ -792,6 +809,29 @@ export function AgentPanel({
                     e.preventDefault();
                     setMention(null);
                     return;
+                  }
+                } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+                  // 联想列表没开着才轮到翻历史，且只在光标处在首/末行时触发——
+                  // 多行输入框里，中间行按上下键应该是挪光标，不该被历史打断。
+                  const ta = e.currentTarget;
+                  const atTop = ta.value.slice(0, ta.selectionStart ?? 0).indexOf("\n") === -1;
+                  const atBottom = ta.value.slice(ta.selectionEnd ?? ta.value.length).indexOf("\n") === -1;
+                  const history = conv.messages.filter((m) => m.role === "user").map((m) => m.text);
+                  if (e.key === "ArrowUp" && atTop && history.length > 0) {
+                    e.preventDefault();
+                    if (historyIndexRef.current === -1) draftRef.current = input;
+                    historyIndexRef.current = Math.min(historyIndexRef.current + 1, history.length - 1);
+                    recallCaretToEndRef.current = true;
+                    setInput(history[history.length - 1 - historyIndexRef.current]);
+                  } else if (e.key === "ArrowDown" && atBottom && historyIndexRef.current !== -1) {
+                    e.preventDefault();
+                    historyIndexRef.current -= 1;
+                    recallCaretToEndRef.current = true;
+                    setInput(
+                      historyIndexRef.current === -1
+                        ? draftRef.current
+                        : history[history.length - 1 - historyIndexRef.current]
+                    );
                   }
                 }
                 // 输入法的确认回车已经在上面的 verdict 里排除了
