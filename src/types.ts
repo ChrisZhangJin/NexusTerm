@@ -31,11 +31,8 @@ export interface NewSession {
 }
 
 /**
- * 宏的一步。
- *
- * 只有三种原语，且字段名与 Rust 侧 serde 完全一致（`kind` 是判别式）——
- * 多一种原语就多一个「行为不可预测」的来源；能表达复杂流程的应该写成脚本，
- * 而不是把宏做成一个小语言。
+ * 宏的一步。字段名与 Rust 侧 serde 一致（`kind` 是判别式）。
+ * 刻意只留三种原语：复杂流程应该写脚本，而不是把宏做成一个小语言。
  */
 export type MacroStep =
   /** 发送文本；`enter` 为真时末尾补回车 */
@@ -65,10 +62,7 @@ export interface ConnectRequest {
   host: string;
   port?: number;
   username: string;
-  /**
-   * 登录凭据。SFTP 面板复用已认证的终端连接时不需要，可以省略 ——
-   * 那种情况下本地没存密码也能打开文件面板。
-   */
+  /** 登录凭据。SFTP 面板复用已认证的终端连接时可省略（本地没存密码也能开文件面板）。 */
   auth?: AuthMethod;
   cols: number;
   rows: number;
@@ -87,11 +81,10 @@ export interface ConnectRequest {
    */
   configId?: string;
   /**
-   * 是否允许在该连接上开旁路通道（cwd/tmux 探测、状态栏资源采集）。
+   * 是否允许在该连接上开旁路通道（cwd/tmux 探测、状态栏资源采集）。默认 true。
    *
-   * 默认 true。企业堡垒机常把一条 SSH 连接当成一条终端，收到第二个
-   * `CHANNEL_OPEN` 就直接断开客户端 —— 表现是「连上几秒就掉线」。
-   * 这类会话传 false（会话的「兼容模式」），终端功能不受影响。
+   * 堡垒机常把一条 SSH 连接当成一条终端，收到第二个 `CHANNEL_OPEN` 就断开
+   * 客户端（表现为「连上几秒就掉线」）；这类会话传 false（「兼容模式」）。
    */
   sidecar?: boolean;
 }
@@ -255,8 +248,7 @@ export type AgentProvider = "openai" | "anthropic" | "custom";
 /**
  * 单个 AI 账号的连接与行为配置。后端 `AgentAccount` 的镜像（camelCase）。
  *
- * 多账号设计：用户可配多组（OpenAI / Anthropic / 自建网关…），整组切换。
- * 连接字段与行为字段都随账号走，这样换账号时系统提示词、脱敏策略一并切换。
+ * 行为字段（系统提示词、脱敏）刻意也随账号走，换账号时一并切换。
  */
 export interface AgentAccount {
   /** 账号唯一 id（前端生成）。切换、删除按它定位。 */
@@ -286,9 +278,7 @@ export type AgentExecMode = "agentic" | "approval";
 
 /**
  * AI 助手配置。后端持久化在 SQLite settings 表（key=`agent.config`），
- * serde `rename_all = "camelCase"`，故此处的字段名必须与 TS 侧一致。
- *
- * 顶层只保留全局行为（总开关、新会话默认旁路、执行模式），连接相关下沉到 accounts。
+ * serde `rename_all = "camelCase"`，故字段名必须两侧一致。
  */
 export interface AgentConfig {
   /** 全局总开关。关着的时候后端旁路完全不动，连一次哈希查找都没有。 */
@@ -356,9 +346,8 @@ export interface AgentRunRequest {
   /**
    * 由前端从 xterm 缓冲区抓的当前屏幕快照（含 scrollback）。
    *
-   * 旁路缓冲只记「开了之后」的字节，可能缺开头、也可能被容量截断；
-   * 而用户此刻屏幕上看到的东西才是他要问的那件事的完整现场。
-   * 有它时后端优先用它当上下文，旁路缓冲只作兜底。
+   * 旁路缓冲只记「开了之后」的字节，可能缺开头或被容量截断，所以后端
+   * 优先用这份快照当上下文，旁路缓冲只作兜底。
    */
   consoleText?: string;
   /**
@@ -371,8 +360,7 @@ export interface AgentRunRequest {
 /**
  * `nx://agent/step/{sessionId}` 的载荷：一轮里发生的每一件事。
  *
- * 刻意是「扁平结构 + kind」而不是判别联合：多数字段本就可选，
- * 扁平结构在 TS 侧写起来更省事，渲染时也不用写一堆类型收窄。
+ * 刻意是「扁平结构 + kind」而不是判别联合：多数字段本就可选，渲染时不用做类型收窄。
  */
 export interface AgentStep {
   /** plan | tool | exec | result | skip | note | answer | open | export | tab */
@@ -404,8 +392,8 @@ export interface AgentApproveRequest {
 /**
  * `nx://agent/tab/{sessionId}` 的载荷：请前端动一下标签页。
  *
- * 后端没有 tab 这个概念（它只知道 pty / ssh 连接），所以这不是「执行」，
- * 是「转达」。办完必须回一句 `agentTabAck`，否则后端只能当成没办成。
+ * 后端没有 tab 概念（只知道 pty / ssh 连接），所以这是「转达」不是「执行」：
+ * 办完必须回一句 `agentTabAck`，否则后端只能当成没办成。
  */
 export interface AgentTabRequest {
   requestId: string;

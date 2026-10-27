@@ -113,10 +113,9 @@ pub enum AuthMethod {
 
 /// 发送队列的容量（按消息条数）。
 ///
-/// 必须是**有界**的：终端输入的每条消息只有几十字节，而 ZMODEM 上传是
-/// 256KB 一片 —— 16 条约等于 4MB 峰值。用无界队列时，前端读盘速度远快于
-/// 网络，600MB 的文件会整个堆在后端内存里（实测 400MB+），进度条冲到 99%
-/// 之后看起来像卡死，其实是在等网络把积压发完。
+/// 必须**有界**：ZMODEM 上传按 256KB 一片，16 条约 4MB 峰值。用无界队列时前端
+/// 读盘远快于网络，600MB 文件会整个堆进后端内存（实测 400MB+），进度条冲到 99%
+/// 后看起来像卡死，其实是在等积压发完。
 const INPUT_QUEUE: usize = 16;
 
 /// 旁路通道被服务端拒绝时返回的文案。
@@ -147,10 +146,9 @@ struct SessionRuntime {
 
 /// 探测脚本：在同一 SSH 连接上开 exec 通道执行（stdin 喂给 `sh -s`，不依赖用户登录 shell 类型）。
 ///
-/// 原理：同一 TCP 连接上的所有通道共享同一个 `SSH_CONNECTION`（含客户端端口，全局唯一）。
-/// 据此在 /proc 里找出「父进程是 sshd、且 stdin 是 pts」的进程 —— 就是本标签的交互 shell；
-/// 再从其 stat 的 tpgid 拿到前台进程组，读出 cwd / 命令行；tmux 则按 tty 查询所附着的 session。
-/// 只读、不修改远端任何东西；非 Linux（无 /proc）时输出为空，前端按「未知」处理。
+/// 原理：同一 TCP 连接上的所有通道共享同一个 `SSH_CONNECTION`（含客户端端口，全局唯一），
+/// 据此在 /proc 里认出本标签的交互 shell（父进程是 sshd、stdin 是 pts），
+/// 再由 stat 的 tpgid 拿前台进程组。只读；非 Linux（无 /proc）时输出为空，前端按「未知」处理。
 const PROBE_SCRIPT: &str = r#"
 sc="$SSH_CONNECTION"
 [ -n "$sc" ] || exit 0
@@ -248,11 +246,10 @@ pub struct SharedConn {
 
 /// 「已认证连接」登记表：标签 id → 那条连接。
 ///
-/// 只服务一个目的：让 SFTP 面板不必重新认证就能在同一条连接上开 `sftp` 子系统。
-/// 对要求 keyboard-interactive（OTP / 堡垒机）的服务器，这一步等于省掉一次
-/// 验证码输入 —— 否则每打开一次文件面板都要重新要一次码。
+/// 只服务一个目的：让 SFTP 面板不必重新认证就能在同一条连接上开 `sftp` 子系统
+/// （对 OTP / 堡垒机服务器等于省掉一次验证码）。
 ///
-/// 键是**标签 id** 而不是配置 id：同一个配置可能开了多个标签，关掉其中一个
+/// 键是**标签 id** 而不是配置 id：同一配置可能开了多个标签，关掉其中一个
 /// 不该影响其它标签登记的那条连接。
 pub type SharedConns = Arc<Mutex<HashMap<String, SharedConn>>>;
 
@@ -449,9 +446,8 @@ impl SessionManager {
     /// 写数据。**队列满时会等** —— 这个 await 就是全链路的背压：
     /// 网络慢 → 队列堵 → IPC 不返回 → 前端读盘停在这一片，内存恒定。
     ///
-    /// 先用 `try_send` 走快路径：普通键入/粘贴时队列永远是空的，同步入队可以
-    /// 沿用「命令按到达顺序执行」的旧语义；只有批量上传把队列填满时才退化成
-    /// 等待（那时本来就是单条数据流，顺序由前端的发送队列保证）。
+    /// 先 `try_send` 走快路径，保住普通键入/粘贴「按到达顺序执行」的旧语义；
+    /// 只有批量上传填满队列时才退化成等待（那时顺序由前端的发送队列保证）。
     pub async fn write(&self, id: &str, data: Vec<u8>) -> Result<(), SessionError> {
         // 取完 sender 立刻放锁：parking_lot 的 guard 不是 Send，跨 await 持有会编译不过
         let tx = {
@@ -640,6 +636,74 @@ impl SessionManager {
             .map_err(|_| SessionError::Channel("读取文件超时".into()))?
     }
 
+    /// id 是否是一条已登记的远程 SSH 会话（本地终端不在这张表里）。
+    pub fn has(&self, id: &str) -> bool {
+        self.inner.lock().contains_key(id)
+    }
+
+    /// 开 exec 通道 `cat > path` 写任意字节到远端文件，不依赖 SFTP 子系统。
+    pub async fn write_remote_file(
+        &self,
+        id: &str,
+        remote_path: &str,
+        bytes: &[u8],
+    ) -> Result<(), SessionError> {
+        let (handle, sidecar) = {
+            let map = self.inner.lock();
+            let rt = map
+                .get(id)
+                .ok_or_else(|| SessionError::NotFound(id.into()))?;
+            (rt.handle.clone(), rt.sidecar)
+        };
+        if !sidecar {
+            return Err(SessionError::Channel(SIDECAR_OFF.into()));
+        }
+        let cmd = format!("cat > {}", shq(remote_path));
+        let bytes = bytes.to_vec();
+        let run = async move {
+            let mut ch = handle
+                .channel_open_session()
+                .await
+                .map_err(|e| SessionError::Channel(sidecar_error(&e)))?;
+            ch.exec(true, cmd.as_bytes())
+                .await
+                .map_err(|e| SessionError::Channel(sidecar_error(&e)))?;
+            // 分块写，避免个别服务端对单帧大小敏感
+            for chunk in bytes.chunks(32 * 1024) {
+                ch.data(chunk)
+                    .await
+                    .map_err(|e| SessionError::Channel(e.to_string()))?;
+            }
+            ch.eof().await.map_err(|e| SessionError::Channel(e.to_string()))?;
+            let mut err = Vec::new();
+            let mut code: Option<u32> = None;
+            while let Some(msg) = ch.wait().await {
+                match msg {
+                    ChannelMsg::ExtendedData { data, .. } => {
+                        if err.len() < 4096 {
+                            err.extend_from_slice(&data);
+                        }
+                    }
+                    ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            if code.unwrap_or(0) != 0 {
+                let msg = String::from_utf8_lossy(&err).trim().to_string();
+                return Err(SessionError::Channel(if msg.is_empty() {
+                    format!("写入远端文件失败（退出码 {}）", code.unwrap_or(0))
+                } else {
+                    msg
+                }));
+            }
+            Ok::<_, SessionError>(())
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), run)
+            .await
+            .map_err(|_| SessionError::Channel("写入远端文件超时".into()))?
+    }
+
     pub fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), SessionError> {
         let map = self.inner.lock();
         let rt = map
@@ -671,22 +735,17 @@ pub struct AuthContext<'a> {
 pub enum AuthOutcome {
     /// 认证完成，可以直接开通道
     Done,
-    /// 用户选的方式没通过，服务端还可能有二次验证。
-    ///
-    /// 调用方**必须换一条新连接**再用 [`authenticate_kbi`] 重来，原因见下。
+    /// 用户选的方式没通过，服务端还可能有二次验证 —— 调用方接着走 [`authenticate_kbi`]。
     NeedKeyboardInteractive,
 }
 
-/// 现在只在**换连接重试**这条兜底路径上出现（见 [`super::open_authenticated`]）。
+/// 只在**换连接重试**这条兜底路径上出现（见 [`super::open_authenticated`]）。
 ///
-/// 历史：russh 0.49 的 `auth_request.current` 只在 SERVICE_ACCEPT 那一刻被置为
-/// `KeyboardInteractive`，而 SERVICE_ACCEPT 只对应本次连接的**第一个**认证请求。
-/// 先密码再转 KBI 时 `current` 仍是 `None`，服务端下发 USERAUTH_INFO_REQUEST
-/// 后两个分支都不匹配，包被**静默丢弃**，客户端永久挂起。
-///
-/// 该缺陷已在 `vendor/russh` 里修掉（判据改为「当前请求是不是 KBI」，不再依赖
-/// `current`），因此「密码 + 验证码」可以在同一条连接上完成。这条常量与重连兜底
-/// 仍然保留：对极少数只允许 KBI 作为首个请求的服务器，换连接才是对的。
+/// 历史：russh 0.49 的 `auth_request.current` 只在 SERVICE_ACCEPT 时置为
+/// `KeyboardInteractive`，而那只对应连接上的第一个认证请求 —— 先密码再转 KBI 时
+/// INFO_REQUEST 两个分支都不匹配，包被**静默丢弃**、客户端永久挂起。
+/// 该缺陷已在 `vendor/russh` 修掉（判据改为「当前请求是不是 KBI」）。
+/// 常量与重连兜底仍保留：少数服务器确实只允许 KBI 作为首个请求。
 pub const KBI_MUST_BE_FIRST: &str = "keyboard-interactive 必须是本次连接的第一个认证请求";
 
 /// keyboard-interactive 允许的最大问答轮数。正常的多因素也就 2~3 轮，
@@ -726,18 +785,12 @@ fn asks_for_password(text: &str, echo: bool) -> bool {
 
 /// RSA 公钥认证要按服务端能力挑签名算法。
 ///
-/// 两种世界都存在，且**光看版本号没法区分**：
-/// * OpenSSH ≥ 7.2 支持 `rsa-sha2-256/512`，新版本默认已禁用 `ssh-rsa`（SHA-1）。
-/// * OpenSSH < 7.2（5.3 的 CentOS 6 / VOS 之类）只认 `ssh-rsa`，收到
-///   `rsa-sha2-256` 会直接回 `USERAUTH_FAILURE`。
+/// 新旧两种世界都存在：OpenSSH ≥ 7.2 用 `rsa-sha2-256/512` 且新版已禁 `ssh-rsa`，
+/// < 7.2（CentOS 6 的 5.3 之类）只认 `ssh-rsa`。告知能力的 `server-sig-algs` 扩展
+/// 本身也是 7.2 才有，且 russh 0.49 收到就丢，所以只能「先新后旧」实试。
 ///
-/// 服务端「支持哪些公钥签名算法」是通过 `server-sig-algs` 扩展告知的，但这个扩展
-/// 本身也是 7.2 才加的，老服务器根本没有；russh 0.49 又没把它暴露出来
-/// （`client::encrypted::handle_ext_info` 收到就丢）。所以只能按「先新后旧」
-/// 实试：SHA-256 被拒就在同一条连接上改用 `ssh-rsa` 再来一次。
-///
-/// 顺序不能反：现代服务器（尤其被加固过的）把 `ssh-rsa` 关掉了，
-/// 先试 SHA-1 会白白失败一次，还可能触发 fail2ban 计数。
+/// 顺序不能反：加固过的现代服务器关了 `ssh-rsa`，先试 SHA-1 会白失败一次，
+/// 还可能触发 fail2ban 计数。
 async fn authenticate_key<H>(
     handle: &mut Handle<H>,
     username: &str,
@@ -793,10 +846,9 @@ where
 /// 执行用户选定的认证方式（第一步）。
 ///
 /// 返回 `NeedKeyboardInteractive` 表示「方式没通过，值得再走一次二次验证」，
-/// 由调用方重连后交给 [`authenticate_kbi`]。
+/// 由调用方接着交给 [`authenticate_kbi`]。
 ///
-/// 抽成独立函数是为了让 SSH 终端与 SFTP 子系统复用同一套逻辑 ——
-/// 两者若各写一份，认证规则一变动就必然出现漂移。
+/// 抽成独立函数是为了让 SSH 终端与 SFTP 子系统复用同一套逻辑，避免规则漂移。
 pub async fn authenticate<H>(
     handle: &mut Handle<H>,
     username: &str,
@@ -841,20 +893,7 @@ pub(crate) enum KbiOutcome {
     Unavailable,
 }
 
-/// 只走 keyboard-interactive。两种调用姿势都对：
-///
-/// * **纯 KBI 服务器**（KBI 就是第一因子）：新连接上直接调；
-/// * **密码 / 公钥 + 动态口令**（`AuthenticationMethods password,keyboard-interactive`
-///   或 Go 写的堡垒机）：先做完第一因子，**在同一条连接上**接着调。
-///
-/// 第二种曾经做不到 —— russh 只在「本次连接的第一个认证请求就是 KBI」时才认
-/// INFO_REQUEST，其余情况静默丢包并永久挂起。已在 `vendor/russh` 里修掉，
-/// 所以现在可以直接在已认证一半的连接上继续。
-///
-/// 「问用户」做成闭包参数而不是写死 `AuthPrompts`，是为了让这些路径能对着
-/// 真服务端跑通，不必拉起 Tauri 窗口。
-///
-/// 只有测试用（生产走 [`authenticate_kbi`]，因为同一条闭包要在两条路径上复用）。
+/// 按值接闭包的测试入口（生产走 [`authenticate_kbi`]，那里闭包要在两条路径上复用）。
 #[cfg(test)]
 pub(crate) async fn authenticate_kbi_with<H, F, Fut>(
     handle: &mut Handle<H>,
@@ -872,8 +911,14 @@ where
     authenticate_kbi(handle, username, auth, session_id, host, &ask).await
 }
 
-/// [`authenticate_kbi_with`] 的实现体，闭包按引用传 —— 调用方常常要在
-/// 「同一连接重试」和「换连接重试」两条路径上复用同一个闭包。
+/// 只走 keyboard-interactive。两种调用姿势都对：
+///
+/// * **纯 KBI 服务器**（KBI 就是第一因子）：新连接上直接调；
+/// * **密码 / 公钥 + 动态口令**：先做完第一因子，**在同一条连接上**接着调
+///   （russh 0.49 在这里会静默丢包挂起，已由 `vendor/russh` 修掉）。
+///
+/// 闭包按引用传：调用方要在「同一连接重试」和「换连接重试」两条路径上复用它。
+/// 「问用户」做成参数而非写死 `AuthPrompts`，是为了能对着真服务端跑测试。
 pub(crate) async fn authenticate_kbi<H, F, Fut>(
     handle: &mut Handle<H>,
     username: &str,
@@ -1155,9 +1200,8 @@ fn sidecar_error(e: &russh::Error) -> String {
 
 /// 追加一行会话日志到 `<app_data>/sessions.log`。
 ///
-/// 排查「连上几秒就断」时用户手上没有控制台（GUI 版看不到 tracing 输出），
-/// 这行日志至少能给出：断开原因、存活时长、是否开过旁路通道、以及离最后一次
-/// 旁路操作过了多久 —— 后者是判断「是不是旁路把连接弄死的」的直接证据。
+/// GUI 版看不到 tracing 输出，排查「连上几秒就断」只能靠它。`since_sidecar`
+/// 是判断「是不是旁路通道把连接弄死的」的直接证据。
 fn log_session_end(
     app: &AppHandle,
     id: &str,
@@ -1237,9 +1281,6 @@ mod kbi_probe {
     //! python tests/kbi_server.py 2223 --rounds 2   # 分两轮问
     //! NEXUS_KBI_PORT2=2223 cargo test --lib kbi_probe -- --ignored --nocapture
     //! ```
-    //!
-    //! 注意：每条用例都必须用**新连接**，且 KBI 是这条连接上的第一个认证请求。
-    //! 这不是测试的偷懒，而是生产代码的真实形态 —— 见 `KBI_MUST_BE_FIRST`。
 
     use super::*;
     use std::sync::Mutex as StdMutex;
@@ -1305,11 +1346,9 @@ mod kbi_probe {
 
     /// 回归：**先密码、再 KBI，全在同一条连接上**完成。
     ///
-    /// 这是「密码 + 动态口令」类企业堡垒机的形态（它们用 USERAUTH_FAILURE 的
-    /// partial-success 位说「密码对了，还差一步」）。修复前 russh 会在这里
-    /// 静默丢掉服务端下发的 INFO_REQUEST 并永久挂起 —— 现象是客户端既不弹
-    /// 验证码框、也不报错，最后只能超时；而断开重连又会让服务端重新要求密码，
-    /// 于是一路退化成「密码不正确」。
+    /// 「密码 + 动态口令」类企业堡垒机的形态。修复前 russh 会静默丢掉服务端下发的
+    /// INFO_REQUEST 并永久挂起（既不弹验证码框也不报错），而断开重连又让服务端
+    /// 重新要密码，一路退化成「密码不正确」。
     #[tokio::test]
     #[ignore]
     async fn kbi_after_failed_password_on_same_connection() {
@@ -1518,12 +1557,8 @@ mod kbi_probe {
 
     /// 在**同一条已认证连接**上直接开 `sftp` 子系统。
     ///
-    /// 这是文件面板免二次认证的核心机制：`SftpManager::connect` 拿到终端那条
-    /// 连接的句柄后，走的就是下面这三步。对着 OTP 服务器，省掉的就是这一整轮
-    /// 重新握手 + 重新要验证码。
-    ///
-    /// 用真实握手真实验证，而不是只测登记表 —— 出问题的往往正是「这条连接还能
-    /// 不能再开通道」。
+    /// 文件面板免二次认证的核心机制（`SftpManager::connect` 走的就是这三步）。
+    /// 用真实握手而不是只测登记表 —— 出问题的往往正是「这条连接还能不能再开通道」。
     #[tokio::test]
     #[ignore]
     async fn sftp_opens_on_already_authenticated_connection() {

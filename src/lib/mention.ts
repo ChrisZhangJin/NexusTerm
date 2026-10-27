@@ -1,9 +1,4 @@
-/**
- * 输入框里的 `@会话名` 联想。
- *
- * 抽出来是为了能被单独验证：这里全是字符串下标的活儿，
- * 混在 React 组件的 onChange 里就只能靠「打几个字看看」来验了。
- */
+/** 输入框里的 `@会话名` 联想。全是字符串下标的活儿，抽出组件以便单独验证。 */
 
 /** 光标停在的 `@xxx` 片段：`start` 是 `@` 的下标，`query` 是 `@` 之后到光标的部分 */
 export interface MentionQuery {
@@ -12,11 +7,8 @@ export interface MentionQuery {
 }
 
 /**
- * 光标是不是正停在一个 `@xxx` 片段里？是就返回它的起点与已输入的部分。
- *
- * 判定规则刻意简单：
- * - `@` 必须在行首或空白之后（邮箱、`a@b` 不该触发）
- * - `@` 到光标之间不能有空白（打完了就是普通文本）
+ * 光标是不是正停在一个 `@xxx` 片段里？规则刻意简单：`@` 必须在行首或空白之后
+ * （邮箱、`a@b` 不该触发），且 `@` 到光标之间不能有空白。
  */
 export function scanMention(text: string, caret: number): MentionQuery | null {
   if (caret < 0 || caret > text.length) return null;
@@ -39,10 +31,8 @@ export function beforeMention(text: string, m: MentionQuery): string {
 }
 
 /**
- * 匹配 `@` 片段的会话。
- *
- * 排序讲究：**没在作用范围里的排前面**。人敲 `@` 多半是想加一台新机器，
- * 把已经选过的顶在最前面，等于让他每次都要多按一下方向键。
+ * 匹配 `@` 片段的会话。没在作用范围里的排前面：敲 `@` 多半是想加一台新机器，
+ * 把已选过的顶在最前等于让人每次多按一下方向键。
  */
 export function matchSessions<T extends { id: string; label: string }>(
   all: T[],

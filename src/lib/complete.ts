@@ -2,19 +2,15 @@
  * Console 自动补全的数据层：**完全不碰 DOM / xterm**，只回答一个问题——
  * 根据这个会话的历史，人现在敲的这半句最可能是哪条命令？
  *
- * 把它和渲染拆开是有意的：这件事能独立推理与验证，
- * 混进 xterm 的事件回调里就只能靠「跑起来看屏幕」来验了。
+ * 和渲染拆开是有意的：这件事能独立推理与验证，混进 xterm 的事件回调里就只能
+ * 靠「跑起来看屏幕」来验了。
  *
  * ## key 是「会话身份」，不是标签页 id
  *
- * 历史按 `historyKey` 存取——本地 shell 固定是 `"local"`，已保存的 SSH
- * 连接是它的 `SessionRecord.id`，两者都会落盘（`api.historyRecord`），
- * 同一台机器下次重连、甚至重启应用后新开的标签都能接着用。
- *
- * 没有引用已保存连接记录的临时 SSH 连接（比如手填参数、不保存就连）
- * 没有这个身份，调用方应该传标签页自己的 `tabId` 当 key——这类 key
- * **不会**被持久化（没人会调 `loadHistory`/`persistCommand` 之外的
- * 持久化路径去碰它），行为和过去的纯内存历史一致，关掉标签就没了。
+ * 本地 shell 固定是 `"local"`，已保存的 SSH 连接是它的 `SessionRecord.id`，
+ * 两者都会落盘，重启应用后新开的标签也能接着用。临时 SSH 连接（手填参数、
+ * 不保存就连）没有这个身份，调用方传标签页自己的 `tabId` 当 key —— 这类 key
+ * 不走持久化路径，关掉标签就没了。
  */
 
 import { api } from "../api";
@@ -59,15 +55,12 @@ const ESC_CSI = 2;
 /**
  * 把一串按键喂进行状态。
  *
- * 回车表示「这行交出去了」；退格表示「行变短了」；
- * 其余控制字符（↑↓、Ctrl-U/Ctrl-W 整行编辑、Tab…）意味着
- * **画面被改写，我们已经无从得知光标停在哪、剩下什么**。
- * 与其拿一个错的半句去猜，不如把补全自动撤下：
- * 人回到提示符上重新敲，状态立刻又是准的。
+ * 除回车（提交）与退格外，其余控制字符（↑↓、Ctrl-U/Ctrl-W、Tab…）一律清空行
+ * 状态：**画面已被改写，无从得知光标停在哪、剩下什么**，与其拿错的半句去猜，
+ * 不如撤下补全，人回到提示符重敲状态立刻又准。
  *
- * ESC 序列必须整段吃掉：方向键是 `ESC [ A` 三个字节，
- * 只按 ESC 一个字节处理的话，后面的 `[A` 会被当成普通字符接进行里，
- * 于是「按了一下 ↑」之后行状态变成 `[A`，预测与灰字全错。
+ * ESC 序列必须整段吃掉：方向键是 `ESC [ A` 三个字节，只处理 ESC 的话后面的
+ * `[A` 会被当普通字符接进行里，按一下 ↑ 行状态就变成 `[A`。
  *
  * @returns 本次按键里若有回车，返回被提交的那条命令；否则返回 null
  */
@@ -133,9 +126,8 @@ function historyOf(key: string): History {
  * 只收非空且不含控制字符的输入：被打断的半句、一路 Tab 拼出来的残句，
  * 都不该混进历史 —— 它们一旦被记下，下次就会把垃圾推到最前面。
  *
- * 本地缓存立即更新（同步，接下来几次按键的预测不用等网络往返）；
- * `persist` 为真时再额外 fire-and-forget 落盘 —— 失败不影响本地体验，
- * 和过去 `--help` 查询失败退化成空数组是同一套哲学。
+ * 本地缓存同步更新（接下来几次按键的预测不用等网络往返）；`persist` 为真时
+ * 再 fire-and-forget 落盘 —— 失败不影响本地体验。
  */
 export function recordCommand(key: string, raw: string, persist: boolean): void {
   const cmd = raw.trim();
@@ -158,10 +150,9 @@ export function recordCommand(key: string, raw: string, persist: boolean): void 
 /**
  * 从后端拉一个会话身份的全量历史，灌进本地缓存。
  *
- * 只给**持久化**的 key 调用（本地 shell / 已保存的 SSH 连接）——
- * 标签打开或重连时调一次即可，之后的预测全部走本地缓存，
- * 和 `predictHistory`/`historyMatches` 的同步特性保持一致。
- * 失败就留着本地缓存原样（通常是空的）：这台机器以前没留下历史。
+ * 只给**持久化**的 key 调用（本地 shell / 已保存的 SSH 连接），标签打开或重连时
+ * 一次即可——之后的预测全走本地缓存，`predictHistory`/`historyMatches` 才能是同步的。
+ * 失败就当这台机器以前没留下历史。
  */
 export async function loadHistory(key: string): Promise<void> {
   const items = await api.historyList(key).catch(() => [] as string[]);
@@ -172,11 +163,10 @@ export async function loadHistory(key: string): Promise<void> {
 /**
  * 历史预测：这半句之后最可能是什么。
  *
- * 返回**完整的一条命令**，调用方拿它减去已输入的部分就是该显示的灰字；
- * 没有合适候选时返回 null。
+ * 返回**完整的一条命令**，调用方减去已输入的部分就是该显示的灰字。
  *
- * 排序只按「最近用过」：终端里的工作是成串的 —— 刚跑过 `tail -f`，
- * 下一次多半还是它。比词频模型简单得多，也更贴合真实手感。
+ * 只按「最近用过」排序：终端里的工作是成串的，刚跑过 `tail -f` 下一次多半
+ * 还是它 —— 比词频模型简单，也更贴合真实手感。
  */
 export function predictHistory(key: string, line: string): string | null {
   const prefix = line.trimStart();
@@ -225,9 +215,7 @@ export interface CompletionItem {
   insert: string;
 }
 
-/**
- * 把历史预测合成候选列表（按当前整行做前缀匹配，不区分命令名/参数阶段）。
- */
+/** 候选列表：按当前整行做前缀匹配，不区分命令名/参数阶段。 */
 export function buildCompletions(key: string, line: string): CompletionItem[] {
   const prefix = line.trimStart();
   if (!prefix) return [];

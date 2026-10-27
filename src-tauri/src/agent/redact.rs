@@ -92,15 +92,11 @@ fn is_body_line(line: &str) -> bool {
 
 /// 剥离 PEM 私钥块（含被环形缓冲截断的残块）。
 ///
-/// 为什么不用正则（`-----BEGIN [\s\S]*?-----END`）：
-/// 环形缓冲按字节丢弃最老的内容，一个排了几屏的私钥被切断几乎是必然的 ——
-/// 排到的可能只有 `-----END` 和它前面的一串 base64（头丢了），
-/// 也可能只有 `-----BEGIN` 和一串 base64（尾丢了）。正则一次只能认完整的块，
-/// 缺一头就整段失守，而**正在没有被覆盖的那半截才是泄漏的主体**
-/// （BASE64 正文才是 key，标记行本身一文不值）。
+/// 不用正则（`-----BEGIN [\s\S]*?-----END`）：环形缓冲会把几屏长的私钥切断，
+/// 只剩半截是常态，而 base64 正文才是真正的 key，标记行一文不值 ——
+/// 正则只认完整块，缺一头就整段失守。
 ///
-/// 所以这里改成按行扫描：`BEGIN` 没等到 `END` 就删到串尾；
-/// 反过来 `END` 前面连着的 base64 正文也一并回溯删掉。
+/// 故改为按行扫描：`BEGIN` 没等到 `END` 就删到串尾；`END` 前面连着的 base64 正文回溯删掉。
 fn redact_pem_blocks(text: &str) -> String {
     // split_inclusive 保留换行符，重建时能原样拼回去（含 \r\n）
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
@@ -201,17 +197,14 @@ fn redact_pem_blocks(text: &str) -> String {
 
 /// 脱敏一段文本，返回替换后的新串。
 ///
-/// 纯函数、无 panic（正则本身已由单测保证可编译）。
-///
-/// 调用点是第三阶段 LLM 请求层的「出网前最后一个闸门」——
-/// `AgentManager::context` 刻意保持原文（UI 要展示），脱敏只在这条边界上做。
+/// `AgentManager::context` 刻意保持原文（UI 要展示），脱敏只在 LLM 请求出网这条边界上做
+/// （见 `llm::sanitize_context`）。
 #[allow(dead_code)]
 pub fn redact(text: &str) -> String {
     // PEM 先走：它的 base64 正文不该被后面的 IP / 邮箱规则再点一遍名
     let mut out = redact_pem_blocks(text);
     for rule in rules() {
         out = if rule.keep_name {
-            // 保留 `$1`（参数名），只把值换成占位符
             rule.re
                 .replace_all(&out, format!("${{1}}={PLACEHOLDER}").as_str())
                 .into_owned()

@@ -1,9 +1,8 @@
 import type { Terminal } from "@xterm/xterm";
 
 /**
- * tabId → xterm 实例。
- * App 层需要读终端状态（光标列、当前行是否是提示符）来决定何时、以何种方式注入还原命令，
- * 但 Terminal 由 TerminalView 持有 —— 这里做一个只读登记表，避免把实例层层往上传。
+ * tabId → xterm 实例。App 层要读终端状态（光标列、是否停在提示符）来决定怎么注入还原
+ * 命令，而 Terminal 由 TerminalView 持有 —— 只读登记表，避免把实例层层往上传。
  */
 const registry = new Map<string, Terminal>();
 /** 最近一次收到远端输出的时间（判断「输出已静默」用） */
@@ -68,11 +67,8 @@ export function lastOutputAt(id: string): number {
 }
 
 /**
- * 用户按键的旁路监听（不影响正常发送）。
- *
- * 宏录制需要知道用户敲了什么，但按键处理在 TerminalView、录制/回放逻辑在
- * App 层 —— 与其把 TerminalView 改成受控组件，不如在这里开一个只读的 tap：
- * 多订阅方互不干扰，xterm 的 onData 本身也支持多监听。
+ * 用户按键的旁路监听（不影响正常发送）。按键处理在 TerminalView、宏录制在 App 层，
+ * 与其把 TerminalView 改成受控组件，不如开一个只读 tap，多订阅方互不干扰。
  */
 type InputTap = (data: string) => void;
 const inputTaps = new Map<string, Set<InputTap>>();
@@ -154,10 +150,8 @@ export function textBeforeCursor(term: Terminal): string {
 }
 
 /**
- * 抓当前屏幕快照：把 xterm 的整个缓冲区（scrollback + 视口）摊平成纯文本。
- *
- * 这是 AI 助手「当前会话上下文」的首选来源 —— 旁路缓冲只记开旁路之后的字节，
- * 用户刚连上就问「这个报错什么意思」时，旁路里往往是空的，而屏幕上写满了他要看的东西。
+ * 抓当前屏幕快照（scrollback + 视口摊平成纯文本）。这是 AI 助手上下文的首选来源 ——
+ * 旁路缓冲只记开旁路之后的字节，刚连上就提问时往往是空的，而屏幕上写满了东西。
  *
  * @param maxChars 只保留末尾这么多字符（模型上下文有预算，越早的输出价值越低）
  */

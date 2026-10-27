@@ -21,9 +21,8 @@ struct LocalSession {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: SharedChild,
-    /// 本地 shell 自身的 pid，开局捕获一次。Agent 判断「命令是否还在跑」时，
-    /// 靠它去查这个 shell 现在有没有活着的前台子进程（见 `has_live_child`）。
-    /// 极少数平台 `Child::process_id()` 拿不到时为 `None`，届时活体确认直接答不上来。
+    /// 本地 shell 自身的 pid，供 `has_live_child` 查活体子进程。
+    /// 极少数平台 `Child::process_id()` 拿不到时为 `None`。
     pid: Option<u32>,
 }
 
@@ -129,8 +128,7 @@ impl LocalManager {
         Ok(())
     }
 
-    /// 该本地会话是否存在。**轻量且无副作用**（不取写锁、不碰 pty），
-    /// 供需要按 id 判断「到底是本地 shell 还是 SSH 会话」的调用方使用。
+    /// 该本地会话是否存在，供调用方按 id 区分本地 shell 与 SSH 会话。
     pub fn contains(&self, id: &str) -> bool {
         self.sessions.lock().unwrap().contains_key(id)
     }
@@ -157,10 +155,8 @@ impl LocalManager {
             .map_err(|e| format!("调整 PTY 尺寸失败：{}", e))
     }
 
-    /// 关闭：先杀进程，再从表里移除。
-    ///
-    /// 这里只管 PTY 本体：agent 的旁路缓冲拿不到 AppState（本结构体不持有它），
-    /// 清理统一由命令层 `cmd::local_close` 在调用本方法后做。
+    /// 关闭：杀进程并从表里移除。只管 PTY 本体——agent 旁路缓冲的清理由
+    /// 命令层 `cmd::local_close` 在调用本方法后做（本结构体不持有 AppState）。
     pub fn close(&self, id: &str) -> Result<(), String> {
         let mut guard = self.sessions.lock().unwrap();
         let Some(s) = guard.remove(id) else {
@@ -170,10 +166,9 @@ impl LocalManager {
         Ok(())
     }
 
-    /// 这个本地 shell 现在是否还有活着的前台子进程——Agent 判断「命令跑完了没有」
-    /// 的活体确认用这个，不依赖命令自己打印退出码。
+    /// 这个本地 shell 现在是否还有活着的前台子进程，供 Agent 判断命令是否跑完。
     ///
-    /// `None` = 问不出来（拿不到 pid，或平台查询失败），调用方要退回静默兜底，
+    /// `None` = 问不出来（拿不到 pid，或平台查询失败），调用方要静默兜底，
     /// **不能**当成「确认没有子进程」处理。
     pub async fn has_live_child(&self, id: &str) -> Option<bool> {
         let pid = {
@@ -187,14 +182,12 @@ impl LocalManager {
     }
 }
 
-/// 查某个 pid 当前是否还有直接子进程存活。只看「直接子进程」而不是整棵子树——
-/// 和 SSH 那边的 tpgid 前台进程组判定是同一个口径：命令自己 `nohup xxx &` 丢出去的
-/// 孙进程不算数，只关心「这个 shell 现在是不是还在等一个前台命令跑完」。
+/// 查某个 pid 当前是否还有直接子进程存活（不含整棵子树）——与 SSH 那边 tpgid
+/// 前台进程组判定同一口径：`nohup xxx &` 丢出去的孙进程不算数。
 #[cfg(unix)]
 fn platform_has_child(pid: u32) -> Option<bool> {
-    // `pgrep -P <pid>`：退出码 0 = 至少匹配到一个，1 = 没有匹配到，其余 = 查询本身出错。
-    // Linux 的 procps 和 macOS/BSD 自带的 pgrep 在这个退出码约定上是一致的，
-    // 不像 `ps --ppid` 那样 GNU/BSD 两套方言打架。
+    // pgrep -P：退出码 0=匹配到，1=未匹配，其余=查询出错。
+    // procps 与 macOS/BSD 的 pgrep 对这个约定一致，不像 `ps --ppid` 那样方言打架。
     let status = std::process::Command::new("pgrep")
         .arg("-P")
         .arg(pid.to_string())
@@ -209,11 +202,8 @@ fn platform_has_child(pid: u32) -> Option<bool> {
     }
 }
 
-/// Windows 没有 `pgrep`。`wmic` 已标记弃用但目前仍随系统安装，先用它；
-/// 查不到 / 命令本身不存在时一律 `None`，交给调用方退回静默兜底，不堵死整条路径。
-///
-/// 未在真实 Windows 上跑过，只是按同样的「找直接子进程」语义写的——下次有 Windows
-/// 环境时应该专门补一次手测。
+/// Windows 没有 `pgrep`。`wmic` 已弃用但仍随系统安装，先用它；查不到时一律 `None`，
+/// 交给调用方静默兜底。未在真实 Windows 上跑过，下次有环境应补一次手测。
 #[cfg(windows)]
 fn platform_has_child(pid: u32) -> Option<bool> {
     let out = std::process::Command::new("wmic")
@@ -230,7 +220,7 @@ fn platform_has_child(pid: u32) -> Option<bool> {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    // 正常输出是一行表头 `ProcessId` 后面跟零或多行纯数字 pid；没有子进程时表头后面全是空行。
+    // 表头 `ProcessId` 后跟零或多行纯数字 pid；没有子进程时全是空行。
     let has_child = text
         .lines()
         .map(str::trim)
@@ -238,10 +228,7 @@ fn platform_has_child(pid: u32) -> Option<bool> {
     Some(has_child)
 }
 
-/// 各平台的默认登录 shell。
-///
-/// 这里必须按平台分支：`$SHELL` 和 `/bin/zsh` 在 Windows 上都不存在，
-/// 不做分支的话那边一开标签就启动失败。
+/// 各平台的默认登录 shell。`$SHELL` / `/bin/zsh` 在 Windows 上不存在，必须按平台分支。
 #[cfg(windows)]
 fn default_login_shell() -> CommandBuilder {
     let shell = std::env::var("COMSPEC")
@@ -249,10 +236,9 @@ fn default_login_shell() -> CommandBuilder {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "cmd.exe".to_string());
     let mut cmd = CommandBuilder::new(shell);
-    // ConPTY 下 cmd.exe 按系统 ANSI 代码页输出（简体中文环境是 GBK），
-    // 而 xterm.js 一律按 UTF-8 解码 —— 不切页的话所有中文都是乱码。
-    // `/K` 执行完这条命令后回到交互提示符，输出被重定向掉以免首行出现噪音。
-    // 代价：`chcp 65001` 下少数老式控制台程序（如 ping）的进度重绘会错位。
+    // ConPTY 下 cmd.exe 按系统 ANSI 代码页输出（简体中文环境是 GBK），xterm.js 按 UTF-8
+    // 解码，不切页中文就乱码。`/K` 执行完回到交互提示符；代价是 chcp 65001 下少数老式
+    // 控制台程序（如 ping）的进度重绘会错位。
     cmd.args(["/K", "chcp 65001 >nul"]);
     cmd
 }

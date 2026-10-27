@@ -12,9 +12,7 @@ use std::collections::VecDeque;
 
 /// 单会话默认的缓冲上限（字节）。
 ///
-/// 32KB 够不够要看场景：一次 `ls -la` 几百行大约 8KB，但 `npm install`、
-/// `docker build` 轻松突破几百 KB。取 256KB 是「能装下几分钟真实操作」与
-/// 「不会因为一个失控的 `yes | dd` 把内存吃光」之间的折中。
+/// 256KB 是「能装下几分钟真实操作」与「不会因为一个失控的 `yes | dd` 把内存吃光」之间的折中。
 pub const DEFAULT_CAPACITY: usize = 256 * 1024;
 
 /// 单段上限。超过就另起一段，避免长时间不间断输出让单段无限膨胀 ——
@@ -37,9 +35,6 @@ const BEL: u8 = 0x07;
 
 /// 旁路流的来源：区分「程序输出」和「人敲进去的输入」。
 /// Agent 需要知道人执行过什么命令，而不只是看到一堆输出。
-///
-/// 两个变体的构造点：`StreamKind::In` 在 cmd.rs 的四个写入命令里，
-/// `StreamKind::Out` 在 ssh/session.rs 的 read_loop 与 local/mod.rs 的读线程里。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
     /// 程序（远端 / PTY）写到终端上的东西
@@ -129,8 +124,7 @@ impl SessionBuffer {
 
     /// 追加一段数据。超出容量时从最老的字节开始丢，并累计丢弃量。
     ///
-    /// 永不失败、永不分配失败传播：调用方（pty 读线程）会在 hot path 上调用它，
-    /// 任何 panic 都会直接炸掉整个终端。
+    /// 永不失败、永不 panic：调用方是 pty 读线程，炸在这里等于整条终端会话断掉。
     pub fn feed(&mut self, data: &[u8], kind: StreamKind) {
         if data.is_empty() {
             return;
@@ -234,10 +228,9 @@ impl SessionBuffer {
 
     /// 段数封顶：合并最旧的两段。
     ///
-    /// 取舍：合并会让较新的一段继承较老那段的 kind —— 在 In/Out 极限交替时，
-    /// 边界标志位可能偏移一段。之所以接受这点误差，是因为被合并的两段位于
-    /// 缓冲最前端，很快就会被 `trim` 彻底丢掉；相比之下任由段数增长，
-    /// 每个按键都留下一个 VecDeque  allocations，长会话会攒出成千上万个。
+    /// 取舍：合并会让较新的一段继承较老那段的 kind，In/Out 极限交替时边界会偏一段。
+    /// 可以接受，因为这两段就在缓冲最前端，很快会被 `trim` 丢掉；而任由段数增长的话，
+    /// 长会话会攒出成千上万个 VecDeque。
     fn cap_chunks(&mut self) {
         while self.chunks.len() > MAX_CHUNKS {
             let Some(oldest) = self.chunks.pop_front() else {
@@ -412,10 +405,7 @@ fn trim_front(text: &str, max_bytes: usize) -> String {
 /// `docker pull` / `apt-get` 这类进度条一次会话能刷几百上千次。
 /// 翻译成换行会得到几百行近乎重复的文本，token 翻十倍而信息量不变；
 /// 丢弃则把最终态压缩在同一行（`Progress: 10%Progress: 20%...100%`），
-/// 模型依然读得出结论，代价只是可读性稍差。对「喂上下文」这个用途来说，
-/// 这笔账是划算的。若将来要给人看的版式，可以另开一个开关。
-///
-/// 纯函数：输入是 `&str`（保证合法 UTF-8），输出只会少字符不会多，无 panic。
+/// 模型依然读得出结论，代价只是可读性稍差。
 pub fn strip_ansi(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

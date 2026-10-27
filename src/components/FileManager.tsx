@@ -30,8 +30,7 @@ export function typeLabel(e: RemoteEntry): string {
   return `${e.name.slice(i + 1).toUpperCase()} 文件`;
 }
 
-/** 一次上传/下载在传输列表里的一行。`id` 由前端生成，贯穿一次传输的始终，
- *  用来把后端推来的进度事件和这一行对上号，也用来发取消指令。 */
+/** 传输列表的一行。`id` 由前端生成，贯穿整次传输：既用来对上后端推来的进度事件，也用来发取消指令。 */
 interface Transfer {
   id: string;
   kind: "upload" | "download";
@@ -91,7 +90,6 @@ function joinPath(dir: string, name: string): string {
   return dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`;
 }
 
-/** 远端上级目录（POSIX）。 */
 function parentPath(p: string): string {
   const trimmed = p.replace(/\/+$/, "");
   if (trimmed === "") return "/";
@@ -110,20 +108,15 @@ function normalizeRemote(p: string): string {
   return "/" + out.join("/");
 }
 
-/**
- * 本地路径拼接。Windows 是 `C:\Users\…`，分隔符可能是 `\`；
- * 沿用上面的 `/` 版本会拼出 `C:\Users\dell/file` 这种混写路径。
- */
+/** 本地路径拼接。沿用 `joinPath` 会在 Windows 上拼出 `C:\Users\dell/file` 这种混写路径。 */
 function joinLocal(dir: string, name: string): string {
   const sep = isWindows() ? "\\" : "/";
   return /[\\/]$/.test(dir) ? `${dir}${name}` : `${dir}${sep}${name}`;
 }
 
 /**
- * 本地上级目录。Windows 要额外认盘符根：
- * `C:\Users\dell` → `C:\Users`，`C:\` → `C:\`（不再往上），
- * 否则按 `/` 切会得到 -1，一路跳到 `/`，整个面板就废了。
- * 已到盘符根时返回空串 —— 后端会据此列出所有可用盘符。
+ * 本地上级目录。Windows 要额外认盘符根，否则按 `/` 切会得到 -1，一路跳到 `/`，整个面板就废了。
+ * 已到盘符根时返回空串 —— 后端 `list_local_dir` 据此列出所有可用盘符。
  */
 function parentLocal(p: string): string {
   const sep = isWindows() ? "\\" : "/";
@@ -149,12 +142,11 @@ interface PaneProps {
   onUp: () => void;
   /** 路径栏回车跳转；返回 false 表示路径无效（输入框抖动并保留输入） */
   onNavigate: (p: string) => Promise<boolean>;
-  /** 条目右键 */
   onEntryContext?: (e: RMouseEvent, entry: RemoteEntry) => void;
   children?: ReactNode;
 }
 
-/** 可编辑路径栏：回车跳转，Esc 还原；外部路径变化（双击进目录 / 上级）时同步显示 */
+/** 可编辑路径栏。外部路径变化（双击进目录 / 上级）时要同步回显，故本地另存一份草稿。 */
 function PathInput({
   path,
   onNavigate,
@@ -295,8 +287,7 @@ interface Props {
   tabId: string;
   passphrase?: string;
   onClose: () => void;
-  /** 面板只在自己所属的那个 tab 处于前台时才显示；不活跃时保持挂载（连接、路径、
-   *  传输列表都留着），只是用 CSS 隐藏——这样切标签页不会反复重连 SFTP。 */
+  /** 不活跃时只用 CSS 隐藏、保持挂载（连接、路径、传输列表都留着），这样切标签页不会反复重连 SFTP。 */
   active: boolean;
 }
 
@@ -422,7 +413,6 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
     }
   }, [sftpId]);
 
-  // 建立 SFTP 连接；成功后解析家目录作为起始路径
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -479,7 +469,6 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
     loadLocal(localPath);
   }, [localPath, loadLocal]);
 
-  // 卸载时释放远端连接
   useEffect(
     () => () => {
       if (readyRef.current) api.sftpClose(sftpId).catch(() => {});
@@ -535,14 +524,11 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
       setRemotePath(e.path);
       loadRemote(e.path);
     } else if (viewableKind(e.name)) {
-      // 双击可浏览文件（md / html / 图片 / 音视频 / 配置文件）直接打开
       void doView(e);
     }
   };
 
-  /** 上传/下载共用：起一条传输记录，订阅进度事件已经在组件级做好了，
-   *  这里只管发起请求、把结果落到对应那一行上。`id` 留给「重试」复用——
-   *  重试是在同一行上重新开始，而不是再长一条新记录。 */
+  /** 上传/下载共用。传入的 `id` 会按 id 去重替换已有行，使「重试」在原行上重开而不是另起一条。 */
   const runTransfer = (kind: "upload" | "download", name: string, local: string, remote: string, size: number, id: string) => {
     setTransfers((prev) => [
       {
@@ -599,7 +585,6 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
   const retryTransfer = (t: Transfer) => {
     setTransferCtx(null);
     // 复用同一个 id：重试是在这一行上重新开始，不是另起一条新记录
-    // （`runTransfer` 按 id 去重替换，见它开头的 `filter((x) => x.id !== id)`）
     runTransfer(t.kind, t.name, t.localPath, t.remotePath, t.size, t.id);
   };
 

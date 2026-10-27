@@ -41,9 +41,9 @@
 //!
 //! 1. **命令必须是单行的**。换行意味着「一次注入一串互不相干的操作」，
 //!    那样既没法逐条审批，也彻底失去了「哪一步炸了」的可追溯性。要分几步请拆成几轮。
-//! 2. **人在回路是可选项，不是默认值**。默认 `ExecMode::Approval`：
-//!    被 `danger::assess` 判为危险的命令会先在 UI 上弹出来等人点头。
-//!    审批是有超时的 —— 人去接杯咖啡回来发现流程卡死，比「超时拒绝」糟糕得多。
+//! 2. **人在回路是默认值**（`ExecMode::Approval`）：被 `danger::assess` 判为危险的
+//!    命令先弹 UI 等人点头。审批有超时 —— 人去接杯咖啡回来发现流程卡死，
+//!    比「超时拒绝」糟糕得多。
 //! 3. **任何一步失败都不能让整轮蒸发**。执行报错会当成一条反馈续喂给模型，
 //!    让它自己决定重试、换命令还是收手；命令的真实输出原样喂回去 ——
 //!    没有退出码这种参考信息，模型得照着输出文本自己判断成败，这与人操作时一致。
@@ -99,7 +99,7 @@ const MAX_FEEDBACK_CHARS: usize = 6000;
 
 /// 一个可操作目标：**会话 id + 给人看的名字**。
 ///
-/// 名字由前端给：后端只知道一串 uuid，把它显示在可执行文件ಕ್ಕ旁边毫无意义。
+/// 名字由前端给：后端只知道一串 uuid，把 uuid 摆给人看毫无意义。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTarget {
@@ -400,12 +400,9 @@ pub fn actions_from_tool_call(call: &llm::ToolCall) -> Vec<AgentAction> {
 
 /// 工具调用在历史里的文本形态。
 ///
-/// 为什么不能直接把带 `tool_calls` 的 assistant 消息塞回历史：OpenAI 系接口
-/// 要求那条消息后面必须紧跟 `role:"tool"` 的回执，否则下一轮直接 400 ——
-/// 而我们的回执是「终端回了什么」这条普通 user 文本。
-///
-/// 所以把这一轮「调用了什么」写成人话记进去。协议上仍是干净的
-/// user/assistant 交替，对任何兼容层都成立。
+/// 不能原样塞回带 `tool_calls` 的 assistant 消息：OpenAI 系接口要求它后面紧跟
+/// `role:"tool"` 回执，而我们的回执是「终端回了什么」这条普通 user 文本，下一轮会 400。
+/// 写成人话记进去，历史就仍是干净的 user/assistant 交替，对任何兼容层都成立。
 fn describe_tool_calls(reply: &llm::LlmReply) -> String {
     let mut out = reply.text.clone();
     for c in &reply.tool_calls {
@@ -740,15 +737,9 @@ fn parse_tab(block: ExecBlock) -> Option<AgentAction> {
 
 /// 「看起来像命令、其实是界面动作」的伪命令 → 纠正话术。
 ///
-/// 终端场景下模型有个顽固的先验：「想做什么，就写个命令」。于是它会写出
-/// `new-tab`、`reconnect` 这类**终端里根本不存在**的东西 —— 敲过去只会被
-/// shell 回一句 `command not found`，既浪费一轮，又在用户终端里留下一行垃圾。
+/// 见模块头「伪命令护栏」。
 ///
-/// 这些动作本来就有对应的工具，所以在**下发到终端之前**拦下来：
-/// 卡片上写清楚为什么没执行，再把正确用法喂回模型。
-///
-/// 只认「命令名本身就是这些词」的情况：先取第一个 token，
-/// 这样 `new-tab --ssh foo` 这种带参数的也拦得住，而 `ls | grep tab` 不受影响。
+/// 只比对第一个 token：`new-tab --ssh foo` 带参数也拦得住，而 `ls | grep tab` 不受影响。
 fn pseudo_command_hint(cmd: &str) -> Option<&'static str> {
     let head = cmd
         .split_whitespace()
@@ -807,10 +798,8 @@ pub fn reject_command(cmd: &str) -> Option<&'static str> {
     if cmd.trim_matches(|c: char| c == ' ' || c == '\t').is_empty() {
         return Some("命令为空");
     }
-    // 换行意味着「一次注入一串互不相干的操作」：既没法逐条审批，
-    // 也彻底失去「哪一步炸了」的可追溯性。要分几步请拆成几轮。
-    // ESC / BEL / NUL 等其余控制字符同理 —— 它们能在屏幕上改写这条命令的显示，
-    // 让人看到 `ls` 而实际跑的是别的。必须挡在协议这一层。
+    // ESC / BEL / NUL 同样要挡：它们能改写命令在屏幕上的显示，
+    // 让人看到 `ls` 而实际跑的是别的。
     if cmd.chars().any(|c| c.is_control() && c != '\t') {
         return Some("命令含换行或控制字符，必须拆成单条执行");
     }
@@ -984,13 +973,11 @@ fn plan_message(
 
 /// 用户已保存的主机清单。
 ///
-/// 没有这一段，`nx_open_tab(kind=ssh)` 是个死功能：协议要求模型给出「已存在的
-/// 会话配置 id」，却从不告诉它有哪些 id 存在。模型只能瞎编一个，然后被
-/// 「未找到会话配置」打回来 —— 这正是截图里它放弃工具、转而自己写
-/// `new-tab` 这条伪命令的真正原因。工具再标准，没有可填的参数也是空的。
+/// 没有这一段，`nx_open_tab(kind=ssh)` 是死功能：协议要模型填「已存在的会话配置 id」，
+/// 却从不告诉它有哪些 —— 模型只能瞎编、被「未找到会话配置」打回，最后放弃工具改写
+/// `new-tab` 伪命令。
 ///
-/// 只给 id / 名称 / host:port，**不给用户名与认证方式**：开新连接用不到，
-/// 没必要多往外发一份凭据相关的数据。
+/// 只给 id / 名称 / host:port，**不给用户名与认证方式**：开新连接用不到，不多发凭据相关数据。
 fn saved_hosts_hint(state: &AppState) -> String {
     let records = match state.store.list() {
         Ok(v) => v,
@@ -1019,15 +1006,13 @@ fn saved_hosts_hint(state: &AppState) -> String {
 /// 全屏程序（tmux / screen / less / vim …）把自己的画面画在 alternate buffer 上，
 /// 远端的真实输出既不进旁路缓冲，也不在前端抓的屏幕快照里。
 ///
-/// 这里用**旁路通道**跑一条只读的抓取命令把内容取回来 —— 用户屏幕上不会多出
-/// 一个字符，也不需要模型先想命令、再执行、再读输出（那要多花一次 LLM 往返）。
+/// 走**旁路通道**跑只读抓取：用户屏幕上不多一个字符，也省掉一次 LLM 往返。
 ///
-/// 只做 tmux：docker / kubectl 之类要么需要自己找容器名、要么常要 sudo，
-/// 贸然替用户跑一条「猜出来的」命令，代价比省下的那一轮大得多 ——
-/// 那些留给模型按系统提示里的抓取 skill 自己决定。
+/// 只做 tmux：docker / kubectl 要么得猜容器名、要么常要 sudo，替用户跑一条猜出来的
+/// 命令代价太大，留给模型按系统提示里的抓取 skill 自己决定。
 ///
-/// 任何一步不成立（不是 tmux、旁路通道被堡垒机拒、超时）都只返回 `None`，
-/// 由调用方退化成「让模型自己抓」。
+/// 任何一步不成立（不是 tmux、旁路被堡垒机拒、超时）一律 `None`，由调用方退化成
+/// 「让模型自己抓」。
 async fn capture_fullscreen(state: &AppState, session_id: &str) -> Option<String> {
     // 先定位「用户此刻在看哪个 pane」：
     //   1) display-message 在没有任何客户端上下文时会失败，但成功时最准；
@@ -1053,7 +1038,7 @@ async fn capture_fullscreen(state: &AppState, session_id: &str) -> Option<String
     Some(tail_chars(&text, 8 * 1024))
 }
 
-/// 取末尾 `max` 个字符。抓屏内容的价值集中在最近几屏，超长时砍头不砍尾。
+/// 取末尾 `max` 个字节（切点对齐到字符边界）。抓屏的价值集中在最近几屏，砍头不砍尾。
 fn tail_chars(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -1154,14 +1139,12 @@ async fn write_to(state: &AppState, id: &str, data: &[u8]) -> Result<(), String>
 
 /// 问一句「这个 SSH 会话的 shell 现在还有没有前台子进程」。
 ///
-/// 复用 `SessionManager::probe`——它本来就是给控制台自动补全探测前台进程用的，
-/// 不是专门为这里新写的脚本。`SHELL_CWD`/`TTY` 有值说明探测脚本确实在远端
-/// /proc 里定位到了这条会话的交互 shell；此时 `FG_COMM` 有没有值，就是
-/// 「shell 自己是前台」还是「有个子进程正占着前台」的区别。
+/// 复用 `SessionManager::probe`（控制台补全本来就在用）。`SHELL_CWD`/`TTY` 有值 =
+/// 远端 /proc 里定位到了这条会话的交互 shell；此时 `FG_COMM` 有无，就是
+/// 「shell 自己是前台」还是「有子进程占着前台」的区别。
 ///
-/// 远端没有 /proc（非 Linux）、探测脚本没能定位到 shell（两种都是空 map）、
-/// 旁路通道被堡垒机拒绝、探测超时——这些情况下答不上来，一律 `Unknown`，
-/// 交给静默兜底，不能被误判成「确认空闲」。
+/// 远端没有 /proc、定位不到 shell、旁路被堡垒机拒、超时 —— 一律 `Unknown` 交给静默兜底，
+/// 绝不能误判成「确认空闲」。
 async fn ssh_liveness(state: &AppState, session_id: &str) -> Liveness {
     match state.sessions.probe(session_id).await {
         Ok(info) if info.contains_key("FG_COMM") => Liveness::Busy,
@@ -1191,11 +1174,10 @@ async fn local_liveness(state: &AppState, session_id: &str) -> Liveness {
 
 /// 在目标会话上跑一条命令，返回输出与结束原因。
 ///
-/// **会把这条命令原样旁路进 agent 缓冲**：一方面让 `pending_echo` 抵消掉 pty 的回显，
-/// 另一方面留下「这一轮到底干了什么」的完整审计。
+/// **命令会原样旁路进 agent 缓冲**：既让 `pending_echo` 抵消 pty 回显，也留下审计。
 ///
-/// 不再往命令里拼任何哨兵——发的就是 `cmd\n`，跟人手敲一模一样，终端屏幕上
-/// 不会多出一个字符。判定结束靠「静默 + 活体确认」（见 `executor.rs` 顶部的说明）。
+/// 发出去的就是 `cmd\n`，跟人手敲一模一样，屏幕上不多一个字符；结束判定靠
+/// 「静默 + 活体确认」（见 `executor.rs` 顶部）。
 pub async fn run_one(
     state: &AppState,
     app: &AppHandle,
@@ -1654,14 +1636,10 @@ fn tab_list_feedback(tabs: &[TabInfo]) -> String {
 
 /// 诊断用：把每一轮模型的原始回复落盘。
 ///
-/// 只在 `/tmp/nx-agent-trace.on` 存在时才写 —— 这是一个**默认关闭**的开关，
-/// 关着的时候连一次 `exists()` 都算多余，所以放在最前面。
+/// 默认关闭，只在 `/tmp/nx-agent-trace.on` 存在时才写。
 ///
-/// 为什么需要它：模型偶尔「只描述、不下令」，界面上一张卡片都没有，用户只看到
-/// 一句「已执行」。此时有两种可能，光看界面永远分不清：
-///   1. 模型压根没写 ```nx-exec 块（它的锅）；
-///   2. 写了但被解析/执行环节拒掉（我们的锅）。
-/// 把原文和解析出的动作数记下来，这个二分一次就能定案。
+/// 模型偶尔「只描述、不下令」，界面上一张卡片都没有 —— 光看界面分不清是它压根没写
+/// ```nx-exec 块，还是写了被我们的解析/执行环节拒掉。记下原文和动作数，一次就能定案。
 fn trace_round(session: &str, step: usize, reply: &str, actions: usize) {
     use std::io::Write as _;
     const SWITCH: &str = "/tmp/nx-agent-trace.on";
@@ -2191,10 +2169,8 @@ impl IfAgentic {
         if custom.trim().is_empty() {
             agentic_system_prompt()
         } else {
-            // 尊重用户自己的设定 —— 也许他就是要一个不许动手的顾问。
-            // 但协议必须挂上去，而且得是**完整版**：之前这里只是一段压缩说明，
-            // 用户的提示词里若写着「只给结论与必要命令」，模型就退回往代码块里抄
-            // shell，动作块解析不出来，界面上什么都不发生。
+            // 协议必须是**完整版**：曾经这里只挂一段压缩说明，用户若写着
+            // 「只给结论与必要命令」，模型就退回往代码块里抄 shell，界面上什么都不发生。
             format!("{}\n\n{ACTION_PROTOCOL}\n\n{CUSTOM_TAIL}", custom.trim_end())
         }
     }
@@ -2202,9 +2178,7 @@ impl IfAgentic {
 
 /// 挂在用户自定义提示词后面的补充说明。
 ///
-/// 不能简单返回 custom：那样用户的提示词里没有动作协议，模型就永远只会聊天。
-/// 这里做的是「**用户的提示词 + 必需的协议**」而不是二选一 ——
-/// 并明确告诉模型：协议优先于上文关于输出格式的要求。
+/// 明确告诉模型：协议优先于用户提示词里关于输出格式的任何要求。
 const CUSTOM_TAIL: &str = concat!(
     "以上动作协议优先于上文关于「输出格式 / 只给结论」的任何要求：",
     "要真的动手，就必须写成围栏里那一行 JSON，而不是把命令贴在回复正文里。",

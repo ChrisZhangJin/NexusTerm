@@ -17,7 +17,7 @@ interface Props {
   onExportFolder: (sessions: SessionRecord[], folderName: string) => void;
   /** 分组改名：把 oldPath 整体改成以 newName 为末段 */
   onRenameFolder: (oldPath: string, newName: string) => void;
-  /** 导入 / 导出（原工具栏按钮，收编到这里） */
+  /** 导入 / 导出 */
   io: {
     canExportSession: boolean;
     exportSessionHint?: string;
@@ -110,7 +110,7 @@ function collectSessions(node: TreeNode): SessionRecord[] {
   return [...node.sessions, ...node.children.flatMap((c) => collectSessions(c))];
 }
 
-/** 文件夹 SVG 图标 —— 用 currentColor，跟随主题色系。 */
+/** 文件夹图标：用 currentColor 跟随主题色。 */
 function FolderIcon() {
   return (
     <svg className="folder-svg" viewBox="0 0 16 16" aria-hidden>
@@ -122,14 +122,11 @@ function FolderIcon() {
   );
 }
 
-// 右键菜单目标
 type CtxTarget =
   | { kind: "session"; session: SessionRecord }
   | { kind: "folder"; node: TreeNode };
 
-/**
- * 弹出式连接选择器 —— 多级分组树 + 拖拽 + 右键菜单。
- */
+/** 弹出式连接选择器 —— 多级分组树 + 拖拽 + 右键菜单。 */
 export default function SessionList({
   sessions,
   onConnect,
@@ -230,9 +227,7 @@ export default function SessionList({
     });
   };
 
-  /**
-   * 把连接移到 targetFolder；给了 anchorId 则插在该连接前/后（同组内即为排序）。
-   */
+  /** 把连接移到 targetFolder；给了 anchorId 则插在该连接前/后（同组内即为排序）。 */
   const moveSession = (
     sessionId: string,
     targetFolder: string,
@@ -259,9 +254,8 @@ export default function SessionList({
     onReorder(ordered.map((s, i) => [s.id, i, target === "" ? "/" : target]));
   };
 
-  // —— 拖拽：pointer 事件实现 ——
-  // HTML5 drag 在 Tauri/WebView2 里不可靠（宿主拦截、button 子元素抢事件），
-  // 改成按下手柄后监听全局 pointermove，用 elementFromPoint 命中测试落点。
+  // 用 pointer 事件自己实现拖拽：HTML5 drag 在 Tauri/WebView2 里不可靠
+  //（宿主拦截、button 子元素抢事件），落点改用 elementFromPoint 命中测试。
   const dragStart = useRef<{ id: string; x: number; y: number; started: boolean } | null>(null);
   const [dropHint, setDropHint] = useState<{ anchorId?: string; after?: boolean } | null>(null);
   const [ghost, setGhost] = useState<{ x: number; y: number; label: string } | null>(null);
@@ -327,7 +321,6 @@ export default function SessionList({
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
     };
-    // moveSession 依赖 unique；每次 unique 变化重绑即可
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [unique]);
 
@@ -604,7 +597,6 @@ function TreeView(props: TreeViewProps) {
           data-session-id={s.id}
           data-folder={normFolder(s.folder)}
         >
-          {/* 拖拽手柄：按住拖动（整行也可在按住手柄后拖到任意位置） */}
           <span
             className="drag-handle"
             title="按住拖动：调整顺序 / 移入分组"

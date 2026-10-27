@@ -50,14 +50,9 @@ const ECG_PATH = "M0 8h9l3-4 3 8 3-4h7l3-5 3 10 3-5h13";
 type BeatSource = "keepalive" | "stats";
 
 /**
- * 链路脉搏指示。
- *
- * 两种来源都算「链路活着」：
- * ① 服务端 **真正发来** 的 `keepalive@openssh.com`（vendor 补丁 7）；
- * ② 一次成功的资源采集 —— 能取回 CPU/内存/磁盘，说明 exec 通道往返通了，
- *    对不发 keepalive 的服务器（OpenSSH 默认 `ClientAliveInterval 0`）这是唯一的证据。
- *
- * 两条都没有就只画一条暗基线：不假装链路有心跳。
+ * 链路脉搏指示。服务端 keepalive，或一次成功的资源采集（exec 通道往返通了）；
+ * 后者对不发 keepalive 的服务器（OpenSSH 默认 `ClientAliveInterval 0`）是唯一证据。
+ * 两条都没有就只画暗基线：不假装链路有心跳。
  */
 function Ecg({
   beat,
@@ -197,9 +192,8 @@ function Meter({
 }
 
 /**
- * 按主机共享的最近一次采集结果（key = user@host:port，本机为 "local"）。
- * 同一主机的多个标签共用：切回时立刻显示上次数值，不再闪「采集资源…」；
- * 轮询只由当前激活标签发起，远端负载不随标签数增加。
+ * 按主机共享的最近一次采集结果（key = user@host:port，本机为 "local"）：
+ * 切回同主机的另一个标签时立刻显示上次数值，不再闪「采集资源…」。
  */
 const statsCache = new Map<string, Stats>();
 
@@ -277,8 +271,7 @@ function ResourceMeters({
         busy = false;
       }
     };
-    // 关闭实时监控：停止轮询、数值定格在最后一次。
-    // 若这台主机还从没采过（暂停状态下新开的连接），补采一次静态值，避免一直空着
+    // 关闭实时监控时若这台主机还从没采过，补采一次静态值，避免一直空着
     if (!live) {
       if (!statsCache.has(hostKey)) tick(false);
       return () => {
@@ -296,12 +289,8 @@ function ResourceMeters({
   const where = local ? "本机" : "远端";
 
   /**
-   * 重新检测「是否真的只允许一条通道」。
-   *
-   * 兼容模式一旦被记住，连接时就不开旁路通道，于是**永远不会再试探**，
-   * 标记会自我固化 —— 用户看到的「兼容模式」可能是很久以前（甚至通道号
-   * 错位那个 bug 期间）留下的误判。这里给一个显式出口：
-   * 只对当前连接打开旁路，再真取一次数据，拿到就说明放行第二条通道。
+   * 重新检测「是否真的只允许一条通道」。兼容模式一旦记住就永不再试探、会自我固化
+   * （可能是通道号错位那个 bug 期间留下的误判），这里给一个显式出口。
    */
   const retry = async () => {
     if (retrying || !sessionId) return;
@@ -520,8 +509,7 @@ export default function StatusBar({
     onOpenSettings(w);
   };
 
-  // 链路脉搏：服务端 keepalive（后端事件）或一次成功的资源采集，两者都算。
-  // 只订阅当前标签：切走时清空状态，不给后台标签白跑动效。
+  // 只订阅当前标签：切走时清空状态，不给后台标签白跑动效
   const [beat, setBeat] = useState(0);
   const [lastBeat, setLastBeat] = useState<number | null>(null);
   const [beatSource, setBeatSource] = useState<BeatSource | null>(null);

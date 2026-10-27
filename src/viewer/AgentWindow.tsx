@@ -1,13 +1,8 @@
 /**
- * 浮动 Nexus AI Agent 独立窗口。
+ * 浮动 Nexus AI Agent 独立窗口。由后端 `agent_open_window` 开出，注入
+ * `window.__NX_AGENT__ = sessionId` 作为初始会话，之后跟随 `nx://agent/active-session` 事件切换。
  *
- * 由后端 `agent_open_window` 开出，注入 `window.__NX_AGENT__ = sessionId` 作为初始会话。
- * 之后主窗口切换活动标签时，后端/主窗口发 `nx://agent/active-session` 事件，这里跟着切。
- *
- * 与内嵌面板的唯一差别：
- * - 「把命令写入终端」在独立窗口里没有 xterm 实例，改为发 `nx://agent/send-to-terminal`
- *   事件给主窗口，由主窗口用它已有的 sendToTerminal（知道标签是本地还是 SSH）落地。
- * - 「去设置」发 `nx://agent/open-settings` 事件，让主窗口弹设置弹窗。
+ * 与内嵌面板的差别：这里没有 xterm 实例，「写入终端」「去设置」都改成发事件回主窗口执行。
  */
 import { useEffect, useState } from "react";
 import { emit, listen } from "@tauri-apps/api/event";

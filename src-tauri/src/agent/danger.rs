@@ -69,12 +69,10 @@ pub fn assess(cmd: &str) -> RiskAssessment {
 
     let lower = trimmed.to_lowercase();
 
-    // 1) sudo / 提权
     if first_word(trimmed) == "sudo" || lower.contains(" sudo ") || lower.starts_with("sudo ") {
         reasons.push("以 sudo 提权执行".into());
     }
 
-    // 2) 危险程序名（跳过前置 sudo 与 FOO=bar 赋值）
     let prog = effective_program(trimmed);
     for (name, why) in DANGEROUS_PROGRAMS {
         if prog == *name {
@@ -83,19 +81,16 @@ pub fn assess(cmd: &str) -> RiskAssessment {
         }
     }
 
-    // 3) 危险子串
     for (needle, why) in DANGEROUS_SUBSTRINGS {
         if lower.contains(needle) {
             reasons.push(format!("命令含「{needle}」：{why}"));
         }
     }
 
-    // 4) 覆盖式重定向到已存在路径的风险（`>` 而非 `>>`），带绝对路径时尤其危险
     if has_clobbering_redirect(trimmed) {
         reasons.push("包含覆盖式重定向 `>`，可能覆盖已有文件".into());
     }
 
-    // 5) 管道到 shell 执行远程脚本
     if lower.contains("curl ") && (lower.contains("| sh") || lower.contains("| bash"))
         || lower.contains("wget ") && (lower.contains("| sh") || lower.contains("| bash"))
     {
@@ -120,11 +115,10 @@ fn effective_program(cmd: &str) -> String {
         if tok == "sudo" || tok == "command" || tok == "env" {
             continue;
         }
-        // FOO=bar 形式的赋值：等号在前、且不是以 / 开头的路径
+        // FOO=bar 形式的赋值（排除含 = 的路径）
         if tok.contains('=') && !tok.starts_with('/') && !tok.starts_with('.') {
             continue;
         }
-        // 取 basename
         let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
         return base.to_string();
     }
@@ -145,7 +139,7 @@ fn has_clobbering_redirect(cmd: &str) -> bool {
                 return true;
             }
             if next_is_gt {
-                i += 1; // 跳过第二个 >
+                i += 1;
             }
         }
         i += 1;

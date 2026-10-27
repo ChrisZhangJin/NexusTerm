@@ -1,14 +1,8 @@
 /**
- * 宿主平台探测。
+ * 宿主平台探测。标题栏交通灯留白、自绘窗口控制按钮、快捷键与凭据服务文案都要按平台分支。
  *
- * 三处 UI 必须按平台分支，差一个像素都会显得很业余：
- * 1. 标题栏左侧 80px 交通灯留白 —— 只有 macOS 的 Overlay 标题栏需要；
- * 2. 窗口最小化 / 最大化 / 关闭按钮 —— macOS 由窗口服务器画，其余平台没有
- *    系统装饰可用（decorations 关掉后），必须自绘；
- * 3. 快捷键提示 —— ⌘ 与 Ctrl 的写法不同。
- *
- * 值来自 Rust 的 `std::env::consts::OS`，不靠 UA 嗅探：WebView 的 UA
- * 在各版本间会变，而编译期常量不会错。
+ * 值来自 Rust 的 `std::env::consts::OS`，不靠 UA 嗅探：WebView 的 UA 在各版本间会变，
+ * 而编译期常量不会错。
  */
 
 import { invoke } from "@tauri-apps/api/core";

@@ -28,13 +28,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-// 对外（ssh/session.rs、local/mod.rs、cmd.rs 的接线点）只需要这个来源标记，
-// 故单独 pub use 出去，缓冲内部的实现细节仍留在本模块里
+// 接线点（ssh/session.rs、local/mod.rs、cmd.rs）只需要这个来源标记
 pub use self::buffer::StreamKind;
 use self::buffer::{BufferStats, SessionBuffer, DEFAULT_CAPACITY};
 use crate::store::Store;
 
-/// 单个会话缓冲的默认容量（字节），即 `SessionBuffer::DEFAULT_CAPACITY`。
+/// 单次喂给模型的默认上下文字节数（远小于缓冲容量 `buffer::DEFAULT_CAPACITY`）。
 pub const DEFAULT_MAX_CONTEXT_BYTES: u32 = 32 * 1024;
 
 /// 配置在 settings 表里的键名。
@@ -74,10 +73,8 @@ pub enum AgentError {
 
 /// 单个 AI 账号的连接与行为配置。
 ///
-/// 多账号设计：用户可以配好几组（例如一组 OpenAI、一组 Anthropic、一组自建网关），
-/// 整组切换。连接字段（provider/base_url/model/api_key）与行为字段
-/// （system_prompt/max_context_bytes/redact）都随账号走，这样换账号时
-/// 系统提示词、脱敏策略也一并切换，不会出现「换了模型却还带着上一家的提示词」。
+/// 行为字段（system_prompt/max_context_bytes/redact）也随账号走，
+/// 这样切账号时提示词与脱敏策略一并切换，不会「换了模型却还带着上一家的提示词」。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AgentAccount {
@@ -227,7 +224,6 @@ impl AgentConfig {
                 a.id = format!("acct-{i}");
             }
         }
-        // active_id 指向一个不存在的账号时，回落到第一个
         if !self.accounts.iter().any(|a| a.id == self.active_id) {
             self.active_id = self.accounts[0].id.clone();
         }
@@ -247,7 +243,6 @@ pub fn load_config(store: &Store) -> AgentConfig {
     let Some(raw) = store.get_setting(CONFIG_KEY) else {
         return AgentConfig::default();
     };
-    // 先按新格式（带 accounts）解析；失败再尝试旧的扁平格式并迁移。
     match serde_json::from_str::<AgentConfig>(&raw) {
         Ok(mut cfg) if !cfg.accounts.is_empty() => {
             cfg.normalize();
@@ -353,8 +348,7 @@ impl AgentManager {
         }
     }
 
-    /// 把配置里的开关同步进来。改配置后必须调一次，
-    /// 否则 Cargo.toml 里的默认值和 db 里的值会打架。
+    /// 把配置里的开关同步进内存。改配置后必须调一次，否则 db 里的值与内存里的原子开关会打架。
     pub fn apply_config(&self, cfg: &AgentConfig) {
         self.enabled.store(cfg.enabled, Ordering::Relaxed);
         // autoAttach 恒为 true：面板与设置页都已经没有「旁路开关」，
@@ -369,7 +363,6 @@ impl AgentManager {
     /// 永不失败、永不 panic：任何一个异常都只允许 `tracing::warn`，
     /// 因为这里炸掉的代价是整条终端会话断掉 —— 这是旁路绝不能有的破坏力。
     pub fn feed(&self, session_id: &str, data: &[u8], kind: StreamKind) {
-        // 第一道闸门无锁：全局关着的时候，旁路对主链路的开销只有这一次 load
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
@@ -385,8 +378,8 @@ impl AgentManager {
             return;
         }
         // 会话还没登记过：按全局 autoAttach 决定要不要为它建缓冲。
-        // 用 get_mut + 兜底 insert 而不是 entry()，是因为「关闭」是最常见的分支，
-        // 而 entry() 会在 pad 时先分配一个空条目 —— 那正是我们要避免的分配。
+        // 用 get_mut + 兜底 insert 而不是 entry()：entry() 需要先把 session_id 拷成
+        // 一个 owned String，而「已登记」才是热路径，不该为它付这份分配。
         if !self.auto_attach.load(Ordering::Relaxed) {
             return;
         }
@@ -429,8 +422,7 @@ impl AgentManager {
     }
 
     /// 完整会话记录（`AgentManager::context` 只给最近 N 字节用于喂模型）。
-    /// 供 `agent::capture::export_session`（导出工具）与 `act::execute`
-    /// （对比执行前后差量）两处调用。
+    /// 供 `agent::capture::export_session`（导出）与 `act::run_one`（对比执行前后差量）调用。
     pub fn snapshot(&self, session_id: &str) -> Option<String> {
         let guard = self.sessions.lock();
         let buf = guard.get(session_id)?;
@@ -455,8 +447,7 @@ impl AgentManager {
         self.sessions.lock().get(session_id).map(|b| b.stats())
     }
 
-    /// 当前登记了多少会话（诊断 / 排查内存泄漏用）。
-    /// 生产代码暂无调用方：留给后续任务的诊断命令（对照打开的标签数查泄漏）。
+    /// 当前登记了多少会话（诊断用：对照打开的标签数查泄漏）。生产代码暂无调用方。
     #[allow(dead_code)]
     pub fn tracked_sessions(&self) -> usize {
         self.sessions.lock().len()

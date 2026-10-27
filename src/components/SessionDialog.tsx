@@ -28,11 +28,8 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
   const [keyPath, setKeyPath] = useState("");
   const [passphrase, setPassphrase] = useState("");
   /**
-   * 用户是否动过口令输入框。
-   *
-   * 这个标记不是洁癖：编辑会话时口令是异步从库里读出来的，若用户手快、
-   * 在读回来之前点了保存，空字符串会把已保存的口令**覆盖掉**。
-   * 只有真正编辑过才落库，否则原样保留。
+   * 用户是否动过口令输入框。编辑会话时口令是异步读回来的，手快在读回前点保存，
+   * 空字符串会把已保存的口令覆盖掉 —— 只有真正编辑过才落库。
    */
   const [passphraseTouched, setPassphraseTouched] = useState(false);
   /** 浏览选中的外部密钥是否加密（密钥库里的条目直接看 KeyInfo.encrypted） */
@@ -280,14 +277,10 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
 }
 
 /**
- * 连接成功后的自动化：绑定一条宏 + 兼容模式。
+ * 连接成功后的自动化：绑定一条宏 + 兼容模式。宏的录制与编辑在标签栏右侧的「宏」里，
+ * 这里只负责「连上之后跑哪条」。
  *
- * 以前这里是「跳板机登录路径」——只能录「在菜单里选序号」。现在登录路径
- * 只是宏的一种用法，用户还能顺手跑几条初始化命令、`tmux attach`、看日志…
- * 宏本身的录制与编辑在标签栏右侧的「宏」里，这里只负责「连上之后跑哪条」。
- *
- * 直接读写 `lib/sessionExtras` 的缓存（不走 onSave）：它不属于连接参数，
- * 改完立刻生效，不必点「保存」。
+ * 直接读写 `lib/sessionExtras` 的缓存（不走 onSave）：它不属于连接参数，改完立刻生效。
  */
 function AutoRunSection({
   sessionId,
@@ -310,8 +303,7 @@ function AutoRunSection({
   const bound = macros.find((m) => m.id === extras.macroId && extras.macroOn) ?? null;
 
   return (
-    // 折叠：编辑连接本来就有七八个字段，这块是次要信息。
-    // 摘要行直接给出结论（绑了哪条宏 / 是否兼容模式），需要改再展开。
+    // 折叠：编辑连接本来就有七八个字段，摘要行给结论，需要改再展开
     <details className="login-path">
       <summary className="login-path-head">
         <span className="login-path-caret" aria-hidden>

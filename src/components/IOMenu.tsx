@@ -10,10 +10,8 @@ interface Props {
 }
 
 /**
- * 导入 / 导出：连接列表顶部「+」右边的图标按钮 + 下拉菜单。
- *
- * 菜单用 position: fixed 按按钮位置定位 —— 连接列表弹窗是 overflow: hidden，
- * absolute 会被裁掉。菜单 DOM 仍在弹窗内部，因此点菜单不会触发弹窗的「点外部关闭」。
+ * 导入 / 导出菜单。用 position: fixed 按按钮位置定位 —— 连接列表弹窗是 overflow: hidden，
+ * absolute 会被裁掉；菜单 DOM 仍在弹窗内部，所以点菜单不会触发弹窗的「点外部关闭」。
  */
 export default function IOMenu({
   canExportSession,

@@ -3,14 +3,10 @@ import { api } from "../api";
 /**
  * 会话配置的「附加状态」：连接后自动执行的宏 + 兼容模式。
  *
- * 为什么放在一个模块级的缓存里，而不是 App 的 state：
- * ① 连接流程（`dial`）需要**同步**读到 compat 才能决定 `sidecar` 开关，
- *    走 state 会多一次渲染依赖，还容易读到旧值；
- * ② 资源轮询在 StatusBar 里，上下文探测在 App 里，两处都可能发现
- *    「这台机器不接受并行通道」—— 共用一份缓存才不会互相覆盖。
- *
- * 写库是异步的、失败的：这些数据丢了只是下次要重学，不该打断任何操作，
- * 所以 `update` 先改内存、立刻通知 UI，再静默落盘。
+ * 放模块级缓存而非 App state 的原因：① `dial` 需要**同步**读到 compat 才能决定
+ * `sidecar` 开关；② 资源轮询（StatusBar）与上下文探测（App）都可能发现「这台机器
+ * 不接受并行通道」，共用一份缓存才不会互相覆盖。
+ * 丢了只是下次重学，所以 `update` 先改内存、立刻通知 UI，再静默落盘。
  */
 export interface SessionExtras {
   /**
@@ -37,9 +33,8 @@ const EMPTY: SessionExtras = {
 };
 
 let cache = new Map<string, SessionExtras>();
-/** 进行中的首次加载。并发调用必须共享同一个 Promise —— 只置一个 `loaded`
-    布尔位的话，第二个调用会立刻返回而数据其实还没到（启动时「迁移旧登录
-    路径」正好和常规加载并发，读到空值就会把旧数据漏掉）。 */
+/** 进行中的首次加载。并发调用必须共享同一个 Promise：只置 `loaded` 布尔位的话，
+    第二个调用会在数据到达前就返回（启动时的旧登录脚本迁移会因此漏掉数据）。 */
 let loading: Promise<void> | null = null;
 const listeners = new Set<() => void>();
 
@@ -86,11 +81,8 @@ export function subscribeExtras(fn: () => void): () => void {
 }
 
 /**
- * 这个错误是不是「服务端拒绝并行通道」。
- *
- * 后端在 `channel_open_session` / `exec` 被拒时返回固定文案
- * （`SIDECAR_DENIED`，见 ssh/session.rs）。只认这一句，不认「网络超时」
- * 之类 —— 后者是临时故障，误判成兼容模式会让正常服务器永远丢掉状态栏。
+ * 这个错误是不是「服务端拒绝并行通道」。只认后端的固定文案（`SIDECAR_DENIED`，见
+ * ssh/session.rs），不认网络超时之类 —— 临时故障误判成兼容模式会永久丢掉状态栏。
  */
 export function isSidecarDenied(err: unknown): boolean {
   const text = err instanceof Error ? err.message : String(err ?? "");

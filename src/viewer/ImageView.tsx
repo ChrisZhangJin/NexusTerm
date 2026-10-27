@@ -1,10 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 /**
- * 图片查看：Blob URL + <img>（SVG 同样走 <img>，其中的脚本 / 外部资源都不会执行或加载）。
- * - 打开时「适应窗口」（小图不放大），窗口尺寸变化时若仍处于适应模式则跟着重算；
- * - 滚轮以光标为中心缩放，拖拽平移，双击在「适应」与「100%」之间切换；
- * - 背景可切棋盘格 / 暗 / 亮，便于看透明图。
+ * 图片查看：Blob URL + <img>。SVG 同样走 <img>，其中的脚本 / 外部资源都不会执行或加载。
  */
 
 type Bg = "checker" | "dark" | "light";

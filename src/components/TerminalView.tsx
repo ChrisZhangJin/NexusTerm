@@ -58,15 +58,10 @@ const SOFT_NEWLINE = "\x1b\r";
 /**
  * 排查 mac 中文输入法用的两个开关（存 localStorage，重启保持）。
  *
- * 为什么非得有它们：输入法那几类症状（丢字 / 多空格 / 选候选多一个数字 /
- * 标点重复）在别人机器上只闪一下，光靠口头描述连着猜错了三轮 —— 每一轮都以为
- * 找到了原因，构建出来还是错的。现在能做的最有用的两件事是
- *
- *  ① **把真值记下来**：每个输入事件的 keyCode / isComposing / inputType /
- *     data / textarea 内容，以及**每一个真正发往 pty 的字节和是谁发的**，
- *     追加写到 `~/.nexus-term-input.log`。凭描述猜不出来的东西，看一眼日志就有答案。
- *  ② **让接管层能当场关掉**：关掉之后走的就是 xterm 原生路径。同一次操作在
- *     「开 / 关」两种状态下的差别，直接说明问题出在我们这一层还是 xterm 那一层。
+ * 输入法那几类症状（丢字 / 多空格 / 选候选多一个数字 / 标点重复）在别人机器上
+ * 只闪一下，靠口头描述连着猜错了三轮，所以：① 记真值（见 `lib/macInput` 的
+ * trace）；② 接管层能当场关掉 —— 同一次操作在开 / 关两态的差别，直接说明问题
+ * 出在我们这层还是 xterm 那层。
  *
  * - `nx.inputTrace` = "1"：开始记录（默认关 —— 终端里敲的东西含密码，不该默认落盘）
  * - `nx.macInput`   = "0"：关掉 mac 输入接管层
@@ -78,31 +73,20 @@ const LS_MAC_INPUT = "nx.macInput";
 const macLayerOn = (): boolean => localStorage.getItem(LS_MAC_INPUT) !== "0";
 
 /**
- * 输入日志写到哪由后端决定（`<app_data>/logs/input.log`，和 `nexus.log` 一起）。
- * 前端不给路径是有原因的：`@tauri-apps/api/path` 依赖没装的 `path` 插件，
- * 前端拿不到 home。这里只给一句给人看的位置说明。
+ * 路径由后端决定（`<app_data>/logs/input.log`）；前端拿不到 home
+ * （`@tauri-apps/api/path` 依赖没装的 path 插件），这里只是给人看的说明。
  */
 const INPUT_LOG_HINT = "~/Library/Application Support/com.nexus-term.app/logs/input.log";
 
 /**
  * 让 macOS 也支持按住 Shift 拖选文本（绕过 tmux 等程序的鼠标捕获）。
  *
- * xterm.js 的 `SelectionService.shouldForceSelection()` 是按平台分叉的：
+ * xterm.js 的 `SelectionService.shouldForceSelection()` 按平台分叉：mac 上只认
+ * `altKey && macOptionClickForcesSelection`，Shift 根本不算绕过键，于是同一份
+ * `set -g mouse on` 的 tmux 配置在 Windows / Linux 上 Shift+拖选可用、mac 上不行。
  *
- * ```ts
- * if (Browser.isMac) {
- *   return event.altKey && options.macOptionClickForcesSelection;
- * }
- * return event.shiftKey;
- * ```
- *
- * 于是同一份 `set -g mouse on` 的 tmux 配置下，Windows / Linux 上 Shift+拖选
- * 能正常选文本，macOS 上 Shift 根本不算绕过键 —— 只有 ⌥ 算，而且还得显式把
- * macOptionClickForcesSelection 打开（默认 false）。
- *
- * 官方没有给 macOS 开 Shift 的选项（旧的 attachCustomMouseEventHandler 在
- * 5.x 已移除），所以这里对实例上的方法做特性检测式补丁：拿得到就补一条 Shift
- * 分支，拿不到就静默退回官方行为，绝不影响正常的选区与鼠标上报。
+ * 官方没给 mac 开 Shift 的选项（attachCustomMouseEventHandler 在 5.x 已移除），
+ * 只能对实例方法做特性检测式补丁：拿不到就静默退回官方行为。
  */
 function patchShiftSelection(term: Terminal): void {
   if (!isMacOS()) return;
@@ -186,13 +170,8 @@ function viewablePath(sel: string, requireExt?: boolean): string | null {
 /**
  * 鼠标落点所在的「词」——右键浏览不再要求先完整选中文件名，停在上面点右键就行。
  *
- * 把像素坐标换算成终端的列/行（和 `CompletionOverlay` 定位用的是同一套
- * `rect / cols|rows` 算法），读出那一行文本，再从落点列向左右扩到最近的
- * 空白或括号类边界，取出点击处的词。
- *
- * 已知局限：按「1 字符 = 1 列」换算，行里有宽字符（中文等）会让列位置和
- * 字符位置错位，命中可能不准；文件名中间带空格的话仍然只能靠手动选中——
- * 这里只按空白切词，不去猜哪些空格其实是文件名的一部分。
+ * 已知局限：按「1 字符 = 1 列」换算，行里有宽字符（中文等）会让列位置错位，
+ * 命中可能不准；只按空白切词，文件名中间带空格仍需手动选中。
  */
 function wordAtPoint(term: Terminal, host: HTMLElement, clientX: number, clientY: number): string | null {
   const r = host.getBoundingClientRect();
@@ -276,8 +255,7 @@ export default function TerminalView({
   // ——— 输入法排查开关（见上面的常量说明）———
   useEffect(() => {
     let alive = true;
-    // 默认**关**：终端里敲的东西包含密码，没有明确开记录就不该往磁盘上落。
-    // 要记的时候按 ⌘⌥⇧L（再按一次停），状态存在 localStorage 里，重启保持。
+    // 默认关：终端里敲的东西包含密码，没有明确开记录就不该往磁盘上落
     let on = localStorage.getItem(LS_INPUT_TRACE) === "1";
     const apply = (next: boolean) => {
       on = next;
@@ -329,12 +307,8 @@ export default function TerminalView({
   historyPersistRef.current = historyPersist;
   const lineRef = useRef(newLineState());
   /**
-   * 这一行有没有真的被回显过。
-   *
-   * 密码一类的输入（sudo、ssh、`passwd`……）远端会关掉回显，敲的字符
-   * 一个都不会被写回屏幕，`cursorFollowsTyped` 也就永远匹配不上。
-   * 拿它当「这行是不是密码」的判据：回了车却从没见过回显，就别记进历史——
-   * history 本是用来猜下一条命令的，密码混进去既没用又危险。
+   * 这一行有没有真的被回显过 —— 当「是不是密码」的判据：密码输入时远端关掉回显，
+   * `cursorFollowsTyped` 永远匹配不上；回了车却从没见过回显就不记进历史。
    */
   const lineEchoedRef = useRef(false);
   const ghostRef = useRef(new GhostText());
@@ -346,11 +320,8 @@ export default function TerminalView({
   const hintIndexRef = useRef(0);
   hintIndexRef.current = hintIndex;
   /**
-   * 唯一的「改高亮项」入口：ref 与 state 一起写。
-   *
-   * 只调 `setHintIndex` 是不够的 —— ref 要等下一次渲染才跟上，而鼠标划过下拉、
-   * 或按完 ↑↓ 之后，人可能在同一帧内就按 Tab / Enter。那一刻读到的还是旧下标，
-   * 补进去的自然不是屏幕上高亮的那条（表现为「按 Tab 总是补第一条」）。
+   * 唯一的「改高亮项」入口：ref 与 state 必须一起写。只 `setHintIndex` 的话 ref
+   * 要等下一次渲染才跟上，而人可能在同一帧内就按 Tab —— 表现为「总是补第一条」。
    */
   const setActiveHint = useCallback((i: number) => {
     hintIndexRef.current = i;
@@ -365,12 +336,9 @@ export default function TerminalView({
   const hintSigRef = useRef("\u0000");
   const hintsRef = useRef<CompletionItem[]>([]);
   /**
-   * 本帧有没有排队的补全重算（rAF 句柄，0 = 没排）。
-   *
-   * 敲键时**不**当场算候选：算候选要读历史、量 DOM（`getBoundingClientRect`）、
-   * 改 React 状态、往终端里写灰字 —— 这些同步塞在 `onData` 里，等于让
-   * 「把字节发给 shell」排在它们后头，连着敲就是一串能感觉到的顿挫。
-   * 改成一帧最多算一次之后，打字这条路上只剩发字节，提示最多晚一帧出现。
+   * 本帧有没有排队的补全重算（rAF 句柄，0 = 没排）。敲键时不当场算候选：算候选
+   * 要读历史、量 DOM、改 React 状态、写灰字，同步塞在 `onData` 里会让「发字节
+   * 给 shell」排在它们后头，连着敲有肉眼可见的顿挫。
    */
   const hintRaf = useRef(0);
 
@@ -414,9 +382,8 @@ export default function TerminalView({
     }
 
     hintsRef.current = items;
-    // 候选没变就不要再推一次状态：`insert` 是由 `label` 减去已输入前缀算出来的，
-    // 所以 label 一样、补充部分必然一样。行里接着敲字时列表常常是同一批
-    // （历史里就那几条），不比较的话每敲一个字都要重建一遍下拉的 40 个节点。
+    // 候选没变就不推状态（label 一样则 insert 必然一样）：行里接着敲字时列表常常
+    // 是同一批，不比较的话每敲一个字都要重建一遍下拉的 40 个节点。
     const sig = items.map((i) => i.label).join("\n");
     if (sig !== hintSigRef.current) {
       hintSigRef.current = sig;
@@ -425,23 +392,20 @@ export default function TerminalView({
     }
 
     const room = term.cols - term.buffer.active.cursorX - 1;
-    // 画的是「下拉里当前高亮的那条」而不是永远第一条：候选没变时高亮可能已经被
-    // 方向键挪走了（见上面的签名判重），这时灰字必须跟着高亮走，否则按 Tab
-    // 补进去的东西和屏幕上提示的不是同一条。
+    // 画当前高亮那条而非第一条：候选没变时高亮可能已被方向键挪走（见上面的签名
+    // 判重），灰字不跟着走就会和按 Tab 补进去的不是同一条。
     const shownItem = items[Math.min(hintIndexRef.current, items.length - 1)];
     const ghost = ghostRef.current.show(term, shownItem ? shownItem.insert : "", room);
     if (!ghost) return;
 
-    // 只在灰字真的画出来了才定位下拉：位置按光标格换算，
-    // 与 xterm 的字符网格对齐（cellWidth 已处理 CJK / emoji 占两格的情况）
+    // 只在灰字真的画出来了才定位下拉
     const r = host.getBoundingClientRect();
     const cw = term.cols > 0 ? r.width / term.cols : 8;
     const ch = term.rows > 0 ? r.height / term.rows : 16;
     const x = Math.round(Math.min(r.left + term.buffer.active.cursorX * cw, window.innerWidth - 330));
     const y = Math.round(r.top + (term.buffer.active.cursorY + 1) * ch);
-    // 同一个位置就不要再 set 一次：每次都是新对象，React 会当成变化重新渲染 ——
-    // 而「敲一个字、光标挪一格、下拉跟着右移」正是每次按键都发生的事。
-    // 只有真的挪了才推给界面，一行里连着打十个字就只重渲染一次。
+    // 位置没变就别 set：每次都是新对象，React 会当成变化重渲染，而光标挪格是
+    // 每次按键都发生的事。
     const last = hintPosRef.current;
     if (last.x !== x || last.y !== y) {
       hintPosRef.current = { x, y };
@@ -500,13 +464,10 @@ export default function TerminalView({
       const items = hintsRef.current;
       const term = termRef.current;
       if (!term || items.length === 0) return;
-      // 先擦掉灰字再判「光标是否在行尾」：灰字本身就是画在光标后面的真实字符，
-      // 不擦掉的话 `cursorAtLineEnd` 会把它当成「光标后面还有别的字」，
-      // 于是按 Tab 接受补全反而被当成「在行中间编辑」给收起了——
-      // 候选只有一条、灰字立刻画满光标后那几格时最容易踩到。
+      // 必须先擦灰字再判行尾：灰字是画在光标后的真实字符，不擦的话
+      // `cursorAtLineEnd` 会把它当成「后面还有字」，按 Tab 反被当成行中间编辑收起。
       ghostRef.current.clear(term);
-      // 光标已经挪到行中间（人在改前面敲错的字）：这时补进去会插在句子中间，
-      // 收起下拉比硬补安全 —— 想继续补全，按 End 回到行尾即可。
+      // 真在行中间（人在改前面敲错的字）：补进去会插在句子中间，收起更安全
       if (!cursorAtLineEnd(term)) {
         dismissHints();
         return;
@@ -517,14 +478,12 @@ export default function TerminalView({
         return;
       }
       lineRef.current.text += item.insert;
-      // 只把「缺的那一段」写进 pty：已经敲出来的字符已经在 shell 里了，
-      // 再写一遍会重复。这里的写入和敲键盘走的是同一条路。
+      // 只写「缺的那一段」：已敲出来的字符早就在 shell 里了，再写一遍会重复
       void (isLocal
         ? api.localWrite(tabId, stringToBytes(item.insert))
         : api.sshWrite(tabId, stringToBytes(item.insert))
       ).catch(() => {});
-      // 补完后重算一次：多半会自然消失（后面要打的是新 token），
-      // 但遇到 `--f` → `--follow` 这种还能接着补的，下拉会立刻给出下一批。
+      // 补完重算：`--f` → `--follow` 这类还能接着补，下拉要立刻给出下一批
       refreshHints(lineRef.current.text);
     },
     [dismissHints, isLocal, refreshHints]
@@ -544,15 +503,11 @@ export default function TerminalView({
   const imeRef = useRef<ImeGuard>(new ImeGuard());
 
   /**
-   * Enter：先把高亮项补齐，**再**补一个真正的回车（也就是直接跑起来）。
+   * Enter：先补齐高亮项再发回车。屏幕上的「半句 + 灰字」看着就是整条命令，只发
+   * 半句就成了「看到 A 执行 B」。
    *
-   * 下拉开着时，屏幕上的这行是「已经敲进去的半句 + 灰字」，灰字看着就是命令的
-   * 一部分。这时候回车如果照旧只发半句，就成了「看到 A 执行 B」——
-   * 敲的是 `vim P`，跑的是 `vim `。所以回车必须先把高亮项补上。
-   *
-   * 补完一定要收起下拉：`acceptHintAt` 末尾会重算候选，补出来的整句常常还能
-   * 接着联想，下拉会马上又弹出来；不收起的话第二次回车又被吞掉，
-   * 这条命令就永远发不出去了。
+   * 补完必须收起下拉：`acceptHintAt` 末尾会重算候选、下拉马上又弹出来，不收起
+   * 的话第二次回车又被吞，这条命令永远发不出去。
    */
   const acceptHintThenRun = useCallback(() => {
     acceptHintAt(hintIndexRef.current);
@@ -652,13 +607,10 @@ export default function TerminalView({
     };
     host.addEventListener("mousedown", onSelDown, true);
     window.addEventListener("mouseup", onSelUp, true);
-    // 输入法：xterm 自己会处理组合输入，这里只是旁观 —— 记下「组合开始/结束」
-    // 就够了，键盘处理器据此决定回车该不该被补全接管。capture 是为了抢在
-    // xterm 内部处理之前拿到（顺序无所谓，但能保证不漏）。
+    // 输入法：只旁观，记下组合起止供键盘处理器判断回车该不该被补全接管
     const onImeStart = (e: CompositionEvent) => imeRef.current.begin(e.timeStamp);
-    // 组合期间的每一次按键都会触发它：用来判断「组合是不是还活着」，
-    // 见 `lib/ime.ts` 的 `STALE_COMPOSE_MS`——没有这个心跳，卡死的
-    // compositionend 就永远等不到人清理。
+    // 组合是否还活着的心跳，见 `lib/ime.ts` 的 `STALE_COMPOSE_MS`——没有它，
+    // 卡死的 compositionend 就永远等不到人清理
     const onImeUpdate = (e: CompositionEvent) => imeRef.current.touch(e.timeStamp);
     const onImeEnd = (e: CompositionEvent) => imeRef.current.finish(e.timeStamp);
     // 组合中被切走时 compositionend 不一定来，留着 composing=true 会把回车全吞掉
@@ -675,18 +627,16 @@ export default function TerminalView({
       host.removeEventListener("compositionend", onImeEnd, true);
       window.removeEventListener("blur", onImeReset);
     });
-    // resize 会让列数、也可能让光标所在的物理行都变掉：灰字记的 atX/atY
-    // 立刻过时，`clear` 的 `sameSpot` 检查从此永远对不上——擦不掉的灰字就会
-    // 当真字一样赖在屏幕上。索性收起，下一次按键会按新尺寸重新算一遍。
+    // resize 后灰字记的 atX/atY 立刻过时，`clear` 的 `sameSpot` 永远对不上 ——
+    // 擦不掉的灰字会像真字一样赖在屏幕上，索性收起
     const resizeSub = term.onResize(() => {
       hl.refresh();
       dismissHints();
     });
     const bufSub = term.buffer.onBufferChange(() => hl.refresh());
-    // 光标一挪就要复查：灰字是画在「当时的光标」之后的，
-    // 按 ← / Home 回到行中间之后，它还赖在原处就变成了插在句子里的半截命令，
-    // 而下一次擦除又会从新光标一路抹到行尾 —— 把后面真敲的字抹掉。
-    // 只在灰字真的画着时才查 buffer，挪动光标本身是很热的路径。
+    // 灰字画在「当时的光标」之后，按 ← / Home 回行中间后它就成了插在句子里的
+    // 半截命令，下一次擦除还会从新光标抹到行尾、把真字一起抹掉。
+    // 只在灰字真的画着时才查 buffer —— 挪光标是很热的路径。
     const cursorSub = term.onCursorMove(() => {
       if (!ghostRef.current.active) return;
       if (term.buffer.active.type !== "normal" || !cursorAtLineEnd(term)) {
@@ -702,11 +652,9 @@ export default function TerminalView({
     );
 
     /**
-     * 把灰字重新画回光标后面。
-     *
-     * 只在「光标还贴着我们记下的那半行」时才画 —— 见 `cursorFollowsTyped`。
-     * 一旦不成立（真的输出来了、提示符被整行重画了），说明这一轮输入已经结束，
-     * 直接收起提示，别把灰字甩到输出中间。
+     * 把灰字重新画回光标后面，但只在「光标还贴着我们记下的那半行」时
+     * （`cursorFollowsTyped`）。不成立说明这一轮输入已结束（真有输出、或提示符
+     * 被整行重画），收起提示，别把灰字甩到输出中间。
      */
     const redrawGhost = () => {
       const items = hintsRef.current;
@@ -724,17 +672,13 @@ export default function TerminalView({
       ghostRef.current.show(term, item.insert, term.cols - term.buffer.active.cursorX - 1);
     };
 
-    // 灰字画在终端的**显示缓冲**里，不是 pty 里的真实字符。
-    // 只要往屏幕上又写了东西，那段灰字就会变成"真"文本赖在那儿，
-    // 还会把光标推到它后面 —— 于是人接着敲的字全落在灰字之后。
-    // 所以所有「往屏幕上写字」的地方都必须走这一个出口：先擦，写完再补画。
+    // 灰字画在显示缓冲里，不是 pty 的真实字符：再往屏幕上写东西，它就会变成
+    // 「真」文本赖在那儿并把光标推到后面。所以所有往屏幕写字的地方都必须走
+    // `writeOut` 这一个出口：先擦，写完再补画。
     //
-    // 「再补画」不是可有可无的润色：shell 会把人敲的每个字符回显回来，
-    // 回显走的就是这里。不补画的话，灰字只在「按键 → 回显到达」这几十毫秒里
-    // 闪一下就没了 —— 本地还好，SSH 上一个来回就是肉眼可见的闪烁。
-    //
-    // 补画按帧合并：回显是**一个字节一块**到达的，逐块补画等于每个字符都
-    // 擦一次整行、再画一次整行（两次整行重绘）。一帧里到几块都只补画一次。
+    // 补画不是润色 —— shell 回显走的就是这里，不补画灰字只会闪一下就没了
+    // （SSH 一个来回肉眼可见）。按帧合并是因为回显一个字节一块地到，逐块补画
+    // 等于每个字符两次整行重绘。
     let paintRaf = 0;
     const scheduleGhostPaint = () => {
       if (paintRaf) return;
@@ -750,11 +694,9 @@ export default function TerminalView({
     const writeOut = (data: string | Uint8Array) => {
       ghostRef.current.clear(term);
       term.write(data);
-      // 这一行是不是真被回显过——门槛判据与灰字重画共用一套
-      // （见 `lib/ghost.ts` 的 `cursorFollowsTyped`），但这里当安全边界用，
-      // 不能按它默认的「1 个字符就算」：密码的第一个字符恰好撞上提示符
-      // 末尾或者上一行的残留字符，1 个字符的巧合匹配就会把没回显的密码
-      // 误判成「回显过」而记进历史。至少连续匹配 3 个字符才采信。
+      // 这行是不是真被回显过。这里当安全边界用，不能按 `cursorFollowsTyped`
+      // 默认的「1 个字符就算」：密码首字符撞上提示符末尾的巧合匹配，就会把没
+      // 回显的密码记进历史。至少连续匹配 3 个字符才采信。
       if (
         lineRef.current.text &&
         cursorFollowsTyped(term, lineRef.current.text, Math.min(3, lineRef.current.text.length))
@@ -829,10 +771,10 @@ export default function TerminalView({
       // 旁路监听（宏录制、宏回放时「用户插了一脚就中止」）。发不发送由这里决定，监听方只读
       emitInput(tabId, d);
       send(d).catch(() => {});
-      // 新的一行开始：清掉上一行留下的回显标记，不然刚敲完一条密码、
-      // 紧接着正常敲的命令会被上一行"已回显过"的旧状态蹭到历史里。
+      // 新行开始要清掉上一行的回显标记，否则密码行的「已回显过」旧状态会把
+      // 紧接着敲的命令蹭进历史
       if (!lineRef.current.text) lineEchoedRef.current = false;
-      // 补全：喂键攒行（同步、纯字符串运算），候选留到下一帧再算
+      // 喂键攒行（同步、纯字符串运算），候选留到下一帧再算
       const committed = feedKeys(lineRef.current, d);
       if (committed) {
         if (lineEchoedRef.current) recordCommand(historyKeyRef.current, committed, historyPersistRef.current);
@@ -842,18 +784,15 @@ export default function TerminalView({
     };
 
     const dataSub = term.onData((d) => {
-      // xterm 自己发出的字节（回车、Ctrl 组合、方向键、输入法上屏、粘贴）。
-      // 记一笔是为了在日志里能把「我们发的」和「xterm 发的」分开 —— 「，,」
-      // 这种重复只有看到 via 才知道多出来的那一下是谁干的。
+      // 记 via 是为了在日志里把「我们发的」和「xterm 发的」分开 —— 标点重复
+      // 这类问题只有看到 via 才知道多出来的那一下是谁干的
       traceSend(d, "xterm");
       handleInput(d);
     });
 
-    // macOS(WKWebView) 上普通字符改由我们自己在捕获阶段发 —— 详见 lib/macInput。
+    // macOS(WKWebView) 上普通字符改由我们在捕获阶段发 —— 详见 lib/macInput。
     // 必须挂在 host 上：xterm 的监听在 textarea 上，捕获阶段我们先到。
-    //
-    // 装在可重装的壳里：排查输入问题时要能在「接管层开 / 关」之间当场切换对比
-    // （⌘⌥⇧K）。重装只是摘挂几个 DOM 监听，不能为此重建终端。
+    // 包在可重装的壳里是为了 ⌘⌥⇧K 能当场开关对比，不必重建终端。
     let macUninstall: () => void = () => {};
     const applyMacInput = () => {
       macUninstall();
@@ -875,14 +814,11 @@ export default function TerminalView({
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
 
-      // 只在**有候选**时才接管 Tab / Enter / Esc / ↑↓。
-      // 没有候选时一律放行 —— 那几个键本来属于 shell 自己的补全与历史，
-      // 不能因为我们多了个提示层就把终端原本的能力挤掉。
+      // 只在有候选时才接管 Tab / Enter / Esc / ↑↓：没候选就放行，那几个键本来
+      // 属于 shell 自己的补全与历史，不能被我们这个提示层挤掉。
       if (hintsRef.current && hintsRef.current.length > 0) {
-        // 输入法组合中的按键一律不接管：那时候按回车是「选词上屏」、
-        // 按 Esc 是「取消这组候选」，跟补全没关系，吞了就打不出中文了。
-        // 判定走 `lib/ime.ts` 的那套（229 / isComposing / 组合刚结束的窗口），
-        // 这里拿到的是原生事件，直接压成 KeyLike 即可。
+        // 输入法组合中一律不接管：那时回车是「选词上屏」、Esc 是「取消候选」，
+        // 吞了就打不出中文。判定走 `lib/ime.ts`。
         const info: KeyLike = {
           key: e.key,
           shiftKey: e.shiftKey,
@@ -943,11 +879,9 @@ export default function TerminalView({
       const MENU_W = 190;
       const MENU_H = 372;
       const sel = term.getSelection();
-      // 鼠标落点优先：xterm 的选区只在「左键按下」时才会清掉/重建，右键不会碰它——
-      // 所以 `sel` 完全可能是之前随手拖选、现在已经和鼠标位置毫无关系的旧选区。
-      // 落点能解析成文件就必须用落点，不能让一份过期的选区抢答；
-      // 只有落点那个词解析不出文件时（比如选中的是带空格的路径，单个词切不出扩展名）
-      // 才退回去看选区还有没有用。
+      // 落点优先：xterm 的选区只在左键按下时清/重建，右键不碰它，所以 `sel` 很
+      // 可能是和鼠标位置毫无关系的旧选区。只有落点解析不出文件时（如带空格的
+      // 路径）才退回去看选区。
       const atPoint = wordAtPoint(term, host, e.clientX, e.clientY);
       const target = atPoint && viewablePath(atPoint, true) ? atPoint : viewablePath(sel) ? sel : "";
       setCtxMenu({
@@ -989,9 +923,7 @@ export default function TerminalView({
       cleanups.forEach((f) => f());
       term.dispose();
       termRef.current = null;
-      // 临时连接的历史只在内存里，标签关掉就没用了；
-      // 持久化的 key（本地 / 已保存会话）不动——可能还有别的标签在用，
-      // 真正的数据也早就落盘了。
+      // 持久化的 key 不动：可能还有别的标签在用，数据也早落盘了
       dropCompletion(historyKeyRef.current, historyPersistRef.current);
     };
     // 字体等外观变化通过下面的 effect 单独应用，不重建实例
@@ -1093,7 +1025,7 @@ export default function TerminalView({
   const doPaste = useCallback(() => {
     setCtxMenu(null);
     api
-      .clipboardRead()
+      .clipboardRead(tabId)
       .then((t) => {
         if (!t) return;
         // 走 xterm.paste：自动处理换行规范化与 bracketed paste，和键盘粘贴行为一致
@@ -1101,7 +1033,7 @@ export default function TerminalView({
       })
       .catch((e) => onNotify?.(`粘贴失败：${String(e)}`));
     termRef.current?.focus();
-  }, [onNotify]);
+  }, [onNotify, tabId]);
 
   const doSelectAll = useCallback(() => {
     termRef.current?.selectAll();
@@ -1119,15 +1051,11 @@ export default function TerminalView({
   }, [isLocal, tabId]);
 
   /**
-   * 软换行：只换行、不执行。
+   * 软换行：只换行、不执行。xterm.js 对 Enter 只判断 `altKey`，Ctrl+Enter 和
+   * Enter 发的是同一个 `\r`，想改键只能在应用层拦。
    *
-   * xterm.js 对 Enter 只判断 `altKey`（`case 13: altKey ? ESC+CR : CR`），
-   * 也就是说 **Ctrl+Enter 与 Enter 发的是同一个 \r**，想改键必须在应用层拦。
-   *
-   * 这里刻意复用 Alt+Enter 的原生字节序列（ESC + CR），而不是发 "\n"：
-   * 终端里 LF 同样是“提交”，只有 ESC 前缀能让远端 readline / tmux 认出
-   * “这是一个带修饰键的 Enter”。字节一致 ⇒ 行为与改键前完全等价，
-   * 不依赖远端 shell 是否刚好绑了 ^J。
+   * 复用 Alt+Enter 的原生字节（ESC + CR）而不是 "\n"：LF 在终端里同样是「提交」，
+   * 只有 ESC 前缀能让远端 readline / tmux 认出「带修饰键的 Enter」。
    */
   const doSoftNewline = useCallback(() => {
     if (zmodemRef.current?.isActive()) return;
@@ -1166,8 +1094,8 @@ export default function TerminalView({
             probeErr = String(e);
           }
           if (!ctx?.cwd) {
-            // 兼容模式（堡垒机只放行一条通道）下探测目录本来就会被拒绝——
-            // 不是这次操作本身出了问题，说清楚原因，别让人以为是 bug。
+            // 兼容模式（堡垒机只放行一条通道）下探测目录本来就会被拒绝，
+            // 说清原因，别让人以为是 bug
             onNotify?.(
               probeErr?.includes("兼容模式")
                 ? "该连接处于兼容模式（服务器不支持并行通道），无法自动获取远端目录，请选中完整路径（/… 或 ~/…）"

@@ -1,16 +1,12 @@
 //! 导出一个会话「迄今为止的全部输出」，供 agent 工具与前端「导出」按钮共用。
 //!
-//! ## 两层
+//! 两层：
 //!
-//! 1. **基础层**：`AgentManager::snapshot` —— 这条会话旁路缓冲里还留着的全部字节，
-//!    是 pty/SSH 通道的逐字节复刻，tmux / docker exec / vim 等打印到这个会话里的
-//!    内容天然已经在里面，不需要额外识别。
-//! 2. **深度层**（`deep=true` 时追加）：基础层毕竟是个有上限的环形缓冲，装不下
-//!    「这个会话开旁路之前」或者「tmux 里挂了很久的另一个 pane」。这一层主动去
-//!    探一遍 tmux / docker 的现状，把它们自己的 scrollback 要过来。
-//!    远端会话走既有的旁路 exec 通道（`SessionManager::run_sidecar`）；本地会话
-//!    没有这样一条通道，也不该为了导出去打扰用户正在用的那个 pty —— 所以另起一个
-//!    独立子进程去跑探测脚本，复用 `console.rs::spawn_help` 的思路。
+//! 1. **基础层**：`AgentManager::snapshot`，旁路环形缓冲里还留着的字节。
+//! 2. **深度层**（`deep=true`）：环形缓冲装不下「开旁路之前」或「另一个 tmux pane」的内容，
+//!    所以主动去要 tmux / docker 自己的 scrollback。远端走旁路 exec 通道
+//!    （`SessionManager::run_sidecar`）；本地不该为导出去打扰用户正在用的那个 pty，
+//!    故另起独立子进程跑探测脚本。
 //!
 //! 深度层是**尽力而为**：探测失败（没装 tmux/docker、超时、命令不存在）一律安静跳过，
 //! 不让「导出」这个本该保底的功能因为环境缺东西而报错。
@@ -123,8 +119,8 @@ async fn deep_scrollback_local() -> Option<String> {
 
 /// 起一个 `sh -c <script>` 子进程，拿标准输出。失败 / 超时一律 `None`。
 ///
-/// 与 `console.rs::spawn_help` 同样的保守做法：掐断 stdin（避免卡死等输入），
-/// 严格超时后把孩子一并带走（`kill_on_drop`），不让探测脚本挂死整个导出。
+/// 掐断 stdin（避免卡死等输入），超时后把孩子一并带走（`kill_on_drop`），
+/// 不让探测脚本挂死整个导出。
 async fn spawn_probe(script: &str) -> Option<String> {
     use std::process::Stdio;
     use tokio::process::Command;

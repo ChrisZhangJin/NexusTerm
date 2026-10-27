@@ -66,11 +66,10 @@ impl Serialize for SftpError {
 
 /// SFTP 会话池。
 ///
-/// 一个 SFTP 面板优先**复用同配置下已认证的终端连接**：在它上面开一条新通道
-/// 请求 `sftp` 子系统即可。对要求 keyboard-interactive 的服务器（OTP / 堡垒机）
-/// 这一点是决定性 —— 独立连接意味着每打开一次文件面板就要再输一次验证码。
-///
-/// 只有在「该配置当前没有活着的终端连接」时才退回独立连接（要重新认证）。
+/// 优先**复用同配置下已认证的终端连接**：在它上面开一条新通道请求 `sftp` 子系统即可。
+/// 对要求 keyboard-interactive 的服务器（OTP / 堡垒机）这一点是决定性的 ——
+/// 独立连接意味着每打开一次文件面板就要再输一次验证码。只有该配置没有活着的
+/// 终端连接时才退回独立连接（要重新认证）。
 pub struct SftpManager {
     inner: Mutex<HashMap<String, SftpSession>>,
     known_hosts: Arc<KnownHosts>,
@@ -78,15 +77,11 @@ pub struct SftpManager {
     auth_prompts: Arc<crate::ssh::prompt::AuthPrompts>,
     /// 已认证连接登记表（与 `SessionManager` 共享同一个 Arc）
     shared: SharedConns,
-    /// 复用了主连接的 SFTP 会话 → 把句柄一起攥着保活。
-    ///
-    /// 不复用的情况下这里没有条目。留着它是因为：主标签关掉后 `SessionRuntime`
-    /// 里的 Arc 被释放，若文件面板还开着，连接会连带被回收 —— 传输到一半就断。
-    /// 句柄在这里活到 SFTP 会话自己 close 为止。
+    /// 复用主连接的 SFTP 会话才有条目：主标签关掉后 `SessionRuntime` 里的 Arc 被释放，
+    /// 若文件面板还开着，连接会连带被回收——传输到一半就断。句柄在这里保活到 SFTP 会话自己 close。
     held: parking_lot::Mutex<HashMap<String, Arc<Handle<ClientHandler>>>>,
     /// 进行中传输的取消标志，按前端生成的 transfer id 登记。
-    /// 置位由 `cancel_transfer` 做；拷贝循环每轮检查一次；传输结束（无论成败）
-    /// 都要 `end_transfer` 清掉，不然标志会无限堆积。
+    /// 传输结束（无论成败）都要 `end_transfer` 清掉，不然标志会无限堆积。
     transfers: parking_lot::Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
@@ -154,11 +149,9 @@ impl SftpManager {
     ) -> Result<(), SftpError> {
         let port = req.port.unwrap_or(22);
 
-        // ① 复用路径：省掉整个握手 + 认证过程。
-        //    对 OTP 服务器尤其重要 —— 否则每次打开文件面板都要再输一次验证码。
-        //    四个条件缺一不可：同一配置、同一主机端口、同一用户、连接还活着。
-        //    少掉主机校验就会出这种事：配置从 A 改成 B 后旧标签仍连着 A，
-        //    文件面板会悄悄列出 A 的目录。
+        // 复用路径：省掉整个握手 + 认证过程，对 OTP 服务器尤其重要。
+        // 四个条件缺一不可：同一配置、同一主机端口、同一用户、连接还活着——
+        // 少掉主机校验，配置从 A 改成 B 后旧标签仍连着 A，文件面板会悄悄列出 A 的目录。
         if let Some(config_id) = req.config_id.as_deref() {
             let alive = self
                 .shared
@@ -271,7 +264,7 @@ impl SftpManager {
 
     /// 列出远端目录。目录在前、名称升序，符合文件管理器习惯。
     pub async fn list(&self, id: &str, path: &str) -> Result<Vec<RemoteEntry>, SftpError> {
-        // read_dir 返回的是同步迭代器，先收干再排序，即可避免在持锁期间 await
+        // 先收干再排序，避免在持锁期间 await
         let mut entries = {
             let map = self.inner.lock().await;
             let s = map

@@ -23,7 +23,7 @@ interface Props {
   onRename: (id: string, name: string) => void;
   /** 拖拽换位 */
   onMove: (fromId: string, toId: string, after: boolean) => void;
-  /** 最左侧「☰ 连接」按钮（原工具栏唯一按钮，已并入标签栏） */
+  /** 最左侧「☰ 连接」按钮 */
   sessionPopupOpen: boolean;
   onToggleSessionPopup: () => void;
   /** 右侧 AI 助手面板开关 */
@@ -83,11 +83,9 @@ export default function TabBar({
   }, [mac]);
 
   /**
-   * macOS 全屏时系统会**把红绿灯整个藏起来**，那条 80px 的预留就变成了纯白留 ——
-   * 用户看到的就是「标题栏左边空了一块」。所以全屏下要把预留收回去，
-   * 顺便把栏左内边距补回来，免得「连接」贴到屏幕边上。
-   *
-   * 只在 mac 上跑：别的平台本来就没有交通灯，--lights-w 是 0。
+   * macOS 全屏时系统会隐藏红绿灯，80px 的预留就变成标题栏左边空一块；
+   * 写 data-fullscreen 让 CSS 收回 --lights-w 并补回栏左内边距。
+   * 只在 mac 上跑：别的平台 --lights-w 本来就是 0。
    */
   useEffect(() => {
     if (!mac) return;
@@ -116,14 +114,12 @@ export default function TabBar({
     };
   }, [mac]);
 
-  // 拖拽状态
   const [drag, setDrag] = useState<{ id: string; overId: string | null; after: boolean } | null>(
     null
   );
   const dragStart = useRef<{ id: string; x: number; started: boolean } | null>(null);
   const tabEls = useRef(new Map<string, HTMLDivElement>());
 
-  // 点菜单外关闭
   useEffect(() => {
     if (!ctx) return;
     const hide = (e: MouseEvent) => {
@@ -142,7 +138,6 @@ export default function TabBar({
     };
   }, [ctx]);
 
-  // 拖拽：全局监听移动与松开
   useEffect(() => {
     const move = (e: PointerEvent) => {
       const st = dragStart.current;
@@ -196,9 +191,9 @@ export default function TabBar({
 
   return (
     <div className="tabbar" data-tauri-drag-region="deep">
-      {/* 交通灯预留区：只占位，不响应任何交互。仅 macOS 需要 */}
+      {/* 交通灯预留区：只占位，不响应交互 */}
       {mac && <div className="titlebar-lights" aria-hidden />}
-      {/* 非 macOS 没有系统标题栏图标，补一枚应用 logo，否则标签栏左边空荡荡的 */}
+      {/* 非 macOS 没有系统标题栏图标，补一枚应用 logo */}
       {!mac && <img className="titlebar-appicon" src={appIcon} alt="" aria-hidden />}
 
       {/* sp-toggle：连接列表的「点外部关闭」会放行它，避免先关后开 */}
@@ -233,11 +228,8 @@ export default function TabBar({
                 dropBefore ? "drop-before" : "",
                 dropAfter ? "drop-after" : "",
               ].join(" ")}
-              // .tabbar 整体是 data-tauri-drag-region="deep"（空白处要能拖动窗口），
-              // 但标签本身是个普通 div，不像 BUTTON/INPUT 那样被 Tauri 自动排除在
-              // 拖动区之外 —— 于是点击标签会被当成「按下就开始拖窗口」，左键单击
-              // 偶发被吞、双击直接触发系统的最大化/还原。显式关掉即可，标签之间的
-              // 空隙仍然可以拖动窗口。
+              // .tabbar 是 deep 拖动区，而标签是普通 div，不像 BUTTON/INPUT 那样被
+              // Tauri 自动排除：单击会被吞、双击触发系统最大化/还原。显式关掉。
               data-tauri-drag-region="false"
               onPointerDown={(e) => {
                 if (e.button !== 0 || renaming === t.id) return;
@@ -301,7 +293,7 @@ export default function TabBar({
         </button>
       </div>
 
-      {/* AI 助手面板开关：靠右，与标签列表分开（.tabs 是 flex:1，把这里顶到最右） */}
+      {/* 靠右：.tabs 是 flex:1，把这个按钮顶到最右 */}
       <button
         className={`tb-action tabbar-agent ${agentOpen ? "active" : ""}`}
         onClick={onToggleAgent}

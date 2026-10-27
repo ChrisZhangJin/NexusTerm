@@ -3,11 +3,10 @@ import type { IDecoration, Terminal } from "@xterm/xterm";
 /**
  * 终端关键字「标记」：把整个缓冲区（含滚动历史）里命中的文本用指定底色高亮。
  *
- * 实现要点：
- * - 按「逻辑行」匹配：被自动折行（isWrapped）的物理行先拼回一整行，跨行的关键字也能命中
- * - 先用 translateToString 粗筛，只有命中的逻辑行才逐格（getCell）建立「字符 → 列」映射，
- *   CJK / emoji 宽字符占 2 列，直接用字符串下标当列号会错位
- * - 用 registerMarker + registerDecoration 画底色；marker 随滚动历史裁剪自动释放
+ * - 按「逻辑行」匹配：折行（isWrapped）的物理行先拼回一整行，跨行关键字也能命中
+ * - translateToString 粗筛后才逐格建「字符 → 列」映射：CJK / emoji 占 2 列，
+ *   直接用字符串下标当列号会错位
+ * - marker 随滚动历史裁剪自动释放
  */
 
 export interface MarkRule {

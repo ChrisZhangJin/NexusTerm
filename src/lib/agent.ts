@@ -1,11 +1,9 @@
 /**
  * AI Agent 配置的前端 store。
  *
- * 配置的真身在后端 SQLite（settings 表 key=`agent.config`），这里做的是：
- * 进程内缓存一份 + useSyncExternalStore 广播。
- * 之所以必须走订阅而不是各面板自己 useState 再传 props ——
- * 设置窗口里改完（比如关掉总开关、换模型），终端侧的提问按钮要立刻跟着变，
- * 二者不在一个组件树分支上，层层传 props 会把 App.tsx 撑爆。玩法与 prefs.ts 一致。
+ * 配置的真身在后端 SQLite（settings 表 key=`agent.config`），这里是进程内缓存 +
+ * useSyncExternalStore 广播。走订阅而不是传 props：设置窗口与终端侧提问按钮不在
+ * 同一组件树分支上，层层传 props 会把 App.tsx 撑爆。玩法与 prefs.ts 一致。
  */
 
 import { useSyncExternalStore } from "react";
@@ -134,7 +132,7 @@ function setCache(next: AgentConfig) {
 export const getAgentConfig = (): AgentConfig => config;
 
 /**
- * 加载配置。已加载过就直接返回缓存 —— 反复开关聊天面板不该反复打 IPC。
+ * 加载配置。已加载过就走缓存 —— 反复开关聊天面板不该反复打 IPC。
  * @param force true 时忽略缓存强制回源（后端配置可能被其它窗口改过）
  */
 export async function loadAgentConfig(force = false): Promise<AgentConfig> {
@@ -181,10 +179,8 @@ export function useAgentConfig(): AgentConfig {
 // ——— 校验 / 格式化 ———
 
 /**
- * 配置是否足以发起一次提问。
- * 检查顺序与文案刻意对齐后端 `llm::validate`，免得前后端弹出两句不同的话。
- * 注意这里**不校验** apiKey 的格式：各家 key 形状差别太大，
- * 唯一可信的校验就是打一次模型 —— 那件事交给 `agent_test`。
+ * 配置是否足以发起一次提问。检查顺序与文案刻意对齐后端 `llm::validate`，免得前后端
+ * 弹出两句不同的话。不校验 apiKey 格式：各家形状差别太大，真校验交给 `agent_test`。
  */
 export function isAgentReady(cfg: AgentConfig): { ok: boolean; reason?: string } {
   if (!cfg.enabled) return { ok: false, reason: "Nexus AI Agent 未启用：请先在设置里打开总开关" };

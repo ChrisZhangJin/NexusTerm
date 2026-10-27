@@ -78,14 +78,9 @@ export const BUILTIN_THEMES: Record<string, Theme> = {
 };
 
 export const FONT_FAMILIES = [
-  // 跨平台等宽字体。各项都带足回退链，确保在 Windows / macOS / Linux 上
-  // 至少命中一款真实存在的字体 —— 否则切换「看不出变化」。
-  //
-  // 末尾统一追加 Liberation Mono / Noto Sans Mono / DejaVu Sans Mono：
-  // 这几款在主流 Linux 发行版上几乎总是预装的。没有它们时，字体链会在
-  // Windows/macOS 专属字体都缺失的 Linux 机器上落到泛型 monospace 关键字，
-  // 而 WebKitGTK 的测量字体和实际渲染字体可能解析成不同的具体字体，
-  // 导致终端里每个字符之间出现异常宽的间隙。
+  // 每项末尾都追加 Liberation Mono / Noto Sans Mono / DejaVu Sans Mono（Linux 上几乎必装）：
+  // 否则字体链会落到泛型 monospace，而 WebKitGTK 的测量字体与实际渲染字体可能解析成不同
+  // 的具体字体，终端里每个字符之间会出现异常宽的间隙。
   {
     label: "Cascadia Code",
     value:

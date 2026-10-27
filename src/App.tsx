@@ -62,7 +62,6 @@ import type {
 let tabSeq = 0;
 const nextId = () => `tab-${Date.now()}-${++tabSeq}`;
 
-/** 断线自动重连的等待间隔（ms），数组长度即最大尝试次数 */
 /** 断线自动重连：最多 10 次，间隔从 2 秒起每次翻倍（2s、4s、8s … 1024s，累计约 34 分钟） */
 const RECONNECT_MAX = 10;
 const RECONNECT_BASE = 2000;
@@ -87,10 +86,8 @@ export default function App() {
     "appearance" | "behavior" | "shortcuts" | "keys" | "agent" | null
   >(null);
   const settingsOpen = settingsWin !== null;
-  // 按 tabId 索引：哪些标签开着 SFTP 文件管理器、连的是哪个 session。
-  // 用 map 而不是单个值，是因为面板必须「只在自己所属的标签前台时展示」——
-  // 单个全局值做不到这件事：切标签页时它既不隐藏也不跟着换，表现就是不管
-  // 切到哪个标签，看到的都是最初那个 session 的面板。
+  // 按 tabId 索引（而不是单个全局值）：面板必须「只在自己所属的标签前台时展示」，
+  // 单槽做不到 —— 切标签时它既不隐藏也不跟着换。
   const [sftpTabs, setSftpTabs] = useState<Record<string, SessionRecord>>({});
   /**
    * AI 助手侧栏是否展开。
@@ -180,11 +177,9 @@ export default function App() {
 
   // —— 二次验证（OTP / 堡垒机挑战）——
   // 后端在认证中途挂起等答案，这里弹框收集。
-  //
-  // 必须用**队列**而不是单个 state：终端标签和 SFTP 面板是两条独立连接，
-  // 打到同一台要 OTP 的机器时会同时各弹一个问题。单槽的话后到的会把先到的
-  // 顶掉，被顶掉的那个连接只能干等到 180 秒超时后失败 —— 表现就是
-  // 「明明输了验证码却连不上」。
+  // 必须用**队列**：终端标签和 SFTP 面板是两条独立连接，打到同一台要 OTP 的
+  // 机器时会各弹一个问题；单槽的话后到的顶掉先到的，被顶掉那条只能干等 180 秒
+  // 超时 —— 表现就是「明明输了验证码却连不上」。
   const [authPrompts, setAuthPrompts] = useState<AuthPrompt[]>([]);
   /** 本次重连过程中出现过交互式认证（OTP）的标签：自动重试没有意义，交给用户手动点 */
   const interactiveAuth = useRef(new Set<string>());
@@ -308,9 +303,8 @@ export default function App() {
   /**
    * 后台标签收到新输出：点亮标签栏的提醒动效。
    *
-   * `TerminalView` 已经在「自己不是前台标签」时才调它，这里只再做一次幂等检查——
-   * 真正高频的是日志刷屏（tmux/docker 这类场景一秒钟能触发几十次 onWriteParsed），
-   * 已经点亮了就不用再 `setTabs` 一次，否则整个标签栏跟着空刷新。
+   * 这里的幂等检查是为了日志刷屏：tmux/docker 一秒能触发几十次 onWriteParsed，
+   * 已点亮还 `setTabs` 会让整个标签栏跟着空刷新。
    */
   const markTabActivity = useCallback((tabId: string) => {
     if (tabsRef.current.find((t) => t.id === tabId)?.hasActivity) return;
@@ -335,15 +329,12 @@ export default function App() {
   /**
    * 新会话建立时，把「是否旁路」的默认值下发到后端。
    *
-   * 后端对「没登记过的会话」本来就回落到全局 autoAttach，所以这条 IPC 严格说
-   * 是冗余的；仍然发一次，是为了让这个会话的开关状态**在还没有任何输出时就
-   * 是确定的** —— 面板打开即可看到它是开是关、也能在采集开始前就关掉它，
-   * 而不是等第一字节输出时被 feed() 顺手建出来、想关也已经采了一截。
+   * 后端对未登记会话本就回落到全局 autoAttach，这条 IPC 严格说是冗余的；发它
+   * 是为了让开关状态在**还没有任何输出时**就确定 —— 否则要等第一字节被 feed()
+   * 顺手建出来，想关时已经采了一截。
    *
-   * 两条硬约束：
-   * - 总开关关着时什么都不发。未启用 = 零开销，一条 IPC 也不该有。
-   * - 只在**建会话时**发一次。之后用户在面板里的每次开关都由面板直接写后端
-   *   （它是这条状态的唯一写入者），App 不另起一份镜像，避免两处状态打架。
+   * 两条硬约束：总开关关着时一条 IPC 都不发（未启用 = 零开销）；只在建会话时
+   * 发一次，之后面板是这条状态的唯一写入者，App 不另存镜像。
    */
   const seedAgentAttach = useCallback((tabId: string) => {
     void loadAgentConfig().then((cfg) => {
@@ -368,9 +359,9 @@ export default function App() {
       }
     }
     const auth: AuthMethod = await resolveAuth(s, passphrase);
-    // 用终端当前的真实尺寸申请 PTY。原来写死 120×32：TerminalView 挂载时的 resize
-    // 早于会话建立（后端还没这个 id，静默失败），之后尺寸不变也就不再推送，
-    // 远端就一直停在 120×32 —— 复制会话 / tmux 只占左上角一块的根因。
+    // 必须用终端的真实尺寸申请 PTY：TerminalView 挂载时的 resize 早于会话建立
+    // （后端没这个 id，静默失败），之后尺寸不变就不再推送，远端会一直停在初始值
+    // —— 复制会话 / tmux 只占左上角一块的根因。
     const term = getTerm(tabId);
     const outcome = await api.sshConnect(tabId, {
       host: s.host,
@@ -420,9 +411,8 @@ export default function App() {
 
   // ───────────────────────── 宏 ─────────────────────────
   //
-  // 宏替换掉了原来的「跳板机登录路径」专用功能：那是一套只会录「菜单里选序号」
-  // 的特例，换一台堡垒机、或者想顺手跑几条命令就不适用了。现在同一个引擎既能
-  // 重放登录路径，也能做任何「等一会儿、敲一行」的事，绑到会话上就是自动执行。
+  // 宏取代了原来只会录「菜单里选序号」的「跳板机登录路径」：同一个引擎既能重放
+  // 登录路径，也能做任何「等一会儿、敲一行」的事，绑到会话上即自动执行。
 
   const [macros, setMacros] = useState<MacroRecord[]>([]);
   const [macroOpen, setMacroOpen] = useState(false);
@@ -456,11 +446,8 @@ export default function App() {
   }, [refreshMacros]);
 
   /**
-   * 旧版「跳板机登录路径」→ 宏 的一次性迁移。
-   *
-   * 原来的实现只认「屏幕像菜单」这一种场景，换台堡垒机或想顺手跑几条命令就
-   * 不适用了；现在统一成宏，但用户已经录过的路径不能丢。转换后清空旧字段，
-   * 下次启动就不会重复生成。
+   * 旧版「跳板机登录路径」→ 宏 的一次性迁移：用户已经录过的路径不能丢。
+   * 转换后清空旧字段，下次启动就不会重复生成。
    */
   const migratedLogin = useRef(false);
   useEffect(() => {
@@ -524,9 +511,8 @@ export default function App() {
   /**
    * 在一个标签上跑宏。
    *
-   * 三重中止条件：连接断开、用户按键、用户点悬浮条。用户按键中止看着有点凶，
-   * 但宏正在往远端打字时人再插一脚，两边输入交错后基本没法收拾 —— 停下重来
-   * 永远比「看起来在跑、其实发错了」便宜。
+   * 三重中止条件：连接断开、用户按键、用户点悬浮条。按键即中止看着凶，但宏正
+   * 往远端打字时人插一脚，两边输入交错就没法收拾了。
    */
   const executeMacro = useCallback(
     async (tabId: string, macro: MacroRecord, opts: { auto?: boolean } = {}) => {
@@ -867,10 +853,9 @@ export default function App() {
       if (info.reason === "user") return; // 本地主动关闭，标签已移除
       patchTab(tabId, { status: "closed", closedAt: Date.now() });
 
-      // 「连上没几秒就掉线」+ 这条连接还开着旁路通道 → 高度怀疑是堡垒机
-      // 因为第二条 CHANNEL_OPEN 把整条连接掐了（有的实现连拒绝包都不发，
-      // 我们那边只能看到 lost，认不出是「被拒」）。这里做兜底学习：
-      // 自动切兼容模式，重连时才不会无限循环「连上→几秒→断开」。
+      // 「连上没几秒就掉线」+ 还开着旁路通道 → 多半是堡垒机因第二条 CHANNEL_OPEN
+      // 把整条连接掐了（有的实现连拒绝包都不发，我们只看得到 lost）。兜底学习：
+      // 自动切兼容模式，否则重连会无限循环「连上→几秒→断开」。
       const tab = tabsRef.current.find((t) => t.id === tabId);
       const at = connectedAt.current.get(tabId);
       if (
@@ -1000,12 +985,11 @@ export default function App() {
   /**
    * 把文本写进某个会话的 pty —— AI 面板「插入到终端」的唯一落地路径。
    *
-   * 调用链上必然已经过了两道人为确认：点建议卡片上的「插入到终端」→ 在确认框里
-   * 点「插入」。除这条链路外，本函数没有任何调用方，也不接受任何自动触发。
+   * 调用链上必然经过两道人为确认（建议卡片的「插入到终端」→ 确认框），没有任何
+   * 自动触发路径。
    *
-   * **刻意不追加 \n**：只把命令插进当前输入行，回车执行留给人在终端里自己按。
-   * 替用户按下这个回车，等于替他执行一条可能没读完的命令 —— 那不是便利，是事故。
-   * 后端会把这次写入当成 StreamKind::In 记进上下文，与人手敲进去的命令同等对待。
+   * **刻意不追加 \n**：只插进当前输入行，回车留给人自己按 —— 替用户按下这个
+   * 回车等于替他执行一条可能没读完的命令。
    */
   const sendToTerminal = useCallback(async (tabId: string, text: string) => {
     if (!text) return;
@@ -1025,10 +1009,8 @@ export default function App() {
   }, [activeTab]);
 
   /**
-   * 交给 Agent 的「可操作会话」清单。
-   *
-   * 只列**还活着**的标签：给模型一个已经断开的会话 id，它会在那边吃到
-   * 一句看不懂的「会话不存在」，而用户完全不知道该去修什么。
+   * 交给 Agent 的「可操作会话」清单。只列还活着的标签：给模型一个已断开的 id，
+   * 它只会回一句「会话不存在」，用户完全不知道该修什么。
    */
   const agentSessions: AgentTarget[] = useMemo(
     () =>

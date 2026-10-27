@@ -377,7 +377,7 @@ pub async fn generate(
             PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519)
                 .map_err(|e| e.to_string())?
         } else {
-            // PrivateKey::random 的 RSA 分支固定 2048 位，要自选长度只能直接构造
+            // PrivateKey::random 的 RSA 分支固定 4096 位，要自选长度只能直接构造
             let kp = ssh_key::private::RsaKeypair::random(&mut rng, bits as usize)
                 .map_err(|e| e.to_string())?;
             PrivateKey::new(ssh_key::private::KeypairData::from(kp), &comment_for_task)

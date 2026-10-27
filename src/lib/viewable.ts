@@ -92,10 +92,9 @@ function extOf(name: string): string | null {
 }
 
 /**
- * @param opts.requireExt 为 true 时，没有扩展名一律当不可浏览处理（不走纯文本兜底）。
- *   给「鼠标落点自动取词」这类低置信度来源用——提示符这种整行没有空格的文本
- *   会被当成一整个词，`README` 式的兜底会让它也被误判成「可浏览的文本文件」，
- *   拼出一个本不存在的路径发去 `cat`。真正选中文字（用户的明确意图）仍然走宽松判断。
+ * @param opts.requireExt 为 true 时，没有扩展名一律当不可浏览（不走纯文本兜底）。
+ *   给「鼠标落点自动取词」这类低置信度来源用：提示符整行没有空格会被当成一个词，
+ *   `README` 式兜底会让它被误判成文本文件，拼出不存在的路径发去 `cat`。
  */
 export function viewableKind(path: string, opts?: { requireExt?: boolean }): ViewableKind | null {
   const name = baseName(path);
@@ -103,11 +102,9 @@ export function viewableKind(path: string, opts?: { requireExt?: boolean }): Vie
   const ext = extOf(name);
   if (!ext) {
     if (opts?.requireExt) return null;
-    // `extOf` 对两种情况都返回 null：真的没有扩展名（README、日志），
-    // 和 ".hidden" 这种只有开头一个点、点后再没内容的隐藏文件——
-    // 这两者不能一视同仁。只有前者才按纯文本兜底；后者维持不可浏览，
-    // 和后端 `kind_of` 的 `rsplit_once('.')` 判断保持一致，否则前端会让
-    // 菜单项显示可点，点下去却被后端拒绝。
+    // `extOf` 对「真没有扩展名」（README）和 ".hidden" 都返回 null，但只有前者按纯文本
+    // 兜底：后者维持不可浏览，与后端 `kind_of` 的 `rsplit_once('.')` 一致，否则菜单项
+    // 看着可点、点下去却被后端拒绝。
     return name.includes(".") ? null : "code";
   }
   if (MD.includes(ext)) return "markdown";

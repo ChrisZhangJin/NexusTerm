@@ -144,11 +144,8 @@ function withError(c: Conversation, msg: string): Conversation {
 }
 
 /**
- * 追加一个过程步骤。
- *
- * `result` 会回填到它对应的那条 `exec` 上合成**一张**卡片 ——
- * 「下令 + 结果」本来就是一件事，拆成两张卡会把对话拉长一倍，
- * 人也很难看出哪个结果属于哪条命令。
+ * 追加一个过程步骤。`result` 会回填到它对应的那条 `exec` 上合成**一张**卡片：
+ * 拆成两张会把对话拉长一倍，也看不出哪个结果属于哪条命令。
  */
 function withStep(c: Conversation, step: AgentStep): Conversation {
   const msgs = c.messages.slice();
@@ -208,11 +205,9 @@ function withConclusion(c: Conversation, text: string): Conversation {
 }
 
 /**
- * 一轮结束却**没等到**任何结论时兜的那一步（撞到步数上限就是这种情形）。
- *
- * 判定依据是「调用方看到 busy 仍为 true」：有结论来的话后端会发 kind=answer，
- * 那条事件走的是 `withConclusion`，早就把 busy 置回 false 了 —— 还站着 true
- * 就说明这一轮没有收尾，必须由这里补上，否则界面永远在转圈。
+ * 一轮结束却**没等到**结论时兜的那一步（多半撞到步数上限）。判据是「busy 仍为
+ * true」：有结论的话 kind=answer 走 `withConclusion` 早把它置回 false 了。
+ * 不补这一步界面会永远转圈。
  */
 function finishWithoutAnswer(c: Conversation): Conversation {
   return withConclusion(c, NO_CONCLUSION);
@@ -271,12 +266,9 @@ export function AgentPanel({
   /**
    * 输入框里的 `@` 联想。
    *
-   * 作用范围那一排 chips 是「勾选机器」，而 `@` 是另一条更快的路：
-   * 正写着「把 @host2 的 nginx 重启一下」的时候顺手就把机器定下来了，
-   * 不用先抬头去点 chip 再回来打字。
-   *
-   * 选完之后 `@xxx` 这一段会被吃掉 —— 它只是给人选机器用的记号，
-   * 真正的作用范围在上面的 chips 里，发给模型的也是 chips 的那份。
+   * `@` 是比 chips 更快的一条选机器的路：写「把 @host2 的 nginx 重启一下」时
+   * 顺手就定下来了。选完 `@xxx` 会被吃掉 —— 它只是记号，真正的作用范围（也是
+   * 发给模型的那份）在 chips 里。
    */
   const [mention, setMention] = useState<{
     /** `@` 在输入里的下标 */
@@ -297,9 +289,8 @@ export function AgentPanel({
   // ——— 会话切换 / 收起时的收尾 ———
 
   /**
-   * 切走会话或收起面板都会 unlisten，此后后端的流就算跑完我们也收不到了。
-   * 这里把那条消息从 streaming 摘下来并标记 interrupted，
-   * 否则切回来会看到一个永远在转圈的「正在回答」。
+   * 切走会话或收起面板都会 unlisten，之后流跑完我们也收不到。把消息从 streaming
+   * 摘下并标记 interrupted，否则切回来是一个永远转圈的「正在回答」。
    */
   const markInterrupted = useCallback(() => {
     setConv((c) => {
@@ -495,10 +486,9 @@ export function AgentPanel({
 
   /** Agentic：这一条会真的在终端里跑命令。
    *
-   * `await` 到的是**整轮跑完**（不是「已启动」）：后端把「思考 / 执行 / 读输出」
-   * 串成一条时间线跑到底才返回。模型那边的失败后端已经发过 error 事件了，
-   * 这里的 catch 只兜 IPC / 网络级的意外；finally 负责无论如何把 busy 摘掉 ——
-   * 撞到步数上限时不会有结论 step，少了它界面就会永远转圈。
+   * `await` 到的是**整轮跑完**而不是「已启动」。模型侧的失败后端已发过 error
+   * 事件，这里的 catch 只兜 IPC 级意外；finally 无论如何摘掉 busy —— 撞步数
+   * 上限时不会有结论 step，少了它界面永远转圈。
    */
   const runAgentic = async (q: string) => {
     const sid = sessionId;
@@ -747,9 +737,8 @@ export function AgentPanel({
                 const info = keyInfoFrom(e);
                 const guard = imeRef.current;
 
-                // 输入法正在处理这一个键。注意这里连上下键一起挡：拼音组合中
-                // 上下键是在选候选词，联想列表若同时移动，一次选词就会顺手
-                // 改掉「要发给谁」。回车更不能当成发送。
+                // 连上下键一起挡：拼音组合中上下键是在选候选词，联想列表若跟着
+                // 移动，一次选词就会顺手改掉「要发给谁」。
                 if (isImeKey(info, guard)) return;
 
                 const verdict = enterVerdict(info, guard);
@@ -887,9 +876,7 @@ function SuggestionCard({
 
 /**
  * 把工具的原始参数 JSON 排成一行人话：`{"op":"list"}` → `op=list`。
- *
- * 刻意做成单行而不是漂亮的缩进块：工具参数通常只有两三个字段，
- * 缩进水一倍的高度，把对话区挤没了，换来的可读性却很有限。
+ * 刻意单行而非缩进块：参数通常只有两三个字段，缩进白白占掉对话区高度。
  */
 function prettyToolArgs(raw: string): string {
   const trimmed = raw.trim();
@@ -910,21 +897,16 @@ function prettyToolArgs(raw: string): string {
 }
 
 /**
- * 一次执行的卡片：命令 + 结果。
- *
- * 「在哪台机器上跑的」必须写得清清楚楚 —— Agent 是全局的、可以同时在好几个会话上下令，
- * 只显示命令的话，用户根本分不清这条输出来自哪台机器，那才是最危险的一种糊涂。
+ * 一次执行的卡片：命令 + 结果。「在哪台机器上跑的」必须写清楚 —— Agent 是全局的，
+ * 可以同时在好几个会话上下令，只显示命令的话分不清输出来自哪台机器。
  */
 function StepCard({ step }: { step: AgentStep }) {
   if (step.kind === "note") {
     return <div className="ap-note">{step.text ?? ""}</div>;
   }
-  // 工具调用卡片：把「模型调用了什么、传了什么参数」单独摆出来。
-  //
-  // 没有它的时候，模型想开新标签页会写出 `new-tab` 这种终端里根本不存在的命令，
-  // 敲进去只换来一句 command not found —— 界面上看起来就像它答应了却没动手。
-  // 走了原生工具调用之后，这一步变成结构化的（哪个工具 + 什么参数），
-  // 这里就把它原样展示，让调用过程看得见，也让"它到底想做什么"有据可查。
+  // 工具调用卡片：把「调了哪个工具、传了什么参数」原样摆出来，让调用过程看得见。
+  // 没有它时，模型想开新标签页会写出 `new-tab` 这种不存在的命令，敲进去只换来
+  // command not found —— 看起来就像它答应了却没动手。
   if (step.kind === "tool") {
     return (
       <div className="ap-step tool">
@@ -943,9 +925,8 @@ function StepCard({ step }: { step: AgentStep }) {
       </div>
     );
   }
-  // `open` / `export` 不是「跑了一条命令」，没有 command / output。
-  // 之前它们掉进下面那张执行卡里，就成了一个永远「执行中」的空框 ——
-  // 用户看到的是「卡住了」，而实际上新标签页可能已经开出来了。
+  // `open` / `export` 没有 command / output：掉进下面那张执行卡会变成一个永远
+  // 「执行中」的空框，看着像卡住了，其实标签页早就开出来了。
   if (step.kind === "open" || step.kind === "export" || step.kind === "tab") {
     const isOpen = step.kind === "open";
     const isTab = step.kind === "tab";

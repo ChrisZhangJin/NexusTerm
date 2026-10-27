@@ -84,8 +84,7 @@ export function restoreCommand(
   if (ctx.tmux && mode === "reconnect") {
     parts.push(`tmux attach -t ${shq(ctx.tmux)}`);
   } else if (ctx.tmux) {
-    // 复制会话：建一个「分组会话」挂到原会话上 —— 共享全部窗口，但当前窗口各自独立切换，
-    // 不会像 attach 同一会话那样两边永远同屏；detach/关闭标签后自动销毁，不留垃圾会话。
+    // 分组会话：共享窗口但各自独立切换（不像 attach 那样两边同屏），detach 后自动销毁
     parts.push(
       `tmux new-session -t ${shq(ctx.tmux)} \\; set-option destroy-unattached on`
     );
@@ -95,11 +94,9 @@ export function restoreCommand(
 }
 
 /**
- * 把还原命令包装成「不留痕」的终端输入：
- * - 前置空格：HISTCONTROL=ignorespace 下不进 history
- * - 先执行的 printf 把光标上移 N 行并清到屏尾，抹掉「提示符 + 回显的命令」这几行，
- *   新提示符直接出现在原位 —— 用户看不到注入的命令，说明改由界面卡片展示
- * N = 提示符宽度 + 命令宽度按列数折行后的行数（命令里的 N 本身也占宽度，迭代到稳定）
+ * 把还原命令包装成「不留痕」的终端输入：前置空格让 HISTCONTROL=ignorespace 不记 history；
+ * printf 上移 N 行清到屏尾，抹掉「提示符 + 回显的命令」，改由界面卡片说明。
+ * N = 提示符与命令按列数折行的行数（命令里的 N 本身也占宽度，故迭代到稳定）。
  */
 export function stealthInput(body: string, promptCells: number, cols: number,
   widthOf: (s: string) => number): string {

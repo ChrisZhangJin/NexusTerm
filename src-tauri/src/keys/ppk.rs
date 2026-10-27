@@ -457,15 +457,13 @@ fn build_private_key(h: &Headers, plain: &[u8]) -> Result<PrivateKey, String> {
             })
         }
         KeyData::Ed25519(k) => {
-            // PuTTY 用 `put_mp_le_fixedlen` 写这个字段：先把 seed 当作小端
-            // 整数，再按小端写回 32 字节。两个方向互逆，所以**落盘的字节序
-            // 和 OpenSSH 里的 seed 完全一致**，不能再反转一次。
+            // PuTTY 的 `put_mp_le_fixedlen` 把 seed 当小端整数再写回小端 32 字节，
+            // 两个方向互逆，所以落盘字节序和 OpenSSH 的 seed 完全一致，不能再反转。
             let seed_bytes = r.le_fixed(32)?;
             let mut seed = [0u8; 32];
             seed.copy_from_slice(&seed_bytes);
             let kp = Ed25519Keypair::from_seed(&seed);
-            // 万一哪天把字节序搞错了，公钥必然对不上，这里拦住比事后
-            // 连不上服务器好排查
+            // 字节序一旦搞错公钥必然对不上，这里拦住比事后连不上服务器好排查
             if &kp.public != k {
                 return Err("PPK 里的 Ed25519 私钥与公钥不匹配".into());
             }
@@ -510,9 +508,8 @@ fn to_mpint(bytes: &[u8]) -> Result<Mpint, String> {
     if bytes.is_empty() {
         return Err("PPK 里的 RSA 参数为空".into());
     }
-    // 必须用 `from_positive_bytes`：`from_bytes` 会把最高位为 1 的输入
-    // 当作**负数**解读，而大整数的最高位恰恰经常是 1（RSA 的 d/p/q 几乎必然）。
-    // 用错会让私钥参数变成负值，签名一路失败。
+    // 必须用 `from_positive_bytes`：`from_bytes` 会把最高位为 1 的输入当负数解读，
+    // 而 RSA 的 d/p/q 最高位几乎必然是 1，用错会让参数变负值，签名一路失败。
     Mpint::from_positive_bytes(bytes).map_err(|e| format!("PPK 里的整数不合法：{e}"))
 }
 
@@ -758,8 +755,7 @@ Private-MAC: 5b1f6f4cc43eb0060d2c3e181bc0129343adba2b
 
     #[test]
     fn ed25519_seed_round_trips_to_same_public() {
-        // 小端转大端这个点最容易错，单独验一次：解析出来的私钥重新导出 OpenSSH
-        // 再解析，公钥必须一致（说明 seed 是有效的，而不是被反转坏了）
+        // 小端转大端最容易错：重新导出 OpenSSH 再解析，公钥必须一致，否则说明 seed 被反转坏了
         let key = parse(V3_CLEAR, None).unwrap();
         let openssh = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
         let again = PrivateKey::from_openssh(openssh.as_bytes()).unwrap();

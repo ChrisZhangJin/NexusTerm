@@ -1,11 +1,8 @@
 import type { Theme } from "../types";
 
 /**
- * 把终端配色翻译成外壳（chrome）配色。
- *
- * 主题只定义终端的 16 色，但标题栏、工具栏、侧栏、状态栏也在用同一套
- * CSS 变量 —— 若只换终端不换外壳，会出现「只有 shell 框变色」的割裂感。
- * 这里从 terminal 配色派生出外壳色，新增任何主题都不必再手写 CSS。
+ * 把终端配色翻译成外壳（chrome）配色。主题只定义终端的 16 色，而标题栏/工具栏/侧栏/
+ * 状态栏共用同一套 CSS 变量 —— 从终端色派生，新增主题就不必再手写 CSS。
  */
 
 function hexToRgb(hex: string): [number, number, number] {

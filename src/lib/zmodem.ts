@@ -7,10 +7,10 @@
  * - 远端字节先喂 `Sentry.consume()`：非 ZMODEM 数据原样进终端，
  *   嗅探到握手就触发 `on_detect`，会话接管整条字节流。
  * - `receive` → 远端 `sz`（下载）：accept 收完弹保存框落盘。
- * - `send` → 远端 `rz`（上传）：有拖拽进来的待传文件就直接用，否则弹文件框；
- *   之前「上传卡住」的根因：给 `Browser.send_files` 传的是 {name: File} 对象，而它按 `.length`
- *   遍历数组 —— 结果一个文件都没发、也没发 ZFIN，远端 rz 就一直挂着。现在自己实现发送循环：
- *   send_offer → 分片读文件 xfer.send → xfer.end → 全部完成后 close()（ZFIN/OO）。
+ * - `send` → 远端 `rz`（上传）：有拖拽进来的待传文件就直接用，否则弹文件框。
+ *   发送循环自己实现（send_offer → 分片 xfer.send → xfer.end → close() 发 ZFIN/OO），
+ *   不用 `Browser.send_files`：它按 `.length` 遍历，曾导致一个文件都没发、也没发 ZFIN，
+ *   远端 rz 一直挂着。
  *
  * 出站字节走串行写队列：同一时刻只有一个 IPC 写在途，期间到达的字节合并成一批，
  * 既保证顺序，又避免 8KB 一个 invoke 打满 IPC。
@@ -92,7 +92,6 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
     hooks
       .send(out)
       .catch((e) => {
-        // 连接断了：清掉积压并记下错误，后续 drain() 立刻失败而不是等超时
         sendError = e;
         chunks = [];
         queued = 0;
@@ -118,7 +117,7 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
     drainWaiters = [];
     w.forEach((f) => f());
   };
-  /** 给等待加上限：远端不响应时宁可报错，也不要永远挂在 99% */
+  /** 给等待加上限（见 `STALL_MS`） */
   const deadline = <T,>(p: Promise<T>, ms: number, what: string): Promise<T> =>
     new Promise<T>((resolve, reject) => {
       const t = window.setTimeout(
@@ -160,13 +159,12 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
   /**
    * sz（下载）：先问保存路径，再 accept，边收边落盘。
    *
-   * 关键是 `accept({ on_input })` —— 用回调模式后 zmodem.js 不再把整个文件
-   * 堆在 `_payloads` 里，收到的每块直接进「攒够 1MB 就写一次」的队列。
-   * 老写法是「收完 → get_payloads() 拼成一个大 Uint8Array → Array.from 传给后端」，
-   * 600MB 的文件会同时存在三份（spool + 拼接 + 六亿个 JSON 数字），必然崩。
+   * 必须用 `accept({ on_input })` 回调模式：zmodem.js 才不会把整个文件堆在
+   * `_payloads` 里。老写法「收完 → get_payloads() 拼大数组 → Array.from 传后端」
+   * 让 600MB 文件同时存在三份（spool + 拼接 + 六亿个 JSON 数字），必然崩。
    *
-   * 顺序也讲究：远端发完 ZFILE 后一直在等我们的 ZRPOS，此时还没开始传数据，
-   * 所以在 accept 之前弹保存框不会丢任何字节，也不会先灌进内存。
+   * 保存框必须在 accept **之前**弹：远端发完 ZFILE 还在等我们的 ZRPOS，
+   * 此时一个数据字节都还没来，不会丢也不会先灌进内存。
    */
   const handleOffer = (zsession: ZSession, xfer: ZTransfer) => {
     const { name, size } = xfer.get_details();
@@ -295,12 +293,9 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
           hooks.termWrite(`\x1b[90m  跳过 ${f.name}（远端拒收）\x1b[0m\r\n`);
           continue;
         }
-        // 分片读文件、逐片发送；每片之后等写队列回落再读下一片 —— 内存占用恒定，
-        // 不会像 Browser.send_files 那样把整个文件一次性压进队列。
-        //
-        // 这里的 drain() 是真的背压：后端写命令 await 一个有界队列，队列满时 IPC
-        // 不返回，于是「读盘 → 编码 → 写」被网速卡住。没有它，600MB 文件会一秒内
-        // 全部堆进后端内存，进度条直接冲到 99% 再「卡死」。
+        // 每片之后 drain() 是真的背压：后端写命令 await 一个有界队列，队列满时
+        // IPC 不返回，于是「读盘 → 编码 → 写」被网速卡住，内存占用恒定。没有它，
+        // 600MB 文件一秒内全部堆进后端内存，进度条冲到 99% 再「卡死」。
         const t0 = performance.now();
         let off = xfer.get_offset() || 0;
         let last = 0;

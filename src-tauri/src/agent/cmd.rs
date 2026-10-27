@@ -77,7 +77,6 @@ pub fn agent_context(
     max_bytes: Option<u32>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    // 未指定 / 传 0 时回落到配置里的默认窗口
     let max = max_bytes
         .filter(|v| *v > 0)
         .unwrap_or_else(|| load_config(&state.store).active_account().max_context_bytes)
@@ -160,10 +159,8 @@ pub async fn agent_test(config: AgentConfig) -> Result<String, String> {
 /// - `nx://agent/approve/{session_id}` → 请用户批准一条危险命令（审批模式下才会出现）
 /// - `nx://agent/error/{session_id}`   → 终态错误（其后不再发任何事件）
 ///
-/// 与 `agent_ask`（纯问答、流式）的分工：**这一条会真的在终端里跑命令**。
-/// 它不像 `agent_ask` 那样立即返回是有原因的：整个循环必须串着跑完，
-/// 「模型思考 → 写入终端 → 读回输出」构成一条不可打乱的时间线，
-/// 提前返回反而要另起一堆并发状态去同步它。
+/// 不像 `agent_ask` 那样立即返回：「模型思考 → 写入终端 → 读回输出」是一条
+/// 不可打乱的时间线，提前返回反而要另起一堆并发状态去同步它。
 ///
 /// 同一会话同时只允许一轮。已有轮在跑时返回 `Err`，前端应提示用户先取消。
 #[tauri::command]
@@ -231,8 +228,7 @@ pub fn agent_tab_ack(
 
 /// 在指定会话里手动跑一条命令（UI 上的「帮我执行」按钮、结果卡重试）。
 ///
-/// 与 `agent_run` 共用同一条哨兵执行链路，但不调用模型：
-/// 用户点哪条就跑哪条，跑完把结果直接返回。
+/// 与 `agent_run` 共用同一条执行链路，但不调用模型：用户点哪条就跑哪条。
 #[tauri::command]
 pub async fn agent_exec(
     session_id: String,
@@ -270,13 +266,10 @@ pub async fn agent_exec(
 
 /// 导出一个会话迄今为止的全部输出。
 ///
-/// `deep=false`：只给旁路缓冲里已经记下的内容（`AgentManager::snapshot`，
-/// 逐字节复刻，不受 `agent_context` 那个「喂给模型用」的字节上限约束）。
-/// `deep=true`：额外探一遍该会话里的 tmux pane / docker 容器日志并追加在后面
-/// —— 这两步都是只读、尽力而为，探测失败不算错误，只是拿不到那一部分。
+/// `deep=false`：只给旁路缓冲里的内容（不受 `agent_context` 的字节上限约束）。
+/// `deep=true`：额外追加 tmux pane / docker 日志，尽力而为，探测失败不算错误。
 ///
-/// 会话不存在、或从未开启过旁路且深度探测也一无所获时返回空字符串，
-/// 而不是报错：「没有可导出的内容」本身就是一个合法答案。
+/// 一无所获时返回空字符串而不报错：「没有可导出的内容」是合法答案。
 #[tauri::command]
 pub async fn agent_export_session(
     session_id: String,
@@ -323,12 +316,10 @@ pub async fn agent_open_session(
 
 /// 把 Nexus AI Agent 面板浮出为一个独立系统窗口。
 ///
-/// 复用同一个 label：窗口已存在时只更新它要跟踪的会话（发事件）并聚焦，
-/// 不会叠出第二个窗。窗口加载的仍是本应用 index.html，
-/// 由注入脚本 `window.__NX_AGENT__ = sessionId` 让前端切到「只渲染 Agent 面板」的界面。
+/// 复用同一个 label，不叠窗。加载的仍是本应用 index.html，靠注入脚本
+/// `window.__NX_AGENT__ = sessionId` 让前端切到「只渲染 Agent 面板」的界面。
 #[tauri::command]
 pub fn agent_open_window(session_id: String, app: AppHandle) -> Result<(), String> {
-    // 已有窗口：切会话 + 聚焦，不新建
     if let Some(win) = app.get_webview_window(AGENT_WINDOW_LABEL) {
         use tauri::Emitter;
         let _ = win.emit("nx://agent/active-session", session_id);

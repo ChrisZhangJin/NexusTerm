@@ -23,7 +23,7 @@ impl KnownHosts {
         format!("{}:{}", host, port)
     }
 
-    /// 返回 Some(true) 表示指纹匹配或首次信任；Some(false) 表示指纹冲突。
+    /// true = 指纹匹配或首次信任；false = 指纹与记录冲突。
     pub fn verify(&self, host: &str, port: u16, fingerprint: &str) -> bool {
         let key = Self::slot(host, port);
         let mut map = self.inner.lock().expect("known_hosts poisoned");
@@ -77,15 +77,12 @@ impl client::Handler for ClientHandler {
         Ok(ok)
     }
 
-    /// 服务端 keepalive（全局或通道请求）→ 通知前端画一次脉搏。
-    ///
-    /// 这是「链路还活着」的正向证据：安静期里服务端主动探活，说明会话、
-    /// NAT 映射、堡垒机授权都还在。**不改协议行为**，回调失败也不影响连接。
+    /// 服务端 keepalive → 通知前端画一次脉搏（「链路还活着」的正向证据）。
+    /// 不改协议行为，回调失败也不影响连接。
     async fn server_keepalive(&mut self) -> Result<(), Self::Error> {
         match &self.on_keepalive {
             Some(cb) => {
-                // 临时 INFO：用来确认「服务端心跳 → 前端」这条链有没有打通，
-                // 稳定后降回 debug（每 30 秒一条，不应长期占 INFO）。
+                // TODO 临时 INFO：确认「服务端心跳 → 前端」这条链已打通后降回 debug
                 tracing::info!(host = %self.host, port = self.port, "收到服务端 keepalive");
                 cb();
             }
@@ -96,12 +93,11 @@ impl client::Handler for ClientHandler {
         Ok(())
     }
 
-    /// 连接为什么会断 —— 这里是**唯一**能拿到服务端原始理由的钩子。
+    /// 唯一能拿到服务端 `SSH_MSG_DISCONNECT` 原始理由的钩子。
     ///
-    /// russh 的默认实现只 `debug!("disconnected: {:?}")` 然后返回 `Ok(())`：
-    /// `SSH_MSG_DISCONNECT` 里服务端写的原因（reason code + 人话）就这么被吞了，
-    /// 上层只能看到「通道流结束」，退出码 0、原因 unknown，排查时完全没有抓手。
-    /// 现场那台二次验证服务器「连上 10 秒就断」就是被这条吞掉的。
+    /// russh 默认实现只 `debug!` 一行就吞掉，上层只能看到「通道流结束」、
+    /// 退出码 0、原因 unknown —— 现场那台二次验证服务器「连上 10 秒就断」
+    /// 就是被这条吞掉的，所以必须自己实现。
     async fn disconnected(
         &mut self,
         reason: client::DisconnectReason<Self::Error>,
@@ -115,7 +111,7 @@ impl client::Handler for ClientHandler {
                     message = %info.message,
                     "服务端主动断开连接"
                 );
-                // 保持库的默认语义：服务端主动断开不算错误，只是连接结束
+                // 服务端主动断开不算错误，保持库的默认语义
                 Ok(())
             }
             client::DisconnectReason::Error(e) => {
@@ -139,20 +135,11 @@ pub use session::{SessionError, SessionManager};
 
 // ───────────────────────── 旧服务器兼容 ─────────────────────────
 //
-// 现场问题：CentOS 6.9 自带 OpenSSH 5.3，KEX 只提供
-//   diffie-hellman-group-exchange-sha1 / group14-sha1 / group1-sha1
-// 而 russh 0.49 的默认列表（SAFE_KEX_ORDER）只有 curve25519 与
-// group16-sha512 / group14-sha256，两边**零交集**，于是握手直接返回
-// `NoCommonAlgo { kind: Kex }`，界面上就是「No common algorithm」。
-//
-// russh 内部其实完整实现了 group14-sha1 与 group1-sha1，只是出于安全
-// 考虑没放进默认列表。这里把它们**追加到偏好列表末尾**启用：
-//   · 现代服务器（OpenSSH 7+）依旧按顺序先命中 curve25519，不会降级；
-//   · 只有连老机器时才会真正落到 SHA-1 的 DH 组上。
-//
-// 默认策略是 Auto：先按现代算法握一次手，只有 KEX 报“无公共算法”时才
-// 用旧算法重试一次。这样用户不需要先去翻设置就能连上，同时旧算法不会
-// 被无差别地提供给所有主机。
+// 现场问题：CentOS 6.9 的 OpenSSH 5.3 只提供 SHA-1 系 KEX，与 russh 默认列表
+// 零交集，握手直接 `NoCommonAlgo { kind: Kex }`。russh 其实实现了 group14-sha1 /
+// group1-sha1，只是出于安全没放进默认列表，这里**追加到末尾**启用：现代服务器
+// 仍先命中 curve25519，不会降级。默认 Auto（仅在 KEX 无公共算法时降级重试），
+// 避免把旧算法无差别提供给所有主机。
 
 /// 旧服务器兼容策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,16 +296,10 @@ async fn connect_once(
 
 /// 终端会话的探活间隔。
 ///
-/// **默认不发**（返回 `None`），与 OpenSSH 客户端一致（它的 `ServerAliveInterval`
-/// 默认就是 0）。之前这里写死 10 秒，对标准 sshd 无害，但会平白增加与
-/// 「对非标准全局请求敏感」的实现产生分歧的机会 —— 探活应当是可选项，不是默认行为。
-///
-/// 需要探活（穿 NAT、防中间设备清表、防服务端空闲回收）时用环境变量打开：
-///
-/// - `NEXUS_KEEPALIVE_SECS=<秒>`：开启并指定间隔（建议 ≥60）
-/// - `NEXUS_NO_KEEPALIVE=1`：显式关闭（现在已是默认，保留是为了兼容旧脚本）
-///
-/// 都在启动时读取，改完要重启应用。
+/// **默认不发**（`None`），与 OpenSSH 的 `ServerAliveInterval=0` 一致。曾写死 10 秒，
+/// 但探活应是可选项，不该平白增加与「对非标准全局请求敏感」的实现起冲突的机会。
+/// 需要时用环境变量打开（启动时读取，改完要重启）：
+/// `NEXUS_KEEPALIVE_SECS=<秒>` 开启（建议 ≥60）；`NEXUS_NO_KEEPALIVE=1` 显式关闭（兼容旧脚本）。
 ///
 /// 注意：`wiz-jump` 那台「连上 30.2 秒必断」**不是**探活造成的 —— 真凶是
 /// 通道请求应答里的通道号写错（见 `vendor/russh/PATCHES.md` 补丁 6）。
@@ -383,14 +364,13 @@ fn handler_for(
 
 /// 建立 SSH 连接并完成认证。
 ///
-/// 认证分两轮，且**第二轮换一条新连接**：
+/// 认证最多三步，后两步只在主认证没通过时才走，正常连接不会多付握手：
 ///
-/// 1. 用用户配置的方式（密码 / 公钥 / 无凭据）认证。绝大多数服务器一轮就结束。
-/// 2. 没通过时，如果服务端支持 keyboard-interactive，重连一次并**把 KBI 作为
-///    第一个认证请求**——这是 russh 的硬性要求，同一条连接上先用密码再转 KBI
-///    会永久挂起（详见 [`session::KBI_MUST_BE_FIRST`]）。
-///
-/// 第二轮只在主认证失败时发生，正常连接不会多付一次握手。
+/// 1. 用户配置的方式（密码 / 公钥 / 无凭据）。绝大多数服务器到此为止。
+/// 2. **同一条连接**上接着走 keyboard-interactive —— 「密码 + 动态口令」类服务器
+///    在这一步才给出 partial-success 后的问题，重连会丢掉第一因子状态。
+/// 3. 第 2 步连问题都没问到，则换一条新连接、**把 KBI 作为首个认证请求**重试
+///    （纯 KBI 服务器的形态，详见 [`session::KBI_MUST_BE_FIRST`]）。
 pub async fn open_authenticated(
     host: &str,
     port: u16,
@@ -433,19 +413,12 @@ const ABORT_WAIT: Duration = Duration::from_millis(800);
 
 /// 把一条「还没能用起来」的连接主动收掉。
 ///
-/// 只 `drop(handle)` 在协议层是「不告而别」：我们不通知服务端，它只能在
-/// TCP 层发现对端消失，而这中间它那边的 shell 进程、会话记录、以及
-/// **「同账号在线会话数」配额**都还记着这个人。堡垒机普遍限制并发会话数，
-/// 而二次验证（OTP）偏偏又是最容易被放弃的一步 —— 输慢了、超时了、
-/// 直接关标签页了，都会留下一条这样的连接。攒上几条就是「明明能连，
-/// 突然一个都连不上」，要等它在服务端自然过期才恢复。
-///
-/// 所以这里发一条 `SSH_MSG_DISCONNECT`（`ByApplication` = 客户端主动退出，
-/// 不会在服务端留攻击性告警），再等 run 循环真正退出。
-/// `Handle::is_closed()` 在 run 收尾时置位，是唯一能观察到的关闭信号。
-///
-/// 等待有上限：走到这里本来就是错误路径，网络也不一定健康，
-/// 不能让收尾把错误提示再拖一秒。
+/// 只 `drop(handle)` 是「不告而别」，服务端要等 TCP 超时才回收，期间仍占着
+/// **「同账号在线会话数」配额**。堡垒机普遍限制并发数，而 OTP 又最容易被放弃
+/// （输慢、超时、关标签页），攒几条就变成「明明能连，突然一个都连不上」。
+/// 所以显式发 `SSH_MSG_DISCONNECT`（`ByApplication`，不会触发服务端告警），
+/// 再等 `is_closed()`（run 循环收尾时置位，唯一可观察的关闭信号）。
+/// 等待有上限：这是错误路径，不能让收尾把错误提示再拖一秒。
 pub(super) async fn abort_session(session: &client::Handle<ClientHandler>, why: &str) {
     if session.is_closed() {
         return;
@@ -501,9 +474,8 @@ where
     F: Fn(prompt::AuthPrompt) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<String>, prompt::AskAbort>>,
 {
-    // 私钥口令必须在握手**之前**补齐：加密私钥读不出来，握手再顺利也认证不了。
-    // 这里顺便把「文件不存在 / 格式不对」提前成一句明确提示，
-    // 而不是先花几秒建连、再在认证阶段报一个含混的错误。
+    // 私钥口令必须在握手**之前**补齐：顺便把「文件不存在 / 格式不对」提前成
+    // 一句明确提示，而不是先花几秒建连、再在认证阶段报一个含混的错误。
     let auth = resolve_passphrase(host, session_id, auth, &ask).await?;
 
     let hs = handshake(
@@ -532,12 +504,9 @@ where
     }
 
     // ── 第二因素：先在**同一条连接**上接着走 keyboard-interactive ──
-    //
-    // 这是「密码 + 动态口令」类服务器的唯一正确走法：服务端用 USERAUTH_FAILURE
-    // 的 partial-success 位告诉客户端「密码对了，还有一步」，此时连接上仍保有
-    // 第一因子的状态。断开重连会把这份状态丢掉，服务端于是又要求先输密码。
-    //
-    // （russh 0.49 原本在这里会静默丢包并永久挂起，已由 `vendor/russh` 修掉。）
+    // 「密码 + 动态口令」服务器的唯一正确走法：partial-success 时连接上仍保有
+    // 第一因子状态，断开重连会丢掉它、服务端又要求重输密码。
+    // （russh 0.49 原本在这里静默丢包并永久挂起，已由 `vendor/russh` 修掉。）
     match session::authenticate_kbi(&mut session, username, &auth, session_id, host, &ask).await {
         Ok(session::KbiOutcome::Done) => {
             return Ok(Opened { session, legacy });

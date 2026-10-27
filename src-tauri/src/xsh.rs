@@ -154,16 +154,13 @@ fn try_decrypt_password(b64_password: &str) -> Option<String> {
 
     let (ciphertext, checksum) = raw.split_at(raw.len() - 32);
 
-    // 获取 Windows SID 和用户名
     let key_bytes = derive_xshell_key()?;
 
-    // SHA256 作为 RC4 密钥
     use sha2::{Digest, Sha256};
     let rc4_key = Sha256::digest(&key_bytes);
-
     let plaintext = rc4(&rc4_key, ciphertext);
 
-    // 验证：sha256(plaintext) 应等于尾部 32 字节
+    // 校验：sha256(plaintext) 应等于尾部 32 字节
     let pt_hash = Sha256::digest(&plaintext);
     if pt_hash.as_slice() != checksum {
         return None;
@@ -175,22 +172,18 @@ fn try_decrypt_password(b64_password: &str) -> Option<String> {
 /// 派生 Xshell 的解密密钥：reverse(SID) + windows_username（字节）
 #[cfg(windows)]
 fn derive_xshell_key() -> Option<Vec<u8>> {
-    // 用 whoami 获取 SID（无需额外依赖）
+    // 用 whoami 获取 SID（无需额外依赖），输出格式："DOMAIN\user","S-1-5-21-..."
     use std::process::Command;
     let output = Command::new("whoami")
         .args(["/user", "/fo", "csv", "/nh"])
         .output()
         .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // 输出格式："DOMAIN\user","S-1-5-21-..."
     let mut parts = stdout.trim().split(',');
     let user_part = parts.next()?.trim().trim_matches('"');
     let sid = parts.next()?.trim().trim_matches('"').trim();
-
-    // 从 "DOMAIN\username" 中提取 username
     let username = user_part.rsplit('\\').next().unwrap_or(user_part);
 
-    // key = reverse(SID) + username
     let reversed_sid: String = sid.chars().rev().collect();
     let key_str = format!("{}{}", reversed_sid, username);
     Some(key_str.into_bytes())
@@ -451,16 +444,13 @@ mod tests {
         assert!(parse_xsh(&s, "x").unwrap_err().contains("不支持的协议"));
     }
 
-    /// 测试 RC4 实现：用 NIST 的公开测试向量验证正确性
+    /// RC4 是自逆的（同一流密钥异或两次还原明文），用这个性质代替真实向量核对实现
     #[test]
     fn rc4_correctness() {
-        // RC4 key=0x0102030405, plaintext=0x00000000000000
         let key = &[0x01, 0x02, 0x03, 0x04, 0x05];
         let pt = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let ct = rc4(key, pt);
-        // RC4(Key,PT) → stream 的前几个字节应与公开参考一致
         assert_eq!(ct.len(), 7);
-        // RC4 是自逆的：再加密一次应还原
         let back = rc4(key, &ct);
         assert_eq!(back, pt);
     }
@@ -471,7 +461,6 @@ mod tests {
         use base64::Engine;
         use sha2::{Digest, Sha256};
         let plaintext = b"TestPassword123";
-        // 模拟一组 key
         let fake_key = Sha256::digest(b"fake-sid-reversed-plus-username");
         let ciphertext = rc4(&fake_key, plaintext);
         let checksum = Sha256::digest(plaintext);
@@ -480,7 +469,6 @@ mod tests {
         blob.extend_from_slice(&checksum);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
 
-        // 解密（需要相同的 key）—— 直接调用 rc4 和验证逻辑
         let raw = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
         assert!(raw.len() >= 33);
         let (ct, chk) = raw.split_at(raw.len() - 32);

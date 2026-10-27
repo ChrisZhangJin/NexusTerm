@@ -76,7 +76,7 @@ fn default_true() -> bool {
     true
 }
 
-/// 一条宏。`steps` 在库里是 JSON 文本，进出都走 serde，坏数据在边界上就报错。
+/// 一条宏。`steps` 在库里是 JSON 文本，进出都走 serde（读取时坏数据会退化成空步骤，见 `row_to_macro`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MacroRecord {
@@ -711,10 +711,8 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// 毫秒精度的时间戳，专给 `command_history.last_used_at` 用。
-///
-/// 补全里"敲同一条命令顶到最近"靠 `ORDER BY last_used_at DESC`排序，
-/// 秒级精度在短时间内连续敲好几条命令时会打平，顺序就不对了。
+/// 毫秒精度的时间戳，专给 `command_history.last_used_at` 用——秒级精度在短时间内
+/// 连续敲好几条命令时会打平，`ORDER BY last_used_at DESC` 就排不出正确顺序。
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -723,8 +721,7 @@ fn now_ms() -> i64 {
 }
 
 impl Store {
-    /// 一次性迁移：把旧版本存在系统凭据服务里的密码搬进 db 的明文列。
-    /// 只对 db 里 password 为空、但凭据服务里有值的会话执行；搬完即从凭据服务删除。
+    /// 一次性迁移：把旧版本存在系统凭据服务里的密码搬进 db 的明文列（仅当 db 里为空），搬完即从凭据服务删除。
     pub fn migrate_legacy_secrets(&self) {
         let ids: Vec<String> = {
             let conn = match self.conn.lock() {

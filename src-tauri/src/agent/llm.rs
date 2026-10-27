@@ -244,8 +244,7 @@ struct AnthropicRequest {
 
 /// 一个可下发给模型的工具。
 ///
-/// 刻意与 wire format 解耦：act.rs 决定「有哪些工具、各自什么语义」，
-/// llm.rs 只负责翻译成 OpenAI / Anthropic 各自的形状。
+/// 与 wire format 解耦：act.rs 定义工具语义，llm.rs 只翻译成各家形状。
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
     pub name: &'static str,
@@ -392,8 +391,8 @@ pub fn build_messages(
 
 /// 带工具声明版 [`build_messages`]。
 ///
-/// 抽成独立函数而不是给 `build_messages` 加参数：那会让流式问答、测试连接、
-/// 以及一众 wire format 单测都得多传一个 `&[]`，而这些路径根本不需要工具。
+/// 独立函数而非给 `build_messages` 加参数：流式问答、测试连接和一众单测都不需要工具，
+/// 不该被迫多传一个 `&[]`。
 pub fn build_messages_with_tools(
     acct: &AgentAccount,
     provider: Provider,
@@ -471,8 +470,8 @@ pub fn build_messages_with_tools(
 
 /// 把 `Vec<(String, String)>` 装成 reqwest 的 `HeaderMap`。
 ///
-/// 抽出来是为了让三条出网路径（流式问答 / 测试连接 / Agentic 循环）共用同一套
-/// 「非法字符 → 中文提示」的判定，不至于在其中一条上漏掉。
+/// 三条出网路径（流式问答 / 测试连接 / Agentic 循环）共用同一套「非法字符 → 中文提示」，
+/// 免得漏掉其中一条。
 pub(crate) fn header_map(headers: &[(String, String)]) -> Result<HeaderMap, AgentError> {
     let mut map = HeaderMap::new();
     for (name, value) in headers {
@@ -590,9 +589,8 @@ fn decode_line(raw: &[u8]) -> Option<String> {
 
 /// 从一条 SSE 行里取出 `data:` 的载荷。
 ///
-/// 返回 `None` 的三种情况：注释行（心跳，如 `: ping`）、`event:` / `id:` 等
-/// 其它字段行、以及空行 —— 调用方需要靠「是不是 None」之外的信息区分，
-/// 故空行与 event 行由 [`dispatch_line`] 在更前面处理。
+/// 注释行（心跳 `: ping`）、其它字段行、空行都返回 `None`；空行与 `event:` 行的区分
+/// 由 [`dispatch_line`] 在更前面做掉。
 pub fn parse_data_line(line: &str) -> Option<&str> {
     if line.starts_with(':') {
         return None;
@@ -834,9 +832,8 @@ pub fn truncate_chars(text: &str, max: usize) -> String {
 
 /// 从错误响应体里挑出「给人看的那句话」。
 ///
-/// 字段名各家不统一（OpenAI / Anthropic 用 `error.message`，兼容层有的用
-/// `msg` / `detail`）；JSON 解析不出来就退回纯文本首行（网关的 502 是 HTML）。
-/// 拿不到有意义的文案时返回空串 —— 宁可少给一句，也不要把整坨 JSON 甩给用户。
+/// 字段名各家不统一（`error.message` / `msg` / `detail`）；解析不出 JSON 就退回纯文本首行
+/// （网关的 502 是 HTML）。拿不到有意义的文案返回空串 —— 宁可少一句，不要甩整坨 JSON。
 pub fn extract_error_detail(body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -867,8 +864,8 @@ pub fn extract_error_detail(body: &str) -> String {
 
 /// HTTP 状态码 → 中文提示。
 ///
-/// 沿用 `errors::compose` 的「主文案 + 原始错误」结构：主文案告诉人该做什么，
-/// 原始错误保留在尾部小字里供排障（前端已经按 `RAW_SUFFIX` 拆分显示）。
+/// 沿用 `errors::compose` 的「主文案 + 原始错误」结构：前端按 `RAW_SUFFIX` 拆开，
+/// 原始错误落在尾部小字里供排障。
 pub fn http_status_message(status: StatusCode, body: &str) -> String {
     let main = match status.as_u16() {
         401 | 403 => "API Key 无效、已过期，或没有该模型的访问权限：请到设置里重新填写",
@@ -963,10 +960,8 @@ fn ensure_crypto_provider() {
 
 /// 全局复用的 HTTP 客户端。
 ///
-/// 每个 `Client` 自带连接池：逐次新建意味着每次提问都要重做 TCP + TLS 握手
-/// （几百毫秒），流式首字延迟会明显变差。
-///
-/// `pub(crate)`：Agentic 循环（`agent/act.rs`）也走它。
+/// 每个 `Client` 自带连接池：逐次新建等于每次提问重做一遍 TCP + TLS 握手（几百毫秒），
+/// 流式首字延迟会明显变差。`pub(crate)` 是因为 Agentic 循环（`act.rs`）也走它。
 pub(crate) fn http_client() -> Result<Client, AgentError> {
     static CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
     CLIENT
@@ -987,8 +982,7 @@ pub(crate) fn http_client() -> Result<Client, AgentError> {
 
 /// per-session 的取消标记。
 ///
-/// 用 `Arc<AtomicBool>` 而不是 `tokio_util::sync::CancellationToken`：
-/// 为了一个布尔量多引一个依赖不值得，而且这里只需要「置位 / 查询」两个动作。
+/// 用 `Arc<AtomicBool>` 而非 `CancellationToken`：只需要「置位 / 查询」，不值得多一个依赖。
 type CancelFlag = Arc<AtomicBool>;
 
 struct Inner {
@@ -1177,8 +1171,7 @@ enum Step {
 
 /// [`dispatch_line`] 的薄封装：把「动作」变成「副作用 + 如何继续」。
 ///
-/// 单独拆出来是为了让主循环和「末尾残行」的处理共用同一套逻辑，
-/// 而 [`dispatch_line`] 本身保持纯函数、可单测。
+/// 拆出来让主循环与「末尾残行」共用同一套逻辑，[`dispatch_line`] 自身保持纯函数可单测。
 fn step(
     provider: Provider,
     state: &mut SseState,
@@ -1351,9 +1344,8 @@ pub fn extract_answer_text(provider: Provider, body: &str) -> Option<String> {
 
 /// 从一次非流式响应里取出正文 + 工具调用。
 ///
-/// 两种方言的形状差别不小，但都刻意不反序列化成具体类型：
-/// 兼容层各家往 `tool_calls` / `content` 里塞的字段五花八门，
-/// 用 `pointer` 逐个取，缺哪个就当那个没有，比整体反序列化抗造。
+/// 刻意不反序列化成具体类型：兼容层往 `tool_calls` / `content` 里塞的字段五花八门，
+/// 用 `pointer` 逐个取、缺哪个算哪个，比整体反序列化抗造。
 pub fn extract_reply(provider: Provider, body: &str) -> Option<LlmReply> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let mut reply = LlmReply::default();
@@ -1434,9 +1426,7 @@ fn is_tool_unsupported(body: &str) -> bool {
             || lower.contains("unrecognized"))
 }
 
-/// 单次 actor 回应体上限。
-///
-/// 一次完整的 HTTP 响应够用了；超限时会被截断。
+/// 单次非流式响应体上限，超限截断。
 const MAX_COMPLETE_BODY: usize = 512 * 1024;
 
 /// 等到取消标记被置位。
@@ -1456,10 +1446,9 @@ async fn until_cancelled(cancel: &AtomicBool) {
 ///
 /// 返回正文 + 模型要求调用的工具。`tools` 为空时等价 [`complete`]。
 ///
-/// **服务方不认 tools 时自动降级**：拿掉 tools 重发一次，并把
-/// `tools_supported` 置回 false。这样接第三方兼容层（不少自建网关只转发
-/// messages）不会直接把整个 Agentic 循环打死 —— 调用方据此改回围栏协议，
-/// 而围栏协议本来就是它认的老路。
+/// **服务方不认 tools 时自动降级**：拿掉 tools 重发一次并把 `tools_supported` 置回 false。
+/// 不少自建网关只转发 messages，没有这一步整个 Agentic 循环会被它们直接打死；
+/// 调用方据此改回围栏协议。
 pub async fn complete_reply(
     acct: &AgentAccount,
     system: &str,
@@ -1562,11 +1551,8 @@ impl PostResult {
 
 /// 用一条极短消息验证 Key / 地址 / 模型是否可用，供设置界面「测试连接」用。
 ///
-/// 走**非流式**：少一层 SSE 解析，失败原因更干净（Key 错 / 地址错 / 模型不存在
-/// 都能在状态码上区分），也省掉一次几十秒的生成。
-///
-/// 刻意不接收 `AppState`：测的是用户刚填进去、还没保存的那份配置，
-/// 与库里已保存的、以及运行时状态都无关。
+/// 走**非流式**：少一层 SSE 解析，失败原因更干净（Key 错 / 地址错 / 模型不存在都能
+/// 从状态码区分）。不接收 `AppState`：测的是用户刚填、还没保存的那份配置。
 pub async fn test_connection(cfg: &AgentConfig) -> Result<String, AgentError> {
     validate(cfg)?;
     let acct = cfg.active_account();
@@ -1720,9 +1706,7 @@ mod tests {
         let flood = vec![b'x'; MAX_LINE_BYTES + 10];
         d.push(&flood, &mut out);
         assert!(out.is_empty(), "超长行不该产出");
-        // 丢弃之后仍然可用：后续正常行照常产出。
-        // 前导 \n 会先补出一个空行（那是被截掉的行留下的边界），
-        // 上层对空行本就当作事件分隔符处理，故无害。
+        // 丢弃后仍可用：被截掉的行会留下一个空行边界，而上层本就把空行当事件分隔符。
         d.push(b"\ndata: ok\n", &mut out);
         assert!(out.iter().all(|l| !l.contains('x')), "废弃内容不该再出现");
         assert_eq!(out.last().map(String::as_str), Some("data: ok"));

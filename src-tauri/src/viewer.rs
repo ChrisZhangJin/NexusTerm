@@ -70,8 +70,7 @@ pub fn kind_of(path: &str) -> Option<DocKind> {
         return Some(DocKind::Code);
     }
     let Some((stem, ext)) = name.rsplit_once('.') else {
-        // 没有扩展名：按纯文本处理（README、日志、无后缀导出文件都是这类）。
-        // ".foo" 这种隐藏文件走的是上面 rsplit_once 能切出空 stem 的分支，不会到这里。
+        // 没有扩展名：按纯文本处理（README、日志、无后缀导出文件）
         return Some(DocKind::Code);
     };
     if stem.is_empty() || ext.is_empty() {

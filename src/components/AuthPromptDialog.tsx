@@ -2,17 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import type { AuthPrompt } from "../types";
 
 /**
- * 认证交互框。两类问题共用这个弹窗：
+ * 认证交互框。两类问题共用：服务端二次验证（keyboard-interactive / RFC 4256，后端挂起
+ * 等这里回填）与本地私钥口令（`kind = passphrase`）。
  *
- * 1. **服务端二次验证**（SSH keyboard-interactive / RFC 4256）。
- *    服务端在认证中途下发问题，后端挂起等这里回填。绝大多数场景只有一两个字段：
- *    纯 OTP 服务器只有一个 "Verification code:"；PAM 多因素则是 "Password:" +
- *    "Verification code:"，其中密码由后端预先带入，用户只需补验证码。
- * 2. **本地私钥口令**（`kind = passphrase`）。私钥文件被口令加密时，
- *    后端在握手前要用户解锁，否则连密码框都不该弹出来。
- *
- * 所以焦点刻意不落在第一个输入框，而是**第一个空着的输入框** —— 否则用户还得
- * 先按一下 Tab 才能开始输验证码。
+ * 焦点刻意落在**第一个空着的**输入框：PAM 多因素会把密码预填进来，落在第一个框的话
+ * 用户还得先按一下 Tab 才能开始输验证码。
  */
 export default function AuthPromptDialog({
   prompt,
@@ -225,13 +219,8 @@ function cleanPrompt(prompt: string): string {
 }
 
 /**
- * 是否是一次性验证码字段：提示语里带 code / otp / verification。
- * 用来给用户一句「这个码会过期」的提示 —— 断线重连时最常见的失误就是
- * 又把断线前那个已经用掉的码填一遍。
- *
- * 不按 `echo` 过滤：echo 只是「要不要遮住输入」，各服务器对这个标志的理解
- * 并不一致 —— 有些堡垒机的 OTP 提示（`[OTP Code]: `）就带着 echo=true。
- * 只凭文案判断，反而更准。
+ * 是否是一次性验证码字段。只凭文案判断、不看 `echo`：各服务器对该标志的理解不一致，
+ * 有些堡垒机的 OTP 提示（`[OTP Code]: `）就带着 echo=true。
  */
 function isOneTimeCode(prompt: string): boolean {
   return /(code|otp|verif|passcode|token)/i.test(prompt) || prompt.includes("验证码");

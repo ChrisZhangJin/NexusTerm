@@ -30,7 +30,7 @@ import {
 } from "../lib/prefs";
 import type { FONT_FAMILIES as FontList } from "../lib/theme";
 
-/** Esc 关闭 —— 两个窗口通用 */
+/** Esc 关闭 —— 各设置窗口通用 */
 function useEsc(onClose: () => void, enabled = true) {
   useEffect(() => {
     if (!enabled) return;
@@ -173,7 +173,6 @@ export function AppearanceDialog(p: AppearanceProps) {
 
 interface BehaviorProps {
   onClose: () => void;
-  /** 打开宏管理器（宏已收纳到「行为」下，这里只是个入口） */
   onOpenMacros: () => void;
 }
 
@@ -396,8 +395,7 @@ export function ShortcutsDialog({ onClose }: { onClose: () => void }) {
 
 const PROVIDER_ORDER: readonly AgentProvider[] = ["openai", "anthropic", "custom"];
 
-/** 各 provider 的展示名与默认地址。地址值要和后端 endpoint() 的拼接方式对得上：
- *  OpenAI 系拼 /chat/completions，Anthropic 拼 /messages，所以两家都填「根地址」。 */
+/** 地址默认值要和后端 endpoint() 的拼接对得上：OpenAI 系拼 /chat/completions、Anthropic 拼 /messages，故此处都填「根地址」。 */
 const PROVIDER_META: Record<
   AgentProvider,
   { label: string; url: string; urlHint: string; modelHint: string }
@@ -422,11 +420,7 @@ const PROVIDER_META: Record<
   },
 };
 
-/**
- * 上下文上限的档位。
- * 只给四档而不是自由填数字：后端形参是 u32，且这个值直接决定单次请求的 token 量与花费，
- * 让用户在几个「有实感」的档位里选，比让他猜 24576 和 32768 差多少要安全。
- */
+/** 只给四档而不是自由填数字：这个值直接决定单次请求的 token 量与花费，选档位比让用户猜 24576 和 32768 的差别安全。 */
 const CONTEXT_CHOICES: readonly { bytes: number; label: string }[] = [
   { bytes: 16 * 1024, label: "16 KB · 约 5 千汉字 · 最省" },
   { bytes: 32 * 1024, label: "32 KB · 约 1.1 万汉字 · 默认" },
@@ -437,7 +431,6 @@ const CONTEXT_CHOICES: readonly { bytes: number; label: string }[] = [
 export function AgentDialog({ onClose }: { onClose: () => void }) {
   const saved = useAgentConfig();
   const [draft, setDraft] = useState<AgentConfig>(saved);
-  /** API Key 默认密码态 —— 屏幕上可能有人在后头看 */
   const [showKey, setShowKey] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null);
@@ -447,17 +440,16 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
 
   useEsc(onClose);
 
-  // 配置是异步从后端读的：首帧拿到的是默认值，真值随后才到。
-  // 用户还没编辑过就直接跟随 —— 否则界面会一直停在一份「假」配置上，一保存就把真值冲掉。
+  // 配置是异步从后端读的，首帧是默认值：用户没编辑过就跟随真值，否则界面会停在「假」配置上，一保存就把真值冲掉。
   useEffect(() => {
     if (!editedRef.current) setDraft(saved);
   }, [saved]);
 
-  // 当前正在编辑的账号（activeId 恒有效，由 store.normalize 保证；仍兜底取首个）
+  // 当前正在编辑的账号（activeId 恒有效，由 lib/agent 的 normalize 保证；仍兜底取首个）
   const current: AgentAccount =
     draft.accounts.find((a) => a.id === draft.activeId) ?? draft.accounts[0];
 
-  /** 改顶层配置（总开关 / autoAttach / activeId） */
+  /** 改顶层配置（总开关 / 账号列表 / activeId / execMode） */
   const patch = (p: Partial<AgentConfig>) => {
     editedRef.current = true;
     setDraft((d) => ({ ...d, ...p }));
@@ -474,7 +466,6 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
     setTestMsg(null);
   };
 
-  /** 新增一个账号并切过去 */
   const addAccount = () => {
     const id = newAccountId();
     const acct = defaultAccount(id, `账号 ${draft.accounts.length + 1}`);
@@ -490,7 +481,7 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
 
   const dirty = JSON.stringify(draft) !== JSON.stringify(saved);
 
-  // 测试连接只关心当前账号的「地址 / 模型 / Key」三件套（与后端 validate 的后三项一致）
+  // 与后端 validate 的后三项一致：地址 / 模型 / Key
   const missing = [
     !current.baseUrl.trim() && "接口地址",
     !current.model.trim() && "模型",
@@ -503,8 +494,7 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
     setTesting(true);
     setTestMsg(null);
     try {
-      // 测的是「当前账号」的连通性：临时启用 + 只带当前这一个账号，不动库、不动其它账号。
-      // 后端 validate 第一件事就是查 enabled，且只看 active_account，故这样构造最干净。
+      // 后端 validate 先查 enabled、且只看 active_account：临时启用 + 只带当前账号即可单测它的连通性，不动库。
       const probe: AgentConfig = {
         ...draft,
         enabled: true,
@@ -524,11 +514,8 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
   const save = async () => {
     setSaveErr(null);
     try {
-      // 先写盘、后关窗：saveAgentConfig 保证写成功才更新内存缓存，
-      // 不会出现「界面显示已保存、库里其实没变」
-      //
-      // autoAttach 恒为 true：面板不再提供「旁路开关」，助手默认就能看到
-      // 当前会话 —— 界面上已经没有能置 false 的入口，这里兜住旧配置里的 false。
+      // 先写盘、后关窗：saveAgentConfig 写成功才更新内存缓存，不会出现「界面显示已保存、库里其实没变」。
+      // autoAttach 恒为 true：界面已没有置 false 的入口，这里兜住旧配置里残留的 false。
       await saveAgentConfig({ ...draft, autoAttach: true });
       onClose();
     } catch (e) {
@@ -742,12 +729,7 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
             <em>关闭时后端完全不采集旁路，零开销；不启用则本页其余设置都不生效</em>
           </span>
         </label>
-        {/* 原本这里还有「新会话默认开启旁路」开关。已去掉：助手面向全局，
-            会话在哪、哪就是上下文，没有「这个会话不采集」的第二种用法。 */}
-
-        {/* 与「回答里的命令要不要执行」是同一件事的两面：
-            这里决定它在终端里的权力边界，放在总开关区而不是某个账号下面 ——
-            换模型不该悄悄换掉对一个终端 Agent 的授权级别。 */}
+        {/* 执行权限放在总开关区而不是某个账号下面：换模型不该悄悄换掉 Agent 在终端里的授权级别。 */}
         <div className="settings-section">执行权限</div>
         <div className="row">
           <label>执行模式</label>

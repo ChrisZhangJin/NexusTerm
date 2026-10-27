@@ -3,15 +3,9 @@ import { api } from "../api";
 import type { KeyInfo } from "../types";
 
 /**
- * 用户密钥管理。
- *
- * 对应 Xshell 的「用户密钥」窗口：一张列表（名称 / 类型 / 长度 / 注释）
- * 加右侧一排操作（生成、属性、删除、导入、导出）。
- *
- * 两类条目混在一张表里，靠「来源」区分：
+ * 用户密钥管理。两类条目混在一张表里，靠「来源」区分：
  * - 密钥库（vault）：私钥在应用数据目录，可删除、可导出
- * - `~/.ssh`（sshDir）：只是被扫描出来方便直接选用，删除会牵连 git / ssh，
- *   这里明确禁止，要用只能先「导入」复制一份。
+ * - `~/.ssh`（sshDir）：只是扫描出来方便直接选用；删除会牵连 git / ssh，故明确禁止，要用先「导入」复制一份。
  */
 export default function KeyManagerDialog({ onClose }: { onClose: () => void }) {
   const [keys, setKeys] = useState<KeyInfo[]>([]);
@@ -30,7 +24,6 @@ export default function KeyManagerDialog({ onClose }: { onClose: () => void }) {
     try {
       const all = await api.listKeys();
       setKeys(all);
-      // 刷新后尽量保持在原来那一条上，别让用户重新找
       const target = keep ?? selected;
       if (target && all.some((k) => k.id === target)) setSelected(target);
       else setSelected(all[0]?.id ?? null);
@@ -150,8 +143,7 @@ export default function KeyManagerDialog({ onClose }: { onClose: () => void }) {
       <div className="modal key-modal" onClick={(e) => e.stopPropagation()}>
         <h2>{pane === "generate" ? "生成密钥" : pane === "props" ? "密钥属性" : "密钥管理"}</h2>
 
-        {/* 提示放在视图切换之外：生成 / 属性是内嵌子页，
-            错误若只渲染在列表页，用户在子页里操作失败会完全看不到原因 */}
+        {/* 提示放在视图切换之外：否则在生成 / 属性子页里操作失败会完全看不到原因 */}
         {error && <p className="error">{error}</p>}
         {notice && <p className="key-notice">{notice}</p>}
 

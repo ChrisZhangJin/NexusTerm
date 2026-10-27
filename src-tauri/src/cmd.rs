@@ -22,8 +22,6 @@ pub struct AppState {
     pub auth_prompts: std::sync::Arc<crate::ssh::prompt::AuthPrompts>,
     /// 用户密钥库目录（`<app_data>/keys`）。私钥文件落在这里，
     /// 不碰 `~/.ssh` —— 那是 ssh / git 自己的资产。
-    /// 用户密钥库目录（`<app_data>/keys`）。私钥文件落在这里，
-    /// 不碰 `~/.ssh` —— 那是 ssh / git 自己的资产。
     pub keys_dir: std::path::PathBuf,
 }
 
@@ -48,15 +46,13 @@ pub fn write_file_b64(path: String, data: String) -> Result<(), String> {
 
 /// 输入诊断日志落盘（排查 macOS 中文输入法用）。
 ///
-/// 为什么不复用 `append_file_b64`：那条要前端自己给绝对路径，而前端拿不到 home
-/// —— `@tauri-apps/api/path` 走的是 `path` 插件，本项目没装，调用会直接失败。
-/// 后端本来就知道 app_data 在哪，写进 `<app_data>/logs/input.log` 最省事，
-/// 也和 `nexus.log` 待在一起，现场排查时不会找不着。
+/// 不复用 `append_file_b64`：那条要前端给绝对路径，而前端拿不到 home
+/// （`path` 插件没装）。后端自己知道 app_data 在哪，直接写
+/// `<app_data>/logs/input.log`，和 `nexus.log` 放一起方便现场排查。
 ///
-/// 内容由 `lib/macInput` 的现场记录产出：每个输入事件的 keyCode / isComposing /
-/// data / textarea，以及每一个真正发往 pty 的字节是谁发的。输入法那几类症状
-/// （丢字 / 多空格 / 选候选多一个数字 / 标点重复）在用户机器上只闪一下，
-/// 光靠描述猜不出来，只能靠这份记录。
+/// 内容由 `lib/macInput` 产出：每个输入事件的 keyCode / isComposing / data /
+/// textarea，以及每个真正发往 pty 的字节的来源 —— 输入法那几类症状（丢字 /
+/// 多空格 / 标点重复）在用户机器上转瞬即逝，光靠描述猜不出来。
 #[tauri::command]
 pub fn append_input_log(app: AppHandle, lines: String) -> Result<(), String> {
     use std::io::Write as _;
@@ -73,10 +69,7 @@ pub fn append_input_log(app: AppHandle, lines: String) -> Result<(), String> {
 }
 
 /// 追加写（ZMODEM 下载流式落盘）：每来一 MB 就写一次，内存不随文件大小增长。
-///
-/// `truncate = true` 时用 `create`（清空重建），之后一律 `append`。
-/// 每次重新 open 而不长驻句柄：一 MB 一次的系统调用开销可以忽略，换来的是
-/// 进程被强杀时不会留下未 flush 的句柄。
+/// 每次重新 open 而不长驻句柄：系统调用开销可忽略，换来的是进程被强杀时不留未 flush 的句柄。
 #[tauri::command]
 pub fn append_file_b64(path: String, data: String, truncate: bool) -> Result<(), String> {
     use base64::Engine as _;
@@ -166,9 +159,7 @@ pub async fn ssh_write(
     data: Vec<u8>,
     state: State<'_, AppState>,
 ) -> Result<(), SessionError> {
-    // 多一次拷贝换来的是严格的顺序：只有真正发出去的输入才进 agent 上下文。
-    // 写失败（会话已关）时缓冲里不该留下这一段 —— 命令没执行过，却出现在
-    // 「人干过什么」里，比少记一条的误导性大得多。
+    // 写失败时不进 agent 缓冲：没真正执行过的命令不该出现在「人干过什么」里
     let res = state.sessions.write(&id, data.clone()).await;
     if res.is_ok() {
         state.agent.feed(&id, &data, StreamKind::In);
@@ -176,10 +167,8 @@ pub async fn ssh_write(
     res
 }
 
-/// 大块二进制写入（ZMODEM 上传）：base64 字符串比 JSON 数字数组小 ~3 倍、解析快得多。
-///
-/// **async 是必须的**：它 await 发送队列，队列满时 IPC 才不返回。
-/// 这样前端「读盘 → 编码 → 写」的循环会被网速卡住，而不是把整个文件堆进内存。
+/// 大块二进制写入（ZMODEM 上传）：base64 比 JSON 数字数组小 ~3 倍、解析快得多。
+/// async 是必须的：它 await 发送队列，队列满时前端的读盘循环会被网速卡住，而不是把整个文件堆进内存。
 #[tauri::command]
 pub async fn ssh_write_b64(
     id: String,
@@ -255,9 +244,8 @@ pub async fn local_stats() -> Result<crate::sysstat::Stats, String> {
 
 // ——— Console 自动补全：session 级命令历史 ———
 //
-// 按会话身份（已保存连接配置的 id，本地固定 'local'）持久化，而不是按
-// 临时的标签页 id —— 这样同一台服务器下次重连、甚至重启应用后新开的
-// 标签，都能接着用之前在这台机器上敲过的命令做补全。
+// 按会话身份（已保存连接配置的 id，本地固定 'local'）持久化而非临时标签页 id，
+// 这样重连甚至重启应用后新开的标签都能接着用之前敲过的命令补全。
 
 #[tauri::command]
 pub fn history_record(key: String, command: String, state: State<'_, AppState>) -> Result<(), String> {
@@ -299,31 +287,42 @@ pub fn ssh_set_sidecar(id: String, on: bool, state: State<'_, AppState>) {
 // WebView2 里 navigator.clipboard.readText 会被权限策略拦截（静默失败），
 // 统一走后端读写系统剪贴板。
 
-/// 剪贴板里是图片（截图工具「复制」放的就是位图，没有文本）时，落盘成临时 PNG，
-/// 把路径当文本粘贴进终端——这是 iTerm2「粘贴图片」的同一套做法：pty 只能传字节流，
-/// 没有「粘贴一张图」这个概念，大家都是靠这条路子让终端里跑的程序能认出图片。
-/// Claude Code 这类 CLI 能「识别粘贴的图片」，识别的就是这种指向真实文件的路径文本，
-/// 不是直接去读系统剪贴板。
-fn write_clipboard_image_to_temp() -> Result<String, String> {
+/// 剪贴板里是位图（截图工具「复制」放的就是这种）时编码成 PNG 字节，落盘位置由调用方决定。
+fn encode_clipboard_image_to_png() -> Result<Vec<u8>, String> {
     let img = arboard::Clipboard::new()
         .and_then(|mut c| c.get_image())
         .map_err(|e| e.to_string())?;
     let buf = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())
         .ok_or_else(|| "剪贴板图片数据尺寸不对，无法解码".to_string())?;
+    let mut bytes: Vec<u8> = Vec::new();
+    buf.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .map_err(|e| format!("PNG 编码失败：{e}"))?;
+    Ok(bytes)
+}
+
+/// 落盘成本地临时文件，返回路径当文本粘贴进终端——pty 只能传字节流，这是让
+/// 终端里的程序认出「刚粘贴的是一张图」的唯一办法（iTerm2 等终端同样如此）。
+fn write_png_bytes_to_local_temp(bytes: &[u8]) -> Result<String, String> {
     let path = std::env::temp_dir().join(format!("nexusterm-paste-{}.png", uuid::Uuid::new_v4().simple()));
-    buf.save(&path).map_err(|e| format!("无法写入临时文件：{e}"))?;
+    std::fs::write(&path, bytes).map_err(|e| format!("无法写入临时文件：{e}"))?;
     Ok(path.display().to_string())
 }
 
 #[tauri::command]
-pub fn clipboard_read() -> Result<String, String> {
+pub async fn clipboard_read(tab_id: String, state: State<'_, AppState>) -> Result<String, String> {
     match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-        Ok(t) if !t.is_empty() => Ok(t),
-        // 没有文本：可能是空剪贴板，也可能是图片——试一把图片再说
-        text_result => write_clipboard_image_to_temp().map_err(|img_err| {
-            text_result.err().map(|e| e.to_string()).unwrap_or(img_err)
-        }),
+        Ok(t) if !t.is_empty() => return Ok(t),
+        _ => {}
     }
+    let png = encode_clipboard_image_to_png()?;
+    // 远程 tab：直接写到远端 /tmp，省掉手动 scp。写入失败（堡垒机/兼容模式等）静默回退本地。
+    if !tab_id.is_empty() && state.sessions.has(&tab_id) {
+        let remote_path = format!("/tmp/nexusterm-paste-{}.png", uuid::Uuid::new_v4().simple());
+        if state.sessions.write_remote_file(&tab_id, &remote_path, &png).await.is_ok() {
+            return Ok(remote_path);
+        }
+    }
+    write_png_bytes_to_local_temp(&png)
 }
 
 #[tauri::command]
@@ -365,8 +364,7 @@ pub fn delete_session(id: String, state: State<'_, AppState>) -> Result<(), Stri
 
 // ——— 宏 ———
 //
-// 宏的执行完全在前端（需要读终端屏幕、按输出节奏决定何时发下一步），
-// 后端只负责持久化 —— 这样宏的定义与执行不会出现两套解析逻辑。
+// 执行完全在前端（需要读终端屏幕、按输出节奏决定何时发下一步），后端只负责持久化。
 
 #[tauri::command]
 pub fn list_macros(state: State<'_, AppState>) -> Result<Vec<store::MacroRecord>, String> {
@@ -439,7 +437,6 @@ pub fn import_xsh(paths: Vec<String>, state: State<AppState>) -> Result<Vec<Impo
         let (ok, error, password_imported) = match &parsed.result {
             Ok(new) => match state.store.create(new.clone()) {
                 Ok(created) => {
-                    // 如果密码解密成功，自动写入 db 明文密码列
                     let pw_ok = if let Some(ref pw) = parsed.password {
                         state.store.set_password(&created.id, pw).is_ok()
                     } else {

@@ -53,7 +53,7 @@ export const api = {
     extras: import("./lib/sessionExtras").SessionExtras
   ) => invoke<void>("set_session_extras", { id, extras }),
   localStats: () => invoke<Record<string, string>>("local_stats"),
-  clipboardRead: () => invoke<string>("clipboard_read"),
+  clipboardRead: (tabId: string) => invoke<string>("clipboard_read", { tabId }),
   clipboardWrite: (text: string) => invoke<void>("clipboard_write", { text }),
 
   listSessions: () => invoke<SessionRecord[]>("list_sessions"),
@@ -288,7 +288,6 @@ export function base64ToBytes(b64: string): Uint8Array {
   return out;
 }
 
-/** 字符串 → 后端的 Vec<u8> */
 /** 字节 → base64（分块 fromCharCode，避免大数组展开爆栈） */
 export function bytesToBase64(bytes: ArrayLike<number>): string {
   let bin = "";
@@ -302,6 +301,7 @@ export function bytesToBase64(bytes: ArrayLike<number>): string {
   return btoa(bin);
 }
 
+/** 字符串 → 后端的 Vec<u8> */
 export function stringToBytes(s: string): number[] {
   return Array.from(new TextEncoder().encode(s));
 }
