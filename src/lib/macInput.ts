@@ -54,6 +54,13 @@ export function isPlainChar(ch: string | null | undefined): boolean {
   return c >= 0x20 && c < 0x7f;
 }
 
+/** 整串都是可打印 ASCII（输入法「原样交出」的字母 / 空格） */
+function isAsciiRun(s: string | null | undefined): boolean {
+  if (!s) return false;
+  for (const ch of s) if (!isPlainChar(ch)) return false;
+  return true;
+}
+
 /**
  * 这颗 keydown 该不该由我们接管：无 Ctrl/Alt/⌘（组合键归 xterm 发转义序列，
  * Option 出的 é / 死键也在那条路上，碰了就是两份输入）、且是单个可打印 ASCII
@@ -484,6 +491,16 @@ export function installMacKeyboard(
   let imeConsumedKey: string | null = null;
   /** 最近一次 `compositionend` 的时间戳，用于识别「同一次按键的两半」 */
   let composeEndedTs = -Infinity;
+  /**
+   * 刚刚这次上屏是不是「原样交出」：输入法把用户敲的 ASCII 原封不动交了出来
+   *（豆包输入法的英文模式就是这样，一个词一次组合，`compend.data` 正是那几个字母）。
+   *
+   * 判它的原因：中文上屏（`nihao` → `你好`）时，那颗结束组合的**空格**属于输入法，
+   * 一个字节都不该进 pty；但英文直通模式下同一个空格既是「结束这个词」，也是用户
+   * 真正敲下的一个空格 —— 拦住它，"hello world" 就成了 "helloworld"（真机实测
+   * 豆包英文模式打 `hello world angry birds` 只出来 `helloworldangry`）。
+   */
+  let lastCommitAscii = false;
 
   /**
    * 中文输入法「智能全角标点」把 `,` `;` 换成 `，` `；`，曾经两个都发了出去。
@@ -567,10 +584,23 @@ export function installMacKeyboard(
   const onComposeEnd = (ev: CompositionEvent) => {
     trace({ ev: "compend", act: "state", data: ev.data ?? undefined, comp: true, ta: taOf(internals.textarea) }, ev);
     composing = false;
-    composeEndedTs = ev.timeStamp;
-    // 无论这一轮是怎么结束的，存在的那一刻 IM 一定还活着
-    imAlive();
+    // 自救（`revive`）是我们自己 `blur()` 掉 textarea，WebKit 会当场回一个
+    // **data 为空**的 compositionend。它不是 IM 的回应，而是我们掐断会话的产物：
+    // 认了它就会把 `imGone` 复位、还把 `composeEndedTs` 写成「刚刚」，于是紧跟着
+    // 那颗真正属于用户的键被当成「上屏键的另一半」吞掉 —— 真机上正好丢一颗字母
+    //（实测 `hello` 只剩 `helo`，丢的就是触发自救的那颗 `l`）。
+    const selfTeardown = imGone && !(ev.data ?? "");
+    if (!selfTeardown) {
+      composeEndedTs = ev.timeStamp;
+      // 无论这一轮是怎么结束的，存在的那一刻 IM 一定还活着
+      imAlive();
+    }
     composeTa = "";
+    // 这一轮上屏是不是「原样交出」：交给 pty 的文本就是刚才敲的那几个 ASCII 字母。
+    // 英文直通模式（豆包）走的就是这条，中文上屏（`nihao` → `你好`）不是。
+    const committedText = ev.data ?? "";
+    lastCommitAscii =
+      isAsciiRun(committedText) && taOf(internals.textarea).endsWith(committedText);
     const consumed = imeConsumedKey;
     imeConsumedKey = null;
     const ta = internals.textarea;
@@ -744,15 +774,36 @@ export function installMacKeyboard(
         return;
       }
       if (sameAsComposeEnd(ev)) {
-        // 上屏已完成，这颗只是同一次物理按键的另一半。此时 preventDefault 只会
-        // 拦住「插进 textarea」，动不了已上屏的字，可以放心拦死。
-        // 不要再记 imeConsumedKey：那次 compositionend 已过去，记了只会留到
-        // **下一次**上屏时才消费，把下一句结尾剥掉。
-        ev.preventDefault();
-        ev.stopPropagation();
-        markSent();
-        trace({ ev: "keydown", act: "stop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
-        return;
+        // 上屏已完成，这颗只是同一次物理按键的另一半。
+        //
+        // 但「另一半」有两种：中文上屏时空格是**输入法的确认键**，它的字符绝不能进
+        // pty（否则每句中文后面多一个空格）；英文直通模式（豆包）时空格既是「结束
+        // 这个词」也是用户实打实敲的一个空格 —— 真机上把它一起拦掉，"hello world"
+        // 就粘连成 "helloworld"。判据是 `lastCommitAscii`：输入法原样交出了 ASCII，
+        // 说明它只是在替用户转手，这颗键的字符还得照常发出去。
+        //
+        // 「照常发」= 放行到下面那条通用路径由我们自己发。**不能指望 WebKit 的默认
+        // 行为**：这类键带 `keyCode 229` 且 `isComposing=false`，真机上 WebKit 既不
+        // 插进 textarea 也不派发 input（实测空格的 keydown 放行了，input 一条没有），
+        // 光靠默认行为就是继续丢空格。
+        if (!(lastCommitAscii && isPlainChar(ev.key))) {
+          // 中文上屏：此时 preventDefault 只会拦住「插进 textarea」，动不了已上屏
+          // 的字，可以放心拦死。
+          // 不要再记 imeConsumedKey：那次 compositionend 已过去，记了只会留到
+          // **下一次**上屏时才消费，把下一句结尾剥掉。
+          ev.preventDefault();
+          ev.stopPropagation();
+          markSent();
+          // 回车同理：英文直通模式下它既结束这个词、又是用户敲的那一下 —— 吞掉就是
+          // **命令不执行**（真机实测 `pwd`+回车只上屏 `pwd`，要再按一次才跑）。
+          if (lastCommitAscii && ev.key === "Enter") {
+            out("\r");
+            trace({ ev: "keydown", act: "send", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea), sent: "\\r", via: "mac" }, ev);
+            return;
+          }
+          trace({ ev: "keydown", act: "stop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
+          return;
+        }
       }
     }
     // 真·组合态：这颗键属于拼音，一个字节都不该由我们发，textarea 也不能动。
@@ -823,10 +874,15 @@ export function installMacKeyboard(
     }
     // 上屏刚过去就到的 insertText，是同一次 IME 操作的尾巴（选候选那颗键被
     // WebKit 顺手当成普通输入派发出来的），不是新的输入 —— 发出去就成了「大2」。
+    // 例外：英文直通模式里「结束这个词」的那颗键（空格）的字符正是从这里到的，
+    // 它本身就是用户敲的字，必须放行（判据见 `lastCommitAscii`）。
     if (sameAsComposeEnd(ev)) {
-      seen.act = "drop";
-      trace(seen);
-      return;
+      const single = !!ev.data && Array.from(ev.data).length === 1;
+      if (!(lastCommitAscii && single)) {
+        seen.act = "drop";
+        trace(seen);
+        return;
+      }
     }
     if (ev.inputType !== "insertText") {
       trace(seen); // 粘贴 / 组合上屏不碰

@@ -1337,3 +1337,74 @@ test("接管：自救之后新开一次真正的组合，仍能正常进组合�
   un();
 });
 
+test("接管：自救时 blur 引出的那次 compositionend 不能吞掉触发自救的那颗键", () => {  // 真机日志（豆包输入法 → 敲到一半切走 → 打 hello）复现的是这条：`revive` 里
+  // `blur()` 会立刻引出一次 data 为空的 compositionend，若把它当成 IM 的回应，
+  // `imGone` 被复位、`composeEndedTs` 记成「刚刚」，紧跟着那颗键就被当成上屏键的
+  // 另一半吞掉 —— 5 颗字母只出了 4 颗（`hello` → `helo`）。
+  const { host, out, ta, un } = rig();
+  (ta as unknown as { blur: () => void }).blur = () => {
+    host.fire("compositionend", { data: "" });
+  };
+  (ta as unknown as { focus: () => void }).focus = () => {};
+  host.fire("compositionstart", {});
+  for (const ch of "abc") {
+    host.fire("keydown", plainKey(ch, { keyCode: 229, isComposing: true }));
+  }
+  assert.equal(out.text, "abc", "触发自救的第 3 颗键也必须出字");
+  un();
+});
+
+test("接管：输入法原样交出英文（豆包英文模式）时，结束那个词的敲空格必须进 pty", () => {
+  // 真机日志：豆包英文模式一个词一次组合，`compend.data` 就是那几个字母；
+  // 结束词的空格既是 IME 的确认键，也是用户实打实敲下的一个空格。
+  // 以前一律当「上屏键的另一半」拦死 → `hello world` 打成 `helloworld`。
+  const { host, ta, out, un } = rig();
+  host.fire("compositionstart", { timeStamp: 900 });
+  ta.value = "hello";
+  host.fire("compositionupdate", { data: "hello", timeStamp: 950 });
+  host.fire("compositionend", { data: "hello", timeStamp: 1000 });
+  host.fire("keydown", plainKey(" ", { keyCode: 229, timeStamp: 1010 }));
+  assert.equal(out.text, " ", "空格必须由接管层发出去（WebKit 不会替这个 229 键插入字符）");
+  // 万一日后 WebKit 又派发了这条尾巴，也不能变成两个空格
+  host.fire("input", { data: " ", inputType: "insertText", timeStamp: 1011 });
+  assert.equal(out.text, " ", "同一颗键只许一个字符");
+  un();
+});
+
+test("接管：中文上屏时空格属于输入法，一个字节都不许进 pty", () => {
+  const { host, ta, out, un } = rig();
+  host.fire("compositionstart", { timeStamp: 900 });
+  ta.value = "nihao";
+  host.fire("compositionupdate", { data: "nihao", timeStamp: 950 });
+  host.fire("compositionend", { data: "你好", timeStamp: 1000 });
+  const space = host.fire("keydown", plainKey(" ", { keyCode: 229, timeStamp: 1010 }));
+  assert.equal(space.propagationStopped, true, "确认键要拦住 xterm");
+  assert.equal(space.defaultPrevented, true, "也不能让它插进 textarea");
+  host.fire("input", { data: " ", inputType: "insertText", timeStamp: 1011 });
+  assert.equal(out.text, "", "中文句尾不能多一个空格");
+  un();
+});
+
+test("接管：豆包英文模式下打完一个词直接回车，命令必须执行（回车不能被吞）", () => {
+  // 真机：`pwd` + 回车 → 只上屏 `pwd`，回车没了，要再按一次才跑。
+  const { host, ta, out, un } = rig();
+  host.fire("compositionstart", { timeStamp: 900 });
+  ta.value = "pwd";
+  host.fire("compositionupdate", { data: "pwd", timeStamp: 950 });
+  host.fire("compositionend", { data: "pwd", timeStamp: 1000 });
+  host.fire("keydown", plainKey("Enter", { keyCode: 229, timeStamp: 1010 }));
+  assert.equal(out.text, "\r", "回车得由接管层补发（xterm 对 229 的回车什么都不发）");
+  un();
+});
+
+test("接管：中文上屏时的回车属于输入法，不能往 pty 里塞一个回车", () => {
+  const { host, ta, out, un } = rig();
+  host.fire("compositionstart", { timeStamp: 900 });
+  ta.value = "nihao";
+  host.fire("compositionupdate", { data: "nihao", timeStamp: 950 });
+  host.fire("compositionend", { data: "你好", timeStamp: 1000 });
+  host.fire("keydown", plainKey("Enter", { keyCode: 229, timeStamp: 1010 }));
+  assert.equal(out.text, "", "中文确认回车不许进 pty");
+  un();
+});
+
