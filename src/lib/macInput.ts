@@ -28,7 +28,13 @@ import { api } from "../api";
  *    composition 事件岔开，英文输入法下没有，每个标点必重复。见
  *    `keydownStoppedWithoutDefault`。
  *
- * 上面四条都是「猜 xterm 这一路会不会也发」，每条对应一次真机翻车。猜不完：
+ * 5. **组合永不结束 → 整个终端失聪**（`IM_GONE_KEYS` / `revive`）：组合进行到一半
+ *    切走输入法（第三方输入法尤其容易），WebKit 这一焦点的 composition 再也不会
+ *    end，于是之后每颗键都是 `keyCode 229 + isComposing`，两路人都不发 —— 一个
+ *    字节都不出去，直到用户切走 app 再回来。这是「中文没问题、英文丢一大片」的
+ *    根因之一：中文每轮组合都能正常收尾，出事的全是那些没收尾的会话。
+ *
+ * 上面四条（连同第 5 条）都是「猜 xterm 这一路会不会也发」，每条对应一次真机翻车。猜不完：
  * 发送方有两个（xterm 的 `onData` 和这一层），而 WKWebView 的事件序列按输入法
  * 变，换一种输入法就多一条没覆盖的路。所以**最后兜底的不是分支，是出口**——
  * 见 [`OnceGuard`]：一颗键只许放一个可见字符出去，谁先到算谁的。
@@ -272,14 +278,23 @@ type TraceRec = {
   data?: string;
   /** 处置前隐藏 textarea 的内容（非空就说明有攒字） */
   ta?: string;
+  /**
+   * **事件自己的时间戳**（`ev.timeStamp`，与 `t` 同一时钟）。
+   *
+   * `t` 是处理时的时刻，`ts` 是事件产生的时刻，两者之差就是「事件在队列里躺了
+   * 多久」——「打字发钝」这类纯延迟症状只有这个差值能证明，光看发出的字节
+   * 一条不少、看不出慢。
+   */
+  ts?: number;
   t?: number;
 };
 
 const traceOn = (): boolean =>
   (globalThis as { __NX_TRACE_INPUT?: boolean }).__NX_TRACE_INPUT === true;
 
-function trace(rec: TraceRec): void {
+function trace(rec: TraceRec, ev?: Event): void {
   if (!traceOn()) return;
+  if (ev !== undefined) rec.ts = ev.timeStamp;
   const g = globalThis as { __nxInputLog?: TraceRec[] };
   const log = (g.__nxInputLog ??= []);
   log.push({ t: nowMs(), ...rec });
@@ -412,6 +427,59 @@ export function installMacKeyboard(
   // （该 false 的时候 true、该 true 的时候 false），只有 compositionstart
   // 与 compositionend 这对事件说的是事实。
   let composing = false;
+
+  /**
+   * 第五类缺陷：**组合态永远不结束，整个终端失聪**。
+   *
+   * 真机路径（macOS + WKWebView + 第三方输入法，本机用豆包输入法复现）：
+   * 拼音敲到一半（隐藏 textarea 里留着 marked text `ni`）→ 组合还没上屏就切
+   * 走输入法 / 切走 app 把这次会话丢掉 → **WebKit 这一焦点的组合从没结束**，
+   * 于是之后每颗键都是 `keyCode 229 + isComposing true`：
+   *
+   * - 我们这一层：看到 `composing` 为真就一律放行给 xterm；
+   * - xterm 那一路：`CompositionHelper.keydown` 对 229 直接 return，`_keyDown`
+   *   什么都不发，随后的 `input` 又被 `_inputEvent` 的 `!_keyDownSeen` 丢掉；
+   *
+   * 两路人都没有，**终端一个字节都不再出去**。用户侧的感觉就是「打英文一片字
+   * 没了」；实测只有切到别的 app 再回来才恢复（WebKit 在可编辑元素失焦时才真正
+   * 结束 IM 会话）。
+   *
+   * 判据刻意**不用时间**：真组合里用户停下来想三秒很正常，掐表必误杀中文。
+   * 用「按键有没有回音」——真组合时每颗键都会带来 compositionupdate，或至少让
+   * textarea 里的 marked text 变一变；连着好几颗键什么都没动，只可能是 IM 已经
+   * 不接电话了，那时留着 `composing` 只会把整 tab 憋死。
+   *
+   * 证据见：`IM_GONE_KEYS` 定 3 颗 = 真机上一次也不会误伤（中文组合每颗键必有
+   * update），同时用户最多丢 3 颗键就会被救回来。
+   */
+  const IM_GONE_KEYS = 3;
+  /** 已判定 IM 失联：后续的 `composing` 一律不再当真 */
+  let imGone = false;
+  /** 组合态下连续几颗键没带来任何 IM 回应 */
+  let quietKeys = 0;
+  /** 上次看到的 marked text，用来发现「这次按键 IM 毫无反应」 */
+  let composeTa = "";
+  /**
+   * 组合态里被我们按下不表的那几颗键。判定 IM 失联时把它们补发出去——用户真听到
+   * 的「丢字母」往往就是自救前那两颗；补发的前提是从没人发出过（`markSent`
+   * 之前一定顺手清掉这队），所以不可能是重复。
+   */
+  let swallowed: Array<{ ch: string; at: number }> = [];
+  /** 补发的上限与有效期：只救「刚刚两颗」，不可能把十分钟前的键翻出来 */
+  const SWALLOW_MAX = 3;
+  const SWALLOW_TTL_MS = 400;
+
+  /** 输入法确实收下了这颗键（它有回应了），压着的就作废 */
+  const discardSwallowed = (): void => {
+    swallowed = [];
+  };
+
+  /** 组合态里按下不表的键记一笔，等 ① 自救时补发 ② IM 有回应时作废 */
+  const swallow = (ch: string): void => {
+    const now = nowMs();
+    swallowed = swallowed.filter((e) => now - e.at <= SWALLOW_TTL_MS);
+    if (swallowed.length < SWALLOW_MAX) swallowed.push({ ch, at: now });
+  };
   /** 本轮组合里被我们拦下的那颗 IME 键；只供 `onComposeEnd` 决定是否剥尾。 */
   let imeConsumedKey: string | null = null;
   /** 最近一次 `compositionend` 的时间戳，用于识别「同一次按键的两半」 */
@@ -483,20 +551,26 @@ export function installMacKeyboard(
     ev.timeStamp - composeEndedTs < 30;
 
   const onComposeStart = (ev?: CompositionEvent) => {
-    trace({ ev: "compstart", act: "state", data: ev?.data ?? undefined, comp: false, ta: taOf(internals.textarea) });
+    trace({ ev: "compstart", act: "state", data: ev?.data ?? undefined, comp: false, ta: taOf(internals.textarea) }, ev);
     // **不清账本**：WebKit 会给空格这类普通按键补一对 composition 事件，清掉
     // 就会让已发出的那一颗在随后的 input 里被当成「没发过」，变成两个空格。
     // 组合期间 `composing` 会让 input 当场返回，账本也不会被误用。
     composing = true;
+    // 新一轮组合开始 = 输入法又能接电话了，看门狗归零
+    imAlive();
+    composeTa = internals.textarea?.value ?? "";
     // 上一轮如果因为异常路径没消费掉，别让它带到这一轮
     imeConsumedKey = null;
     clearPending();
   };
 
   const onComposeEnd = (ev: CompositionEvent) => {
-    trace({ ev: "compend", act: "state", data: ev.data ?? undefined, comp: true, ta: taOf(internals.textarea) });
+    trace({ ev: "compend", act: "state", data: ev.data ?? undefined, comp: true, ta: taOf(internals.textarea) }, ev);
     composing = false;
     composeEndedTs = ev.timeStamp;
+    // 无论这一轮是怎么结束的，存在的那一刻 IM 一定还活着
+    imAlive();
+    composeTa = "";
     const consumed = imeConsumedKey;
     imeConsumedKey = null;
     const ta = internals.textarea;
@@ -533,6 +607,55 @@ export function installMacKeyboard(
     if (ta && ta.value) ta.value = "";
   };
 
+  /**
+   * 组合态是否还值得相信。IM 已判定失联时，残留的 `composing` 只剩副作用
+   * （把所有键都放给一个不会发字的 xterm），所以一律按「没在组合」处理。
+   */
+  const activeCompose = (): boolean => composing && !imGone;
+
+  /** 组合真的重新开始 ↔ IM 回来了 */
+  const imAlive = (): void => {
+    imGone = false;
+    quietKeys = 0;
+    discardSwallowed();
+  };
+
+  /**
+   * 自救：把遗留的 IM 会话掐断，让键回到正常路径。
+   *
+   * 唯一有效的动作是**让隐藏 textarea 失焦再聚焦** —— 和「切走别的 app 再回来」
+   * 是同一件事：WebKit 在可编辑元素失焦时会结束 IM 会话、丢掉 marked text，
+   * 之后 WebKit 给回来的 keyCode 就从 229 变回真实值。
+   *
+   * 顺手清掉 textarea 里那截残留：它已经不可能上屏了，留着只会在某次
+   * `_handleAnyTextareaChanges` 里按长度差算进 pty，变成一串幽灵字符。
+   */
+  const revive = (): void => {
+    const ta = internals.textarea;
+    trace({ ev: "revive", act: "state", comp: composing, ta: taOf(ta) });
+    quietKeys = 0;
+    imGone = true;
+    // 判定不失联的那一刻之前被按下不表的那几颗键，趁现在补发出去 —— 用户嘴里
+    // 的「丢字母」多半就是这几颗（判定要攒够几颗键，第一颗没法当场知道）。
+    const replay = swallowed.splice(0, swallowed.length);
+    try {
+      ta?.blur();
+      if (ta) ta.value = "";
+      // 同一个「帧」里聚焦回去：拖到定时任务里可能被别的元素抢走焦点，
+      // 那就只是丢了一次组合，反而更糟。
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => ta?.focus?.());
+      }
+    } catch {
+      // 焦点操作失败也不能让终端继续失聪：`imGone` 已经置位，按键照样走我们的出口
+    }
+    for (const it of replay) {
+      clearTextarea();
+      out(it.ch);
+      trace({ ev: "send", act: "replay", sent: it.ch, via: "mac" });
+    }
+  };
+
   /** 我们替 xterm 把这颗键标成「已发过」，防止它再从 input 补一遍 */
   const markSent = () => {
     internals._keyDownSeen = true;
@@ -545,12 +668,28 @@ export function installMacKeyboard(
     guard.reset();
     // 每颗键重置：keypress 紧跟着它自己的 keydown 来，不会隔着下一颗键
     keydownStoppedWithoutDefault = false;
+    // —— 看门狗：组合态下 IM 还在不在接电话（详见 `IM_GONE_KEYS` 的注释）——
+    if (composing) {
+      const taNow = internals.textarea?.value ?? "";
+      // 只有「又有新的预编辑串被写进来」才算 IM 活着。`revive` 与 ASCII 分支都会
+      // 自己清空 textarea，若把「变空」也当成 IM 的动静，自救会在下一颗键上被
+      // 自己推翻 —— 实测那正好会让终端只在第 3 颗键出字、之后又哑掉。
+      if (taNow.length > 0 && taNow !== composeTa) {
+        composeTa = taNow;
+        imAlive();
+      } else if (!imGone && isPlainChar(ev.key) && ++quietKeys >= IM_GONE_KEYS) {
+        revive();
+      }
+    } else {
+      composeTa = internals.textarea?.value ?? "";
+      quietKeys = 0;
+    }
     // 中文输入法「智能全角标点」：必须排在最前面、且**不看 `ev.isComposing`**——
     // 它在输入法上下文残留时会谎报 true，跟着走下面 `isImeKey` / `ev.isComposing`
     // 那几条分支的话，这颗键要么被当成「组合态里的确认键」吞掉、要么提前 return，
     // 根本轮不到标点处理。真实组合状态只认 `composing`。
     if (
-      !composing &&
+      !activeCompose() &&
       !ev.ctrlKey && !ev.altKey && !ev.metaKey &&
       PUNCT_RISK.has(ev.key)
     ) {
@@ -562,7 +701,7 @@ export function installMacKeyboard(
       // 刚刚才有 insertText 交出过字符 → 这颗键的结果已经发出去了，绝不再补。
       // 少了这一句，「input 先到」的机型上每敲一个标点都会多出一个字符。
       if (nowMs() - lastTextInputAt < 200) {
-        trace({ ev: "keydown", act: "drop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) });
+        trace({ ev: "keydown", act: "drop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
         return;
       }
       clearPending();
@@ -580,12 +719,15 @@ export function installMacKeyboard(
         }
         pendingTimer = undefined;
       }, 80);
-      trace({ ev: "keydown", act: "defer", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) });
+      trace({ ev: "keydown", act: "defer", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
       return;
     }
     // 组合态里被 IME 吃掉的键：拦在这里，别让它走到 xterm 的 `_keyDown`。
     if (isImeKey(ev)) {
-      if (composing || ev.isComposing) {
+      if (activeCompose() || (ev.isComposing && !imGone)) {
+        // 交给 IM 之前先留底：万一它压根没收下（输入法已经走了），自救时把这颗
+        // 补发回来。IM 有反应的话 `imAlive` 会立刻作废这份留底。
+        if (activeCompose() && isPlainChar(ev.key)) swallow(ev.key);
         // 组合还没结束：**不能 preventDefault**，上屏是 IME 的默认行为，拦掉会
         // 把候选词卡住。只 stopPropagation 掐断 xterm 那一路（否则空格多一个
         // 空格、选候选的数字变成「大2」）。代价是那颗键照样可能写进隐藏
@@ -595,9 +737,9 @@ export function installMacKeyboard(
           keydownStoppedWithoutDefault = true; // 同上：keypress 也要掐
           markSent(); // 让 xterm 的 `_inputEvent` 也别去发上屏那一条（否则上屏两遍）
           imeConsumedKey = ev.key;
-          trace({ ev: "keydown", act: "stop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) });
+          trace({ ev: "keydown", act: "stop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
         } else {
-          trace({ ev: "keydown", act: "pass", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) });
+          trace({ ev: "keydown", act: "pass", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
         }
         return;
       }
@@ -609,24 +751,26 @@ export function installMacKeyboard(
         ev.preventDefault();
         ev.stopPropagation();
         markSent();
-        trace({ ev: "keydown", act: "stop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) });
+        trace({ ev: "keydown", act: "stop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
         return;
       }
     }
-    // 真·组合态：这颗键属于拼音，一个字节都不该由我们发，textarea 也不能动
-    if (composing) {
-      trace({ ev: "keydown", act: "pass", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) });
+    // 真·组合态：这颗键属于拼音，一个字节都不该由我们发，textarea 也不能动。
+    // 同样留底：判据是「IM 有没有回应」，此刻还没回应不代表它没有在听。
+    if (activeCompose()) {
+      if (isPlainChar(ev.key)) swallow(ev.key);
+      trace({ ev: "keydown", act: "pass", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
       return;
     }
     // 浏览器自称在组合、我们却没收到 compositionstart（真组合的 compositionstart
     // 一定先过 host 的捕获阶段）：输入法上下文残留。这里的字母交给 xterm 会因
     // 229 丢掉，但 `onInput` 那条兜底刻意不看 isComposing，会补发出去。
-    if (ev.isComposing) {
-      trace({ ev: "keydown", act: "pass", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) });
+    if (ev.isComposing && !imGone) {
+      trace({ ev: "keydown", act: "pass", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
       return;
     }
     if (!isPlainKeystroke(ev)) {
-      trace({ ev: "keydown", act: "pass", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) });
+      trace({ ev: "keydown", act: "pass", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
       return;
     }
     // 拦死默认行为：不产生 keypress / beforeinput，也不让 xterm 的 _keyDown 跑
@@ -639,7 +783,7 @@ export function installMacKeyboard(
     clearTextarea();
     const fresh = ledger.keyDown(ev.key, nowMs());
     if (fresh) out(ev.key); // fresh=false 说明 input 已经先发过这一颗
-    trace({ ev: "keydown", act: fresh ? "send" : "drop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taBefore, sent: fresh ? ev.key : undefined, via: fresh ? "mac" : undefined });
+    trace({ ev: "keydown", act: fresh ? "send" : "drop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taBefore, sent: fresh ? ev.key : undefined, via: fresh ? "mac" : undefined }, ev);
   };
 
   /**
@@ -648,33 +792,33 @@ export function installMacKeyboard(
    */
   const onKeyPress = (ev: KeyboardEvent) => {
     if (!keydownStoppedWithoutDefault) {
-      trace({ ev: "keypress", act: "pass", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) });
+      trace({ ev: "keypress", act: "pass", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
       return;
     }
     keydownStoppedWithoutDefault = false;
     // 只拦 xterm 这一路。**不 preventDefault**：全角替换和候选上屏都靠默认行为
     ev.stopPropagation();
-    trace({ ev: "keypress", act: "stop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) });
+    trace({ ev: "keypress", act: "stop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
   };
 
   const onInput = (ev: InputEvent) => {
     // 有半角标点键在等：不管这条 data 是原样还是全角，都是它唯一、最终的结果，
     // 发这一条就够，xterm 不该再碰（否则非 ASCII 会被当成组合上屏再发一遍）。
-    if (pendingPunct && !composing && ev.data) {
+    if (pendingPunct && !activeCompose() && ev.data) {
       clearPending();
       ev.stopPropagation();
       clearTextarea();
       lastTextInputAt = nowMs();
       out(ev.data);
-      trace({ ev: "input", act: "send", it: ev.inputType, data: ev.data, ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea), sent: ev.data, via: "mac" });
+      trace({ ev: "input", act: "send", it: ev.inputType, data: ev.data, ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea), sent: ev.data, via: "mac" }, ev);
       return;
     }
     if (ev.inputType === "insertText" && ev.data) lastTextInputAt = nowMs();
     // 刻意不看 `ev.isComposing`：输入法上下文残留时它会谎报 true，而那正是丢字
     // 发生的那一刻。是否在组合只以我们自己的 compositionstart/end 为准。
     const seen: TraceRec = { ev: "input", act: "pass", it: ev.inputType, data: ev.data ?? undefined, ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) };
-    if (composing) {
-      trace(seen);
+    if (activeCompose()) {
+      trace(seen, ev);
       return;
     }
     // 上屏刚过去就到的 insertText，是同一次 IME 操作的尾巴（选候选那颗键被
@@ -725,20 +869,32 @@ export function installMacKeyboard(
     const rest = single ? ledger.input(data, nowMs()) : "";
     const ok = rest !== "";
     if (ok) out(rest);
-    trace({ ev: "input", act: ok ? "send" : "drop", it: ev.inputType, data, ic: ev.isComposing, comp: composing, ta: taBefore, sent: ok ? rest : undefined, via: ok ? "mac" : undefined });
+    trace({ ev: "input", act: ok ? "send" : "drop", it: ev.inputType, data, ic: ev.isComposing, comp: composing, ta: taBefore, sent: ok ? rest : undefined, via: ok ? "mac" : undefined }, ev);
   };
 
   /** 只记不看：把「我们没接的那些事件」也留下来，才知道漏了什么 */
   const onPassive = (ev: Event) => {
-    if (!traceOn()) return;
-    if (ev instanceof KeyboardEvent) {
-      trace({ ev: ev.type, act: "pass", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) });
-    } else if (ev.type === "compositionupdate") {
-      trace({ ev: "compupdate", act: "pass", data: (ev as CompositionEvent).data ?? undefined, comp: composing, ta: taOf(internals.textarea) });
-    } else if (ev.type === "beforeinput") {
-      const ie = ev as InputEvent;
-      trace({ ev: "beforeinput", act: "pass", it: ie.inputType, data: ie.data ?? undefined, ic: ie.isComposing, comp: composing, ta: taOf(internals.textarea) });
+    // 刻意只用**结构**认事件：不能在 listener 里依赖 `ev.type`（自测的假事件对象
+    // 连 type 都没有），更不能用 `ev instanceof KeyboardEvent` —— node 里这个全局
+    // 根本不存在，`instanceof` 会直接抛 ReferenceError，记日志不该把输入炸掉。
+    const keyboard = "keyCode" in ev;
+    const input = "inputType" in ev;
+    // compositionupdate = 「IM 还活着」的证据，与日志开关无关，必须先看
+    if (!keyboard && !input) {
+      composeTa = internals.textarea?.value ?? "";
+      imAlive();
+      if (!traceOn()) return;
+      trace({ ev: "compupdate", act: "pass", data: (ev as CompositionEvent).data ?? undefined, comp: composing, ta: taOf(internals.textarea) }, ev);
+      return;
     }
+    if (!traceOn()) return;
+    if (input) {
+      const ie = ev as InputEvent;
+      trace({ ev: "beforeinput", act: "pass", it: ie.inputType, data: ie.data ?? undefined, ic: ie.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
+      return;
+    }
+    const k = ev as KeyboardEvent;
+    trace({ ev: k.type, act: "pass", key: k.key, kc: k.keyCode, code: k.code, mods: modsOf(k), ic: k.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
   };
 
   host.addEventListener("keydown", onKeyDown, true);

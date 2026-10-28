@@ -26,6 +26,7 @@ import { matchSessions, scanMention } from "../../src/lib/mention";
 import {
   KeyLedger,
   installMacKeyboard,
+  setInputTrace,
   isPlainChar,
   isPlainKeystroke,
 } from "../../src/lib/macInput";
@@ -539,7 +540,9 @@ function rig() {
     out.text += d;
   };
   const { uninstall: un, arbitrate } = installMacKeyboard(host as never, term as never, send, true);
-  return { host, term, out, send, un, arbitrate };
+  // `ta` 是 xterm 的隐藏 textarea：真机上输入法的预编辑串就写在这儿，
+  // 用例里「敲一颗拼音字母」必须连它一起更新（只看 composition 事件是不够的）
+  return { host, term, ta: term.textarea, out, send, un, arbitrate };
 }
 
 test("接管：keydown 直接把字符发出，并拦下默认行为与冒泡", () => {
@@ -730,9 +733,16 @@ test("接管：拼音组合中按空格确认，不能让它漏进 pty", () => {
   // WKWebView 给空格的 keyCode 是 32 而不是 229，xterm 的 CompositionHelper
   // 只对 229 提前返回 —— 于是它先把组合文本 finalize 一遍，再把空格当普通
   // 输入发出去。用户看到的就是「pin + 空格 → 拼 」。
-  const { host, out, un } = rig();
+  const { host, out, un, ta } = rig();
   host.fire("compositionstart", {});
-  for (const ch of "pin") host.fire("keydown", plainKey(ch, { keyCode: 229 }));
+  // 真机序列（见 macInput 里 `IM_GONE_KEYS` 的注释）：每敲一颗拼音字母，输入法
+  // 都会回一条 compositionupdate、并把预编辑串写进隐藏 textarea。漏了这一步的
+  // 序列在真机上等于「输入法已经不接电话了」，是另一条自救路径，见下面那条用例。
+  for (const ch of "pin") {
+    host.fire("keydown", plainKey(ch, { keyCode: 229 }));
+    ta.value += ch;
+    host.fire("compositionupdate", { data: ta.value });
+  }
   const ev = host.fire("keydown", plainKey(" ", { keyCode: 229 }));
   assert.equal(ev.propagationStopped, true, "必须拦住 xterm 的 _keyDown");
   assert.equal(ev.defaultPrevented, false, "不能 preventDefault，否则 IME 上不了屏");
@@ -820,9 +830,13 @@ test("接管：组合态里按数字选候选，不能让它进 pty", () => {
   // 和空格是同一个漏法：xterm 的 CompositionHelper.keydown 只对 229 提前返回，
   // 数字键的 keyCode 是 50，于是 `_keyDown` 一路走到 triggerDataEvent("2") ——
   // 「da」+「2」选第二个候选，屏幕上就成了「大2」。
-  const { host, out, un } = rig();
+  const { host, out, un, ta } = rig();
   host.fire("compositionstart", {});
-  for (const ch of "da") host.fire("keydown", plainKey(ch, { keyCode: 229 }));
+  for (const ch of "da") {
+    host.fire("keydown", plainKey(ch, { keyCode: 229 }));
+    ta.value += ch;
+    host.fire("compositionupdate", { data: ta.value });
+  }
   const ev = host.fire("keydown", plainKey("2", { keyCode: "2".charCodeAt(0) }));
   assert.equal(ev.propagationStopped, true, "必须拦住 xterm 的 _keyDown");
   assert.equal(ev.defaultPrevented, false, "不能 preventDefault，否则 IME 选不了候选");
@@ -1266,3 +1280,60 @@ test("接管：标点替换键的 isComposing 谎报 true 时，照样只发一�
   assert.equal(out.text, "，", "只发一次，半角逗号不能跟着冒出来");
   un();
 });
+
+test("接管：组合永远不结束时不能让终端失聪（自救后打字照样出字）", () => {
+  // 真机复现：拼音敲到一半切走输入法 → WebKit 这边的 composition 从没结束，
+  // 于是之后每颗键都是 keyCode 229 + isComposing，任何人都不发 → 终端完全失聪。
+  const { host, out, ta, un } = rig();
+  host.fire("compositionstart", {});
+  ta.value = "ni";
+  host.fire("compositionupdate", { data: "ni" });
+  // 连敲 3 颗键，输入法毫无回应（既不 update、也不改 textarea），只可能是它走了
+  for (const ch of "abc") host.fire("keydown", plainKey(ch, { keyCode: 229, isComposing: true }));
+  setInputTrace(false);
+  assert.equal(out.text, "abc", "IM 已判定失联，接管层必须自己把字发出去，不能整条放行给一个不发字的 xterm");
+  un();
+});
+
+test("接管：真·组合还在呼吸时不能误判失聪（中文输入不受影响）", () => {
+  // 和上面那条是同一个判据的两面：每颗拼音字母都带来 compositionupdate +
+  // 预编辑串变长，这轮组合就是活的，按键必须继续交给 IME，一个字节都不许发出去。
+  const { host, out, ta, un } = rig();
+  host.fire("compositionstart", {});
+  for (const ch of "zhongwen") {
+    host.fire("keydown", plainKey(ch, { keyCode: 229, isComposing: true }));
+    ta.value += ch;
+    host.fire("compositionupdate", { data: ta.value });
+  }
+  assert.equal(out.text, "", "组合还在呼吸，拼音字母不许漏进 pty");
+  // 上屏交回 xterm 的组合路径（这一层不插手，详见 `onInput` 的注释）：
+  // 接管层发的是 0 字节，一个多的都没有。
+  host.fire("compositionend", { data: "中文" });
+  host.fire("input", { data: "中文", inputType: "insertCompositionText" });
+  assert.equal(out.text, "", "中文上屏由 xterm 自己的 _finalizeComposition 发，接管层不再插手一遍");
+  un();
+});
+
+test("接管：自救之后新开一次真正的组合，仍能正常进组合态", () => {
+  const { host, out, ta, un } = rig();
+  host.fire("compositionstart", {});
+  for (const ch of "abc") host.fire("keydown", plainKey(ch, { keyCode: 229, isComposing: true }));
+  assert.equal(out.text, "abc", "失联自救：连敲几颗键毫无回音时自己把字发出来");
+
+  // 输入法回来了：新一轮 compositionstart 必须把 `imGone` 复位
+  host.fire("compositionend", { data: "" });
+  ta.value = "";
+  host.fire("compositionstart", {});
+  for (const ch of "hao") {
+    host.fire("keydown", plainKey(ch, { keyCode: 229, isComposing: true }));
+    ta.value += ch;
+    host.fire("compositionupdate", { data: ta.value });
+  }
+  assert.equal(out.text, "abc", "回到活着的组合态后，新敲的拼音字母一个都不该进 pty");
+  const space = host.fire("keydown", plainKey(" ", { keyCode: 229, isComposing: true }));
+  assert.equal(space.propagationStopped, true, "确认键必须拦住 xterm，否则上屏后还多一个空格");
+  assert.equal(space.defaultPrevented, false, "不能 preventDefault，否则 IME 上不了屏");
+  assert.equal(out.text, "abc", "确认键自己也不能出字节");
+  un();
+});
+
