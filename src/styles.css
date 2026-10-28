@@ -326,7 +326,14 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+/* 整行就是拖拽把手，按下不能起文字选区（起拖时没有 preventDefault，见 SessionList）。
+   改名态要排除：里面是输入框，继承了 user-select:none 就选不中字了。 */
+.folder-row:not(.renaming) {
+  user-select: none;
+  touch-action: none;
+}
 .folder-row:hover { color: var(--text); }
+.folder-row.dragging { opacity: 0.4; }
 .folder-row.drop-target {
   background: var(--bg-elev);
   box-shadow: inset 0 0 0 1px var(--accent);

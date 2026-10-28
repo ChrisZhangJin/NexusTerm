@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { SessionRecord } from "../types";
+import {
+  folderDropTarget,
+  isSelfOrDescendant,
+  leafFolder,
+  normFolder,
+  resolveFolderInput,
+} from "../lib/folders";
 import IOMenu from "./IOMenu";
 
 interface Props {
@@ -15,8 +22,11 @@ interface Props {
   onExport: (s: SessionRecord) => void;
   /** 导出整个分组（递归）下的所有连接 */
   onExportFolder: (sessions: SessionRecord[], folderName: string) => void;
-  /** 分组改名：把 oldPath 整体改成以 newName 为末段 */
-  onRenameFolder: (oldPath: string, newName: string) => void;
+  /**
+   * 把分组 oldPath 整棵子树挪到 newPath。改名和「拖进别的分组」在存储层是同一件事
+   * （见 lib/folders），所以共用这一个出口。
+   */
+  onMoveFolder: (oldPath: string, newPath: string) => void;
   /** 导入 / 导出 */
   io: {
     canExportSession: boolean;
@@ -25,11 +35,6 @@ interface Props {
     onExportSession: () => void;
     onExportAll: () => void;
   };
-}
-
-/** 规整 folder：去掉首尾斜杠，空/`/` 视为根（""）。 */
-function normFolder(raw: string): string {
-  return (raw || "").replace(/^\/+|\/+$/g, "").trim();
 }
 
 /** 显示名：有名字用名字，没名字用 IP。 */
@@ -126,6 +131,11 @@ type CtxTarget =
   | { kind: "session"; session: SessionRecord }
   | { kind: "folder"; node: TreeNode };
 
+/** 正在被拖的东西：连接用 id，分组用完整路径。 */
+type DragRef =
+  | { kind: "session"; id: string }
+  | { kind: "folder"; id: string };
+
 /** 弹出式连接选择器 —— 多级分组树 + 拖拽 + 右键菜单。 */
 export default function SessionList({
   sessions,
@@ -137,7 +147,7 @@ export default function SessionList({
   onReorder,
   onExport,
   onExportFolder,
-  onRenameFolder,
+  onMoveFolder,
   io,
 }: Props) {
   const [filter, setFilter] = useState("");
@@ -145,7 +155,7 @@ export default function SessionList({
   const panelRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const [dragId, setDragId] = useState<string | null>(null);
+  const [drag, setDrag] = useState<DragRef | null>(null);
   const [dropFolder, setDropFolder] = useState<string | null>(null);
 
   const [ctx, setCtx] = useState<{
@@ -256,16 +266,29 @@ export default function SessionList({
 
   // 用 pointer 事件自己实现拖拽：HTML5 drag 在 Tauri/WebView2 里不可靠
   //（宿主拦截、button 子元素抢事件），落点改用 elementFromPoint 命中测试。
-  const dragStart = useRef<{ id: string; x: number; y: number; started: boolean } | null>(null);
+  const dragStart = useRef<{
+    target: DragRef;
+    x: number;
+    y: number;
+    started: boolean;
+  } | null>(null);
   const [dropHint, setDropHint] = useState<{ anchorId?: string; after?: boolean } | null>(null);
   const [ghost, setGhost] = useState<{ x: number; y: number; label: string } | null>(null);
   const dropRef = useRef<{ folder: string; anchorId?: string; after?: boolean } | null>(null);
+  /** 刚拖完一次：吃掉紧随 pointerup 的那次 click，别顺手把分组折叠了 */
+  const draggedRef = useRef(false);
 
-  const startDrag = (e: React.PointerEvent, id: string) => {
+  const startDrag = (e: React.PointerEvent, target: DragRef) => {
     if (e.button !== 0) return;
-    e.preventDefault(); // 防止选中文字
-    e.stopPropagation();
-    dragStart.current = { id, x: e.clientX, y: e.clientY, started: false };
+    draggedRef.current = false;
+    if (target.kind === "session") {
+      // 连接是从手柄起拖的，按下就不该再有别的含义
+      e.preventDefault(); // 防止选中文字
+      e.stopPropagation();
+    }
+    // 分组是整行起拖：这里不能 preventDefault，否则 click 不再派发，
+    // 点一下展开 / 折叠就坏了。防选中改由 .folder-row 的 user-select 负责。
+    dragStart.current = { target, x: e.clientX, y: e.clientY, started: false };
   };
 
   useEffect(() => {
@@ -275,18 +298,38 @@ export default function SessionList({
       if (!st.started) {
         if (Math.hypot(e.clientX - st.x, e.clientY - st.y) < 4) return;
         st.started = true;
-        setDragId(st.id);
+        setDrag(st.target);
         setCtx(null);
       }
-      const s = unique.find((x) => x.id === st.id);
-      setGhost({ x: e.clientX, y: e.clientY, label: s ? displayName(s) : "" });
+      const label =
+        st.target.kind === "folder"
+          ? leafFolder(st.target.id)
+          : (() => {
+              const s = unique.find((x) => x.id === st.target.id);
+              return s ? displayName(s) : "";
+            })();
+      setGhost({ x: e.clientX, y: e.clientY, label });
 
       const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
       const row = el?.closest<HTMLElement>("[data-session-id]");
       const folderRow = el?.closest<HTMLElement>("[data-drop-folder]");
       const inList = el?.closest(".sp-list");
       let drop: typeof dropRef.current = null;
-      if (row) {
+      if (st.target.kind === "folder") {
+        // 分组之间没有可排的次序（同层按名字排），所以只认「落进哪个分组」。
+        // 落在某条连接上，就按那条连接所在的分组算。
+        const parent = folderRow
+          ? folderRow.dataset.dropFolder ?? ""
+          : row
+            ? row.dataset.folder ?? ""
+            : inList
+              ? ""
+              : null;
+        // 落进自己或自己的子孙是无解的，既不高亮也不接收
+        if (parent !== null && !isSelfOrDescendant(st.target.id, parent)) {
+          drop = { folder: parent };
+        }
+      } else if (row) {
         const r = row.getBoundingClientRect();
         drop = {
           folder: row.dataset.folder ?? "",
@@ -305,12 +348,17 @@ export default function SessionList({
     const up = () => {
       const st = dragStart.current;
       dragStart.current = null;
+      if (st?.started) draggedRef.current = true;
       if (st?.started && dropRef.current) {
         const d = dropRef.current;
-        moveSession(st.id, d.folder, d.anchorId, d.after);
+        if (st.target.kind === "folder") {
+          onMoveFolder(st.target.id, folderDropTarget(st.target.id, d.folder));
+        } else {
+          moveSession(st.target.id, d.folder, d.anchorId, d.after);
+        }
       }
       dropRef.current = null;
-      setDragId(null);
+      setDrag(null);
       setDropFolder(null);
       setDropHint(null);
       setGhost(null);
@@ -322,7 +370,7 @@ export default function SessionList({
       window.removeEventListener("pointerup", up);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [unique]);
+  }, [unique, onMoveFolder]);
 
   const openCtx = (e: React.MouseEvent, target: CtxTarget) => {
     e.preventDefault();
@@ -369,8 +417,8 @@ export default function SessionList({
       </div>
 
       <div
-        className={`sp-list ${dropFolder === "" && dragId ? "drop-root" : ""} ${
-          dragId ? "is-dragging" : ""
+        className={`sp-list ${dropFolder === "" && drag ? "drop-root" : ""} ${
+          drag ? "is-dragging" : ""
         }`}
       >
         <TreeView
@@ -382,19 +430,21 @@ export default function SessionList({
             onConnect(s);
             onClose();
           }}
-          dragId={dragId}
+          drag={drag}
           dropFolder={dropFolder}
           dropHint={dropHint}
           onStartDrag={startDrag}
+          wasDragged={draggedRef}
           onCtx={openCtx}
           renaming={renaming}
           onRenameDone={(path, next) => {
             if (renamingRef.current !== path) return; // Enter 后 blur 二次触发
             renamingRef.current = null;
             setRenaming(null);
-            const old = path.split("/").pop() ?? "";
-            const v = (next ?? "").trim().replace(/\//g, "");
-            if (v && v !== old) onRenameFolder(path, v);
+            if (next === null) return; // Esc
+            // 输入框里允许带 `/`：填路径就是换层级，见 lib/folders
+            const target = resolveFolderInput(path, next);
+            if (target) onMoveFolder(path, target);
           }}
         />
 
@@ -470,7 +520,7 @@ export default function SessionList({
                       setRenaming(node.path);
                     }}
                   >
-                    改名
+                    改名 / 移动
                   </button>
                   <button
                     className="ctx-item"
@@ -495,10 +545,12 @@ interface TreeViewProps {
   isCollapsed: (path: string) => boolean;
   toggle: (path: string) => void;
   onConnect: (s: SessionRecord) => void;
-  dragId: string | null;
+  drag: DragRef | null;
   dropFolder: string | null;
   dropHint: { anchorId?: string; after?: boolean } | null;
-  onStartDrag: (e: React.PointerEvent, id: string) => void;
+  onStartDrag: (e: React.PointerEvent, target: DragRef) => void;
+  /** 拖拽刚结束的标记：分组行用它判断该不该忽略这次 click */
+  wasDragged: React.MutableRefObject<boolean>;
   onCtx: (e: React.MouseEvent, target: CtxTarget) => void;
   renaming: string | null;
   /** next 为 null 表示取消 */
@@ -512,10 +564,11 @@ function TreeView(props: TreeViewProps) {
     isCollapsed,
     toggle,
     onConnect,
-    dragId,
+    drag,
     dropFolder,
     dropHint,
     onStartDrag,
+    wasDragged,
     onCtx,
     renaming,
     onRenameDone,
@@ -527,7 +580,8 @@ function TreeView(props: TreeViewProps) {
       {node.children.map((child) => {
         const total = countSessions(child);
         const collapsedNow = isCollapsed(child.path);
-        const isDropTarget = dropFolder === child.path && !!dragId;
+        const isDropTarget = dropFolder === child.path && !!drag;
+        const isDragging = drag?.kind === "folder" && drag.id === child.path;
         if (renaming === child.path) {
           return (
             <div key={child.path} className="folder-group">
@@ -541,6 +595,7 @@ function TreeView(props: TreeViewProps) {
                   className="folder-rename"
                   autoFocus
                   defaultValue={child.name}
+                  title="改名；带 / 的路径可以换层级，如 office/train（相对上级）或 /office/train（从根算起）"
                   onFocus={(e) => e.currentTarget.select()}
                   onKeyDown={(e) => {
                     e.stopPropagation();
@@ -559,11 +614,23 @@ function TreeView(props: TreeViewProps) {
         return (
           <div key={child.path} className="folder-group">
             <button
-              className={`folder-row ${isDropTarget ? "drop-target" : ""}`}
+              className={[
+                "folder-row",
+                isDropTarget ? "drop-target" : "",
+                isDragging ? "dragging" : "",
+              ].join(" ")}
               style={{ paddingLeft: 10 + depth * 14 }}
-              onClick={() => toggle(child.path)}
+              onPointerDown={(e) => onStartDrag(e, { kind: "folder", id: child.path })}
+              onClick={() => {
+                // 整行既是折叠开关又是拖拽把手，拖完那下 click 不算数
+                if (wasDragged.current) {
+                  wasDragged.current = false;
+                  return;
+                }
+                toggle(child.path);
+              }}
               onContextMenu={(e) => onCtx(e, { kind: "folder", node: child })}
-              title={child.path}
+              title={`${child.path}\n按住拖动：移到别的分组下`}
               data-drop-folder={child.path}
             >
               <span className="caret">{collapsedNow ? "▸" : "▾"}</span>
@@ -585,8 +652,8 @@ function TreeView(props: TreeViewProps) {
           key={s.id}
           className={[
             "session-row",
-            dragId === s.id ? "dragging" : "",
-            dragId && dropHint?.anchorId === s.id
+            drag?.kind === "session" && drag.id === s.id ? "dragging" : "",
+            drag && dropHint?.anchorId === s.id
               ? dropHint.after
                 ? "drop-after"
                 : "drop-before"
@@ -600,7 +667,7 @@ function TreeView(props: TreeViewProps) {
           <span
             className="drag-handle"
             title="按住拖动：调整顺序 / 移入分组"
-            onPointerDown={(e) => onStartDrag(e, s.id)}
+            onPointerDown={(e) => onStartDrag(e, { kind: "session", id: s.id })}
           >
             ⠿
           </span>

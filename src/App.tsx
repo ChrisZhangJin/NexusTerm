@@ -19,6 +19,13 @@ import AuthPromptDialog from "./components/AuthPromptDialog";
 import { api, onAuthPrompt, onAgentTab, stringToBytes } from "./api";
 import { loadAgentConfig } from "./lib/agent";
 import {
+  folderMoveItems,
+  isSelfOrDescendant,
+  leafFolder,
+  normFolder,
+  parentFolder,
+} from "./lib/folders";
+import {
   parseProbe,
   restoreCommand,
   restoreNotice,
@@ -1253,31 +1260,30 @@ export default function App() {
     [showToast]
   );
 
-  // 分组改名：把 oldPath 这一层的末段名改成 newName，连同其子分组一起平移
-  const renameFolder = useCallback(
-    async (oldPath: string, newName: string) => {
-      const parent = oldPath.includes("/")
-        ? oldPath.slice(0, oldPath.lastIndexOf("/"))
-        : "";
-      const newPath = parent ? `${parent}/${newName}` : newName;
-      const norm = (f: string) => f.replace(/^\/+|\/+$/g, "");
-      // 命中 oldPath 本身或其子路径的连接，整体换前缀
-      const items: [string, number, string][] = [];
-      for (const s of sessions) {
-        const f = norm(s.folder);
-        if (f === oldPath || f.startsWith(`${oldPath}/`)) {
-          const rest = f.slice(oldPath.length); // "" 或 "/子路径"
-          const nf = `${newPath}${rest}`;
-          items.push([s.id, s.sortOrder, nf]);
-        }
+  // 分组改名 / 移动：把 oldPath 整棵子树换到 newPath 下。
+  // 分组没有自己的表，所以这两件事落到存储层是同一个动作，见 lib/folders。
+  const moveFolder = useCallback(
+    async (oldPath: string, newPath: string) => {
+      const from = normFolder(oldPath);
+      const to = normFolder(newPath);
+      if (!from || from === to) return;
+      if (isSelfOrDescendant(from, to)) {
+        showToast("不能把分组移到它自己或它的子分组里");
+        return;
       }
+      const items = folderMoveItems(sessions, from, to);
       if (items.length === 0) return;
       try {
         await api.reorderSessions(items);
         await refresh();
-        showToast(`分组已改名为「${newName}」`);
+        const dest = parentFolder(to);
+        showToast(
+          parentFolder(from) === dest
+            ? `分组已改名为「${leafFolder(to)}」`
+            : `分组「${leafFolder(from)}」已移到${dest ? `「${dest}」下` : "根目录"}`
+        );
       } catch (e) {
-        showToast(`改名失败：${String(e)}`);
+        showToast(`移动失败：${String(e)}`);
       }
     },
     [sessions, refresh, showToast]
@@ -1815,7 +1821,7 @@ export default function App() {
           onReorder={reorderSessions}
           onExport={exportOneXsh}
           onExportFolder={exportFolderXsh}
-          onRenameFolder={renameFolder}
+          onMoveFolder={moveFolder}
           io={{
             canExportSession: canExportActive,
             exportSessionHint: "当前标签不是 SSH 会话",
