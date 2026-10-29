@@ -318,8 +318,12 @@ pub async fn agent_open_session(
 ///
 /// 复用同一个 label，不叠窗。加载的仍是本应用 index.html，靠注入脚本
 /// `window.__NX_AGENT__ = sessionId` 让前端切到「只渲染 Agent 面板」的界面。
+///
+/// **必须 async**：`WebviewWindowBuilder::build()` 在同步命令里跑会死锁整个
+/// 事件循环（Windows/WebView2 已知问题，官方文档明确要求 async 命令开窗）。
+/// macOS 上无此限制，但同码要跑三平台，统一 async。
 #[tauri::command]
-pub fn agent_open_window(session_id: String, app: AppHandle) -> Result<(), String> {
+pub async fn agent_open_window(session_id: String, app: AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window(AGENT_WINDOW_LABEL) {
         use tauri::Emitter;
         let _ = win.emit("nx://agent/active-session", session_id);
