@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { TerminalTab } from "../types";
 import { isMacOS } from "../lib/platform";
-import appIcon from "../assets/app-icon.png";
 
 interface Props {
   tabs: TerminalTab[];
@@ -193,8 +192,6 @@ export default function TabBar({
     <div className="tabbar" data-tauri-drag-region="deep">
       {/* 交通灯预留区：只占位，不响应交互 */}
       {mac && <div className="titlebar-lights" aria-hidden />}
-      {/* 非 macOS 没有系统标题栏图标，补一枚应用 logo */}
-      {!mac && <img className="titlebar-appicon" src={appIcon} alt="" aria-hidden />}
 
       {/* sp-toggle：连接列表的「点外部关闭」会放行它，避免先关后开 */}
       <button
@@ -205,9 +202,8 @@ export default function TabBar({
         <span className="tb-glyph">☰</span>
         连接
       </button>
-      <span className="tb-sep" />
       <div className="tabs">
-        {tabs.map((t, i) => {
+        {tabs.map((t) => {
           const isDragging = drag?.id === t.id; // drag 只在越过阈值后才被设置
           const dropBefore = drag?.overId === t.id && drag.id !== t.id && !drag.after;
           const dropAfter = drag?.overId === t.id && drag.id !== t.id && drag.after;
@@ -221,6 +217,7 @@ export default function TabBar({
               className={[
                 "tab",
                 t.id === activeTab ? "active" : "",
+                renaming === t.id ? "renaming" : "",
                 t.status === "error" ? "tab-error" : "",
                 // 不在前台时收到过新输出：点亮提醒动效。已经是当前标签就不用再提醒自己。
                 t.hasActivity && t.id !== activeTab ? "tab-activity" : "",
@@ -252,12 +249,7 @@ export default function TabBar({
               }}
               title={tabLabel(t)}
             >
-              {t.status === "reconnecting" ? (
-                <span className="spinner sm" title="正在重连" />
-              ) : (
-                <span className={`status status-${t.status}`} title={t.error ?? t.status} />
-              )}
-              <span className="tab-index">{i + 1}</span>
+              {t.status === "reconnecting" && <span className="spinner sm" title="正在重连" />}
               {renaming === t.id ? (
                 <input
                   className="tab-rename"

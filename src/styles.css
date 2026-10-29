@@ -53,15 +53,6 @@ html, body, #root {
   height: 100%;
   pointer-events: none;
 }
-/* 非 macOS 的应用图标。pointer-events 关掉，别阻断拖动 */
-.titlebar-appicon {
-  flex: 0 0 16px;
-  width: 16px;
-  height: 16px;
-  margin-left: 10px;
-  margin-right: 8px;
-  pointer-events: none;
-}
 
 /* ——— 自绘窗口控制按钮（Windows / Linux，无系统装饰）——— */
 .titlebar-controls {
@@ -91,7 +82,7 @@ html, body, #root {
   padding: 0 8px;
   background: var(--bg-elev);
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: 8px;
   color: var(--text-dim);
   font-size: 11.5px;
   cursor: pointer;
@@ -109,36 +100,37 @@ html, body, #root {
   align-items: center;
   gap: 5px;
   height: 25px;
-  padding: 0 9px;
+  padding: 0 10px;
   background: transparent;
   border: 1px solid transparent;
-  border-radius: 5px;
+  border-radius: 8px;
   color: var(--text);
   font-size: 12px;
   cursor: pointer;
   white-space: nowrap;
 }
-.tb-action:hover:not(:disabled) { background: var(--bg-elev); border-color: var(--border); }
-.tb-action.active { color: var(--accent); border-color: var(--accent); }
+.tb-action:hover:not(:disabled) { background: var(--bg-elev); }
+.tb-action.active {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
 .tb-action:disabled { opacity: 0.4; cursor: not-allowed; }
 .tb-glyph { font-size: 13px; line-height: 1; color: var(--text-dim); }
 .tb-action:hover:not(:disabled) .tb-glyph { color: var(--accent); }
-.tb-sep { width: 1px; height: 18px; background: var(--border); margin: 0 5px; }
 .tb-spacer { flex: 1; }
 
 /* ——— 标签栏（已并入标题栏 / 工具栏，顶部只剩这一条） ——— */
+/* 不用分割线：靠色度分层 —— 顶栏比终端区亮一档，肉眼自己分得出边界 */
 .tabbar {
   flex: 0 0 38px;
   height: 38px;
   display: flex;
   align-items: center;
   background: var(--bg-panel);
-  border-bottom: 1px solid var(--border);
-  padding: 0 0 0 6px;
+  padding: 0 0 0 8px;
   user-select: none;
 }
 .tabbar .tabbar-conn { flex-shrink: 0; height: 26px; }
-.tabbar .tb-sep { flex-shrink: 0; margin: 0 2px 0 6px; }
 .tabbar .tabbar-agent { flex-shrink: 0; height: 26px; margin-left: 6px; }
 .tabbar .tabbar-macro { flex-shrink: 0; height: 26px; }
 /* macOS 没有自绘窗口按钮兜底，AI 按钮右边要留白，不然贴着窗口边缘 */
@@ -151,22 +143,25 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   margin-left: 1px; animation: macro-pulse 1.2s ease-in-out infinite;
 }
 .tabbar-macro.rec { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 55%, transparent); }
-.tabs { flex: 1; min-width: 0; display: flex; overflow-x: auto; padding: 0 6px; }
+.tabs { flex: 1; min-width: 0; display: flex; overflow-x: auto; padding: 0 8px; }
 .tabs::-webkit-scrollbar { height: 0; }
 
 .tab {
-  display: flex; align-items: center; gap: 7px;
-  padding: 0 10px; height: 26px;
-  border-radius: 6px;
+  display: flex; align-items: center;
+  /* 两侧对称留白：右侧给悬停才出现的关闭 ×（18px + 边距）让位，
+     左侧对称保证标题真正居中、长标题省略号也不会顶到 × */
+  padding: 0 22px; height: 32px;
+  border-radius: 9px;
   cursor: pointer; color: var(--text-dim);
-  white-space: nowrap; max-width: 190px;
+  white-space: nowrap; max-width: 160px; min-width: 96px;
 }
 .tab:hover { background: var(--bg-elev); }
 .tab.active { background: var(--bg-elev); color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
-.tab-title { overflow: hidden; text-overflow: ellipsis; }
+.tab-title { overflow: hidden; text-overflow: ellipsis; flex: 1; text-align: center; }
 
 /* 后台标签有新输出（tmux / docker 等场景常见）：外沿一圈呼吸光环提醒，
-   切过去看一眼就自动熄灭（见 TabBar 的 hasActivity 逻辑）。 */
+   切过去看一眼就自动熄灭（见 TabBar 的 hasActivity 逻辑）。
+   这套效果沿用 main 的实现（nx-tab-pulse），不叠背景色、不动圆角。 */
 .tab.tab-activity { animation: nx-tab-pulse 1.6s ease-out infinite; }
 .tab.tab-activity .tab-title { color: var(--accent); }
 .tab.tab-activity:hover { animation-play-state: paused; }
@@ -175,26 +170,46 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   70% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 0%, transparent); }
   100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
 }
+/* 连接出错：状态点已去掉，用标题变色兜底 */
+.tab.tab-error .tab-title { color: var(--danger); }
 
-.status { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 7px; }
-.status-connecting { background: #e5c07b; }
-.status-connected  { background: var(--accent); }
-.status-closed     { background: var(--text-dim); }
-.status-error      { background: var(--danger); }
-
-.tab-close { background: none; border: none; color: var(--text-dim); cursor: pointer; padding: 0 2px; }
-.tab-close:hover { color: var(--danger); }
+/* 关闭按钮默认收起：鼠标经过标签时才从中心旋转放大出现。
+   绝对定位在右缘、不占布局宽度 —— 标题得以真正居中（否则右侧留位会显偏左）。
+   常显红色（#e06c75），与选中标签的灰绿底色拉开，不会混成一片。 */
+.tab-close {
+  position: absolute; right: 4px; top: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: none; width: 18px; height: 18px; padding: 0;
+  background: none; border: none; border-radius: 5px;
+  color: var(--danger); cursor: pointer;
+  font-size: 15px; line-height: 1;
+  opacity: 0;
+  transform: translateY(-50%) scale(0.2) rotate(-240deg);
+  pointer-events: none;
+  transition:
+    opacity .14s ease,
+    transform .26s cubic-bezier(.34, 1.56, .64, 1),
+    background-color .12s ease;
+}
+.tab:hover .tab-close,
+.tab-close:focus-visible {
+  opacity: 1;
+  transform: translateY(-50%) scale(1) rotate(0deg);
+  pointer-events: auto;
+}
+.tab-close:hover { background: color-mix(in srgb, var(--danger) 18%, transparent); }
+/* 改名输入框铺满标签时，× 会压在框上：改名期间保持收起 */
+.tab.renaming .tab-close { opacity: 0; pointer-events: none; transform: translateY(-50%) scale(0.2) rotate(-240deg); }
 
 .tab-empty { color: var(--text-dim); padding: 0 12px; font-size: 12px; }
 
-/* 标签：编号 / 改名 / 拖拽 / 新建 */
-.tabs { align-items: center; gap: 2px; }
+/* 标签：改名 / 拖拽 / 新建（状态点与编号已按设计移除） */
+.tabs { align-items: center; gap: 4px; }
 .tab { position: relative; user-select: none; flex-shrink: 0; }
-.tab-index { font-size: 11px; opacity: 0.55; margin-right: -3px; }
 .tab-rename {
-  width: 120px; font: inherit; font-size: 12px;
+  flex: 1; min-width: 0; font: inherit; font-size: 12px; text-align: center;
   color: var(--text); background: var(--bg);
-  border: 1px solid var(--accent); border-radius: 4px;
+  border: 1px solid var(--accent); border-radius: 6px;
   padding: 1px 5px; outline: none;
 }
 .tab.tab-dragging { opacity: 0.45; }
@@ -206,11 +221,10 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .tab.drop-after::after { right: -2px; }
 .tab-new {
   flex: 0 0 auto; width: 24px; height: 24px; margin-left: 2px;
-  background: none; border: none; border-radius: 5px;
+  background: none; border: none; border-radius: 8px;
   color: var(--text-dim); font-size: 16px; line-height: 1; cursor: pointer;
 }
 .tab-new:hover { background: var(--bg-elev); color: var(--accent); }
-.status-reconnecting { background: #e5c07b; }
 
 /* 转圈 */
 .spinner {
@@ -283,7 +297,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   height: 26px;
   background: var(--bg-elev);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 8px;
   color: var(--text);
   padding: 0 8px;
   outline: none;
@@ -300,7 +314,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   justify-content: center;
   background: var(--bg-elev);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 8px;
   color: var(--text);
   cursor: pointer;
   font-size: 14px;
@@ -504,6 +518,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 }
 
 /* ——— 状态栏 ——— */
+/* 与终端区同样只靠色度分层，不画上分割线 */
 .statusbar {
   flex: 0 0 24px;
   height: 24px;
@@ -512,7 +527,6 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   gap: 14px;
   padding: 0 12px;
   background: var(--bg-panel);
-  border-top: 1px solid var(--border);
   font-size: 11px;
   color: var(--text-dim);
   user-select: none;
@@ -588,7 +602,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 /* 远端资源指示（CPU / 内存 / 磁盘） */
 .sb-res {
   display: flex; align-items: center; gap: 14px; min-width: 0;
-  padding-left: 12px; border-left: 1px solid var(--border);
+  padding-left: 12px;
   transition: opacity .3s;
 }
 .sb-res.stale { opacity: .55; }
@@ -1546,18 +1560,20 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .ag-err { margin: 12px 0 0; color: var(--danger); font-size: 12px; line-height: 1.5; }
 
 /* ——— AI 助手对话面板（AgentPanel）——— */
+/* 与终端区靠色度分层（面板比终端亮一档），不画左分割线 */
 .ap-root {
   display: flex; flex-direction: column;
   height: 100%; min-width: 0;
-  background: var(--bg-panel); border-left: 1px solid var(--border);
+  background: var(--bg-panel);
 }
 .ap-head {
   flex: none; display: flex; align-items: center; gap: 8px;
-  padding: 7px 10px; border-bottom: 1px solid var(--border);
+  padding: 7px 10px;
+  background: color-mix(in srgb, var(--bg-elev) 42%, var(--bg-panel));
 }
 .ap-title { flex: 1; min-width: 0; font-size: 12.5px; font-weight: 600; color: var(--text); }
 .ap-x {
-  flex: none; width: 22px; height: 22px; border-radius: 4px; cursor: pointer;
+  flex: none; width: 22px; height: 22px; border-radius: 7px; cursor: pointer;
   background: none; border: 1px solid transparent; color: var(--text-dim); font-size: 12px;
 }
 .ap-x:hover { background: var(--bg-elev); border-color: var(--border); color: var(--text); }
@@ -1567,7 +1583,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   flex: none; display: flex; align-items: center; gap: 8px;
   /* 只剩「上下文说明 + 清空记忆」两项，按钮推到右边去，别挤在说明后面 */
   justify-content: space-between;
-  padding: 6px 10px; border-bottom: 1px solid var(--border);
+  padding: 6px 10px;
   font-size: 11.5px; color: var(--text-dim);
 }
 .ap-toggle {
@@ -1588,7 +1604,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   border: 1px solid color-mix(in srgb, #e5c07b 30%, transparent);
 }
 .ap-mini {
-  flex: none; padding: 3px 9px; border-radius: 4px; cursor: pointer;
+  flex: none; padding: 3px 9px; border-radius: 7px; cursor: pointer;
   background: none; border: 1px solid var(--border); color: var(--text-dim); font-size: 11px;
 }
 .ap-mini:hover { color: var(--danger); border-color: var(--danger); }
@@ -1596,7 +1612,6 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   flex: none; padding: 6px 10px; color: var(--danger);
   font-size: 11.5px; line-height: 1.5;
   background: color-mix(in srgb, var(--danger) 10%, transparent);
-  border-bottom: 1px solid var(--border);
 }
 
 /* 对话区 */
@@ -1662,8 +1677,12 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .ap-sug-btn:hover { border-color: var(--accent); color: var(--accent); }
 .ap-sug .ap-code { margin: 0; border: none; border-radius: 0; background: var(--bg-panel); }
 
-/* 输入区。relative 是给 `@` 联想浮层当定位父级的 */
-.ap-input { position: relative; flex: none; padding: 8px 10px 10px; border-top: 1px solid var(--border); }
+/* 输入区。relative 是给 `@` 联想浮层当定位父级的。
+   与对话区不画分割线，靠底色亮一档区分。 */
+.ap-input {
+  position: relative; flex: none; padding: 8px 10px 10px;
+  background: color-mix(in srgb, var(--bg-elev) 38%, var(--bg-panel));
+}
 
 /* `@会话名` 联想：贴着输入框上沿往上弹出，盖住的是对话区而不是输入框本人 */
 .ap-mention {
@@ -1691,7 +1710,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
    「问答」和「执行」在权力上差着一个数量级，认错的下场是别人替你把命令跑了。 */
 .ap-modes { display: flex; gap: 6px; margin-bottom: 7px; }
 .ap-mode {
-  flex: 1; padding: 5px 8px; border-radius: 6px; cursor: pointer;
+  flex: 1; padding: 5px 8px; border-radius: 8px; cursor: pointer;
   background: var(--bg); border: 1px solid var(--border); color: var(--text-dim);
   font-size: 12px; line-height: 1.4;
 }
@@ -1785,7 +1804,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .ap-approve-done { padding: 6px 9px 8px; color: var(--text-dim); font-size: 11.5px; }
 .ap-ta {
   width: 100%; min-height: 62px; max-height: 180px; resize: vertical;
-  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
   color: var(--text); padding: 7px 9px; outline: none;
   font: 12.5px/1.6 inherit;
 }
