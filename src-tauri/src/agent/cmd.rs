@@ -336,13 +336,26 @@ pub async fn agent_open_window(session_id: String, app: AppHandle) -> Result<(),
         "window.__NX_AGENT__ = {};",
         serde_json::to_string(&session_id).unwrap_or_else(|_| "\"\"".into())
     );
+    let app_for_event = app.clone();
     WebviewWindowBuilder::new(&app, AGENT_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
         .title("Nexus AI Agent")
         .inner_size(420.0, 640.0)
         .min_inner_size(320.0, 420.0)
         .initialization_script(&init)
         .build()
-        .map(|_| ())
+        .map(|win| {
+            // 窗口被关（原生标题栏 X / 关闭面板 / 退出）时通知主窗口恢复
+            // 「未浮出」状态。**必须在 Rust 侧做**：JS 的 onCloseRequested
+            // 会让 Rust 对原生关闭调 prevent_close、改由 JS destroy() 兜底，
+            // 一旦浮窗 JS 没响应窗口就永远关不掉；Rust 的 Destroyed 事件
+            // 没有这个依赖，原生 X 直接走系统关闭路径。
+            use tauri::Emitter;
+            win.on_window_event(move |e| {
+                if matches!(e, tauri::WindowEvent::Destroyed) {
+                    let _ = app_for_event.emit("nx://agent/window-closed", ());
+                }
+            });
+        })
         .map_err(|e| format!("无法打开 Nexus AI Agent 窗口：{e}"))
 }
 

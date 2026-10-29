@@ -38,13 +38,11 @@ export default function AgentWindow({ initialSession }: { initialSession: string
       if (p?.sessionId) setSessionId(p.sessionId);
       if (Array.isArray(p?.sessions)) setSessions(p.sessions);
     });
-    // 窗口被关（点红灯 / Cmd+W / 代码 close）时通知主窗口恢复「未浮出」状态
-    const unClose = getCurrentWindow().onCloseRequested(() => {
-      void emit("nx://agent/window-closed");
-    });
+    // 窗口被关时通知主窗口恢复「未浮出」状态 —— 这件事由 Rust 侧的
+    // Destroyed 事件做（见 agent_open_window），这里不注册 onCloseRequested：
+    // 它会让原生关闭改由 JS destroy() 兜底，JS 一旦没响应窗口就关不掉。
     return () => {
       void un.then((f) => f());
-      void unClose.then((f) => f());
     };
   }, []);
 
