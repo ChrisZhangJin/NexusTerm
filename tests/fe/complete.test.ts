@@ -1515,3 +1515,46 @@ test("Tab 接受路径：灰字画着时 clear 的结论不依赖缓冲 flush", 
   t.flush();
   assert.equal(g.clear(t as never), "erased", "修复前：异步 ECH 未生效 + 读缓冲 → 误判行中间 → dismiss");
 });
+
+test("Tab 接受决策：ECH 没 flush 时 cursorAtLineEnd 仍读到灰字，决断必须信 clear 的 erased", () => {
+  // 这是「erased 短路」存在的理由本身：clear() 写出的 ECH 此刻还在缓冲队列里，
+  // 紧接着读 buffer 看到的仍是自己刚要擦掉的灰字。若把决策写成
+  // 「clear 之后无条件读 cursorAtLineEnd」，灰字就永远擦不干净 → 永远判行中间。
+  const t = asyncTerm({ lineText: "tmux " });
+  const g = new GhostText();
+  g.show(t as never, "attach -t unp", 40);
+  t.flush();
+  const cleared = g.clear(t as never);
+  assert.equal(cleared, "erased");
+  assert.equal(
+    cursorAtLineEnd(t as never),
+    false,
+    "未 flush 时缓冲里还有灰字，cursorAtLineEnd 必然是 false —— 所以不能用它"
+  );
+  // 正确的决策式（与 TerminalView.acceptHint 一致）：erased ⇒ 当行尾，直接接受
+  const accept = cleared === "erased" || cursorAtLineEnd(t as never);
+  assert.ok(accept, "灰字画着时按 Tab 必须能决断为接受，而不是误判行中间后收起");
+});
+
+test("Tab 接受后 ghost 状态同步清空：再按 Tab 是 idle，不重复擦、不重复插", () => {
+  const t = asyncTerm({ lineText: "tmux " });
+  const g = new GhostText();
+  g.show(t as never, "attach -t unp", 40);
+  t.flush();
+
+  // 第一次 Tab：接受。clear 同步清掉内部状态（不依赖 flush），
+  // 后续的 Tab 判定（ghostRef.active / 再次 clear）必须立刻看到「没灰字了」，
+  // 否则会把刚补进终端的真字再擦一遍 / 再插一遍。
+  assert.equal(g.clear(t as never), "erased");
+  assert.equal(g.active, false, "状态是同步清的，不能等 flush");
+  assert.equal(g.text, "");
+
+  const echWrites = t.written.filter((s) => s.includes(`${ESC}[13X`)).length;
+  assert.equal(echWrites, 1, "ECH 13 只写一次：接受后没有第二次擦除");
+
+  // 第二次 Tab：没有灰字 → clear 是 idle、一个字节都不写，
+  // 组件层的判定直接放行给 shell，不会把建议再插一遍
+  const totalBefore = t.written.length;
+  assert.equal(g.clear(t as never), "idle");
+  assert.equal(t.written.length, totalBefore, "idle 的 clear 不写任何序列");
+});
