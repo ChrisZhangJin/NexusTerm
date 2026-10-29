@@ -41,6 +41,13 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 sha2 = "0.10"
+# —— TOTP 种子的静态加密（secret.rs）与解析（totp.rs）——
+# aes-gcm 和 data-encoding 本来就在依赖树里（分别经由 aes/aead 一族和
+# tracing 侧的传递依赖），提成直接依赖几乎不增加编译时间。
+# TOTP 算法本身没有引第三方 crate：hmac / sha1 / sha2 为了下面的 .ppk 已经在了。
+aes-gcm = "0.10"
+# base32 解码。种子是手抄进来的，要容忍空格/小写/补等号，自己写解码不划算。
+data-encoding = "2"
 # —— PuTTY .ppk 支持 ——
 # ppk 是完全独立于 OpenSSH 的容器格式，ssh-key 不认识它，只能自己实现。
 # v1/v2 用 SHA-1 计数派生出 AES-256-CBC 的 key（IV 恒为 0），v3 改成 Argon2id

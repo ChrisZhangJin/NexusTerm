@@ -404,6 +404,7 @@ pub async fn open_authenticated(
         session_id,
         on_keepalive,
         |p| async move { ctx.prompts.ask(ctx.app, p).await },
+        ctx.totp,
     )
     .await
 }
@@ -469,6 +470,7 @@ async fn open_authenticated_with<F, Fut>(
     session_id: &str,
     on_keepalive: Option<Arc<dyn Fn() + Send + Sync>>,
     ask: F,
+    totp: Option<&crate::totp::TotpAutofill>,
 ) -> Result<Opened, OpenError>
 where
     F: Fn(prompt::AuthPrompt) -> Fut,
@@ -507,7 +509,8 @@ where
     // 「密码 + 动态口令」服务器的唯一正确走法：partial-success 时连接上仍保有
     // 第一因子状态，断开重连会丢掉它、服务端又要求重输密码。
     // （russh 0.49 原本在这里静默丢包并永久挂起，已由 `vendor/russh` 修掉。）
-    match session::authenticate_kbi(&mut session, username, &auth, session_id, host, &ask).await {
+    match session::authenticate_kbi(&mut session, username, &auth, session_id, host, &ask, totp)
+        .await {
         Ok(session::KbiOutcome::Done) => {
             return Ok(Opened { session, legacy });
         }
@@ -549,7 +552,8 @@ where
     let legacy = hs.legacy;
     let mut session = hs.session;
 
-    match session::authenticate_kbi(&mut session, username, &auth, session_id, host, &ask).await {
+    match session::authenticate_kbi(&mut session, username, &auth, session_id, host, &ask, totp)
+        .await {
         Ok(session::KbiOutcome::Done) => Ok(Opened { session, legacy }),
         // 换了新连接还是一个问题都不问 → 服务端确实不要这一步，
         // 那就回到「主认证方式失败」的原始文案。
@@ -1046,6 +1050,7 @@ mod crypto_tests {
                         .collect::<Vec<_>>())
                 }
             },
+            None,
         )
         .await;
 
@@ -1115,6 +1120,7 @@ mod kbi_flow {
                         .collect::<Vec<_>>())
                 }
             },
+            None,
         )
         .await
         .expect("应当重连后完成二次验证");
@@ -1160,6 +1166,7 @@ mod kbi_flow {
             "probe",
             None,
             |_p: prompt::AuthPrompt| async move { Err(prompt::AskAbort::Cancelled) },
+            None,
         )
         .await
         {

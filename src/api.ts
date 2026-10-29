@@ -22,6 +22,7 @@ import type {
   NewSession,
   RemoteEntry,
   SessionRecord,
+  TotpPreview,
 } from "./types";
 
 export const api = {
@@ -111,6 +112,21 @@ export const api = {
   savePassphrase: (id: string, passphrase: string) =>
     invoke<void>("save_passphrase", { id, passphrase }),
   loadPassphrase: (id: string) => invoke<string | null>("load_passphrase", { id }),
+
+  /**
+   * 保存 TOTP 种子。接受裸 base32（空格 / 连字符 / 小写都行）或 `otpauth://totp/...` 链接。
+   * 传空串 = 清除。种子不合法时后端直接返回中文错误。
+   */
+  saveTotpSeed: (id: string, seed: string) => invoke<void>("save_totp_seed", { id, seed }),
+  /**
+   * 这条连接有没有存过种子。
+   *
+   * 注意这里没有对应的 `loadTotpSeed` —— 种子是第二因子，存进去就不再出后端，
+   * 前端只问得到「有没有」。要改只能重填一次。
+   */
+  hasTotpSeed: (id: string) => invoke<boolean>("has_totp_seed", { id }),
+  /** 按用户此刻填的**种子本身**（不是 id）算出当前的码与剩余秒数，供保存前跟手机对一眼 */
+  totpPreview: (seed: string) => invoke<TotpPreview>("totp_preview", { seed }),
 
   listLocalDir: (path: string) =>
     invoke<RemoteEntry[]>("list_local_dir", { path }),

@@ -31,6 +31,26 @@ export interface NewSession {
 }
 
 /**
+ * 连接的几样秘密，和 `NewSession` 分开传。
+ *
+ * 合成一个对象而不是继续往 `onSave` 后面挂位置参数：三样里有两样是
+ * `string | null` 且 null 另有含义，排成一串位置参数时传反了编译器也看不出来。
+ */
+export interface SessionSecrets {
+  password: string;
+  /** 私钥口令；null = 用户没动过，保持库里原值 */
+  passphrase: string | null;
+  /** TOTP 种子；null = 用户没动过，保持库里原值；空串 = 清除 */
+  totpSeed: string | null;
+}
+
+/** `totp_preview` 的结果：此刻算出的码 + 它还剩几秒 */
+export interface TotpPreview {
+  code: string;
+  remainingSecs: number;
+}
+
+/**
  * 宏的一步。字段名与 Rust 侧 serde 一致（`kind` 是判别式）。
  * 刻意只留三种原语：复杂流程应该写脚本，而不是把宏做成一个小语言。
  */

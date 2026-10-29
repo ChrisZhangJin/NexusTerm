@@ -63,6 +63,7 @@ import type {
   MacroStep,
   NewSession,
   SessionRecord,
+  SessionSecrets,
   TerminalTab,
 } from "./types";
 
@@ -1173,7 +1174,7 @@ export default function App() {
   }, [handleAgentTab]);
 
   const saveSession = useCallback(
-    async (payload: NewSession, password: string, passphrase: string | null) => {
+    async (payload: NewSession, secrets: SessionSecrets) => {
       let id = editing?.id;
       if (editing) {
         await api.updateSession(editing.id, payload);
@@ -1182,14 +1183,17 @@ export default function App() {
         id = created.id;
       }
       if (!id) return;
-      if (password) await api.savePassword(id, password);
+      if (secrets.password) await api.savePassword(id, secrets.password);
       // passphrase === null：用户没动过这个字段，保持库里的原值
-      if (payload.authType === "key" && passphrase !== null) {
-        const value = passphrase.trim();
+      if (payload.authType === "key" && secrets.passphrase !== null) {
+        const value = secrets.passphrase.trim();
         await api.savePassphrase(id, value);
         if (value) passphraseRef.current.set(id, value);
         else passphraseRef.current.delete(id);
       }
+      // 同上的 null 语义。种子与 authType 无关，所以不按 authType 过滤；
+      // 空串在后端就是「清除」，正是「清除」按钮要的效果。
+      if (secrets.totpSeed !== null) await api.saveTotpSeed(id, secrets.totpSeed);
       await refresh();
     },
     [editing, refresh]

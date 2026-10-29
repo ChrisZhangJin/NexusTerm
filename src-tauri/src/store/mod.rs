@@ -116,6 +116,10 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         // 私钥口令（passphrase）。与密码同理随 db 保存 —— 它只是「解开本地私钥文件」
         // 的口令，不是服务器凭据；不存的话每次连接都要重输一遍。
         ("passphrase", "ALTER TABLE sessions ADD COLUMN passphrase TEXT"),
+        // TOTP 种子。和上面两列不同，这一列存的是**密文**（见 `crate::secret`）：
+        // 种子是第二因子，和明文密码躺在同一个文件里的话二次验证就名存实亡。
+        // 代价是换机器拷 db 过去解不开，要重填 —— 对第二因子来说这是对的。
+        ("totp_seed", "ALTER TABLE sessions ADD COLUMN totp_seed TEXT"),
     ] {
         let exists: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?1")?
@@ -156,6 +160,7 @@ impl Store {
                 connect_timeout INTEGER,
                 password     TEXT,
                 passphrase   TEXT,
+                totp_seed    TEXT,
                 sort_order   INTEGER NOT NULL DEFAULT 0,
                 created_at   INTEGER NOT NULL,
                 updated_at   INTEGER NOT NULL
@@ -482,6 +487,70 @@ impl Store {
         .ok()
         .flatten()
         .filter(|p| !p.is_empty())
+    }
+
+    /// 保存 TOTP 种子。**落库前加密**（`crate::secret`），空串视为「清除」。
+    ///
+    /// 加密失败（取不到系统凭据服务）时宁可整个报错也不降级存明文 —— 一个
+    /// 「存上了，但其实是明文」的静默降级，比存不上危险得多。
+    pub fn set_totp_seed(&self, id: &str, seed: &str) -> Result<(), String> {
+        let stored = if seed.is_empty() {
+            None
+        } else {
+            Some(crate::secret::encrypt(seed)?)
+        };
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE sessions SET totp_seed = ?2 WHERE id = ?1",
+            params![id, stored],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// 读回并解密 TOTP 种子。
+    ///
+    /// 解密失败只记一条日志返回 `None`，不往上抛：最常见的原因是「db 拷到了
+    /// 新机器、密钥还在老机器的凭据服务里」，这时该做的是照常弹框让人手输
+    /// 验证码，而不是让整条连接失败。
+    pub fn get_totp_seed(&self, id: &str) -> Option<String> {
+        let blob: Option<String> = {
+            let conn = self.conn.lock().ok()?;
+            conn.query_row(
+                "SELECT totp_seed FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+        let blob = blob.filter(|b| !b.is_empty())?;
+        match crate::secret::decrypt(&blob) {
+            Ok(seed) => Some(seed),
+            Err(e) => {
+                tracing::warn!(session = id, error = %e, "TOTP 种子解密失败，本次按未配置处理");
+                None
+            }
+        }
+    }
+
+    /// 这条连接有没有存过种子。
+    ///
+    /// 配置弹窗只需要知道这个 —— 种子本身不过 IPC，要改就重填一次。
+    /// 故意不解密：换机器解不开时，界面也该如实显示「存过」，否则用户会以为
+    /// 自己没填过，而真正要做的是重填覆盖。
+    pub fn has_totp_seed(&self, id: &str) -> bool {
+        let Ok(conn) = self.conn.lock() else {
+            return false;
+        };
+        conn.query_row(
+            "SELECT totp_seed FROM sessions WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|b| !b.is_empty())
     }
 
     // ——— 密钥库 ———

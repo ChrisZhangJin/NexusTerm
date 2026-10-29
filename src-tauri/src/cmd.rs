@@ -657,6 +657,55 @@ pub fn load_passphrase(id: String, state: State<'_, AppState>) -> Option<String>
     state.store.get_passphrase(&id)
 }
 
+// ——— 二次验证（TOTP）———
+//
+// 注意这组命令和上面几组的不对称：**没有 load_totp_seed**。种子一旦存进去就
+// 不再出后端，前端只问得到「有没有」。密码会读回前端是因为要能查看和修改，
+// 而种子是第二因子，让它定期在 IPC 上走一趟、落进 JS 堆里没有收益 ——
+// 要改就重填一次，反正也就那一次。
+
+/// 保存 TOTP 种子。接受裸 base32 或 `otpauth://totp/...` 链接。
+/// 先解析一遍再存：种子抄错的话，此刻报错远好过下次连服务器时才发现。
+#[tauri::command]
+pub fn save_totp_seed(id: String, seed: String, state: State<'_, AppState>) -> Result<(), String> {
+    let seed = seed.trim();
+    if seed.is_empty() {
+        return state.store.set_totp_seed(&id, "");
+    }
+    crate::totp::parse_secret(seed)?;
+    state.store.set_totp_seed(&id, seed)
+}
+
+/// 这条连接有没有存过种子。前端据此显示「已保存」而不是把种子回填进输入框。
+#[tauri::command]
+pub fn has_totp_seed(id: String, state: State<'_, AppState>) -> bool {
+    state.store.has_totp_seed(&id)
+}
+
+/// 用户填的种子**现在**会算出什么码，以及这个码还剩几秒。
+///
+/// 让人在保存前跟手机上的 app 对一眼。种子抄错是这个功能最常见的失败方式，
+/// 而它的症状（连接时验证码被拒）离病因隔着一次连接，很难归因。
+#[tauri::command]
+pub fn totp_preview(seed: String) -> Result<TotpPreview, String> {
+    let cfg = crate::totp::parse_secret(&seed)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(TotpPreview {
+        code: cfg.code_at(now),
+        remaining_secs: cfg.period() - (now % cfg.period()),
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TotpPreview {
+    pub code: String,
+    pub remaining_secs: u64,
+}
+
 /// Windows 的驱动器列表。只有真正存在的盘才列出（跳过空软驱 A: 等）。
 #[cfg(windows)]
 fn list_drives() -> Result<Vec<RemoteEntry>, String> {

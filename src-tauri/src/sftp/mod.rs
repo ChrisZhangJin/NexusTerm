@@ -198,6 +198,10 @@ impl SftpManager {
             )
         })?;
 
+        // 文件面板独立拨号时同样要能过二次验证 —— 否则对着要 OTP 的服务器，
+        // 终端能自动连上、打开文件面板却还要手输一次码。
+        let totp = crate::totp::autofill_for(app, req.config_id.as_deref());
+
         let opened = crate::ssh::open_authenticated(
             &req.host,
             port,
@@ -211,6 +215,7 @@ impl SftpManager {
             crate::ssh::session::AuthContext {
                 app,
                 prompts: &self.auth_prompts,
+                totp: totp.as_ref(),
             },
         )
         .await

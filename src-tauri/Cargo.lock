@@ -2821,12 +2821,14 @@ name = "nexus-term"
 version = "0.3.0"
 dependencies = [
  "aes",
+ "aes-gcm",
  "arboard",
  "argon2",
  "async-trait",
  "base64 0.22.1",
  "cbc",
  "chrono",
+ "data-encoding",
  "futures-util",
  "hmac",
  "image",

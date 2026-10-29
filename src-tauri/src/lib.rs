@@ -14,10 +14,12 @@ mod cmd;
 mod keys;
 mod local;
 mod viewer;
+mod secret;
 mod sftp;
 mod ssh;
 mod store;
 mod sysstat;
+mod totp;
 mod xsh;
 
 pub(crate) fn app_data_dir(app: &tauri::AppHandle) -> PathBuf {
@@ -218,6 +220,9 @@ pub fn run() {
             cmd::key_public,
             cmd::save_passphrase,
             cmd::load_passphrase,
+            cmd::save_totp_seed,
+            cmd::has_totp_seed,
+            cmd::totp_preview,
             cmd::list_local_dir,
             cmd::sftp_connect,
             cmd::sftp_list,

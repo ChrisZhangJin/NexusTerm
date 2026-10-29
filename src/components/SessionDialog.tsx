@@ -2,18 +2,21 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import { normalizeTimeout } from "../lib/errors";
 import { getExtras, updateExtras } from "../lib/sessionExtras";
-import type { AuthMethod, KeyInfo, MacroRecord, NewSession, SessionRecord } from "../types";
+import type {
+  AuthMethod,
+  KeyInfo,
+  MacroRecord,
+  NewSession,
+  SessionRecord,
+  SessionSecrets,
+  TotpPreview,
+} from "../types";
 
 interface Props {
   editing: SessionRecord | null;
   /** 连接可绑定的宏（连接后自动执行） */
   macros: MacroRecord[];
-  onSave: (
-    payload: NewSession,
-    password: string,
-    /** 私钥口令；null = 用户没动它，保持库里原值 */
-    passphrase: string | null
-  ) => Promise<void>;
+  onSave: (payload: NewSession, secrets: SessionSecrets) => Promise<void>;
   onClose: () => void;
 }
 
@@ -32,6 +35,22 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
    * 空字符串会把已保存的口令覆盖掉 —— 只有真正编辑过才落库。
    */
   const [passphraseTouched, setPassphraseTouched] = useState(false);
+  const [totpSeed, setTotpSeed] = useState("");
+  /**
+   * 同 `passphraseTouched`：编辑连接时「有没有存过种子」是异步查回来的，
+   * 用户没动过这个框就绝不能拿空串去覆盖已存的种子 —— 空串在后端是「清除」。
+   */
+  const [totpTouched, setTotpTouched] = useState(false);
+  /** 库里是否已有种子。种子不回显（后端没有 load），只能靠这个显示「已保存」 */
+  const [hasSeed, setHasSeed] = useState(false);
+  /**
+   * 种子输入框是否明文。本文件里别的密码框都没有这个切换，这里加是因为种子
+   * 是从手机 / 网页上手抄过来的一长串 base32：看不见就抄错，而抄错的症状
+   * （下次连接时验证码被拒）离病因隔着一次连接，几乎没法归因。
+   */
+  const [showSeed, setShowSeed] = useState(false);
+  const [totpChecking, setTotpChecking] = useState(false);
+  const [totpResult, setTotpResult] = useState<{ ok: boolean; msg: string } | null>(null);
   /** 浏览选中的外部密钥是否加密（密钥库里的条目直接看 KeyInfo.encrypted） */
   const [encryptedKey, setEncryptedKey] = useState(false);
   const [connectTimeout, setConnectTimeout] = useState("10");
@@ -53,6 +72,14 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
       setAuthType(editing.authType);
       setKeyPath(editing.keyPath ?? "");
       setConnectTimeout(String(normalizeTimeout(editing.connectTimeout)));
+      // TOTP 与 authType 正交（密码登录和密钥登录都可能要二次验证），所以放在
+      // authType 的分支外面无条件查一次。种子本身查不回来，只查「有没有」。
+      setTotpSeed("");
+      setTotpTouched(false);
+      setShowSeed(false);
+      setTotpResult(null);
+      setHasSeed(false);
+      api.hasTotpSeed(editing.id).then(setHasSeed).catch(() => {});
       // 载入已保存的密码 / 私钥口令，方便查看和修改
       if (editing.authType === "password") {
         api.loadPassword(editing.id).then((p) => setPassword(p ?? "")).catch(() => {});
@@ -79,6 +106,11 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
       setPassphrase("");
       setPassphraseTouched(false);
       setConnectTimeout("10");
+      setTotpSeed("");
+      setTotpTouched(false);
+      setHasSeed(false);
+      setShowSeed(false);
+      setTotpResult(null);
     }
   }, [editing]);
 
@@ -143,6 +175,23 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
     }
   };
 
+  /**
+   * 拿当前填的种子算一次码，让人跟手机上的 app 对一眼再保存。
+   * 校验交给后端（`totp_preview` 解析不了就返回中文错误），前端不重写一遍 base32。
+   */
+  const previewTotp = async () => {
+    setTotpResult(null);
+    setTotpChecking(true);
+    try {
+      const p: TotpPreview = await api.totpPreview(totpSeed.trim());
+      setTotpResult({ ok: true, msg: `当前验证码 ${p.code}（${p.remainingSecs} 秒后刷新）` });
+    } catch (e) {
+      setTotpResult({ ok: false, msg: String(e) });
+    } finally {
+      setTotpChecking(false);
+    }
+  };
+
   const submit = async () => {
     setError(null);
     if (!host.trim()) return setError("主机不能为空");
@@ -166,9 +215,13 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
           keyPath: authType === "key" ? keyPath : undefined,
           connectTimeout: normalizeTimeout(Number(connectTimeout)),
         },
-        authType === "password" ? password : "",
-        // null 表示「没动过」：编辑连接时不能拿空串覆盖已保存的口令
-        authType === "key" && passphraseTouched ? passphrase : null
+        {
+          password: authType === "password" ? password : "",
+          // null 表示「没动过」：编辑连接时不能拿空串覆盖已保存的口令
+          passphrase: authType === "key" && passphraseTouched ? passphrase : null,
+          // 同理。种子和 authType 无关，所以这里不按 authType 过滤
+          totpSeed: totpTouched ? totpSeed.trim() : null,
+        }
       );
       onClose();
     } catch (e) {
@@ -296,6 +349,72 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
         {authType === "agent" && (
           <p className="hint">使用系统 ssh-agent 中的凭据。需先在终端执行 ssh-add。</p>
         )}
+
+        {/*
+          TOTP 与认证方式正交：密码登录和密钥登录都可能被要求二次验证，
+          所以这一段放在 authType 的分支之外，任何认证方式下都渲染。
+        */}
+        <div className="row">
+          <label>二次验证</label>
+          <div className="key-pick">
+            <input
+              // 种子是手抄进来的一长串 base32，看不见极易抄错，所以这里配了显示切换
+              type={showSeed ? "text" : "password"}
+              value={totpSeed}
+              onChange={(e) => {
+                setTotpSeed(e.target.value);
+                setTotpTouched(true);
+                setTotpResult(null);
+              }}
+              placeholder={
+                hasSeed && !totpTouched
+                  ? "已保存（留空不修改）"
+                  : hasSeed && !totpSeed.trim()
+                    ? "保存后将清除已存的种子"
+                    : "TOTP 种子，或 otpauth://totp/… 链接"
+              }
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <button type="button" className="btn" onClick={() => setShowSeed((v) => !v)}>
+              {showSeed ? "隐藏" : "显示"}
+            </button>
+            {hasSeed && (
+              <button
+                type="button"
+                className="btn"
+                onClick={() => {
+                  setTotpSeed("");
+                  setTotpTouched(true);
+                  setTotpResult(null);
+                }}
+                disabled={totpTouched && !totpSeed.trim()}
+              >
+                清除
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="row">
+          <label />
+          <button
+            className="btn"
+            onClick={previewTotp}
+            disabled={totpChecking || saving || !totpSeed.trim()}
+          >
+            {totpChecking ? "验证中…" : "验证"}
+          </button>
+        </div>
+        {totpResult && <p className={totpResult.ok ? "hint" : "error"}>{totpResult.msg}</p>}
+
+        <p className="hint">
+          填了种子之后，服务器索要验证码时就不用再掏手机。点「验证」可以算出此刻的码，
+          跟手机上的 app 对一眼再保存 —— 抄错一位的话，不验就得等到下次连接才发现。
+          种子加密保存在本机，把数据库拷到别的机器上解不开，换机器需要重填一次。
+          连接时第一次会自动提交算出的验证码；一旦被服务器拒绝，本次连接剩下的问答就只预填，
+          由你确认后再发 —— 连错几次会锁账号，自动重试只会烧得更快。
+        </p>
 
         <div className="row">
           <label />
