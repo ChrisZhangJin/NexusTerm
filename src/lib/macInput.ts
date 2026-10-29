@@ -787,20 +787,22 @@ export function installMacKeyboard(
         // 插进 textarea 也不派发 input（实测空格的 keydown 放行了，input 一条没有），
         // 光靠默认行为就是继续丢空格。
         if (!(lastCommitAscii && isPlainChar(ev.key))) {
-          // 中文上屏：此时 preventDefault 只会拦住「插进 textarea」，动不了已上屏
-          // 的字，可以放心拦死。
+          // 中文上屏 / 回车确认：此时 preventDefault 只会拦住「插进 textarea」，
+          // 动不了已上屏的字，可以放心拦死。
           // 不要再记 imeConsumedKey：那次 compositionend 已过去，记了只会留到
           // **下一次**上屏时才消费，把下一句结尾剥掉。
           ev.preventDefault();
           ev.stopPropagation();
           markSent();
-          // 回车同理：英文直通模式下它既结束这个词、又是用户敲的那一下 —— 吞掉就是
-          // **命令不执行**（真机实测 `pwd`+回车只上屏 `pwd`，要再按一次才跑）。
-          if (lastCommitAscii && ev.key === "Enter") {
-            out("\r");
-            trace({ ev: "keydown", act: "send", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea), sent: "\\r", via: "mac" }, ev);
-            return;
-          }
+          // ⚠️ 回车**绝不补发**。曾经为了修「豆包英文直通模式 `pwd`+回车不执行」
+          // 在这里补过一颗 `\r`，结果把中文也带进坑：真机上 拼音打 `pinyin` +
+          // 回车确认（Enter 对输入法只是「提交原始字母」）→ 上屏 `pinyin` **外加**
+          // 一个换行，命令直接被执行。两种场景在事件层面完全同形：
+          //   compend.data 都是可打印 ASCII，keydown 都是 kc=229 + isComposing=false，
+          //   都发生在 compend 之后 30ms 内 —— 没有任何判据能把它们分开。
+          // 既然分不开，就按「宁可少一个换行，不可多一个换行」定：多出来的换行会
+          // **执行**用户还没写完的命令（`rm -rf /tmp/x` 打一半就回车，后果是真实的），
+          // 少一个换行只是再按一次回车。英文直通模式同理，第二次回车会走正常路径。
           trace({ ev: "keydown", act: "stop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
           return;
         }

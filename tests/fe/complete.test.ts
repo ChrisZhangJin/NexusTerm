@@ -1385,15 +1385,25 @@ test("接管：中文上屏时空格属于输入法，一个字节都不许进 p
   un();
 });
 
-test("接管：豆包英文模式下打完一个词直接回车，命令必须执行（回车不能被吞）", () => {
-  // 真机：`pwd` + 回车 → 只上屏 `pwd`，回车没了，要再按一次才跑。
+test("接管：拼音上屏是原样 ASCII 时，回车确认也不许补一个回车（真机：命令被提前执行）", () => {
+  // 真机复现（系统拼音、豆包 都一样）：`pinyin` + 回车 → 上屏 `pinyin`。
+  // Enter 对输入法只是「提交原始字母」，对 pty 什么都不该是。
+  // 这里曾经补发过一颗 \r（为修「豆包英文模式 pwd+回车不执行」），于是中文用户
+  // 每次用回车确认都会把命令跑掉 —— 两种场景事件同形，分不开，只能一律不补。
   const { host, ta, out, un } = rig();
   host.fire("compositionstart", { timeStamp: 900 });
-  ta.value = "pwd";
-  host.fire("compositionupdate", { data: "pwd", timeStamp: 950 });
-  host.fire("compositionend", { data: "pwd", timeStamp: 1000 });
-  host.fire("keydown", plainKey("Enter", { keyCode: 229, timeStamp: 1010 }));
-  assert.equal(out.text, "\r", "回车得由接管层补发（xterm 对 229 的回车什么都不发）");
+  ta.value = "pinyin";
+  host.fire("compositionupdate", { data: "pinyin", timeStamp: 950 });
+  host.fire("compositionend", { data: "pinyin", timeStamp: 1000 });
+  const ev = host.fire("keydown", plainKey("Enter", { keyCode: 229, timeStamp: 1010 }));
+  assert.equal(ev.defaultPrevented, true, "确认回车要拦死");
+  assert.equal(ev.propagationStopped, true, "也不能让 xterm 拿到（它可能按 keyCode 发 \\r）");
+  assert.equal(out.text, "", "确认回车不许进 pty（否则命令被提前执行）");
+
+  // 人真的想发命令：再按一次回车。已过 30ms 窗口，必须原样放行。
+  const again = host.fire("keydown", plainKey("Enter", { timeStamp: 1400 }));
+  assert.equal(again.propagationStopped, false, "第二次回车归 xterm");
+  assert.equal(again.defaultPrevented, false, "第二次回车不许拦");
   un();
 });
 
