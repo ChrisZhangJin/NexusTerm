@@ -1408,3 +1408,110 @@ test("接管：中文上屏时的回车属于输入法，不能往 pty 里塞一
   un();
 });
 
+
+// ——— 真实 xterm 的 write 是异步的：回归「按 Tab 补全失灵」———
+
+/**
+ * 模拟 xterm 5.x 的 write 时序：`write()` 只入队，缓冲在 `flush()` 时才更新。
+ * 只有这样能复现「刚 write 完 ECH 就去读 buffer，读到的还是没擦的灰字」。
+ * 只解析 GhostText 自己会写的四种序列：文本 / `ESC[nD` / `ESC[nX` / `ESC[2m`·`22m`。
+ */
+function asyncTerm(opts?: { cursorX?: number; lineText?: string }) {
+  const written: string[] = [];
+  const queue: string[] = [];
+  const cells = [...(opts?.lineText ?? "")];
+  let cursorX = opts?.cursorX ?? (opts?.lineText?.length ?? 0);
+  const CSI_RE = new RegExp(`${ESC}\\[(\\d*)([DXm])`, "g");
+  const apply = (s: string) => {
+    let last = 0;
+    for (const m of s.matchAll(CSI_RE)) {
+      for (const ch of s.slice(last, m.index)) cells[cursorX++] = ch;
+      last = (m.index ?? 0) + m[0].length;
+      const n = m[1] === "" ? 1 : parseInt(m[1], 10);
+      if (m[2] === "D") cursorX = Math.max(0, cursorX - n);
+      else if (m[2] === "X") for (let k = 0; k < n; k++) delete cells[cursorX + k];
+      // m：SGR，不影响字符与光标
+    }
+    for (const ch of s.slice(last)) cells[cursorX++] = ch;
+  };
+  return {
+    written,
+    cols: 80,
+    get cursorX() {
+      return cursorX;
+    },
+    text: () => written.join(""),
+    line: () => cells.map((c) => c ?? "").join(""),
+    move(x: number) {
+      cursorX = x;
+    },
+    flush() {
+      while (queue.length) apply(queue.shift()!);
+    },
+    write(s: string) {
+      written.push(s);
+      queue.push(s);
+    },
+    buffer: {
+      active: {
+        type: "normal",
+        get cursorX() {
+          return cursorX;
+        },
+        cursorY: 0,
+        baseY: 0,
+        getLine: (y: number) =>
+          y === 0
+            ? {
+                getCell: (x: number) => ({
+                  getChars: () => cells[x] ?? "",
+                }),
+              }
+            : undefined,
+      },
+    },
+  };
+}
+
+test("灰字：clear 返回 idle/erased/moved，让调用方免读异步缓冲", () => {
+  const t = asyncTerm({ lineText: "st" });
+  const g = new GhostText();
+  assert.equal(g.clear(t as never), "idle", "没画过就是 idle，一个字节都不写");
+  assert.equal(t.written.length, 0);
+
+  g.show(t as never, "atus", 40);
+  assert.equal(g.clear(t as never), "erased", "光标没动：后面全是我们的灰字");
+  assert.ok(t.written.some((s) => s.includes(`${ESC}[4X`)), "写了 ECH 4");
+  t.flush();
+  assert.equal(t.line(), "st", "flush 后灰字真的没了");
+
+  // 光标被 shell 挪走后再 clear：不能写任何东西
+  const t2 = asyncTerm({ lineText: "st" });
+  const g2 = new GhostText();
+  g2.show(t2 as never, "atus", 40);
+  t2.move(0); // shell 把光标挪走了
+  assert.equal(g2.clear(t2 as never), "moved");
+  assert.equal(t2.written.length, 1, "只有 show 那一次写");
+});
+
+test("灰字：ECH 还没 flush 时换建议也能重画（修复前会误判行中间而罢画）", () => {
+  const t = asyncTerm({ lineText: "st" });
+  const g = new GhostText();
+  g.show(t as never, "atus", 40);
+  t.flush(); // 屏幕上是 st|atus（灰字），光标回到 2
+  // ↑↓ 挑了另一条：show 内部先 clear（ECH 入队，未 flush）再判行尾。
+  // 修复前这里会读到旧灰字 → 判「行中间」→ 返回 ""，灰字从此消失。
+  const shown = g.show(t as never, "ew -s x", 40);
+  assert.equal(shown, "ew -s x");
+  t.flush();
+  assert.equal(t.line(), "stew -s x");
+});
+
+test("Tab 接受路径：灰字画着时 clear 的结论不依赖缓冲 flush", () => {
+  // 复现真机时序：下拉+灰字都在 → 按 Tab → acceptHintAt 先 clear 后判行尾
+  const t = asyncTerm({ lineText: "tmux " });
+  const g = new GhostText();
+  g.show(t as never, "attach -t unp", 40);
+  t.flush();
+  assert.equal(g.clear(t as never), "erased", "修复前：异步 ECH 未生效 + 读缓冲 → 误判行中间 → dismiss");
+});

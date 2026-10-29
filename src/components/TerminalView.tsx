@@ -467,9 +467,12 @@ export default function TerminalView({
       if (!term || items.length === 0) return;
       // 必须先擦灰字再判行尾：灰字是画在光标后的真实字符，不擦的话
       // `cursorAtLineEnd` 会把它当成「后面还有字」，按 Tab 反被当成行中间编辑收起。
-      ghostRef.current.clear(term);
+      // 但擦除是异步进缓冲的（xterm write 的性质），擦完立刻读缓冲读到的还是
+      // 旧灰字 —— 所以「erased」（光标没动、后面全是灰字）直接当行尾用，
+      // 只有没画过/被挪走时才去读真实缓冲。
+      const cleared = ghostRef.current.clear(term);
       // 真在行中间（人在改前面敲错的字）：补进去会插在句子中间，收起更安全
-      if (!cursorAtLineEnd(term)) {
+      if (cleared !== "erased" && !cursorAtLineEnd(term)) {
         dismissHints();
         return;
       }

@@ -91,6 +91,20 @@ export function cursorAtLineEnd(term: Terminal): boolean {
   return true;
 }
 
+/**
+ * `clear()` 的结果。调用方**必须**用它而不是紧接着再读一遍缓冲：
+ * xterm 的 `write()` 是异步的（见下），刚写出去的擦除序列此刻还没进缓冲，
+ * 再读 `cursorAtLineEnd` 看到的是自己刚要擦掉的灰字 —— 「按 Tab 补全失灵」
+ * 就是这么来的。
+ */
+export type GhostClear =
+  /** 本来就没画灰字，什么都没写 */
+  | "idle"
+  /** 光标仍在画灰字时的位置：光标之后那一段全是我们的灰字，擦了就是行尾 */
+  | "erased"
+  /** 光标已被挪走（shell 重绘/输出）：一个字节都没写，屏幕状态不明 */
+  | "moved";
+
 export class GhostText {
   /** 当前画在屏幕上的灰字（用于计算光标回退量） */
   private shown = "";
@@ -122,17 +136,23 @@ export class GhostText {
    * - **光标必须还在原地**：光标被挪走之后（shell 重绘了整行、输出把光标顶走），
    *   从当前光标往后那一段已经不是我们画的了，这时候一个字节都不能写。
    */
-  clear(term: Terminal): void {
-    if (!this.shown) return;
+  clear(term: Terminal): GhostClear {
+    if (!this.shown) return "idle";
     const buf = term.buffer.active;
     const sameSpot = this.atX === buf.cursorX && this.atY === buf.baseY + buf.cursorY;
-    if (sameSpot && this.shownCols > 0) {
-      term.write(CSI + this.shownCols + "X");
-    }
+    const cols = this.shownCols;
     this.shown = "";
     this.shownCols = 0;
     this.atX = -1;
     this.atY = -1;
+    if (!sameSpot) {
+      // 光标被挪走了：从这里往后已经不是我画的，一个字节都不能写
+      return "moved";
+    }
+    term.write(CSI + cols + "X");
+    // 画灰字的前提就是「当时光标后没有真字」，光标又没动过，
+    // 所以那一段（乃至到行尾）仍然是空的 —— 不用读缓冲就敢下这个结论
+    return "erased";
   }
 
   /**
@@ -153,9 +173,11 @@ export class GhostText {
     // 字符，它还在屏幕上时 `cursorAtLineEnd` 永远判「后面还有别的字」。顺序反了
     // 的话灰字一旦画出来过就再也画不回来（每次都被当成「在行中间」擦掉）。
     if (used === this.shown) return this.shown;
-    // 先擦旧的：既不留残影，也让下面的 `cursorAtLineEnd` 看到的是真实内容
-    this.clear(term);
-    if (!cursorAtLineEnd(term)) return "";
+    // 先擦旧的：既不留残影，也让下面的 `cursorAtLineEnd` 看到的是真实内容。
+    // 擦除是异步进缓冲的（xterm write 的性质），所以「erased」时不能再读缓冲
+    // 判行尾 —— 那只会读到刚要擦掉的旧灰字；「erased」本身就说明是行尾。
+    const cleared = this.clear(term);
+    if (cleared !== "erased" && !cursorAtLineEnd(term)) return "";
     if (!used) return "";
 
     const buf = term.buffer.active;
