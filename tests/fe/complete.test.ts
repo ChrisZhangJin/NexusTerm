@@ -1421,15 +1421,21 @@ function asyncTerm(opts?: { cursorX?: number; lineText?: string }) {
   const queue: string[] = [];
   const cells = [...(opts?.lineText ?? "")];
   let cursorX = opts?.cursorX ?? (opts?.lineText?.length ?? 0);
-  const CSI_RE = new RegExp(`${ESC}\\[(\\d*)([DXm])`, "g");
+  const CSI_RE = new RegExp(`${ESC}\\[(\\d*)(?:;(\\d*))?([DXmH])`, "g");
   const apply = (s: string) => {
     let last = 0;
     for (const m of s.matchAll(CSI_RE)) {
       for (const ch of s.slice(last, m.index)) cells[cursorX++] = ch;
       last = (m.index ?? 0) + m[0].length;
+      const cmd = m[3];
       const n = m[1] === "" ? 1 : parseInt(m[1], 10);
-      if (m[2] === "D") cursorX = Math.max(0, cursorX - n);
-      else if (m[2] === "X") for (let k = 0; k < n; k++) delete cells[cursorX + k];
+      if (cmd === "D") cursorX = Math.max(0, cursorX - n);
+      else if (cmd === "X") for (let k = 0; k < n; k++) delete cells[cursorX + k];
+      else if (cmd === "H") {
+        // CUP：helper 只有一行缓冲，只支持第 1 行；列号从 1 起
+        const col = m[2] === "" || m[2] === undefined ? 1 : parseInt(m[2], 10);
+        if (n === 1) cursorX = col - 1;
+      }
       // m：SGR，不影响字符与光标
     }
     for (const ch of s.slice(last)) cells[cursorX++] = ch;
@@ -1437,6 +1443,7 @@ function asyncTerm(opts?: { cursorX?: number; lineText?: string }) {
   return {
     written,
     cols: 80,
+    rows: 24,
     get cursorX() {
       return cursorX;
     },
@@ -1557,4 +1564,51 @@ test("Tab 接受后 ghost 状态同步清空：再按 Tab 是 idle，不重复�
   const totalBefore = t.written.length;
   assert.equal(g.clear(t as never), "idle");
   assert.equal(t.written.length, totalBefore, "idle 的 clear 不写任何序列");
+});
+
+test("灰字：atMark 按坐标判定，不读缓冲内容", () => {
+  const t = asyncTerm({ lineText: "st" });
+  const g = new GhostText();
+  // 没画过：一律 false（调用方会走 cursorAtLineEnd 分支）
+  assert.equal(g.atMark(t as never), false);
+
+  g.show(t as never, "atus", 40);
+  t.flush();
+  assert.equal(g.atMark(t as never), true, "光标还在作画位置");
+
+  t.move(0); // shell 回显/输出把光标顶走
+  assert.equal(g.atMark(t as never), false);
+});
+
+test("灰字：光标被挪走后 clear 原地核实并擦掉残影（cleaned）", () => {
+  // 这是「Tab 掉回给 shell」那条链的根治用例：状态清了但残影赖在屏幕上，
+  // 下一次 Tab 因 active=false 不被接管，bash 自己的补全就接管了终端。
+  const t = asyncTerm({ lineText: "tmux " });
+  const g = new GhostText();
+  g.show(t as never, "attach -t unp", 40);
+  t.flush();
+  assert.equal(t.line(), "tmux attach -t unp");
+
+  t.move(30); // 回显/输出把光标顶走：sameSpot 不成立
+  assert.equal(g.clear(t as never), "cleaned", "旧位置逐格核实仍是我们画的 → 原地擦除");
+  t.flush();
+  assert.equal(t.line(), "tmux ", "残影被擦干净");
+  assert.equal(t.cursorX, 30, "光标被送回擦除时的位置");
+  assert.ok(t.written.some((s) => s.includes(`${ESC}[1;6H`)), "擦除前先 CUP 到旧位置");
+  assert.equal(g.atMark(t as never), false);
+  assert.equal(g.clear(t as never), "idle");
+});
+
+test("灰字：旧位置被输出盖掉时 clear 返回 moved、一个字节不写", () => {
+  const t = asyncTerm({ lineText: "tmux " });
+  const g = new GhostText();
+  g.show(t as never, "attach -t unp", 40);
+  t.flush();
+  t.move(30);
+  // 模拟别的输出恰好写在残影开头那几格 → 逐格比对失败
+  t.write(`${ESC}[1;6HZZZ`);
+  t.flush();
+  const before = t.written.length;
+  assert.equal(g.clear(t as never), "moved", "认不出是我们画的，不敢写");
+  assert.equal(t.written.length, before, "moved 分支零写入");
 });

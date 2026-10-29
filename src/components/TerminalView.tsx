@@ -347,8 +347,12 @@ export default function TerminalView({
       }
       // 人在行中间删改时一律不提示：补进去的那段会插到句子中间，
       // 而且灰字的擦除只敢从光标往后抹 —— 那里有真字就会连真字一起抹掉
-      // （屏幕上看没了、shell 里还在，回车就又冒出来）。见 `cursorAtLineEnd`。
-      if (!cursorAtLineEnd(term)) {
+      // （屏幕上看没了、shell 里还在，回车就又冒出来）。
+      // 灰字画着时**不能**扫缓冲：灰字自己就是「光标后面的字」，cursorAtLineEnd
+      // 必判「行中间」，刚画好的提示会被当场收掉、Tab 掉回给 shell（bash 接管
+      // 就成了「Display all 126 possibilities?」）。active 时只看光标是否仍在
+      // 画灰字时的位置；没画才允许读缓冲。
+      if (ghostRef.current.active ? !ghostRef.current.atMark(term) : !cursorAtLineEnd(term)) {
         dismissHints();
         return;
       }
@@ -579,7 +583,12 @@ export default function TerminalView({
     // 只在灰字真的画着时才查 buffer —— 挪光标是很热的路径。
     const cursorSub = term.onCursorMove(() => {
       if (!ghostRef.current.active) return;
-      if (term.buffer.active.type !== "normal" || !cursorAtLineEnd(term)) {
+      // 同 `publish`：灰字画着时不扫缓冲，只看光标是否离开了作画位置。
+      // 挪走了就收起 —— `clear` 会先逐格核实旧位置、把残影原地擦干净。
+      const stillFine =
+        term.buffer.active.type === "normal" &&
+        (ghostRef.current.atMark(term) || cursorAtLineEnd(term));
+      if (!stillFine) {
         dismissHints();
       }
     });
@@ -600,9 +609,13 @@ export default function TerminalView({
       const items = hintsRef.current;
       const typed = lineRef.current.text;
       if (!items.length || !typed) return;
+      // 灰字画着时用 atMark（坐标），没画时才扫缓冲 —— 理由见 `publish`。
+      const spotOk = ghostRef.current.active
+        ? ghostRef.current.atMark(term)
+        : cursorAtLineEnd(term);
       if (
         term.buffer.active.type !== "normal" ||
-        !cursorAtLineEnd(term) ||
+        !spotOk ||
         !cursorFollowsTyped(term, typed)
       ) {
         dismissHints();

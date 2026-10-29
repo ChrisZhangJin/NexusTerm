@@ -92,6 +92,31 @@ export function cursorAtLineEnd(term: Terminal): boolean {
 }
 
 /**
+ * 逐格核对绝对行 `y`、列 `x` 起的那段缓冲，是不是正好是我们画的灰字。
+ * 宽字符占两格（后半格 getChars 为空），按 `cellWidth` 走位比对。
+ * 灰字从不进 pty，shell 输出不可能在原位恰好排出同一段字 —— 全文逐格
+ * 相同就足以认定是我们的，不必再验前后界。
+ */
+function ghostCellsMatch(
+  term: Terminal,
+  y: number,
+  x: number,
+  text: string,
+  cols: number
+): boolean {
+  if (cols <= 0) return false;
+  const line = term.buffer.active.getLine(y);
+  if (!line) return false;
+  let cursor = x;
+  for (const ch of text) {
+    const cell = line.getCell(cursor);
+    if (!cell || cell.getChars() !== ch) return false;
+    cursor += cellWidth(ch);
+  }
+  return true;
+}
+
+/**
  * `clear()` 的结果。调用方**必须**用它而不是紧接着再读一遍缓冲：
  * xterm 的 `write()` 是异步的（见下），刚写出去的擦除序列此刻还没进缓冲，
  * 再读 `cursorAtLineEnd` 看到的是自己刚要擦掉的灰字 —— 「按 Tab 补全失灵」
@@ -102,7 +127,9 @@ export type GhostClear =
   | "idle"
   /** 光标仍在画灰字时的位置：光标之后那一段全是我们的灰字，擦了就是行尾 */
   | "erased"
-  /** 光标已被挪走（shell 重绘/输出）：一个字节都没写，屏幕状态不明 */
+  /** 光标已被挪走，但旧位置核实过确实是我们画的灰字，已原地擦干净 */
+  | "cleaned"
+  /** 光标已被挪走，旧位置的内容也认不出是我们画的：一个字节都没写，屏幕状态不明 */
   | "moved";
 
 export class GhostText {
@@ -120,6 +147,20 @@ export class GhostText {
 
   get active(): boolean {
     return this.shown.length > 0;
+  }
+
+  /**
+   * 光标是否还停在画灰字时的那个位置。
+   *
+   * 判「还能不能按当初的前提继续操作」只看**坐标**，绝不读缓冲 —— 灰字自己就是
+   * 光标后面的真实字符，凡是「光标后面有没有字」的缓冲扫描（`cursorAtLineEnd`）
+   * 在灰字画着的时候永远判「有」，拿来当守卫就会把刚画好的灰字当场收掉
+   * （Tab 因此掉回给 shell，表现为「部分场景下 Tab 补不了」）。
+   */
+  atMark(term: Terminal): boolean {
+    if (!this.active) return false;
+    const buf = term.buffer.active;
+    return this.atX === buf.cursorX && this.atY === buf.baseY + buf.cursorY;
   }
 
   /** 灰字占了多少列（用于自测：必须等于 `CSI n D` 里退回去的格数） */
@@ -141,18 +182,32 @@ export class GhostText {
     const buf = term.buffer.active;
     const sameSpot = this.atX === buf.cursorX && this.atY === buf.baseY + buf.cursorY;
     const cols = this.shownCols;
+    const text = this.shown;
+    const oldX = this.atX;
+    const oldY = this.atY;
     this.shown = "";
     this.shownCols = 0;
     this.atX = -1;
     this.atY = -1;
-    if (!sameSpot) {
-      // 光标被挪走了：从这里往后已经不是我画的，一个字节都不能写
-      return "moved";
+    if (sameSpot) {
+      term.write(CSI + cols + "X");
+      // 画灰字的前提就是「当时光标后没有真字」，光标又没动过，
+      // 所以那一段（乃至到行尾）仍然是空的 —— 不用读缓冲就敢下这个结论
+      return "erased";
     }
-    term.write(CSI + cols + "X");
-    // 画灰字的前提就是「当时光标后没有真字」，光标又没动过，
-    // 所以那一段（乃至到行尾）仍然是空的 —— 不用读缓冲就敢下这个结论
-    return "erased";
+    // 光标已被挪走。但不能就此撒手：状态一清，调用方就当「屏幕干净」处理，
+    // Tab 会掉回给 shell —— 而灰字还赖在原地（截图里那截擦不掉的残影）。
+    // 逐格核对旧位置：确实还是我们画的那段字，就跳过去原地擦掉、再把光标送回
+    // 现在的位置。认不出（被输出盖掉了/滚屏了）才是真正的"moved"，不敢写。
+    if (ghostCellsMatch(term, oldY, oldX, text, cols)) {
+      const row = oldY - buf.baseY; // CUP 用视口行号；滚出视口时上面已判 false
+      if (row >= 0 && row < term.rows) {
+        const restore = `${CSI}${buf.cursorY + 1};${buf.cursorX + 1}H`;
+        term.write(`${CSI}${row + 1};${oldX + 1}H${CSI}${cols}X${restore}`);
+        return "cleaned";
+      }
+    }
+    return "moved";
   }
 
   /**
