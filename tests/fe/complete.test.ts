@@ -1234,6 +1234,47 @@ test("接管：同一个键码 188 但没被替换（英文输入法）也只发
   un();
 });
 
+// ——— 第九轮：中文输入法把 `/` 换成 `、`，那颗原始半角键后到，又多一颗 ———
+//
+// 真机（豆包输入法，`input.log`）：敲一个斜线，出来的却是「、/」——
+//   beforeinput/input  data="、"  ts=49297   ← 替换结果先到，已经发出去了
+//   keydown  key="/"   kc=229     ts=49289   ← 原始半角后到，而且时间戳更早
+// 同一个操作在系统「终端」里只出「、」。所以这颗 keydown 是**同一次物理按键的
+// 另一半**，认亲用时间戳：那条 input 的时间戳晚于本 keydown。
+//
+// 不能用「200ms 内有过 input 就不发」：连打 `//` 时第二颗会被吞掉。
+
+test("接管：豆包把 / 换成 、时，后到的半角 keydown 不再多发一颗", () => {
+  const { host, out, un } = rig();
+  host.fire("input", { data: "、", inputType: "insertText", isComposing: false, timeStamp: 49297 });
+  assert.equal(out.text, "、");
+  const ev = host.fire("keydown", plainKey("/", { keyCode: 229, timeStamp: 49289 }));
+  assert.equal(out.text, "、", "多出来的那个 / 就是「、/」里的第二颗");
+  assert.equal(ev.propagationStopped, true, "xterm 也不该再发一份");
+  un();
+});
+
+test("接管：连打两个 / 各自一颗，不能被「刚刚有过 input」误吞", () => {
+  // 两次完整序列，时间戳依次前进：第二颗的 input 一定晚于第二颗的 keydown，
+  // 而第一颗的 input 一定早于它 —— 靠窗口判断会错，靠时间戳不会。
+  const { host, out, un } = rig();
+  host.fire("input", { data: "、", inputType: "insertText", isComposing: false, timeStamp: 100 });
+  host.fire("keydown", plainKey("/", { keyCode: 229, timeStamp: 95 }));
+  host.fire("input", { data: "、", inputType: "insertText", isComposing: false, timeStamp: 200 });
+  host.fire("keydown", plainKey("/", { keyCode: 229, timeStamp: 195 }));
+  assert.equal(out.text, "、、", "两颗斜线两个顿号，一颗都不能少");
+  un();
+});
+
+test("接管：上一个字符的 input 早于本 keydown 时，新字符照常发", () => {
+  // 这条钉住判据的方向：input(1000) 之后敲的 "b"(keydown ts=1010) 是新输入。
+  const { host, out, un } = rig();
+  host.fire("input", { data: "a", inputType: "insertText", isComposing: false, timeStamp: 1000 });
+  host.fire("keydown", plainKey("b", { timeStamp: 1010 }));
+  assert.equal(out.text, "ab");
+  un();
+});
+
 // ——— 第八轮：照着真机日志改（前三轮都是猜的，猜错三次）———
 //
 // 真机（macOS + WKWebView + 系统拼音）敲一个中文逗号，<app_data>/logs/input.log

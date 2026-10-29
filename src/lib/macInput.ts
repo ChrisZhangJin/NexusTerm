@@ -34,7 +34,12 @@ import { api } from "../api";
  *    字节都不出去，直到用户切走 app 再回来。这是「中文没问题、英文丢一大片」的
  *    根因之一：中文每轮组合都能正常收尾，出事的全是那些没收尾的会话。
  *
- * 上面四条（连同第 5 条）都是「猜 xterm 这一路会不会也发」，每条对应一次真机翻车。猜不完：
+ * 6. **替换过的标点后面又跟一颗原始半角**（中文输入法敲 `/` 出 `、/`）：输入法
+ *    把标点换成别的字符时，WebKit 先派发替换结果的 `input`，再补一颗**原始半角**
+ *    的 keydown（`key="/"`，kc=229，时间戳甚至更早）。那颗 keydown 是同一颗物理
+ *    按键的另一半，不能再发 —— 见 `lastInputEmitTs`。
+ *
+ * 上面六条都是「猜 xterm 这一路会不会也发」，每条对应一次真机翻车。猜不完：
  * 发送方有两个（xterm 的 `onData` 和这一层），而 WKWebView 的事件序列按输入法
  * 变，换一种输入法就多一条没覆盖的路。所以**最后兜底的不是分支，是出口**——
  * 见 [`OnceGuard`]：一颗键只许放一个可见字符出去，谁先到算谁的。
@@ -550,6 +555,32 @@ export function installMacKeyboard(
    * insertText 就认定结果已交出，接管层闭嘴。
    */
   let lastTextInputAt = -Infinity;
+  /**
+   * 最近一条**由 input 路交出去**的单字符，连同那条 input 自己的 `timeStamp`。
+   *
+   * 输入法替换标点时（豆包输入法：`/` → `、`），WebKit 派事件的顺序是**先 input、
+   * 后 keydown**，而且那颗补发的 keydown 时间戳比 input 还早 —— 它们本来就是同一
+   * 次物理按键的两半。真机日志（`input.log`，中文输入法敲一个斜线）：
+   *
+   * ```
+   * beforeinput/input  data="、"   ts=49297   ← 替换结果先到，已经发出去了
+   * keydown  key="/"   kc=229     ts=49289   ← 原始半角后到（时间戳更早）
+   * ```
+   *
+   * 那颗 keydown 不是「新的输入」，再发一颗就成了 `、/`。
+   *
+   * 判据用**时间戳先后**而不是「多久以内」：`输入的时间戳 > 本 keydown 的时间戳`
+   * 只可能是同一颗键 —— 上一个字符的 input 一定早于本 keydown，所以连打 `//`
+   * 也不会被误吞（换成 200ms 窗口就会）。
+   */
+  let lastInputEmitTs = -Infinity;
+  let lastInputEmitAt = -Infinity;
+  /** 记下「这条 input 已经替用户把结果交出去了」，供紧接着那颗原始 keydown 认亲 */
+  const noteInputEmit = (ev: InputEvent, data: string): void => {
+    if (!isSingleVisible(data)) return;
+    lastInputEmitTs = ev.timeStamp;
+    lastInputEmitAt = nowMs();
+  };
   const clearPending = () => {
     pendingPunct = null;
     if (pendingTimer !== undefined) {
@@ -826,6 +857,18 @@ export function installMacKeyboard(
       trace({ ev: "keydown", act: "pass", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
       return;
     }
+    // 输入法把标点换成了别的字符（豆包：`/` → `、`）：替换结果已经由 input 交出
+    // 去了，这颗后到的 keydown 却还带着**原始半角**（`key="/"`，kc=229）。照常发
+    // 就是 `、/`（真机复现；同样的操作在系统「终端」里只出 `、`）。
+    // 认亲用时间戳，见 `lastInputEmitTs` 的注释。
+    if (lastInputEmitTs > ev.timeStamp && nowMs() - lastInputEmitAt < 200) {
+      // 结果已经发过，这颗键不能插入任何东西，拦死最干净
+      ev.preventDefault();
+      ev.stopPropagation();
+      markSent();
+      trace({ ev: "keydown", act: "drop", key: ev.key, kc: ev.keyCode, code: ev.code, mods: modsOf(ev), ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea) }, ev);
+      return;
+    }
     // 拦死默认行为：不产生 keypress / beforeinput，也不让 xterm 的 _keyDown 跑
     ev.preventDefault();
     ev.stopPropagation();
@@ -862,6 +905,7 @@ export function installMacKeyboard(
       ev.stopPropagation();
       clearTextarea();
       lastTextInputAt = nowMs();
+      noteInputEmit(ev, ev.data);
       out(ev.data);
       trace({ ev: "input", act: "send", it: ev.inputType, data: ev.data, ic: ev.isComposing, comp: composing, ta: taOf(internals.textarea), sent: ev.data, via: "mac" }, ev);
       return;
@@ -926,7 +970,10 @@ export function installMacKeyboard(
     // keydown 早就各自发过了，逐字重放只会多出字节："  " → ". " → "  . "。
     const rest = single ? ledger.input(data, nowMs()) : "";
     const ok = rest !== "";
-    if (ok) out(rest);
+    if (ok) {
+      noteInputEmit(ev, rest);
+      out(rest);
+    }
     trace({ ev: "input", act: ok ? "send" : "drop", it: ev.inputType, data, ic: ev.isComposing, comp: composing, ta: taBefore, sent: ok ? rest : undefined, via: ok ? "mac" : undefined }, ev);
   };
 
