@@ -20,6 +20,7 @@ mod ssh;
 mod store;
 mod sysstat;
 mod totp;
+mod vault;
 mod xsh;
 
 pub(crate) fn app_data_dir(app: &tauri::AppHandle) -> PathBuf {

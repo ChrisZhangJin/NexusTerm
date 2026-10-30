@@ -62,6 +62,14 @@ argon2 = "0.5"
 # 否则 trait 不是同一个，编译期会报「未实现」。
 ssh-encoding = "0.2"
 parking_lot = "0.12"
+# —— 保险库（vault.rs）——
+# 主密码、KEK、DEK 离开作用域时擦掉。aes-gcm/argon2 已经在传递依赖里带着它，
+# 提成直接依赖不增加编译单元。不开 `derive` feature：`Zeroizing<T>` 已经够用，
+# 而 derive 会额外拉一个 proc-macro crate。
+#
+# 注意 `panic = "abort"` 的影响：panic 时不展开，Drop 不跑。但那条路径上进程
+# 随即结束、页面由 OS 回收并清零，正常作用域退出的 Drop 不受影响。
+zeroize = "1"
 # 上下文脱敏。已在依赖树里（tracing-subscriber/env-filter 传递依赖），
 # 直接引用不会引入额外的编译单元。
 regex = "1"
