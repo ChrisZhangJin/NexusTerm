@@ -7,6 +7,10 @@ use std::sync::Mutex;
 
 use crate::vault::{Field, Vault};
 
+/// 保险库的启用 / 解锁 / 全量扫描。单独一个文件是因为那套流程的注意事项
+/// （三段事务的顺序、锁序、失败时宁可中止也不降级）值得集中讲一遍。
+mod vault_ops;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
@@ -46,6 +50,8 @@ pub struct NewSession {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// nexus.db 的完整路径。启用保险库前要照着它备份一份。
+    path: PathBuf,
     /// 凭据列的加解密。密钥住在这里而不是 `AppState`，是因为读写凭据的方法
     /// 全是 `Store` 的方法 —— 密钥跟着数据走，所有调用方的签名一个都不用动。
     ///
@@ -225,10 +231,14 @@ impl Store {
 
         migrate(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
 
+        // 一次主键查找就能判定要不要弹解锁框。刻意不做 KDF、不碰系统凭据服务 ——
+        // 这条路径在 `lib.rs` 的 setup 里是 `expect`，不能慢也不能阻塞。
+        let vault = vault_ops::probe(&conn);
+
         Ok(Self {
             conn: Mutex::new(conn),
-            // 恒为「未启用」：启用保险库的入口还没接上，所以凭据照旧按明文走。
-            vault: Vault::disabled(),
+            path,
+            vault,
         })
     }
 

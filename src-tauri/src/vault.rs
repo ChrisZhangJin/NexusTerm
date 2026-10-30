@@ -88,6 +88,9 @@ const DEFAULT_P_COST: u32 = 4;
 const KEY_LEN: usize = 32;
 const SALT_LEN: usize = 16;
 
+/// [`KdfSpec::damaged`] 用的算法名。不可能和任何真实算法撞上。
+const DAMAGED: &str = "<damaged>";
+
 fn b64() -> base64::engine::general_purpose::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
 }
@@ -197,6 +200,23 @@ impl KdfSpec {
         }
     }
 
+    /// `vault.dek` 在、但 `vault.kdf` 读不出来时的占位。
+    ///
+    /// 这种库打不开了，但**绝不能因此回落成「未启用」**：那会让界面以为凭据是
+    /// 明文，用户随手存一个密码就把明文写在了一堆密文旁边，还会让人以为
+    /// 「加密功能自己关掉了」。钉在「已锁定」，解锁时给一句说人话的错误。
+    pub fn damaged() -> Self {
+        Self {
+            alg: DAMAGED.into(),
+            ver: 0,
+            m: 0,
+            t: 0,
+            p: 0,
+            len: 0,
+            salt: String::new(),
+        }
+    }
+
     /// 序列化成要存进 `settings` 的那一串。
     pub fn to_json(&self) -> Result<String, String> {
         serde_json::to_string(self).map_err(|e| format!("无法序列化保险库 KDF 参数：{e}"))
@@ -209,6 +229,11 @@ impl KdfSpec {
 
     /// 由主密码派生 KEK。
     fn derive(&self, password: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
+        if self.alg == DAMAGED {
+            return Err("保险库元数据已损坏（settings 里的 vault.kdf 读不出来），\
+                        无法解锁。如果有 nexus.db.pre-vault.bak，可以用它恢复。"
+                .into());
+        }
         if self.alg != "argon2id" {
             return Err(format!("不支持的保险库密钥派生算法：{}", self.alg));
         }
@@ -528,6 +553,60 @@ impl Vault {
 
 const LOCKED_WRITE: &str = "保险库已锁定，无法保存凭据。请先输入主密码解锁。";
 const LOCKED_READ: &str = "保险库已锁定，无法读取凭据。请先输入主密码解锁。";
+
+/// 「在本机记住」：把 DEK 交给系统凭据服务，下次启动免输主密码。
+///
+/// **存的是 DEK 不是 KEK**，两个理由：省掉启动时那一次 Argon2；改了主密码之后
+/// 记住的条目依然有效（DEK 没变，变的只是包装它的 KEK）。
+///
+/// 条目名用建库时生成的 uuid，所以多个 db 天然互不干扰，而把 db 拷到新机器之后
+/// 「已记住」会自动变成否 —— 可移植性没有因为这个功能打折。
+///
+/// 代价要说清楚：开了它，本机上能读到当前用户凭据服务的人就等于拿到了全部密码。
+/// 所以默认关闭。
+pub mod remember {
+    use super::{b64, KEY_LEN};
+    use base64::Engine as _;
+    use zeroize::Zeroizing;
+
+    /// 和 [`crate::secret`] 的 `com.nexus-term.secrets`、`store` 里那个只用于
+    /// 一次性迁移的 `com.nexus-term.sessions` 都是两回事，别混用。
+    const SERVICE: &str = "com.nexus-term.vault";
+
+    pub fn save(id: &str, dek: &[u8; KEY_LEN]) -> Result<(), String> {
+        let entry = keyring::Entry::new(SERVICE, id)
+            .map_err(|e| format!("无法访问系统凭据服务：{e}"))?;
+        entry
+            .set_password(&b64().encode(dek))
+            .map_err(|e| format!("无法记住主密码：{e}"))
+    }
+
+    /// 取回记住的 DEK。
+    ///
+    /// **取回来还不能直接用** —— 这里没有主密码，也就没有 KEK，无从验证这把
+    /// DEK 是不是这个库的。调用方必须拿 `vault.verify` 哨兵再核一遍。
+    pub fn load(id: &str) -> Option<Zeroizing<[u8; KEY_LEN]>> {
+        let entry = keyring::Entry::new(SERVICE, id).ok()?;
+        let stored = entry.get_password().ok()?;
+        let raw = b64().decode(stored.trim()).ok()?;
+        let dek: [u8; KEY_LEN] = raw.try_into().ok()?;
+        Some(Zeroizing::new(dek))
+    }
+
+    /// 忘掉。条目本来就不存在也算成功 —— 调用方要的是「之后读不到」。
+    pub fn forget(id: &str) {
+        if let Ok(entry) = keyring::Entry::new(SERVICE, id) {
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(e) => tracing::warn!(error = %e, "清除记住的保险库密钥失败"),
+            }
+        }
+    }
+
+    pub fn is_remembered(id: &str) -> bool {
+        load(id).is_some()
+    }
+}
 
 #[cfg(test)]
 mod tests {
