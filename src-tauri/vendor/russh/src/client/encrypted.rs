@@ -210,7 +210,9 @@ impl Session {
                                     let len = enc.write.len();
                                     #[allow(clippy::indexing_slicing)] // length checked
                                     if enc.write_auth_request(&self.common.auth_user, meth)? {
-                                        debug!("enc: {:?}", &enc.write[len..]);
+                                        // 上游这里把整包认证请求 `{:?}` 打出来 —— 密码认证时那是**明文密码**，
+                                        // 开 debug 日志就落盘。只记长度。见 PATCHES.md 补丁 8。
+                                        debug!("enc: {} bytes", enc.write.len() - len);
                                         enc.state = EncryptedState::WaitingAuthRequest(auth_request)
                                     }
                                 } else {

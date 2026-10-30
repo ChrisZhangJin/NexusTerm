@@ -122,9 +122,16 @@ export default function AuthPromptDialog({
             断线前用过的验证码已经失效，请输入现在这一刻新生成的码。
           </p>
         )}
+        {/*
+          name 和 instructions 都要显示。曾经写成 `instructions || name`，
+          两个都有时 name 被丢掉 —— 堡垒机的 MFA 菜单恰好就放在 name 里。
+        */}
         {(prompt.instructions || prompt.name) && (
           <p className="auth-notice">
-            {prompt.instructions || prompt.name}
+            {[prompt.name, prompt.instructions]
+              .map((t) => t.trim())
+              .filter((t, i, a) => t && a.indexOf(t) === i)
+              .join("\n")}
           </p>
         )}
 
