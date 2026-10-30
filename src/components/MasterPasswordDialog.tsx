@@ -4,15 +4,13 @@ import type { SweepReport } from "../types";
 
 export type MasterPasswordMode = "enable" | "unlock" | "change" | "disable";
 
-/** 重置那一屏要求手敲的字样。不做大小写宽容：这一步的意义就是让手指慢下来。 */
-const RESET_WORD = "RESET";
-
 /**
  * 主密码对话框。启用 / 解锁 / 修改 / 关闭四件事共用一个组件 —— 它们的输入几乎一样，
  * 拆成四个文件只会让四份「两次密码不一致」的校验各自跑偏。
  *
- * 「忘记主密码？」做成本组件内的第二屏，而不是外面的 ConfirmDialog：这一步会永久销毁
- * 全部凭据，必须把销毁什么、保留什么、备份在哪摆在用户眼前，一行 message 装不下。
+ * **这里没有「忘记主密码 → 重置」**，是有意的：解锁框谁都能点到，而重置会销毁全部凭据
+ * —— 不知道密码的人进不来，却能删光你的东西。忘了主密码就是忘了（见启用时的确认项），
+ * 不提供任何不需要密码的破坏性入口。后端也没有对应命令，不要补回来。
  */
 export default function MasterPasswordDialog({
   mode,
@@ -25,8 +23,8 @@ export default function MasterPasswordDialog({
   onClose: (() => void) | null;
   /** 「在本机记住」复选框的初始值，默认 false */
   rememberDefault?: boolean;
-  /** 成功后回调：enable/disable 给 SweepReport；忘记主密码走的重置给被清掉的条数；unlock/change 给 null */
-  onDone: (result: SweepReport | number | null) => void;
+  /** 成功后回调：enable/disable 给 SweepReport；unlock/change 给 null */
+  onDone: (result: SweepReport | null) => void;
 }): ReactElement {
   // enable/change 里这是「新主密码」，unlock/disable 里这就是主密码本身
   const [password, setPassword] = useState("");
@@ -37,20 +35,14 @@ export default function MasterPasswordDialog({
   const [ack, setAck] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
-  // 第二屏：忘记主密码 → 销毁重来
-  const [resetting, setResetting] = useState(false);
-  const [resetWord, setResetWord] = useState("");
 
   // change 的焦点要落在「当前主密码」上，其余模式落在主输入框
   const firstRef = useRef<HTMLInputElement>(null);
   const pwRef = useRef<HTMLInputElement>(null);
-  const resetRef = useRef<HTMLInputElement>(null);
 
-  // 切屏时把焦点带过去，别让用户先点一下才能打字
   useEffect(() => {
-    if (resetting) resetRef.current?.focus();
-    else (firstRef.current ?? pwRef.current)?.focus();
-  }, [resetting]);
+    (firstRef.current ?? pwRef.current)?.focus();
+  }, []);
 
   // Escape 取消。用捕获阶段：终端组件的全局键盘钩子也在监听，
   // 不抢在它前面会把 Esc 一起发给远端。
@@ -61,13 +53,11 @@ export default function MasterPasswordDialog({
       if (e.key !== "Escape") return;
       e.preventDefault();
       e.stopPropagation();
-      // 第二屏先退回第一屏，直接关掉会让用户以为「取消」只是取消了重置
-      if (resetting) setResetting(false);
-      else onClose();
+      onClose();
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [onClose, resetting]);
+  }, [onClose]);
 
   /** 请求失败：保留已输入的内容，只把焦点送回密码框。打错一个字符就被清空很烦人。 */
   const fail = (e: unknown) => {
@@ -114,98 +104,6 @@ export default function MasterPasswordDialog({
       fail(e);
     }
   };
-
-  const doReset = async () => {
-    if (busy || resetWord.trim() !== RESET_WORD) return;
-    setErr("");
-    setBusy(true);
-    try {
-      onDone(await api.vaultReset());
-    } catch (e) {
-      setErr(String(e));
-      setBusy(false);
-      resetRef.current?.focus();
-    }
-  };
-
-  if (resetting) {
-    return (
-      <div className="modal-backdrop">
-        <form
-          className="modal"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void doReset();
-          }}
-        >
-          <h2>忘记主密码</h2>
-
-          <div className="vault-danger">
-            <strong>没有找回手段，只能全部销毁重来。</strong>
-            <br />
-            将<strong>永久销毁</strong>：
-            <ul>
-              <li>已保存的 SSH 登录密码</li>
-              <li>私钥口令</li>
-              <li>LLM API Key</li>
-              <li>TOTP 种子（双因素验证码的来源）</li>
-            </ul>
-            将保留：
-            <ul>
-              <li>主机 / 端口 / 用户名 / 分组</li>
-              <li>宏</li>
-              <li>私钥文件本身</li>
-            </ul>
-            重置前会自动把旧库备份成应用数据目录里的{" "}
-            <strong>nexus.db.pre-reset.bak</strong>
-            ，日后想起主密码仍可从它找回，别急着删。
-          </div>
-
-          <div className="row">
-            <label htmlFor="vault-reset-word">确认</label>
-            <input
-              id="vault-reset-word"
-              ref={resetRef}
-              type="text"
-              value={resetWord}
-              onChange={(e) => setResetWord(e.target.value)}
-              placeholder={`输入 ${RESET_WORD} 以确认`}
-              autoComplete="off"
-              autoCapitalize="off"
-              autoCorrect="off"
-              spellCheck={false}
-              disabled={busy}
-            />
-          </div>
-          <p className="hint">手动输入大写的 {RESET_WORD} 才会点亮下面的按钮。</p>
-
-          {err && <p className="error">{err}</p>}
-
-          <div className="modal-actions">
-            <button
-              type="button"
-              className="btn"
-              onClick={() => {
-                setResetWord("");
-                setErr("");
-                setResetting(false);
-              }}
-              disabled={busy}
-            >
-              返回
-            </button>
-            <button
-              type="submit"
-              className="btn primary danger"
-              disabled={busy || resetWord.trim() !== RESET_WORD}
-            >
-              {busy ? "销毁中…" : "销毁并重来"}
-            </button>
-          </div>
-        </form>
-      </div>
-    );
-  }
 
   const title =
     mode === "enable"
@@ -353,20 +251,6 @@ export default function MasterPasswordDialog({
         {err && <p className="error">{err}</p>}
 
         <div className="modal-actions">
-          {mode === "unlock" && (
-            <button
-              type="button"
-              className="btn-link"
-              style={{ marginRight: "auto" }}
-              onClick={() => {
-                setErr("");
-                setResetting(true);
-              }}
-              disabled={busy}
-            >
-              忘记主密码？
-            </button>
-          )}
           {onClose && (
             <button type="button" className="btn" onClick={onClose} disabled={busy}>
               取消

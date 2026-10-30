@@ -784,11 +784,6 @@ interface VaultReport {
   warn: boolean;
 }
 
-/** `SweepReport | number | null` 三选一里挑出 SweepReport —— number 是重置返回的条数 */
-function isSweep(r: SweepReport | number | null): r is SweepReport {
-  return typeof r === "object" && r !== null;
-}
-
 /** 「12 条凭据、2 个 API Key、3 个 TOTP 种子」——为 0 的项不列，免得报告里全是「0 个」。 */
 function sweepParts(r: SweepReport): string {
   const xs = [
@@ -802,18 +797,9 @@ function sweepParts(r: SweepReport): string {
 
 /**
  * 把 `onDone` 的回值翻成人话。
- *
- * 先看回值类型再看 mode：`unlock` 这一屏里用户可能走的是「忘记主密码 → 重置」，
- * 那条路返回的是 number，和解锁完全不是一回事。
  */
-function describeDone(mode: MasterPasswordMode, r: SweepReport | number | null): VaultReport {
-  if (typeof r === "number") {
-    return {
-      text: `已重置保险库，销毁了 ${r} 条加密凭据，保险库退回未启用。旧数据的备份留在应用数据目录，日后想起主密码仍可找回。`,
-      warn: true,
-    };
-  }
-  if (isSweep(r)) {
+function describeDone(mode: MasterPasswordMode, r: SweepReport | null): VaultReport {
+  if (r) {
     if (mode === "disable") {
       return {
         text: `已关闭主密码保护，${sweepParts(r)}还原成明文存回 nexus.db。`,
@@ -880,7 +866,7 @@ export function SecurityDialog({ onClose }: { onClose: () => void }) {
     setPrompt(mode);
   };
 
-  const done = (mode: MasterPasswordMode) => (r: SweepReport | number | null) => {
+  const done = (mode: MasterPasswordMode) => (r: SweepReport | null) => {
     setPrompt(null);
     setReport(describeDone(mode, r));
     setTick((t) => t + 1);

@@ -1066,10 +1066,3 @@ pub fn vault_disable(password: String, state: State<'_, AppState>) -> Result<Swe
     state.store.vault_disable(&password)
 }
 
-/// 忘了主密码时的逃生口：**销毁**全部加密凭据，退回未启用。
-///
-/// 返回被清掉的条数。这是破坏性重置不是恢复，界面上必须让用户先确认。
-#[tauri::command]
-pub fn vault_reset(state: State<'_, AppState>) -> Result<usize, String> {
-    state.store.vault_reset()
-}

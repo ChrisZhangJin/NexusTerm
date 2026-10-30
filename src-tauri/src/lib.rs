@@ -257,7 +257,6 @@ pub fn run() {
             cmd::vault_forget,
             cmd::vault_change_password,
             cmd::vault_disable,
-            cmd::vault_reset,
             viewer::viewer_open_sftp,
             viewer::viewer_open_ssh,
             viewer::viewer_open_local,

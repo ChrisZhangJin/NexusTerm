@@ -341,97 +341,6 @@ impl Store {
         Ok(report)
     }
 
-    // ——— 重置（忘了主密码的逃生口）———
-
-    /// **销毁**所有解不开的凭据，把库退回未启用。
-    ///
-    /// 这不是恢复，是破坏性重置，界面上必须说清楚。主机 / 端口 / 用户名 / 分组 /
-    /// 宏 / 密钥元数据全部保留，用户要补的只是密码本身。做这个口子是因为另一条路
-    /// 更糟：忘了主密码又没有出口，用户只能删掉整个 nexus.db 重建全部连接。
-    ///
-    /// 不需要主密码 —— 需要的话这个功能就没有存在意义了。
-    pub fn vault_reset(&self) -> Result<usize, String> {
-        let meta = self.vault.meta().ok_or("保险库未启用")?;
-
-        // 留一份再动手。用户现在解不开这些密文，但将来想起主密码就解得开 ——
-        // 这份备份是那条退路唯一的载体，而它只值几十毫秒。
-        self.backup_db("db.pre-reset.bak", true)?;
-
-        // 先销毁数据再删元数据：反过来的话中途失败就剩下一堆没有密钥的密文，
-        // 而那时连「哪些是密文」都还能看出来，只是再也没有入口去清它们了。
-        let cleared = self.clear_encrypted_credentials()? + self.clear_api_keys()?;
-        self.clear_settings(&[K_ID, K_KDF, K_DEK, K_VERIFY, K_MIGRATING])?;
-        if !meta.id.is_empty() {
-            remember::forget(&meta.id);
-        }
-        self.vault.disable();
-        tracing::warn!(cleared, "保险库已重置，其中的加密凭据已销毁");
-        Ok(cleared)
-    }
-
-    /// 把 `agent.config` 里解不开的 api_key 清成空串。
-    ///
-    /// 只动那一个叶子：模型、baseUrl、系统提示词这些没加密的字段原样留着 ——
-    /// 重置之后用户要补的只有 key 本身。
-    fn clear_api_keys(&self) -> Result<usize, String> {
-        const CONFIG_KEY: &str = "agent.config";
-        let Some(raw) = self.get_setting(CONFIG_KEY) else {
-            return Ok(0);
-        };
-        let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            return Ok(0);
-        };
-        let slots = api_key_slots(&mut root);
-
-        let mut cleared = 0usize;
-        for slot in slots {
-            if slot.as_str().is_some_and(|s| vault::classify(s) == Form::Dek) {
-                *slot = serde_json::Value::String(String::new());
-                cleared += 1;
-            }
-        }
-        if cleared > 0 {
-            let json = serde_json::to_string(&root).map_err(|e| e.to_string())?;
-            self.write_settings(&[(CONFIG_KEY, &json)])?;
-        }
-        Ok(cleared)
-    }
-
-    /// 把所有 `v2:` 的凭据列清成 NULL。`v1:` 的 TOTP 种子不动 —— 那些挂在
-    /// 系统凭据服务上，和主密码无关，重置之后照样能用。
-    fn clear_encrypted_credentials(&self) -> Result<usize, String> {
-        let rows = self.read_credential_rows()?;
-        let mut targets: Vec<(String, &'static str, String)> = Vec::new();
-        for (id, password, passphrase, seed) in rows {
-            for (column, current) in [
-                ("password", password),
-                ("passphrase", passphrase),
-                ("totp_seed", seed),
-            ] {
-                let Some(current) = current.filter(|s| !s.is_empty()) else {
-                    continue;
-                };
-                if vault::classify(&current) != Form::Dek {
-                    continue;
-                }
-                targets.push((id.clone(), column, current));
-            }
-        }
-        if targets.is_empty() {
-            return Ok(0);
-        }
-        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        for (id, column, old) in &targets {
-            // 清成 NULL 而不是空串：六个凭据方法把「空」一律当成「没配置」，
-            // 两种写法读回来都是 None，但 NULL 才是它们自己写出来的形状。
-            let sql = format!("UPDATE sessions SET {0} = NULL WHERE id = ?1 AND {0} = ?2", column);
-            tx.execute(&sql, params![id, old]).map_err(|e| e.to_string())?;
-        }
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(targets.len())
-    }
-
     // ——— 全量扫描 ———
 
     /// 上次启用/扫描被中断过的话，在这里接着扫完。解锁成功后调用。
@@ -1019,40 +928,6 @@ mod tests {
         assert_eq!(store.get_password(&id).as_deref(), Some("PLAINTEXT-CANARY"));
     }
 
-    // ——— 重置 ———
-
-    /// 忘了主密码的逃生口：凭据没了，连接配置还在。
-    #[test]
-    fn resetting_destroys_the_credentials_but_keeps_the_sessions() {
-        let (store, db, id) = store_with_credentials("vault-reset");
-        store.vault_enable(PW, false).unwrap();
-        store.vault_lock();
-
-        let cleared = store.vault_reset().unwrap();
-        assert_eq!(cleared, 2);
-        assert!(!store.vault().status().enabled);
-        assert_eq!(store.get_password(&id), None);
-        assert_eq!(store.get_passphrase(&id), None);
-
-        let s = store.get(&id).expect("会话本身必须还在");
-        assert_eq!(s.host, "example.com");
-        assert_eq!(s.username, "root");
-
-        // 销毁之前留下的那一份：用户哪天想起主密码，这是唯一的退路。
-        let backup = db.with_extension("db.pre-reset.bak");
-        assert!(backup.exists(), "重置前必须留一份备份");
-
-        // 清完就是一个干净的未启用库，照样能重新填密码。
-        store.set_password(&id, "a-new-one").unwrap();
-        assert_eq!(store.get_password(&id).as_deref(), Some("a-new-one"));
-    }
-
-    #[test]
-    fn resetting_a_vault_that_was_never_enabled_is_an_error() {
-        let (store, _, _) = store_with_credentials("vault-reset-none");
-        assert!(store.vault_reset().is_err());
-    }
-
     // ——— agent.config 里的 LLM API Key ———
 
     /// 装一份带两个账号的 AI 配置。
@@ -1134,22 +1009,6 @@ mod tests {
             crate::agent::load_config(&store).accounts[0].api_key,
             "sk-FIRST-CANARY"
         );
-    }
-
-    #[test]
-    fn resetting_clears_the_api_keys_but_keeps_the_rest_of_the_config() {
-        let (store, _, _) = store_with_credentials("vault-apikey-reset");
-        with_agent_config(&store);
-        store.vault_enable(PW, false).unwrap();
-        store.vault_lock();
-
-        let cleared = store.vault_reset().unwrap();
-        assert_eq!(cleared, 4, "两条凭据 + 两个 key");
-
-        let cfg = crate::agent::load_config(&store);
-        assert_eq!(cfg.accounts[0].api_key, "");
-        assert_eq!(cfg.accounts[0].model, "gpt-4o-mini", "模型配置要留着");
-        assert_eq!(cfg.accounts.len(), 2);
     }
 
     // ——— 损坏的元数据 ———

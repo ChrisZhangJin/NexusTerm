@@ -331,13 +331,6 @@ export const api = {
   /** 关闭保险库，凭据还原成明文。要验主密码 */
   vaultDisable: (password: string) =>
     invoke<SweepReport>("vault_disable", { password }),
-  /**
-   * 忘了主密码时的逃生口：**销毁**全部加密凭据，退回未启用，返回被清掉的条数。
-   *
-   * 这是破坏性重置不是恢复 —— 界面上必须先让用户确认。后端动手前会留一份
-   * `nexus.db.pre-reset.bak`，日后想起主密码仍能从那里找回。
-   */
-  vaultReset: () => invoke<number>("vault_reset"),
 };
 
 /** base64 → Uint8Array。SSH 数据流必须走这条路径，不能 lossy 转字符串。 */
