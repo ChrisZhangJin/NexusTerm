@@ -1048,6 +1048,9 @@ where
     // 就说明那次没过 —— 这是我们能拿到的唯一失败信号（KBI 的重试表现为
     // 再来一个 INFO_REQUEST，而不是 FAILURE）。
     let mut auto_submitted = false;
+    // 「纯提示」轮（没有输入框）里服务器说的话。堡垒机常把 MFA 菜单放在这样一轮里，
+    // 下一轮才是 `Option>`；这些文字要带到下一个真正的弹框里，不能随空应答一起丢。
+    let mut carried_info = String::new();
 
     loop {
         match resp {
@@ -1095,8 +1098,27 @@ where
                 }
                 auto_submitted = false;
 
+                // 服务器到底发了什么，现场排查二次验证问题时第一手要看的东西。
+                // 只记题面，不记任何用户填的内容。
+                tracing::info!(
+                    round,
+                    name = %name,
+                    instructions = %instructions,
+                    prompts = ?prompts.iter().map(|p| (p.prompt.as_str(), p.echo)).collect::<Vec<_>>(),
+                    "keyboard-interactive：收到服务器的问题"
+                );
+
                 let mut answers = if prompts.is_empty() {
-                    // 纯提示（没有可填字段），回空列表表示「知道了」
+                    // 纯提示（没有可填字段），回空列表表示「知道了」。
+                    // 但文字要留着，见 `carried_info`。
+                    for part in [name.trim(), instructions.trim()] {
+                        if !part.is_empty() && !carried_info.contains(part) {
+                            if !carried_info.is_empty() {
+                                carried_info.push('\n');
+                            }
+                            carried_info.push_str(part);
+                        }
+                    }
                     Vec::new()
                 } else {
                     // 每个字段尽量自己填上。只有**全部**字段都填上了、
@@ -1149,6 +1171,23 @@ where
                         // 跳过弹框，直接应答 —— 用户连那一下回车都省了
                         answers
                     } else {
+                        // 先前纯提示轮攒下的文字拼在最前面，用掉就清空
+                        let instructions = if carried_info.is_empty() {
+                            instructions
+                        } else {
+                            let head = std::mem::take(&mut carried_info);
+                            if instructions.trim().is_empty() {
+                                // 弹框只显示 instructions，空的话才退回 name；
+                                // 这里 instructions 已被占用，name 要一并带上
+                                if name.trim().is_empty() {
+                                    head
+                                } else {
+                                    format!("{head}\n\n{}", name.trim())
+                                }
+                            } else {
+                                format!("{head}\n\n{instructions}")
+                            }
+                        };
                         let prompt = AuthPrompt {
                             session_id: session_id.to_string(),
                             kind: "keyboard-interactive".into(),

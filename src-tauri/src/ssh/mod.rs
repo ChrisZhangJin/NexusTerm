@@ -129,6 +129,7 @@ impl client::Handler for ClientHandler {
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         let clean = clean_banner(banner);
+        tracing::info!(host = %self.host, banner = %clean, "收到服务器的登录横幅");
         if clean.trim().is_empty() {
             return Ok(());
         }
