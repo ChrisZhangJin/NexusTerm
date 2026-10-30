@@ -1186,6 +1186,9 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   line-height: 1.7;
   white-space: pre-line;
   word-break: break-word;
+  /* 登录横幅（堡垒机的 MFA 菜单）可能很长，别把输入框顶出屏幕 */
+  max-height: 40vh;
+  overflow-y: auto;
 }
 .auth-notice.warn {
   border-left-color: #e5c07b;

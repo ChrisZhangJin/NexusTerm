@@ -62,11 +62,91 @@ pub struct ClientHandler {
     pub host_key_rejected: Arc<AtomicBool>,
     /// 服务端 keepalive 到达时的回调（前端心跳动效，见 vendor 补丁 7）。
     pub on_keepalive: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// 服务端在认证阶段下发的登录横幅（`SSH_MSG_USERAUTH_BANNER`）。
+    ///
+    /// 堡垒机的「MFA 方式选择」菜单常常就放在这里，而提示符只有一句 `Option>`。
+    /// 句柄一旦交给 russh 就拿不回 handler，所以靠这个共享的 `Arc` 把文字带出来，
+    /// 见 [`ClientHandler::banner_handle`]。
+    pub banner: Arc<parking_lot::Mutex<String>>,
+}
+
+/// 横幅攒到这么多字节就不再收了。横幅是服务端说了算的，不能让它无限撑大弹框。
+const BANNER_MAX: usize = 4096;
+
+/// 去掉横幅里的 ANSI 转义序列和其它控制字符（保留换行与制表符）。
+/// 弹框不是终端，`\x1b[1;32m` 之类原样显示出来只是乱码。
+pub(crate) fn clean_banner(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut it = raw.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\x1b' => {
+                // CSI：ESC [ 参数 终结字节(0x40..=0x7e)。其它 ESC 序列只吃掉 ESC 本身。
+                if it.peek() == Some(&'[') {
+                    it.next();
+                    for n in it.by_ref() {
+                        if ('\x40'..='\x7e').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+            }
+            '\r' => {}
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// 把登录横幅拼到服务端给的 instructions 前面。两者都空就还是空串。
+fn merge_banner(banner: &parking_lot::Mutex<String>, instructions: String) -> String {
+    let b = banner.lock();
+    let b = b.trim();
+    match (b.is_empty(), instructions.trim().is_empty()) {
+        (true, _) => instructions,
+        (false, true) => b.to_string(),
+        (false, false) => format!("{b}\n\n{instructions}"),
+    }
+}
+
+impl ClientHandler {
+    /// 横幅的共享句柄。要在 handler 被 `handshake` 吃掉之前取。
+    pub fn banner_handle(&self) -> Arc<parking_lot::Mutex<String>> {
+        self.banner.clone()
+    }
 }
 
 #[async_trait::async_trait]
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
+
+    /// russh 默认实现直接丢掉横幅。这里留下来，弹二次验证框时一并给用户看。
+    async fn auth_banner(
+        &mut self,
+        banner: &str,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let clean = clean_banner(banner);
+        if clean.trim().is_empty() {
+            return Ok(());
+        }
+        let mut buf = self.banner.lock();
+        if buf.len() < BANNER_MAX {
+            if !buf.is_empty() && !buf.ends_with('\n') {
+                buf.push('\n');
+            }
+            let room = BANNER_MAX - buf.len();
+            // 按字符边界截断
+            let take: String = clean.chars().scan(0usize, |n, c| {
+                *n += c.len_utf8();
+                (*n <= room).then_some(c)
+            }).collect();
+            buf.push_str(&take);
+        }
+        Ok(())
+    }
 
     async fn check_server_key(&mut self, key: &PublicKey) -> Result<bool, Self::Error> {
         let fp = KnownHosts::fingerprint_of(key);
@@ -359,6 +439,7 @@ fn handler_for(
         port,
         host_key_rejected: Arc::new(AtomicBool::new(false)),
         on_keepalive,
+        banner: Arc::default(),
     }
 }
 
@@ -480,16 +561,11 @@ where
     // 一句明确提示，而不是先花几秒建连、再在认证阶段报一个含混的错误。
     let auth = resolve_passphrase(host, session_id, auth, &ask).await?;
 
-    let hs = handshake(
-        host,
-        port,
-        handler_for(host, port, &known_hosts, on_keepalive.clone()),
-        timeout,
-        policy,
-        keepalive,
-    )
-    .await
-    .map_err(map_handshake)?;
+    let handler = handler_for(host, port, &known_hosts, on_keepalive.clone());
+    let banner = handler.banner_handle();
+    let hs = handshake(host, port, handler, timeout, policy, keepalive)
+        .await
+        .map_err(map_handshake)?;
 
     let legacy = hs.legacy;
     let mut session = hs.session;
@@ -509,8 +585,22 @@ where
     // 「密码 + 动态口令」服务器的唯一正确走法：partial-success 时连接上仍保有
     // 第一因子状态，断开重连会丢掉它、服务端又要求重输密码。
     // （russh 0.49 原本在这里静默丢包并永久挂起，已由 `vendor/russh` 修掉。）
-    match session::authenticate_kbi(&mut session, username, &auth, session_id, host, &ask, totp)
-        .await {
+    // 横幅是在认证过程中陆续到的，所以每次弹框时现读，不在这里一次性取走。
+    let ask_with_banner = |mut p: prompt::AuthPrompt| {
+        p.instructions = merge_banner(&banner, p.instructions);
+        ask(p)
+    };
+    match session::authenticate_kbi(
+        &mut session,
+        username,
+        &auth,
+        session_id,
+        host,
+        &ask_with_banner,
+        totp,
+    )
+    .await
+    {
         Ok(session::KbiOutcome::Done) => {
             return Ok(Opened { session, legacy });
         }
@@ -538,22 +628,31 @@ where
         "主认证未通过，换新连接以 keyboard-interactive 重试（二次验证）"
     );
 
-    let hs = handshake(
-        host,
-        port,
-        handler_for(host, port, &known_hosts, on_keepalive.clone()),
-        timeout,
-        policy,
-        keepalive,
-    )
-    .await
-    .map_err(map_handshake)?;
+    let handler = handler_for(host, port, &known_hosts, on_keepalive.clone());
+    let banner = handler.banner_handle();
+    let hs = handshake(host, port, handler, timeout, policy, keepalive)
+        .await
+        .map_err(map_handshake)?;
 
     let legacy = hs.legacy;
     let mut session = hs.session;
 
-    match session::authenticate_kbi(&mut session, username, &auth, session_id, host, &ask, totp)
-        .await {
+    // 横幅是在认证过程中陆续到的，所以每次弹框时现读，不在这里一次性取走。
+    let ask_with_banner = |mut p: prompt::AuthPrompt| {
+        p.instructions = merge_banner(&banner, p.instructions);
+        ask(p)
+    };
+    match session::authenticate_kbi(
+        &mut session,
+        username,
+        &auth,
+        session_id,
+        host,
+        &ask_with_banner,
+        totp,
+    )
+    .await
+    {
         Ok(session::KbiOutcome::Done) => Ok(Opened { session, legacy }),
         // 换了新连接还是一个问题都不问 → 服务端确实不要这一步，
         // 那就回到「主认证方式失败」的原始文案。
@@ -700,6 +799,7 @@ mod handler_tests {
             on_keepalive: Some(Arc::new(move || {
                 n.fetch_add(1, Ordering::SeqCst);
             })),
+            banner: Arc::default(),
         };
         client::Handler::server_keepalive(&mut h)
             .await
@@ -713,6 +813,7 @@ mod handler_tests {
             port: 22,
             host_key_rejected: Arc::new(AtomicBool::new(false)),
             on_keepalive: None,
+            banner: Arc::default(),
         };
         client::Handler::server_keepalive(&mut bare)
             .await
@@ -790,6 +891,7 @@ mod crypto_tests {
             port,
             host_key_rejected: Arc::new(AtomicBool::new(false)),
             on_keepalive: None,
+            banner: Arc::default(),
         };
 
         match handshake(
@@ -839,6 +941,7 @@ mod crypto_tests {
             port,
             host_key_rejected: Arc::new(AtomicBool::new(false)),
             on_keepalive: None,
+            banner: Arc::default(),
         };
 
         let opened = handshake(
@@ -1177,5 +1280,27 @@ mod kbi_flow {
         // 走到这里是「读私钥就失败」，属于主认证错误 —— 关键是不能冒出二次验证的文案
         let msg = format!("{err:?}");
         assert!(!msg.contains("二次验证未通过"), "实际：{msg}");
+    }
+}
+
+#[cfg(test)]
+mod banner_tests {
+    use super::*;
+
+    #[test]
+    fn clean_banner_strips_ansi_and_controls() {
+        let raw = "\x1b[1;32mPlease Select MFA Option\x1b[0m\r\n1) TOTP\x07\n2) Push";
+        assert_eq!(clean_banner(raw), "Please Select MFA Option\n1) TOTP\n2) Push");
+    }
+
+    #[test]
+    fn merge_banner_cases() {
+        let b = parking_lot::Mutex::new(String::new());
+        assert_eq!(merge_banner(&b, "hi".into()), "hi");
+        assert_eq!(merge_banner(&b, String::new()), "");
+        *b.lock() = "1) TOTP\n2) Push\n".into();
+        assert_eq!(merge_banner(&b, String::new()), "1) TOTP\n2) Push");
+        assert_eq!(merge_banner(&b, "  ".into()), "1) TOTP\n2) Push");
+        assert_eq!(merge_banner(&b, "hi".into()), "1) TOTP\n2) Push\n\nhi");
     }
 }
