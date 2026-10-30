@@ -10,6 +10,7 @@ use crate::vault::{Field, Vault};
 /// 保险库的启用 / 解锁 / 全量扫描。单独一个文件是因为那套流程的注意事项
 /// （三段事务的顺序、锁序、失败时宁可中止也不降级）值得集中讲一遍。
 mod vault_ops;
+pub use vault_ops::SweepReport;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -858,8 +859,14 @@ impl Store {
         for id in ids {
             if let Some(pw) = legacy_keyring::load(&id) {
                 if !pw.is_empty() {
-                    let _ = self.set_password(&id, &pw);
-                    legacy_keyring::delete(&id);
+                    // **存成功了才删。** 吞掉写入错误再无条件删除，等于把唯一的
+                    // 一份密码扔掉。保险库上线后这尤其致命：锁定态 `set_password`
+                    // 必定失败，而凭据服务里那份是仅存的副本。
+                    if self.set_password(&id, &pw).is_ok() {
+                        legacy_keyring::delete(&id);
+                    } else {
+                        tracing::warn!(session = %id, "旧密码迁移失败，先留在系统凭据服务里");
+                    }
                 }
             }
         }
@@ -886,12 +893,12 @@ mod legacy_keyring {
 mod tests {
     use super::*;
 
-    fn temp_store(tag: &str) -> Store {
+    pub(super) fn temp_store(tag: &str) -> Store {
         temp_store_at(tag).0
     }
 
     /// 连 db 文件路径一起返回，给需要直接翻字节的用例。
-    fn temp_store_at(tag: &str) -> (Store, PathBuf) {
+    pub(super) fn temp_store_at(tag: &str) -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "nexus-store-{tag}-{}",
             uuid::Uuid::new_v4()
@@ -900,7 +907,7 @@ mod tests {
         (store, dir.join("nexus.db"))
     }
 
-    fn a_session(store: &Store, name: &str) -> String {
+    pub(super) fn a_session(store: &Store, name: &str) -> String {
         store
             .create(NewSession {
                 name: name.into(),

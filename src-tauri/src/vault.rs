@@ -42,11 +42,6 @@
 //! 解密失败就是真的失败，必须报错。绝不能回退成「原样返回」——那会把一串
 //! base64 当成密码发给服务器，一次失败的登录远比一个明确的报错难排查。
 
-// 这一步是纯核心：密码学原语 + 状态机都齐了，但还没有任何调用方 —— 接进
-// `Store` 的凭据读写是下一步的事。在那之前整个模块对 lib 来说都是死代码。
-// **接线之后请删掉这一行**，它会掩盖真正没人用的东西。
-#![allow(dead_code)]
-
 use aes_gcm::aead::{Aead, KeyInit, OsRng as AeadRng, Payload};
 use aes_gcm::{AeadCore, Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -106,6 +101,9 @@ pub enum Field {
     Password,
     Passphrase,
     Totp,
+    /// `settings` 表里 `agent.config` JSON 中每个账号的 LLM API Key。
+    /// 加解密的接线还没做（那是 `agent/mod.rs` 那一步），所以暂时没有构造点。
+    #[allow(dead_code)]
     ApiKey,
 }
 
@@ -394,7 +392,8 @@ enum VaultState {
 
 /// 对前端暴露的状态。「已记住」不是第四个状态，它只是 `Locked → Unlocked`
 /// 的一条自动边。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VaultStatus {
     pub enabled: bool,
     pub unlocked: bool,

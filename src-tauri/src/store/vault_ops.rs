@@ -14,9 +14,6 @@
 //! 对不上就整个中止，一个字节都不碰 db。关闭保险库时如果系统凭据服务不可用、
 //! TOTP 种子没法转回 v1，直接报错，**绝不降级存明文**。
 
-// 命令层还没接上，所以这里大半还没有调用方。**接线之后请删掉这一行。**
-#![allow(dead_code)]
-
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
@@ -30,6 +27,19 @@ const K_KDF: &str = "vault.kdf";
 const K_DEK: &str = "vault.dek";
 const K_VERIFY: &str = "vault.verify";
 const K_MIGRATING: &str = "vault.migrating";
+
+/// 新建一组 KDF 参数。
+///
+/// 单测里换成极轻的一组：默认那组每次派生要 64 MiB、约一秒，而本文件的用例验的
+/// 是流程不是 KDF 强度，照默认跑下来整个测试套件会慢上几十秒。
+#[cfg(not(test))]
+fn fresh_kdf() -> KdfSpec {
+    KdfSpec::generate()
+}
+#[cfg(test)]
+fn fresh_kdf() -> KdfSpec {
+    KdfSpec::generate_with(8, 1, 1)
+}
 
 /// 预留给将来的恢复码：第二个 KEK 包装同一把 DEK。
 ///
@@ -98,6 +108,15 @@ impl Store {
         &self.vault
     }
 
+    /// 启用了但没解锁 —— 此刻凭据读不出来也写不进去。
+    ///
+    /// 调用点用它来给出一句说得通的错误，而不是让用户看见「未保存密码」
+    /// 这种与事实相反的提示。
+    pub fn vault_locked(&self) -> bool {
+        let s = self.vault.status();
+        s.enabled && !s.unlocked
+    }
+
     /// 这个库的 DEK 有没有被记在本机凭据服务里。
     ///
     /// 会真的去读一次凭据服务，在 Linux 上可能慢，**别放在启动路径里**。
@@ -123,7 +142,7 @@ impl Store {
         self.backup_before_vault()?;
 
         let id = uuid::Uuid::new_v4().to_string();
-        let kdf = KdfSpec::generate();
+        let kdf = fresh_kdf();
         let kdf_json = kdf.to_json()?;
         let dek = vault::new_dek();
         let wrapped = vault::wrap_dek(password, &kdf, &kdf_json, &dek)?;
@@ -192,7 +211,7 @@ impl Store {
         if remember_here {
             self.remember_now(&id)?;
         }
-        self.finish_interrupted_sweep();
+        self.after_unlock();
         Ok(())
     }
 
@@ -227,8 +246,16 @@ impl Store {
         }
 
         self.vault.unlock(meta, dek);
-        self.finish_interrupted_sweep();
+        self.after_unlock();
         true
+    }
+
+    /// 刚解锁要补的两件事。
+    fn after_unlock(&self) {
+        self.finish_interrupted_sweep();
+        // 旧版密码还躺在系统凭据服务里的话，现在才轮到把它们迁进来 ——
+        // 启动时保险库是锁着的，那会儿迁移只会写失败然后把源头删掉。
+        self.migrate_legacy_secrets();
     }
 
     /// 丢掉内存里的密钥。不影响「已记住」。
@@ -267,7 +294,7 @@ impl Store {
             .map_err(|_| "原主密码不正确".to_string())?;
 
         // 换密码顺手换盐，免得两次派生共用同一份预计算。
-        let kdf = KdfSpec::generate();
+        let kdf = fresh_kdf();
         let kdf_json = kdf.to_json()?;
         let rewrapped = vault::wrap_dek(new, &kdf, &kdf_json, &dek)?;
 
@@ -310,6 +337,69 @@ impl Store {
         self.vault.disable();
         tracing::info!(?report, "保险库已关闭，凭据恢复明文");
         Ok(report)
+    }
+
+    // ——— 重置（忘了主密码的逃生口）———
+
+    /// **销毁**所有解不开的凭据，把库退回未启用。
+    ///
+    /// 这不是恢复，是破坏性重置，界面上必须说清楚。主机 / 端口 / 用户名 / 分组 /
+    /// 宏 / 密钥元数据全部保留，用户要补的只是密码本身。做这个口子是因为另一条路
+    /// 更糟：忘了主密码又没有出口，用户只能删掉整个 nexus.db 重建全部连接。
+    ///
+    /// 不需要主密码 —— 需要的话这个功能就没有存在意义了。
+    pub fn vault_reset(&self) -> Result<usize, String> {
+        let meta = self.vault.meta().ok_or("保险库未启用")?;
+
+        // 留一份再动手。用户现在解不开这些密文，但将来想起主密码就解得开 ——
+        // 这份备份是那条退路唯一的载体，而它只值几十毫秒。
+        self.backup_db("db.pre-reset.bak", true)?;
+
+        // 先销毁数据再删元数据：反过来的话中途失败就剩下一堆没有密钥的密文，
+        // 而那时连「哪些是密文」都还能看出来，只是再也没有入口去清它们了。
+        let cleared = self.clear_encrypted_credentials()?;
+        self.clear_settings(&[K_ID, K_KDF, K_DEK, K_VERIFY, K_MIGRATING])?;
+        if !meta.id.is_empty() {
+            remember::forget(&meta.id);
+        }
+        self.vault.disable();
+        tracing::warn!(cleared, "保险库已重置，其中的加密凭据已销毁");
+        Ok(cleared)
+    }
+
+    /// 把所有 `v2:` 的凭据列清成 NULL。`v1:` 的 TOTP 种子不动 —— 那些挂在
+    /// 系统凭据服务上，和主密码无关，重置之后照样能用。
+    fn clear_encrypted_credentials(&self) -> Result<usize, String> {
+        let rows = self.read_credential_rows()?;
+        let mut targets: Vec<(String, &'static str, String)> = Vec::new();
+        for (id, password, passphrase, seed) in rows {
+            for (column, current) in [
+                ("password", password),
+                ("passphrase", passphrase),
+                ("totp_seed", seed),
+            ] {
+                let Some(current) = current.filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                if vault::classify(&current) != Form::Dek {
+                    continue;
+                }
+                targets.push((id.clone(), column, current));
+            }
+        }
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        for (id, column, old) in &targets {
+            // 清成 NULL 而不是空串：六个凭据方法把「空」一律当成「没配置」，
+            // 两种写法读回来都是 None，但 NULL 才是它们自己写出来的形状。
+            let sql = format!("UPDATE sessions SET {0} = NULL WHERE id = ?1 AND {0} = ?2", column);
+            tx.execute(&sql, params![id, old]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(targets.len())
     }
 
     // ——— 全量扫描 ———
@@ -531,9 +621,20 @@ impl Store {
 
     /// 启用前留一份原样的库。已经有备份就不覆盖 —— 那一份才是真正「启用之前」的。
     fn backup_before_vault(&self) -> Result<(), String> {
-        let backup = self.path.with_extension("db.pre-vault.bak");
+        self.backup_db("db.pre-vault.bak", false)
+    }
+
+    /// 在不可逆的操作之前复制一份 db。
+    ///
+    /// `overwrite = false` 时已有同名备份就直接跳过：那一份比新的更有价值，
+    /// 它才是「动手之前」的样子。
+    fn backup_db(&self, suffix: &str, overwrite: bool) -> Result<(), String> {
+        let backup = self.path.with_extension(suffix);
         if backup.exists() {
-            return Ok(());
+            if !overwrite {
+                return Ok(());
+            }
+            std::fs::remove_file(&backup).map_err(|e| format!("无法覆盖旧备份：{e}"))?;
         }
         // 走一遍 SQLite 自己的备份 API 而不是 fs::copy：WAL 模式下直接拷主文件
         // 可能拿到一份缺了最近写入的副本。
@@ -547,7 +648,7 @@ impl Store {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600));
         }
-        tracing::info!(path = %backup.display(), "启用保险库前已备份数据库");
+        tracing::info!(path = %backup.display(), "已备份数据库");
         Ok(())
     }
 }
@@ -560,4 +661,323 @@ struct Rewrite {
     column: &'static str,
     old: String,
     new: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{a_session, temp_store_at};
+    use super::*;
+    use crate::store::Store;
+    use std::path::PathBuf;
+
+    const PW: &str = "correct horse battery staple";
+
+    /// 建一个装了两条凭据的库。返回 (store, 数据目录, 会话 id)。
+    ///
+    /// 数据目录单独返回是为了「关掉再开一次」—— 保险库能不能跨进程存活，
+    /// 只有重新 `Store::open` 才验得出来。
+    fn store_with_credentials(tag: &str) -> (Store, PathBuf, String) {
+        let (store, db) = temp_store_at(tag);
+        let id = a_session(&store, "s");
+        store.set_password(&id, "PLAINTEXT-CANARY").unwrap();
+        store.set_passphrase(&id, "PASSPHRASE-CANARY").unwrap();
+        (store, db, id)
+    }
+
+    /// 把 db 文件读成字节。
+    ///
+    /// 先 VACUUM 一遍：`UPDATE` 过的旧值会留在页面的空闲区里，不清理的话
+    /// 「文件里搜不到明文」这条断言会被上一代的残留误伤。
+    fn db_bytes(store: &Store, db: &std::path::Path) -> Vec<u8> {
+        store.conn.lock().unwrap().execute_batch("VACUUM").unwrap();
+        std::fs::read(db).expect("读 db 文件")
+    }
+
+    fn contains(hay: &[u8], needle: &str) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    /// 绕过 `reveal` 直接看列里存的那一串。用来断言「密文一个字节都没变」。
+    fn raw_column(store: &Store, id: &str, column: &str) -> Option<String> {
+        let conn = store.conn.lock().unwrap();
+        conn.query_row(
+            &format!("SELECT {column} FROM sessions WHERE id = ?1"),
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+    }
+
+    // ——— 启用 ———
+
+    /// 和 `without_a_vault_passwords_sit_in_the_file_as_plaintext` 互为镜像：
+    /// 那条钉住「默认不开 = 零回归」，这条钉住「开了就真的加密了」。
+    #[test]
+    fn enabling_the_vault_scrubs_the_plaintext_out_of_the_file() {
+        let (store, db, id) = store_with_credentials("vault-enable");
+        assert!(contains(&db_bytes(&store, &db), "PLAINTEXT-CANARY"), "前置条件");
+
+        let report = store.vault_enable(PW, false).unwrap();
+        assert_eq!(report.credentials, 2, "密码 + 私钥口令");
+
+        let bytes = db_bytes(&store, &db);
+        assert!(!contains(&bytes, "PLAINTEXT-CANARY"), "密码不该还在文件里");
+        assert!(!contains(&bytes, "PASSPHRASE-CANARY"), "私钥口令不该还在文件里");
+
+        // 加密了，但照样读得回来。
+        assert_eq!(store.get_password(&id).as_deref(), Some("PLAINTEXT-CANARY"));
+        assert_eq!(store.get_passphrase(&id).as_deref(), Some("PASSPHRASE-CANARY"));
+    }
+
+    #[test]
+    fn enabling_leaves_a_backup_of_the_original_database() {
+        let (store, db, _) = store_with_credentials("vault-backup");
+        store.vault_enable(PW, false).unwrap();
+
+        let backup = db.with_extension("db.pre-vault.bak");
+        let bytes = std::fs::read(&backup).expect("备份文件应当存在");
+        assert!(
+            contains(&bytes, "PLAINTEXT-CANARY"),
+            "备份的意义就是留下启用之前的样子"
+        );
+    }
+
+    #[test]
+    fn the_vault_cannot_be_enabled_twice() {
+        let (store, _, _) = store_with_credentials("vault-twice");
+        store.vault_enable(PW, false).unwrap();
+        assert!(store.vault_enable("another", false).is_err());
+    }
+
+    #[test]
+    fn an_empty_master_password_is_refused() {
+        let (store, _, _) = store_with_credentials("vault-empty-pw");
+        assert!(store.vault_enable("", false).is_err());
+        assert!(!store.vault().status().enabled, "拒了就不该留下半个保险库");
+    }
+
+    // ——— 可移植性：整个功能的验收标准 ———
+
+    /// 把库关掉重开 —— 等价于「拷到另一台机器」，因为密钥材料全都在 db 里。
+    #[test]
+    fn a_vault_survives_reopening_the_database() {
+        let (store, db, id) = store_with_credentials("vault-reopen");
+        store.vault_enable(PW, false).unwrap();
+        drop(store);
+
+        let dir = db.parent().unwrap().to_path_buf();
+        let store = Store::open(dir).expect("重新打开");
+        assert_eq!(
+            store.vault().status(),
+            crate::vault::VaultStatus { enabled: true, unlocked: false },
+            "开库应当认出保险库，并且是锁着的"
+        );
+        assert!(store.get_password(&id).is_none(), "没解锁就读不出来");
+
+        assert!(store.vault_unlock("wrong", false).is_err(), "错密码必须失败");
+        store.vault_unlock(PW, false).unwrap();
+        assert_eq!(store.get_password(&id).as_deref(), Some("PLAINTEXT-CANARY"));
+    }
+
+    /// 锁着的时候写凭据必须**失败**，而不是悄悄写一份明文进去。
+    ///
+    /// 这条是「读出来是 None」之所以安全的前提：界面上看到空密码的用户点保存，
+    /// 这里会报错，不会把真密码覆盖掉。
+    #[test]
+    fn a_locked_vault_refuses_to_write() {
+        let (store, _, id) = store_with_credentials("vault-locked-write");
+        store.vault_enable(PW, false).unwrap();
+        store.vault_lock();
+
+        assert!(store.vault_locked());
+        assert!(store.set_password(&id, "new-one").is_err());
+        assert!(store.set_passphrase(&id, "new-one").is_err());
+
+        store.vault_unlock(PW, false).unwrap();
+        assert_eq!(
+            store.get_password(&id).as_deref(),
+            Some("PLAINTEXT-CANARY"),
+            "刚才那次失败的写入不该动过任何东西"
+        );
+    }
+
+    // ——— 扫描 ———
+
+    #[test]
+    fn sweeping_again_changes_nothing() {
+        let (store, _, id) = store_with_credentials("vault-sweep-idem");
+        store.vault_enable(PW, false).unwrap();
+        let before = raw_column(&store, &id, "password");
+
+        let again = store.sweep().unwrap();
+        assert_eq!(again.credentials, 0, "已经是密文的不该再被卷一次");
+        assert_eq!(raw_column(&store, &id, "password"), before, "连密文都该一个字节没动");
+    }
+
+    /// 启用扫到一半掉电：库里一半明文一半密文，`vault.migrating` 还立着。
+    /// 下一次解锁应当把剩下的扫完。
+    #[test]
+    fn an_interrupted_sweep_finishes_on_the_next_unlock() {
+        let (store, db, id) = store_with_credentials("vault-resume");
+        store.vault_enable(PW, false).unwrap();
+
+        // 手工伪造那个中断现场。
+        let other = a_session(&store, "half-done");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET password = 'LEFTOVER-CANARY' WHERE id = ?1",
+                params![other],
+            )
+            .unwrap();
+        store.write_settings(&[(K_MIGRATING, "1")]).unwrap();
+        store.vault_lock();
+
+        store.vault_unlock(PW, false).unwrap();
+        assert_eq!(
+            store.get_setting(K_MIGRATING),
+            None,
+            "补扫完了就该把标记清掉"
+        );
+        assert_eq!(store.get_password(&other).as_deref(), Some("LEFTOVER-CANARY"));
+        assert!(!contains(&db_bytes(&store, &db), "LEFTOVER-CANARY"));
+        assert_eq!(store.get_password(&id).as_deref(), Some("PLAINTEXT-CANARY"));
+    }
+
+    /// 来自另一台机器的 db：TOTP 种子是用那台机器的密钥加密的，这儿解不开。
+    /// 能转的转，转不动的计个数，**绝不中止整个启用**。
+    #[test]
+    fn unreadable_totp_seeds_do_not_abort_the_enable() {
+        let (store, db, id) = store_with_credentials("vault-bad-seed");
+        // 直接写一个认不出形态的值，绕开 `set_totp_seed`（那条路要碰系统凭据服务）。
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET totp_seed = 'JUNK-FROM-ELSEWHERE' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let report = store.vault_enable(PW, false).unwrap();
+        assert_eq!(report.seeds_unreadable, 1);
+        assert_eq!(report.credentials, 2, "密码照样要加密");
+        assert!(!contains(&db_bytes(&store, &db), "PLAINTEXT-CANARY"));
+    }
+
+    // ——— 换主密码 ———
+
+    #[test]
+    fn changing_the_master_password_keeps_every_credential() {
+        let (store, db, id) = store_with_credentials("vault-chpw");
+        store.vault_enable(PW, false).unwrap();
+        let ciphertext_before = raw_column(&store, &id, "password");
+
+        assert!(store.vault_change_password("wrong", "new-pw").is_err());
+        store.vault_change_password(PW, "new-pw").unwrap();
+
+        assert_eq!(
+            raw_column(&store, &id, "password"),
+            ciphertext_before,
+            "换的是包着 DEK 的那层，凭据密文一个字节都不该动"
+        );
+
+        drop(store);
+        let store = Store::open(db.parent().unwrap().to_path_buf()).unwrap();
+        assert!(store.vault_unlock(PW, false).is_err(), "旧密码该作废了");
+        store.vault_unlock("new-pw", false).unwrap();
+        assert_eq!(store.get_password(&id).as_deref(), Some("PLAINTEXT-CANARY"));
+    }
+
+    #[test]
+    fn an_empty_new_master_password_is_refused() {
+        let (store, _, _) = store_with_credentials("vault-chpw-empty");
+        store.vault_enable(PW, false).unwrap();
+        assert!(store.vault_change_password(PW, "").is_err());
+    }
+
+    // ——— 关闭 ———
+
+    #[test]
+    fn disabling_the_vault_puts_the_plaintext_back() {
+        let (store, db, id) = store_with_credentials("vault-disable");
+        store.vault_enable(PW, false).unwrap();
+
+        assert!(store.vault_disable("wrong").is_err(), "关闭也要验主密码");
+
+        let report = store.vault_disable(PW).unwrap();
+        assert_eq!(report.credentials, 2);
+        assert!(!store.vault().status().enabled);
+        assert_eq!(store.get_password(&id).as_deref(), Some("PLAINTEXT-CANARY"));
+        assert!(contains(&db_bytes(&store, &db), "PLAINTEXT-CANARY"));
+        assert_eq!(store.get_setting(K_DEK), None, "元数据该清干净");
+    }
+
+    /// 关掉之后还能再开一次，而且是一把全新的 DEK / 盐。
+    #[test]
+    fn the_vault_can_be_enabled_again_after_being_disabled() {
+        let (store, _, id) = store_with_credentials("vault-recycle");
+        store.vault_enable(PW, false).unwrap();
+        let first = store.get_setting(K_DEK).unwrap();
+        store.vault_disable(PW).unwrap();
+
+        store.vault_enable(PW, false).unwrap();
+        assert_ne!(store.get_setting(K_DEK).unwrap(), first, "盐和 DEK 都该是新的");
+        assert_eq!(store.get_password(&id).as_deref(), Some("PLAINTEXT-CANARY"));
+    }
+
+    // ——— 重置 ———
+
+    /// 忘了主密码的逃生口：凭据没了，连接配置还在。
+    #[test]
+    fn resetting_destroys_the_credentials_but_keeps_the_sessions() {
+        let (store, db, id) = store_with_credentials("vault-reset");
+        store.vault_enable(PW, false).unwrap();
+        store.vault_lock();
+
+        let cleared = store.vault_reset().unwrap();
+        assert_eq!(cleared, 2);
+        assert!(!store.vault().status().enabled);
+        assert_eq!(store.get_password(&id), None);
+        assert_eq!(store.get_passphrase(&id), None);
+
+        let s = store.get(&id).expect("会话本身必须还在");
+        assert_eq!(s.host, "example.com");
+        assert_eq!(s.username, "root");
+
+        // 销毁之前留下的那一份：用户哪天想起主密码，这是唯一的退路。
+        let backup = db.with_extension("db.pre-reset.bak");
+        assert!(backup.exists(), "重置前必须留一份备份");
+
+        // 清完就是一个干净的未启用库，照样能重新填密码。
+        store.set_password(&id, "a-new-one").unwrap();
+        assert_eq!(store.get_password(&id).as_deref(), Some("a-new-one"));
+    }
+
+    #[test]
+    fn resetting_a_vault_that_was_never_enabled_is_an_error() {
+        let (store, _, _) = store_with_credentials("vault-reset-none");
+        assert!(store.vault_reset().is_err());
+    }
+
+    // ——— 损坏的元数据 ———
+
+    /// 有 `vault.dek` 但 `vault.kdf` 读不出来 —— 必须判成**锁着**。
+    ///
+    /// 退回「未启用」看起来更友好，实际是最坏的选择：界面会以为凭据是明文，
+    /// 然后让用户往一堆密文旁边写明文。
+    #[test]
+    fn damaged_metadata_pins_the_vault_shut() {
+        let (store, db, _) = store_with_credentials("vault-damaged");
+        store.vault_enable(PW, false).unwrap();
+        store.write_settings(&[(K_KDF, "{ not json")]).unwrap();
+        drop(store);
+
+        let store = Store::open(db.parent().unwrap().to_path_buf()).unwrap();
+        assert!(store.vault_locked(), "元数据坏了要 fail-closed");
+        assert!(store.vault_unlock(PW, false).is_err());
+    }
 }

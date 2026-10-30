@@ -141,8 +141,13 @@ pub fn run() {
             init_logging(&dir);
             let keys_dir = dir.join(crate::keys::VAULT_DIR);
             let store = Store::open(dir).expect("SQLite 初始化失败");
-            // 把旧版存在系统凭据服务里的密码迁移到 db 明文列
-            store.migrate_legacy_secrets();
+            // 把旧版存在系统凭据服务里的密码迁移到 db 的凭据列。
+            //
+            // 保险库锁着的时候**必须跳过**：那时写不进去，而迁移的收尾动作是删掉
+            // 凭据服务里的源头 —— 仅存的那一份。解锁成功后 `after_unlock` 会补跑。
+            if !store.vault_locked() {
+                store.migrate_legacy_secrets();
+            }
             let sessions = SessionManager::new();
             // SFTP 复用同一份主机指纹表，保证 TOFU 策略在两个通道上一致；
             // 二次验证登记表同理 —— 一个 SFTP 面板在等验证码时，
@@ -243,6 +248,16 @@ pub fn run() {
             cmd::local_write,
             cmd::local_resize,
             cmd::local_close,
+            cmd::vault_status,
+            cmd::vault_is_remembered,
+            cmd::vault_try_remembered,
+            cmd::vault_enable,
+            cmd::vault_unlock,
+            cmd::vault_lock,
+            cmd::vault_forget,
+            cmd::vault_change_password,
+            cmd::vault_disable,
+            cmd::vault_reset,
             viewer::viewer_open_sftp,
             viewer::viewer_open_ssh,
             viewer::viewer_open_local,

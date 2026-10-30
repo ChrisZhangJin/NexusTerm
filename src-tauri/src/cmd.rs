@@ -4,7 +4,8 @@ use crate::agent::StreamKind;
 use crate::keys;
 use crate::sftp::{RemoteEntry, SftpError, SftpManager};
 use crate::ssh::session::{ConnectOutcome, ConnectRequest, SessionError, SessionManager};
-use crate::store::{self, Store};
+use crate::store::{self, Store, SweepReport};
+use zeroize::Zeroizing;
 
 pub struct AppState {
     pub sessions: SessionManager,
@@ -417,13 +418,23 @@ pub fn reorder_sessions(
     state.store.reorder(&items)
 }
 
-// ——— 凭据（明文随 db 保存，便于跨机器迁移）———
+// ——— 凭据 ———
+//
+// 默认随 db 明文保存（为了「拷到另一台机器就能接着用」）；用户在设置里启用
+// 主密码之后，同样这两条路径会把值加密成 `v2:` 再落盘。见 `vault.rs`。
 
 #[tauri::command]
 pub fn save_password(id: String, password: String, state: State<'_, AppState>) -> Result<(), String> {
+    let password = Zeroizing::new(password);
     state.store.set_password(&id, &password)
 }
 
+/// 读密码。
+///
+/// 返回 `Option` 而不是 `Result`：保险库锁着的时候这里给的是 `None`，和「没存过」
+/// 一个样子。看着像是在掩盖错误，但对调用方来说是安全的 —— 锁定态下
+/// `save_password` 一定失败，所以「读出空 → 用户保存 → 把真密码覆盖掉」这条
+/// 丢数据的路走不通。真正该拦住用户的是界面上的解锁闸门。
 #[tauri::command]
 pub fn load_password(id: String, state: State<'_, AppState>) -> Option<String> {
     state.store.get_password(&id)
@@ -444,6 +455,11 @@ pub struct ImportedFile {
 /// 批量导入 .xsh。在同一台 Windows 机器上可自动解密密码并存入系统凭据服务。
 #[tauri::command]
 pub fn import_xsh(paths: Vec<String>, state: State<AppState>) -> Result<Vec<ImportedFile>, String> {
+    // 整件事挡在门外，而不是「会话建好、密码一条都没进去」。后者更难收拾：
+    // 用户看到一屏新连接，以为导完了，实际每一条都要重新填密码。
+    if state.store.vault_locked() {
+        return Err("保险库已锁定，请先输入主密码再导入".into());
+    }
     let mut out = Vec::new();
     for parsed in crate::xsh::parse_files(&paths) {
         let (ok, error, password_imported) = match &parsed.result {
@@ -649,6 +665,7 @@ pub fn save_passphrase(
     passphrase: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let passphrase = Zeroizing::new(passphrase);
     state.store.set_passphrase(&id, &passphrase)
 }
 
@@ -958,4 +975,96 @@ fn os_version() -> String {
 #[tauri::command]
 pub fn health() -> String {
     "nexus-term backend ok".into()
+}
+
+// ——— 保险库（主密码）———
+//
+// 后端是唯一真相。界面上的解锁闸门是 UX，不是安全边界 —— 浮动 Agent 窗口不挂
+// `App.tsx`，而 `agent/act.rs` 的动作层能在完全没有前端参与的情况下去读密码。
+// 真正拦得住的是 `Store` 这一层：锁着就写不进去。
+//
+// 主密码一进来就 move 进 `Zeroizing<String>`。管不到的副本要诚实标注：Tauri 的
+// IPC 反序列化过程中 serde 已经产生过一份中间 String，webview 的 JS 堆里还有一份。
+
+/// 保险库现状。**廉价**：只读一个内存里的枚举，不做 KDF、不碰系统凭据服务，
+/// 所以前端可以随便调。
+#[tauri::command]
+pub fn vault_status(state: State<'_, AppState>) -> crate::vault::VaultStatus {
+    state.store.vault().status()
+}
+
+/// 这个库的钥匙有没有记在本机。
+///
+/// **会访问系统凭据服务**，Linux 上没有 D-Bus 时可能卡住，所以它和
+/// [`vault_status`] 是分开的两条命令：启动路径只调前者。
+#[tauri::command]
+pub fn vault_is_remembered(state: State<'_, AppState>) -> bool {
+    state.store.vault_is_remembered()
+}
+
+/// 试着用本机记住的钥匙直接解锁。前端在**准备弹解锁框之前**调一次：
+/// 返回 true 就不用弹了。没记住、或者记的是别的库的钥匙，都返回 false。
+#[tauri::command]
+pub fn vault_try_remembered(state: State<'_, AppState>) -> bool {
+    state.store.vault_try_remembered()
+}
+
+/// 启用保险库：建密钥、落元数据、把现有凭据全部改写成密文。
+#[tauri::command]
+pub fn vault_enable(
+    password: String,
+    remember_here: bool,
+    state: State<'_, AppState>,
+) -> Result<SweepReport, String> {
+    let password = Zeroizing::new(password);
+    state.store.vault_enable(&password, remember_here)
+}
+
+#[tauri::command]
+pub fn vault_unlock(
+    password: String,
+    remember_here: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let password = Zeroizing::new(password);
+    state.store.vault_unlock(&password, remember_here)
+}
+
+/// 丢掉内存里的密钥。不影响「本机记住」—— 那是另一条命令。
+#[tauri::command]
+pub fn vault_lock(state: State<'_, AppState>) {
+    state.store.vault_lock();
+}
+
+/// 忘掉本机记住的钥匙。当前这把锁不受影响，下次启动才要重新输主密码。
+#[tauri::command]
+pub fn vault_forget(state: State<'_, AppState>) {
+    state.store.vault_forget();
+}
+
+/// 换主密码。只重新包装那把 DEK，一条凭据都不动，所以不管库里有多少条都是一瞬间。
+#[tauri::command]
+pub fn vault_change_password(
+    old_password: String,
+    new_password: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let old = Zeroizing::new(old_password);
+    let new = Zeroizing::new(new_password);
+    state.store.vault_change_password(&old, &new)
+}
+
+/// 关闭保险库，凭据还原成明文。要验主密码 —— 这一步比读一条密码危险得多。
+#[tauri::command]
+pub fn vault_disable(password: String, state: State<'_, AppState>) -> Result<SweepReport, String> {
+    let password = Zeroizing::new(password);
+    state.store.vault_disable(&password)
+}
+
+/// 忘了主密码时的逃生口：**销毁**全部加密凭据，退回未启用。
+///
+/// 返回被清掉的条数。这是破坏性重置不是恢复，界面上必须让用户先确认。
+#[tauri::command]
+pub fn vault_reset(state: State<'_, AppState>) -> Result<usize, String> {
+    state.store.vault_reset()
 }

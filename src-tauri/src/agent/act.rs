@@ -1323,6 +1323,12 @@ fn default_rows() -> u16 {
 fn resolve_auth(state: &AppState, record: &store::SessionRecord) -> Result<AuthMethod, String> {
     match record.auth_type.as_str() {
         "password" => {
+            // 锁定态下 `get_password` 返回的也是 None，和「没存过」长得一样。
+            // 不区分的话，用户会得到一句与事实相反的「未保存密码」，然后去重填
+            // 一个其实已经存在的密码 —— 而那一步同样会失败。
+            if state.store.vault_locked() {
+                return Err("保险库已锁定，请先输入主密码".into());
+            }
             let password = state
                 .store
                 .get_password(&record.id)
