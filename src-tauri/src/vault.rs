@@ -488,16 +488,34 @@ impl Vault {
 
     /// [`Vault::protect`] 的逆。
     ///
-    /// 派发看的是**值自己的前缀**而不是当前状态，因为半迁移的库是合法的：
-    /// 同一张表里可以既有 `v2:` 又有还没扫到的明文。
+    /// 保险库启用之后，派发看的是**值自己的前缀**而不是当前状态，因为半迁移的
+    /// 库是合法的：同一张表里可以既有 `v2:` 又有还没扫到的明文。
     pub fn reveal(&self, kind: Field, stored: &str) -> Result<String, String> {
+        let state = self.state.read();
+
+        // 未启用保险库时，除 TOTP 外的字段**从来没被加密过** —— 前缀再像也只是
+        // 密码本身，必须无条件原样返回。
+        //
+        // 这是「用户的真实密码恰好以 v2: 开头」唯一会出岔子的地方：这里要是跟着
+        // 前缀走，这种密码就会变成一句莫名其妙的「保险库已锁定」。
+        if matches!(&*state, VaultState::Disabled) && kind != Field::Totp {
+            return Ok(stored.to_string());
+        }
+
         match classify(stored) {
-            Form::Dek => match &*self.state.read() {
-                VaultState::Unlocked { dek, .. } => to_text(open_raw(dek, &kind.aad(), &stored[V2.len()..])?),
+            Form::Dek => match &*state {
+                VaultState::Unlocked { dek, .. } => {
+                    to_text(open_raw(dek, &kind.aad(), &stored[V2.len()..])?)
+                }
                 _ => Err(LOCKED_READ.into()),
             },
-            // v1 的密钥在系统凭据服务里，和保险库是否解锁无关。
+            // v1 的密钥在系统凭据服务里，和保险库锁没锁无关。
             Form::Keyring => crate::secret::decrypt(stored),
+            // TOTP 这一列从引入起就只存密文，裸值只可能是损坏数据。把它当 base32
+            // 种子直接用会安安静静地算出一串错的验证码 —— 报错比那强得多。
+            Form::Plain if kind == Field::Totp => {
+                Err("TOTP 种子格式无法识别（缺少版本前缀），请重新填写".into())
+            }
             // 还没被扫描改写的遗留明文。
             //
             // 即使此刻是 `Locked` 也照常返回：这个值本来就以明文躺在同一个文件里，
@@ -663,11 +681,26 @@ mod tests {
         assert_eq!(v.status().enabled, false);
     }
 
-    /// 用户的真实密码恰好长得像密文时，`Disabled` 下也必须原样穿过去。
+    /// 用户的真实密码恰好长得像密文时，`Disabled` 下必须原样来、原样回。
+    ///
+    /// 读这一侧尤其要紧：跟着前缀走的话，这种密码会变成一句看不懂的
+    /// 「保险库已锁定」，而用户压根没启用过保险库。
     #[test]
     fn disabled_does_not_mangle_a_password_that_looks_like_ciphertext() {
         let v = Vault::disabled();
-        assert_eq!(v.protect(Field::Password, "v2:oops").unwrap(), "v2:oops");
+        for lookalike in ["v2:oops", "v1:oops"] {
+            assert_eq!(v.protect(Field::Password, lookalike).unwrap(), lookalike);
+            assert_eq!(v.reveal(Field::Password, lookalike).unwrap(), lookalike);
+            assert_eq!(v.reveal(Field::Passphrase, lookalike).unwrap(), lookalike);
+            assert_eq!(v.reveal(Field::ApiKey, lookalike).unwrap(), lookalike);
+        }
+    }
+
+    /// TOTP 那一列从引入起就只存密文，裸值是损坏数据而不是种子。
+    #[test]
+    fn a_bare_totp_seed_is_an_error_not_a_seed() {
+        assert!(Vault::disabled().reveal(Field::Totp, "JBSWY3DPEHPK3PXP").is_err());
+        assert!(unlocked_vault().reveal(Field::Totp, "JBSWY3DPEHPK3PXP").is_err());
     }
 
     // ——— Unlocked ———

@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::vault::{Field, Vault};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
@@ -44,6 +46,12 @@ pub struct NewSession {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// 凭据列的加解密。密钥住在这里而不是 `AppState`，是因为读写凭据的方法
+    /// 全是 `Store` 的方法 —— 密钥跟着数据走，所有调用方的签名一个都不用动。
+    ///
+    /// **锁序永远是「先 vault 后 conn」。** `conn` 是不可重入的 `Mutex`，
+    /// 在事务里回头调加解密会直接死锁。
+    vault: Vault,
 }
 
 /// 宏里的一步。
@@ -219,6 +227,8 @@ impl Store {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            // 恒为「未启用」：启用保险库的入口还没接上，所以凭据照旧按明文走。
+            vault: Vault::disabled(),
         })
     }
 
@@ -442,63 +452,100 @@ impl Store {
         Ok(rows)
     }
 
-    /// 保存明文密码（随 db 持久化，便于跨机器迁移）。
+    /// 加密准备写进凭据列的值；空串一律落 `NULL`。
+    ///
+    /// 空串必须在这里就短路掉，不能交给保险库：加密一个空串会得到一串**非空**
+    /// 密文，读回来就从「没存密码」变成了「存着一个空密码」。
+    ///
+    /// **必须在拿 `conn` 之前调用** —— 见 [`Store::vault`] 上的锁序说明。
+    fn seal(&self, kind: Field, plain: &str) -> Result<Option<String>, String> {
+        if plain.is_empty() {
+            return Ok(None);
+        }
+        self.vault.protect(kind, plain).map(Some)
+    }
+
+    /// 把凭据列里读到的值还原成明文。
+    ///
+    /// 解不开只记一条日志返回 `None`，不往上抛。最常见的原因不是「被篡改」，
+    /// 而是**换了台机器**：db 跟着走了，密钥没有。这时该做的是照常弹框让人
+    /// 手输，而不是让整条连接以一个密码学错误失败。
+    fn unseal(&self, kind: Field, id: &str, stored: Option<String>) -> Option<String> {
+        let stored = stored.filter(|s| !s.is_empty())?;
+        match self.vault.reveal(kind, &stored) {
+            // 解出空串等同于没存 —— 空口令不该被当成有效口令传给解密流程。
+            Ok(plain) if plain.is_empty() => None,
+            Ok(plain) => Some(plain),
+            Err(e) => {
+                tracing::warn!(session = id, field = ?kind, error = %e, "凭据解密失败，本次按未配置处理");
+                None
+            }
+        }
+    }
+
+    /// 保存密码（随 db 持久化，便于跨机器迁移）。空串视为「清除」。
     pub fn set_password(&self, id: &str, password: &str) -> Result<(), String> {
+        let stored = self.seal(Field::Password, password)?;
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "UPDATE sessions SET password = ?2 WHERE id = ?1",
-            params![id, password],
+            params![id, stored],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    /// 读取明文密码。
+    /// 读取密码。
     pub fn get_password(&self, id: &str) -> Option<String> {
-        let conn = self.conn.lock().ok()?;
-        conn.query_row(
-            "SELECT password FROM sessions WHERE id = ?1",
-            params![id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-        .filter(|p| !p.is_empty())
+        let stored = {
+            let conn = self.conn.lock().ok()?;
+            conn.query_row(
+                "SELECT password FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+        self.unseal(Field::Password, id, stored)
     }
 
     /// 保存私钥口令。空串视为「清除」——避免把空口令当成有效口令传给解密流程。
     pub fn set_passphrase(&self, id: &str, passphrase: &str) -> Result<(), String> {
+        let stored = self.seal(Field::Passphrase, passphrase)?;
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "UPDATE sessions SET passphrase = ?2 WHERE id = ?1",
-            params![id, passphrase],
+            params![id, stored],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn get_passphrase(&self, id: &str) -> Option<String> {
-        let conn = self.conn.lock().ok()?;
-        conn.query_row(
-            "SELECT passphrase FROM sessions WHERE id = ?1",
-            params![id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-        .filter(|p| !p.is_empty())
+        let stored = {
+            let conn = self.conn.lock().ok()?;
+            conn.query_row(
+                "SELECT passphrase FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+        self.unseal(Field::Passphrase, id, stored)
     }
 
-    /// 保存 TOTP 种子。**落库前加密**（`crate::secret`），空串视为「清除」。
+    /// 保存 TOTP 种子。**落库前一定加密**，空串视为「清除」。
     ///
-    /// 加密失败（取不到系统凭据服务）时宁可整个报错也不降级存明文 —— 一个
-    /// 「存上了，但其实是明文」的静默降级，比存不上危险得多。
+    /// 和密码不同，这一列即使在保险库未启用时也是密文（密钥在系统凭据服务里，
+    /// 见 [`crate::secret`]）：种子是第二因子，和明文密码躺在同一个文件里的话
+    /// 二次验证就名存实亡。
+    ///
+    /// 加密失败时宁可整个报错也不降级存明文 —— 一个「存上了，但其实是明文」的
+    /// 静默降级，比存不上危险得多。
     pub fn set_totp_seed(&self, id: &str, seed: &str) -> Result<(), String> {
-        let stored = if seed.is_empty() {
-            None
-        } else {
-            Some(crate::secret::encrypt(seed)?)
-        };
+        let stored = self.seal(Field::Totp, seed)?;
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "UPDATE sessions SET totp_seed = ?2 WHERE id = ?1",
@@ -509,12 +556,8 @@ impl Store {
     }
 
     /// 读回并解密 TOTP 种子。
-    ///
-    /// 解密失败只记一条日志返回 `None`，不往上抛：最常见的原因是「db 拷到了
-    /// 新机器、密钥还在老机器的凭据服务里」，这时该做的是照常弹框让人手输
-    /// 验证码，而不是让整条连接失败。
     pub fn get_totp_seed(&self, id: &str) -> Option<String> {
-        let blob: Option<String> = {
+        let stored = {
             let conn = self.conn.lock().ok()?;
             conn.query_row(
                 "SELECT totp_seed FROM sessions WHERE id = ?1",
@@ -524,14 +567,7 @@ impl Store {
             .ok()
             .flatten()
         };
-        let blob = blob.filter(|b| !b.is_empty())?;
-        match crate::secret::decrypt(&blob) {
-            Ok(seed) => Some(seed),
-            Err(e) => {
-                tracing::warn!(session = id, error = %e, "TOTP 种子解密失败，本次按未配置处理");
-                None
-            }
-        }
+        self.unseal(Field::Totp, id, stored)
     }
 
     /// 这条连接有没有存过种子。
@@ -841,11 +877,97 @@ mod tests {
     use super::*;
 
     fn temp_store(tag: &str) -> Store {
+        temp_store_at(tag).0
+    }
+
+    /// 连 db 文件路径一起返回，给需要直接翻字节的用例。
+    fn temp_store_at(tag: &str) -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "nexus-store-{tag}-{}",
             uuid::Uuid::new_v4()
         ));
-        Store::open(dir).expect("打开临时库")
+        let store = Store::open(dir.clone()).expect("打开临时库");
+        (store, dir.join("nexus.db"))
+    }
+
+    fn a_session(store: &Store, name: &str) -> String {
+        store
+            .create(NewSession {
+                name: name.into(),
+                folder: None,
+                host: "example.com".into(),
+                port: None,
+                username: "root".into(),
+                auth_type: "password".into(),
+                key_path: None,
+                startup_cmd: None,
+                theme: None,
+                connect_timeout: None,
+            })
+            .expect("建会话")
+            .id
+    }
+
+    // ——— 凭据列 ———
+
+    #[test]
+    fn password_and_passphrase_roundtrip() {
+        let store = temp_store("cred");
+        let id = a_session(&store, "s");
+
+        store.set_password(&id, "hunter2").unwrap();
+        store.set_passphrase(&id, "key-pass").unwrap();
+        assert_eq!(store.get_password(&id).as_deref(), Some("hunter2"));
+        assert_eq!(store.get_passphrase(&id).as_deref(), Some("key-pass"));
+    }
+
+    /// 空串是「清除」，不是「存了一个空密码」。保险库启用后这一条尤其要命：
+    /// 加密空串会得到一串非空密文，没短路的话读回来就成了 `Some("")`。
+    #[test]
+    fn empty_credentials_read_back_as_none() {
+        let store = temp_store("cred-empty");
+        let id = a_session(&store, "s");
+
+        assert_eq!(store.get_password(&id), None, "从没存过");
+
+        store.set_password(&id, "hunter2").unwrap();
+        store.set_password(&id, "").unwrap();
+        assert_eq!(store.get_password(&id), None, "存空串应当等于清除");
+
+        store.set_passphrase(&id, "").unwrap();
+        assert_eq!(store.get_passphrase(&id), None);
+    }
+
+    /// 没启用保险库时，密码**就是明文躺在 db 文件里**。
+    ///
+    /// 这条断言看着像在测试一个缺陷，其实是在钉住「默认不开 = 零回归」：
+    /// 改造前后这个文件的字节内容必须一样。等启用保险库的入口接上之后，
+    /// 会有一条镜像的用例断言同样的 grep **找不到**明文。
+    #[test]
+    fn without_a_vault_passwords_sit_in_the_file_as_plaintext() {
+        let (store, path) = temp_store_at("cred-plain");
+        let id = a_session(&store, "s");
+        store.set_password(&id, "PLAINTEXT-CANARY").unwrap();
+        store.set_passphrase(&id, "PASSPHRASE-CANARY").unwrap();
+
+        let bytes = std::fs::read(&path).expect("读 db 文件");
+        assert!(
+            bytes.windows(16).any(|w| w == b"PLAINTEXT-CANARY"),
+            "未启用保险库时密码应当是明文"
+        );
+        assert!(
+            bytes.windows(17).any(|w| w == b"PASSPHRASE-CANARY"),
+            "未启用保险库时私钥口令应当是明文"
+        );
+    }
+
+    /// 真实密码恰好长得像密文前缀时不能被误当成密文。
+    #[test]
+    fn a_password_that_looks_like_ciphertext_survives() {
+        let store = temp_store("cred-lookalike");
+        let id = a_session(&store, "s");
+        store.set_password(&id, "v2:not-really").unwrap();
+        assert_eq!(store.get_password(&id).as_deref(), Some("v2:not-really"));
     }
 
     /// 步骤的 JSON 形状是和前端共用的契约，改字段名必须两边一起改 ——
