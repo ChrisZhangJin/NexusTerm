@@ -12,6 +12,8 @@ export interface SessionRecord {
   theme: string | null;
   /** TCP 连接超时（秒）。null 表示沿用后端默认值。 */
   connectTimeout: number | null;
+  /** 用户写的备注，纯展示。连接流程不读它。 */
+  note: string | null;
   sortOrder: number;
   createdAt: number;
   updatedAt: number;
@@ -28,6 +30,7 @@ export interface NewSession {
   startupCmd?: string;
   theme?: string;
   connectTimeout?: number | null;
+  note?: string | null;
 }
 
 /**

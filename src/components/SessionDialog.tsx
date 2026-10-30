@@ -54,6 +54,7 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
   /** 浏览选中的外部密钥是否加密（密钥库里的条目直接看 KeyInfo.encrypted） */
   const [encryptedKey, setEncryptedKey] = useState(false);
   const [connectTimeout, setConnectTimeout] = useState("10");
+  const [note, setNote] = useState("");
   const [keys, setKeys] = useState<KeyInfo[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -72,6 +73,7 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
       setAuthType(editing.authType);
       setKeyPath(editing.keyPath ?? "");
       setConnectTimeout(String(normalizeTimeout(editing.connectTimeout)));
+      setNote(editing.note ?? "");
       // TOTP 与 authType 正交（密码登录和密钥登录都可能要二次验证），所以放在
       // authType 的分支外面无条件查一次。种子本身查不回来，只查「有没有」。
       setTotpSeed("");
@@ -106,6 +108,7 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
       setPassphrase("");
       setPassphraseTouched(false);
       setConnectTimeout("10");
+      setNote("");
       setTotpSeed("");
       setTotpTouched(false);
       setHasSeed(false);
@@ -214,6 +217,8 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
           authType,
           keyPath: authType === "key" ? keyPath : undefined,
           connectTimeout: normalizeTimeout(Number(connectTimeout)),
+          // 全空白等于没写，存 null 而不是空串 —— 列表那边只要判一次 falsy
+          note: note.trim() || null,
         },
         {
           password: authType === "password" ? password : "",
@@ -271,6 +276,23 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
         </div>
         <p className="hint">
           TCP 握手超过该秒数即判定主机不可达，默认 10 秒。主机响应慢可适当调大。
+        </p>
+
+        <div className="row">
+          <label htmlFor="session-note">备注</label>
+          <textarea
+            id="session-note"
+            className="note-input"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            rows={3}
+            placeholder="这台机器是干嘛的、改动前要通知谁、什么时候不能重启…"
+            spellCheck={false}
+          />
+        </div>
+        <p className="hint">
+          可空，纯备忘。在连接列表里悬停这条连接就能看到。
+          <strong>不要往里写密码</strong> —— 这一列不加密，启用主密码也不会保护它。
         </p>
 
         <div className="row">

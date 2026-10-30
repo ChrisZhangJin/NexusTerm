@@ -351,6 +351,8 @@ pub fn parse_files(paths: &[String]) -> Vec<ParsedFile> {
                             startup_cmd: None,
                             theme: None,
                             connect_timeout: None,
+                            // .xsh 里没有对应的字段，留空让用户自己写
+                            note: None,
                         }), pw)
                     }
                     Err(e) => (Err(e), None),

@@ -29,6 +29,8 @@ pub struct SessionRecord {
     pub theme: Option<String>,
     /// TCP 连接超时（秒）。NULL 表示沿用 `errors::DEFAULT_CONNECT_TIMEOUT_SECS`。
     pub connect_timeout: Option<u32>,
+    /// 用户写的备注，纯展示。可空，连接流程不读它。
+    pub note: Option<String>,
     pub sort_order: i32,
     pub created_at: i64,
     pub updated_at: i64,
@@ -47,6 +49,7 @@ pub struct NewSession {
     pub startup_cmd: Option<String>,
     pub theme: Option<String>,
     pub connect_timeout: Option<u32>,
+    pub note: Option<String>,
 }
 
 pub struct Store {
@@ -139,6 +142,11 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         // 未启用主密码时是 `v1:`（密钥在系统凭据服务，见 `crate::secret`），
         // 代价是换机器拷 db 过去解不开要重填；启用主密码后改挂 `v2:`，这个代价消失。
         ("totp_seed", "ALTER TABLE sessions ADD COLUMN totp_seed TEXT"),
+        // 用户自己写的备注，纯展示用，连接流程一个字都不会读它。
+        // **不加密**：它是用来在列表里一眼认出这台机器是干嘛的，锁定态下看不见
+        // 就失去了意义。也正因为如此，别往里写密码 —— 界面上的「安全」面板
+        // 已经把这一列列在「未加密」那一栏里。
+        ("note", "ALTER TABLE sessions ADD COLUMN note TEXT"),
     ] {
         let exists: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?1")?
@@ -177,6 +185,7 @@ impl Store {
                 startup_cmd  TEXT,
                 theme        TEXT,
                 connect_timeout INTEGER,
+                note         TEXT,
                 password     TEXT,
                 passphrase   TEXT,
                 totp_seed    TEXT,
@@ -252,7 +261,7 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id,name,folder,host,port,username,auth_type,key_path,
-                        startup_cmd,theme,connect_timeout,sort_order,created_at,updated_at
+                        startup_cmd,theme,connect_timeout,note,sort_order,created_at,updated_at
                  FROM sessions ORDER BY folder, sort_order, name",
             )
             .map_err(|e| e.to_string())?;
@@ -274,8 +283,8 @@ impl Store {
 
         conn.execute(
             "INSERT INTO sessions (id,name,folder,host,port,username,auth_type,key_path,
-                                   startup_cmd,theme,connect_timeout,sort_order,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                                   startup_cmd,theme,connect_timeout,note,sort_order,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
                 id,
                 s.name,
@@ -288,6 +297,7 @@ impl Store {
                 s.startup_cmd,
                 s.theme,
                 s.connect_timeout,
+                s.note,
                 max_order + 1,
                 now,
                 now,
@@ -302,7 +312,7 @@ impl Store {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.query_row(
             "SELECT id,name,folder,host,port,username,auth_type,key_path,
-                    startup_cmd,theme,connect_timeout,sort_order,created_at,updated_at
+                    startup_cmd,theme,connect_timeout,note,sort_order,created_at,updated_at
              FROM sessions WHERE id = ?1",
             params![id],
             row_to_session,
@@ -315,7 +325,7 @@ impl Store {
         conn.execute(
             "UPDATE sessions SET name=?2, folder=?3, host=?4, port=?5, username=?6,
                     auth_type=?7, key_path=?8, startup_cmd=?9, theme=?10,
-                    connect_timeout=?11, updated_at=?12
+                    connect_timeout=?11, note=?12, updated_at=?13
              WHERE id=?1",
             params![
                 id,
@@ -329,6 +339,7 @@ impl Store {
                 s.startup_cmd,
                 s.theme,
                 s.connect_timeout,
+                s.note,
                 now_secs(),
             ],
         )
@@ -804,9 +815,10 @@ fn row_to_session(r: &rusqlite::Row) -> SqlResult<SessionRecord> {
         startup_cmd: r.get(8)?,
         theme: r.get(9)?,
         connect_timeout: r.get(10)?,
-        sort_order: r.get(11)?,
-        created_at: r.get(12)?,
-        updated_at: r.get(13)?,
+        note: r.get(11)?,
+        sort_order: r.get(12)?,
+        created_at: r.get(13)?,
+        updated_at: r.get(14)?,
     })
 }
 
@@ -922,6 +934,7 @@ mod tests {
                 auth_type: "password".into(),
                 key_path: None,
                 startup_cmd: None,
+                note: None,
                 theme: None,
                 connect_timeout: None,
             })

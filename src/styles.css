@@ -2022,3 +2022,21 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .sec-state.locked::before { background: var(--danger); }
 .sec-state.off { color: var(--text-dim); }
 .sec-state.off::before { background: var(--text-dim); }
+
+/* 连接备注：多行输入框。和 .row 里的单行 input 共用左侧标签列，
+   所以只补 textarea 特有的那几条（可纵向拉伸、字体跟随、行高放松）。 */
+.note-input {
+  flex: 1;
+  min-width: 0;
+  resize: vertical;
+  min-height: 56px;
+  font: inherit;
+  line-height: 1.6;
+  padding: 7px 9px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.note-input:focus { outline: none; border-color: var(--accent); }
+.note-input::placeholder { color: var(--text-dim); }

@@ -1044,6 +1044,7 @@ export function SecurityDialog({ onClose }: { onClose: () => void }) {
             <h4>未加密（启用主密码也不会加密）</h4>
             <ul>
               <li>命令历史（command_history）</li>
+              <li>连接备注</li>
               <li>登录脚本与会话附加设置</li>
               <li>宏的内容与步骤</li>
               <li>主机 / 端口 / 用户名 / 分组</li>

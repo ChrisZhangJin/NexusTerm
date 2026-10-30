@@ -674,7 +674,13 @@ function TreeView(props: TreeViewProps) {
           <button
             className="session-main"
             onDoubleClick={() => onConnect(s)}
-            title={`${s.username}@${s.host}:${s.port}  双击连接`}
+            // 备注接在连接信息下面，用空行隔开 —— 原生 title 没有排版能力，
+            // 一条分隔线是让多行备注不至于和地址糊成一团的唯一手段。
+            title={
+              s.note
+                ? `${s.username}@${s.host}:${s.port}  双击连接\n\n${s.note}`
+                : `${s.username}@${s.host}:${s.port}  双击连接`
+            }
           >
             <span className="dot" />
             <span className="s-name">{displayName(s)}</span>
