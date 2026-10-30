@@ -62,6 +62,8 @@ pub struct SweepReport {
     pub seeds_converted: usize,
     /// 解不开、原样留着的 TOTP 种子数 —— 这些要让用户重填。
     pub seeds_unreadable: usize,
+    /// 改写了的 LLM API Key 条数。
+    pub api_keys: usize,
 }
 
 /// 开库时判定保险库状态。**只查一次 settings，不做 KDF、不碰系统凭据服务。**
@@ -357,13 +359,41 @@ impl Store {
 
         // 先销毁数据再删元数据：反过来的话中途失败就剩下一堆没有密钥的密文，
         // 而那时连「哪些是密文」都还能看出来，只是再也没有入口去清它们了。
-        let cleared = self.clear_encrypted_credentials()?;
+        let cleared = self.clear_encrypted_credentials()? + self.clear_api_keys()?;
         self.clear_settings(&[K_ID, K_KDF, K_DEK, K_VERIFY, K_MIGRATING])?;
         if !meta.id.is_empty() {
             remember::forget(&meta.id);
         }
         self.vault.disable();
         tracing::warn!(cleared, "保险库已重置，其中的加密凭据已销毁");
+        Ok(cleared)
+    }
+
+    /// 把 `agent.config` 里解不开的 api_key 清成空串。
+    ///
+    /// 只动那一个叶子：模型、baseUrl、系统提示词这些没加密的字段原样留着 ——
+    /// 重置之后用户要补的只有 key 本身。
+    fn clear_api_keys(&self) -> Result<usize, String> {
+        const CONFIG_KEY: &str = "agent.config";
+        let Some(raw) = self.get_setting(CONFIG_KEY) else {
+            return Ok(0);
+        };
+        let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return Ok(0);
+        };
+        let slots = api_key_slots(&mut root);
+
+        let mut cleared = 0usize;
+        for slot in slots {
+            if slot.as_str().is_some_and(|s| vault::classify(s) == Form::Dek) {
+                *slot = serde_json::Value::String(String::new());
+                cleared += 1;
+            }
+        }
+        if cleared > 0 {
+            let json = serde_json::to_string(&root).map_err(|e| e.to_string())?;
+            self.write_settings(&[(CONFIG_KEY, &json)])?;
+        }
         Ok(cleared)
     }
 
@@ -475,7 +505,52 @@ impl Store {
         }
 
         self.apply(&plan)?;
+        report.api_keys = self.sweep_api_keys(true)?;
         Ok(report)
+    }
+
+    /// `settings` 里 `agent.config` 那份 JSON 中每个账号的 `apiKey`。
+    ///
+    /// 走 `serde_json::Value` 而不是 `AgentConfig`：后者会顺手触发旧配置迁移和
+    /// 规整，把一次「只改 key」的改写变成一次结构重写，还会丢掉未知字段。
+    /// 这里要的是外科手术 —— 只动那一个叶子。
+    fn sweep_api_keys(&self, encrypting: bool) -> Result<usize, String> {
+        const CONFIG_KEY: &str = "agent.config";
+        let Some(raw) = self.get_setting(CONFIG_KEY) else {
+            return Ok(0);
+        };
+        let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            // 配置本来就坏了。这不该拦住整个启用 —— 那份 JSON 读的时候会回落
+            // 到默认值，里面也就没有什么 key 需要保护。
+            tracing::warn!("AI 配置不是合法 JSON，跳过其中的 API Key");
+            return Ok(0);
+        };
+
+        let slots = api_key_slots(&mut root);
+
+        let mut changed = 0usize;
+        for slot in slots {
+            let Some(current) = slot.as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let is_sealed = vault::classify(current) == Form::Dek;
+            if is_sealed == encrypting {
+                continue; // 已经是想要的形态了
+            }
+            let next = if encrypting {
+                self.vault.protect(Field::ApiKey, current)?
+            } else {
+                self.vault.reveal(Field::ApiKey, current)?
+            };
+            *slot = serde_json::Value::String(next);
+            changed += 1;
+        }
+
+        if changed > 0 {
+            let json = serde_json::to_string(&root).map_err(|e| e.to_string())?;
+            self.write_settings(&[(CONFIG_KEY, &json)])?;
+        }
+        Ok(changed)
     }
 
     /// [`Store::sweep`] 的逆：密文还原成明文（TOTP 则换回本机密钥）。
@@ -528,6 +603,7 @@ impl Store {
         }
 
         self.apply(&plan)?;
+        report.api_keys = self.sweep_api_keys(false)?;
         Ok(report)
     }
 
@@ -651,6 +727,20 @@ impl Store {
         tracing::info!(path = %backup.display(), "已备份数据库");
         Ok(())
     }
+}
+
+/// `agent.config` 那份 JSON 里所有 `apiKey` 叶子的可变引用。
+///
+/// 多账号结构放在 `accounts[]`，旧的扁平配置则是顶层一个 `apiKey` —— 两种都认。
+fn api_key_slots(root: &mut serde_json::Value) -> Vec<&mut serde_json::Value> {
+    if root.get("accounts").is_some_and(|v| v.is_array()) {
+        return root
+            .get_mut("accounts")
+            .and_then(|v| v.as_array_mut())
+            .map(|arr| arr.iter_mut().filter_map(|a| a.get_mut("apiKey")).collect())
+            .unwrap_or_default();
+    }
+    root.get_mut("apiKey").into_iter().collect()
 }
 
 type CredentialRow = (String, Option<String>, Option<String>, Option<String>);
@@ -961,6 +1051,105 @@ mod tests {
     fn resetting_a_vault_that_was_never_enabled_is_an_error() {
         let (store, _, _) = store_with_credentials("vault-reset-none");
         assert!(store.vault_reset().is_err());
+    }
+
+    // ——— agent.config 里的 LLM API Key ———
+
+    /// 装一份带两个账号的 AI 配置。
+    fn with_agent_config(store: &Store) {
+        use crate::agent::{save_config, AgentAccount, AgentConfig};
+        let mut cfg = AgentConfig::default();
+        cfg.accounts = vec![
+            AgentAccount {
+                id: "a".into(),
+                api_key: "sk-FIRST-CANARY".into(),
+                model: "gpt-4o-mini".into(),
+                ..Default::default()
+            },
+            AgentAccount {
+                id: "b".into(),
+                api_key: "sk-SECOND-CANARY".into(),
+                ..Default::default()
+            },
+        ];
+        cfg.active_id = "a".into();
+        save_config(store, &cfg).unwrap();
+    }
+
+    #[test]
+    fn enabling_the_vault_encrypts_the_llm_api_keys() {
+        let (store, db, _) = store_with_credentials("vault-apikey");
+        with_agent_config(&store);
+        assert!(contains(&db_bytes(&store, &db), "sk-FIRST-CANARY"), "前置条件");
+
+        let report = store.vault_enable(PW, false).unwrap();
+        assert_eq!(report.api_keys, 2);
+
+        let bytes = db_bytes(&store, &db);
+        assert!(!contains(&bytes, "sk-FIRST-CANARY"));
+        assert!(!contains(&bytes, "sk-SECOND-CANARY"));
+
+        let cfg = crate::agent::load_config(&store);
+        assert_eq!(cfg.accounts[0].api_key, "sk-FIRST-CANARY");
+        assert_eq!(cfg.accounts[1].api_key, "sk-SECOND-CANARY");
+        // 只动 apiKey 那一个叶子，别的字段原样。
+        assert_eq!(cfg.accounts[0].model, "gpt-4o-mini");
+        assert_eq!(cfg.active_id, "a");
+    }
+
+    /// 锁定态下读出来的 key 是空的，所以保存必须被拒 —— 否则用户看着一栏空白
+    /// 按下保存，真实的 key 就没了。
+    #[test]
+    fn a_locked_vault_refuses_to_save_the_agent_config() {
+        let (store, _, _) = store_with_credentials("vault-apikey-locked");
+        with_agent_config(&store);
+        store.vault_enable(PW, false).unwrap();
+        store.vault_lock();
+
+        let cfg = crate::agent::load_config(&store);
+        assert_eq!(cfg.accounts[0].api_key, "", "锁着的时候读不出 key");
+        // 但非敏感字段照常读得到 —— 这正是逐字段加密而非整体加密的理由，
+        // 启动时的 apply_config 在锁定态下行为不变。
+        assert_eq!(cfg.accounts[0].model, "gpt-4o-mini");
+        assert!(crate::agent::save_config(&store, &cfg).is_err());
+
+        store.vault_unlock(PW, false).unwrap();
+        assert_eq!(
+            crate::agent::load_config(&store).accounts[0].api_key,
+            "sk-FIRST-CANARY",
+            "刚才那次被拒的保存不该动过任何东西"
+        );
+    }
+
+    #[test]
+    fn disabling_the_vault_puts_the_api_keys_back() {
+        let (store, db, _) = store_with_credentials("vault-apikey-off");
+        with_agent_config(&store);
+        store.vault_enable(PW, false).unwrap();
+
+        let report = store.vault_disable(PW).unwrap();
+        assert_eq!(report.api_keys, 2);
+        assert!(contains(&db_bytes(&store, &db), "sk-FIRST-CANARY"));
+        assert_eq!(
+            crate::agent::load_config(&store).accounts[0].api_key,
+            "sk-FIRST-CANARY"
+        );
+    }
+
+    #[test]
+    fn resetting_clears_the_api_keys_but_keeps_the_rest_of_the_config() {
+        let (store, _, _) = store_with_credentials("vault-apikey-reset");
+        with_agent_config(&store);
+        store.vault_enable(PW, false).unwrap();
+        store.vault_lock();
+
+        let cleared = store.vault_reset().unwrap();
+        assert_eq!(cleared, 4, "两条凭据 + 两个 key");
+
+        let cfg = crate::agent::load_config(&store);
+        assert_eq!(cfg.accounts[0].api_key, "");
+        assert_eq!(cfg.accounts[0].model, "gpt-4o-mini", "模型配置要留着");
+        assert_eq!(cfg.accounts.len(), 2);
     }
 
     // ——— 损坏的元数据 ———

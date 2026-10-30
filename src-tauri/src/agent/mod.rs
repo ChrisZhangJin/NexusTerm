@@ -86,8 +86,11 @@ pub struct AgentAccount {
     pub provider: String,
     pub base_url: String,
     pub model: String,
-    /// 明文存 db —— 与现有 SSH 密码策略保持一致（方便跨机器迁移），
-    /// 已在 store 里把 db 文件权限锁到 0600。
+    /// LLM 的 API Key。
+    ///
+    /// 这个结构体里它永远是**明文** —— 进出 db 时由 [`load_config`] /
+    /// [`save_config`] 逐字段加解密。没启用主密码时随 db 明文保存（与 SSH 密码
+    /// 同一套策略，为了跨机器迁移），db 文件权限锁在 0600。
     pub api_key: String,
     /// 单次喂给模型的最近字节数（环形窗口内的二次截取）
     pub max_context_bytes: u32,
@@ -243,7 +246,7 @@ pub fn load_config(store: &Store) -> AgentConfig {
     let Some(raw) = store.get_setting(CONFIG_KEY) else {
         return AgentConfig::default();
     };
-    match serde_json::from_str::<AgentConfig>(&raw) {
+    let mut cfg = match serde_json::from_str::<AgentConfig>(&raw) {
         Ok(mut cfg) if !cfg.accounts.is_empty() => {
             cfg.normalize();
             cfg
@@ -251,6 +254,31 @@ pub fn load_config(store: &Store) -> AgentConfig {
         // 解析成功但 accounts 为空 → 多半是旧扁平配置被 serde(default) 填成了空列表，
         // 走迁移分支把旧字段捞出来。
         _ => migrate_legacy_config(&raw),
+    };
+    reveal_keys(store, &mut cfg);
+    cfg
+}
+
+/// 把配置里每个账号的 api_key 解开。解不开的按「未配置」处理（清空）。
+///
+/// **逐字段加密，而不是把整个 value 加密**，这是个会直接造成数据丢失的区别：
+/// 本函数所在的 `load_config` 的既定契约是「不存在 / JSON 坏了都静默回落
+/// `Default`」。整体加密的话，锁定态下 AI 面板会显示成「全新未配置」，用户点一下
+/// 保存就把模型、baseUrl、系统提示词全覆盖掉。逐字段还让 `lib.rs` 启动时的
+/// `apply_config` 在锁定态依然读得到 `enabled` / `auto_attach` 这些非敏感开关，
+/// 启动行为与改造前一致。
+fn reveal_keys(store: &Store, cfg: &mut AgentConfig) {
+    for a in &mut cfg.accounts {
+        if a.api_key.is_empty() {
+            continue;
+        }
+        match store.vault().reveal(crate::vault::Field::ApiKey, &a.api_key) {
+            Ok(plain) => a.api_key = plain,
+            Err(e) => {
+                tracing::warn!(account = %a.id, error = %e, "LLM API Key 解不开，本次按未配置处理");
+                a.api_key.clear();
+            }
+        }
     }
 }
 
@@ -316,8 +344,24 @@ fn migrate_legacy_config(raw: &str) -> AgentConfig {
 /// 保存 AI 配置。保存前规整一遍（补账号、修 active_id），
 /// 避免把一份非法状态写进库，下次读出来又得兜底。
 pub fn save_config(store: &Store, cfg: &AgentConfig) -> Result<(), AgentError> {
+    // 锁定态必须拒绝。此刻 `load_config` 给出的 api_key 是空的，界面上那一栏
+    // 看起来就是「没配」—— 放行保存，用户按一下就把真实的 key 清掉了，
+    // 而他完全不知道刚才发生了什么。
+    if store.vault_locked() {
+        return Err(AgentError::Store("保险库已锁定，请先输入主密码".into()));
+    }
+
     let mut cfg = cfg.clone();
     cfg.normalize();
+    for a in &mut cfg.accounts {
+        if a.api_key.is_empty() {
+            continue;
+        }
+        a.api_key = store
+            .vault()
+            .protect(crate::vault::Field::ApiKey, &a.api_key)
+            .map_err(AgentError::Store)?;
+    }
     let json = serde_json::to_string(&cfg).map_err(|e| AgentError::Serialize(e.to_string()))?;
     store
         .set_setting(CONFIG_KEY, &json)
