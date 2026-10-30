@@ -126,14 +126,18 @@ pub struct KeyRow {
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     for (column, ddl) in [
         ("connect_timeout", "ALTER TABLE sessions ADD COLUMN connect_timeout INTEGER"),
-        // 密码明文列：为了跨机器迁移连接配置，密码直接随 db 保存
+        // 密码列：默认明文，为的是跨机器迁移连接配置时密码能跟着 db 走。
+        // 用户启用主密码后这一列存的是 `v2:` 密文（见 `crate::vault`），而且
+        // **仍然可移植** —— 可移植性靠的是「密钥由主密码派生、不绑机器」，
+        // 从来不是靠明文；别把这一列的明文默认当成不可动摇的前提。
         ("password", "ALTER TABLE sessions ADD COLUMN password TEXT"),
         // 私钥口令（passphrase）。与密码同理随 db 保存 —— 它只是「解开本地私钥文件」
-        // 的口令，不是服务器凭据；不存的话每次连接都要重输一遍。
+        // 的口令，不是服务器凭据；不存的话每次连接都要重输一遍。加密与否跟着密码列走。
         ("passphrase", "ALTER TABLE sessions ADD COLUMN passphrase TEXT"),
-        // TOTP 种子。和上面两列不同，这一列存的是**密文**（见 `crate::secret`）：
-        // 种子是第二因子，和明文密码躺在同一个文件里的话二次验证就名存实亡。
-        // 代价是换机器拷 db 过去解不开，要重填 —— 对第二因子来说这是对的。
+        // TOTP 种子。和上面两列不同，这一列**任何时候都是密文**：种子是第二因子，
+        // 和明文密码躺在同一个文件里的话二次验证就名存实亡。
+        // 未启用主密码时是 `v1:`（密钥在系统凭据服务，见 `crate::secret`），
+        // 代价是换机器拷 db 过去解不开要重填；启用主密码后改挂 `v2:`，这个代价消失。
         ("totp_seed", "ALTER TABLE sessions ADD COLUMN totp_seed TEXT"),
     ] {
         let exists: bool = conn

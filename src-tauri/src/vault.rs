@@ -102,8 +102,6 @@ pub enum Field {
     Passphrase,
     Totp,
     /// `settings` 表里 `agent.config` JSON 中每个账号的 LLM API Key。
-    /// 加解密的接线还没做（那是 `agent/mod.rs` 那一步），所以暂时没有构造点。
-    #[allow(dead_code)]
     ApiKey,
 }
 

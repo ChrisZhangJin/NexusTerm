@@ -487,6 +487,11 @@ pub fn import_xsh(paths: Vec<String>, state: State<AppState>) -> Result<Vec<Impo
 }
 
 /// 导出单个会话为 .xsh（UTF-16LE+BOM，Xshell 原生格式）。密码不导出。
+///
+/// 三个 `export_*_xsh` 都**不需要**保险库解锁闸门，别照着上面 `import_xsh` 的样子
+/// 「补齐」：`encode_xsh` 根本不收密码参数，`store::get`/`list` 也不读凭据列，
+/// 导出文件里 `Password=` 永远是空的（`xsh.rs::render_xsh`）。加一道闸门不会多保护
+/// 任何东西，只会让锁定态下连「导出一份主机清单」都做不了。
 #[tauri::command]
 pub fn export_xsh(id: String, path: String, state: State<AppState>) -> Result<(), String> {
     let s = state.store.get(&id)?;
