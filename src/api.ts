@@ -22,7 +22,9 @@ import type {
   NewSession,
   RemoteEntry,
   SessionRecord,
+  SweepReport,
   TotpPreview,
+  VaultStatus,
 } from "./types";
 
 export const api = {
@@ -297,6 +299,45 @@ export const api = {
       kind: "markdown" | "html" | "image" | "audio" | "video" | "code";
       data: string;
     }>("viewer_doc", { id }),
+
+  // ——— 主密码保险库 ———
+  //
+  // 返回 Result<T, E> 的几条（enable / unlock / changePassword / disable / reset）
+  // 在 JS 侧表现为 invoke reject，一律 try/catch；错误已经是中文，直接 String(e) 展示。
+
+  /** 廉价：只读内存里的枚举，不做 KDF、不碰系统凭据服务，随便调 */
+  vaultStatus: () => invoke<VaultStatus>("vault_status"),
+  /**
+   * 这个库的钥匙有没有记在本机。
+   *
+   * **会访问系统凭据服务**，Linux 上没有 D-Bus 时可能卡住 —— 所以它和
+   * `vaultStatus` 是分开的两条命令，别把它放在启动关键路径上。
+   */
+  vaultIsRemembered: () => invoke<boolean>("vault_is_remembered"),
+  /** 试着用本机记住的钥匙直接解锁。在**准备弹解锁框之前**调一次：true 就不用弹了 */
+  vaultTryRemembered: () => invoke<boolean>("vault_try_remembered"),
+  /** 启用保险库：把现有凭据全部改写成密文，返回改了多少条 */
+  vaultEnable: (password: string, rememberHere: boolean) =>
+    invoke<SweepReport>("vault_enable", { password, rememberHere }),
+  vaultUnlock: (password: string, rememberHere: boolean) =>
+    invoke<void>("vault_unlock", { password, rememberHere }),
+  /** 只丢掉内存里的密钥，不影响「本机记住」—— 那是 `vaultForget` */
+  vaultLock: () => invoke<void>("vault_lock"),
+  /** 只忘掉「本机记住」，当前这把锁不受影响，下次启动才要重新输主密码 */
+  vaultForget: () => invoke<void>("vault_forget"),
+  /** 换主密码。只重新包装那把 DEK，库里有多少条凭据都是一瞬间 */
+  vaultChangePassword: (oldPassword: string, newPassword: string) =>
+    invoke<void>("vault_change_password", { oldPassword, newPassword }),
+  /** 关闭保险库，凭据还原成明文。要验主密码 */
+  vaultDisable: (password: string) =>
+    invoke<SweepReport>("vault_disable", { password }),
+  /**
+   * 忘了主密码时的逃生口：**销毁**全部加密凭据，退回未启用，返回被清掉的条数。
+   *
+   * 这是破坏性重置不是恢复 —— 界面上必须先让用户确认。后端动手前会留一份
+   * `nexus.db.pre-reset.bak`，日后想起主密码仍能从那里找回。
+   */
+  vaultReset: () => invoke<number>("vault_reset"),
 };
 
 /** base64 → Uint8Array。SSH 数据流必须走这条路径，不能 lossy 转字符串。 */

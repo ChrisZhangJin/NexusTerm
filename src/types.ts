@@ -449,3 +449,23 @@ export interface AgentExecResult {
   reason: "confirmed" | "silence" | "timeout" | "cancelled";
 }
 
+/**
+ * 保险库状态。「已记住」不是第三种状态 —— 它只是「锁定 → 已解锁」的一条自动边，
+ * 要单独问 `api.vaultIsRemembered()`。
+ */
+export interface VaultStatus {
+  enabled: boolean;
+  unlocked: boolean;
+}
+
+/**
+ * 一次启用 / 关闭扫描动了些什么。要如实报给用户：`seedsUnreadable > 0` 意味着
+ * 那几个 TOTP 种子是别的机器写的、本机解不开，用户必须重新填一遍。
+ */
+export interface SweepReport {
+  credentials: number;
+  seedsConverted: number;
+  seedsUnreadable: number;
+  apiKeys: number;
+}
+

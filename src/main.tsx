@@ -38,13 +38,27 @@ if (window.__NX_VIEWER__) {
 } else {
   // 先问清平台再挂载：标题栏留白与窗口控制按钮都要按平台渲染，
   // 若等 App 里异步拿到，首帧会先闪一下错误的布局。
-  Promise.all([import("./App"), import("./styles.css"), initPlatform().catch(() => null)]).then(
-    ([{ default: App }]) => {
-      root().render(
-        <React.StrictMode>
+  // 保险库状态同理：等它回来再挂载，才不会先闪一下「一条密码都没有」的界面。
+  // 浮动 Agent 窗口那条分支不加闸 —— 主密码归主窗口管。
+  Promise.all([
+    import("./App"),
+    import("./styles.css"),
+    initPlatform().catch(() => null),
+    import("./components/VaultGate"),
+    import("./api")
+      .then(({ api }) => api.vaultStatus())
+      .catch((e) => {
+        // 按「未启用」处理：这时后端多半也起不来，拦在闸口只会让用户连自救界面都打不开
+        console.warn("读取保险库状态失败，按未启用处理：", e);
+        return null;
+      }),
+  ]).then(([{ default: App }, , , { default: VaultGate }, vault]) => {
+    root().render(
+      <React.StrictMode>
+        <VaultGate initial={vault}>
           <App />
-        </React.StrictMode>
-      );
-    }
-  );
+        </VaultGate>
+      </React.StrictMode>
+    );
+  });
 }

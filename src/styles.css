@@ -1930,3 +1930,95 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .macro-running.rec { border-color: color-mix(in srgb, var(--danger) 55%, transparent); }
 .macro-running.rec .mr-dot { background: var(--danger); }
 @keyframes macro-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+/* ——— 主密码保险库 ——— */
+
+/* 启动闸：App 还没挂载时盖住整个窗口。不透明而不是半透明背景 ——
+   后面本来就什么都没有，透出去只会露出一块空白。 */
+.vault-gate {
+  position: fixed; inset: 0; z-index: 300;
+  display: flex; align-items: center; justify-content: center;
+  flex-direction: column; gap: 14px;
+  background: var(--bg);
+}
+
+/* 不可逆操作的警告块。红框 + 红底，和普通 .hint 拉开差距，
+   让用户在点下去之前至少停一秒。 */
+.vault-danger {
+  border: 1px solid var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border-radius: var(--radius);
+  padding: 10px 12px; margin: 12px 0;
+  font-size: 12px; line-height: 1.7; color: var(--text);
+}
+.vault-danger strong { color: var(--danger); font-weight: 600; }
+.vault-danger ul { margin: 6px 0 0; padding-left: 18px; }
+.vault-danger li { margin: 2px 0; }
+
+/* 启用 / 关闭之后的结果摘要：告诉用户到底动了多少条。
+   .warn 给「有种子解不开、需要重填」那种必须被看见的情况。 */
+.vault-report {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  background: var(--bg-panel);
+  border-radius: 6px;
+  padding: 9px 11px; margin: 12px 0 0;
+  font-size: 12px; line-height: 1.7; color: var(--text-dim);
+}
+.vault-report strong { color: var(--text); font-weight: 500; }
+.vault-report.warn { border-left-color: var(--danger); }
+.vault-report.warn strong { color: var(--danger); }
+
+/* 「已加密 / 未加密」两栏对照。窄窗口下退回单栏，别把字挤成竖条。 */
+.sec-cols {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 12px 0 0;
+}
+@media (max-width: 520px) {
+  .sec-cols { grid-template-columns: 1fr; }
+}
+.sec-col {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  border-radius: 6px;
+  padding: 9px 11px;
+}
+.sec-col h4 {
+  margin: 0 0 6px; font-size: 11.5px; font-weight: 500;
+  letter-spacing: .5px; color: var(--text-dim);
+}
+.sec-col ul { margin: 0; padding-left: 16px; }
+.sec-col li { margin: 3px 0; font-size: 12px; line-height: 1.5; color: var(--text); }
+.sec-col em {
+  display: block; font-style: normal; margin-top: 7px;
+  font-size: 11.5px; line-height: 1.6; color: var(--text-dim);
+}
+.sec-col.on { border-left-color: var(--accent); }
+.sec-col.on h4 { color: var(--accent); }
+.sec-col.off { border-left-color: var(--text-dim); }
+
+/* 状态行：未启用 / 已解锁 / 已锁定。左边一个色点，颜色就是状态本身。 */
+.sec-state {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12.5px; color: var(--text);
+  padding: 8px 11px; margin: 10px 0 0;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.sec-state::before {
+  content: ""; flex: none;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--text-dim);
+}
+.sec-state em {
+  font-style: normal; color: var(--text-dim); font-size: 11.5px; margin-left: auto;
+}
+.sec-state.unlocked { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.sec-state.unlocked::before { background: var(--accent); }
+/* 已启用但锁着：用 danger 不是因为出错，而是因为这时候密码读不出来，
+   用户多半正纳闷「我的密码呢」—— 要显眼。 */
+.sec-state.locked { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+.sec-state.locked::before { background: var(--danger); }
+.sec-state.off { color: var(--text-dim); }
+.sec-state.off::before { background: var(--text-dim); }

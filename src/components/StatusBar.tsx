@@ -27,7 +27,9 @@ interface Props {
   /** 复制成功 / 失败时弹一条提示（没传就静默） */
   onNotify?: (msg: string) => void;
   /** 打开「设置」下的某个窗口 */
-  onOpenSettings: (which: "appearance" | "behavior" | "shortcuts" | "keys" | "agent") => void;
+  onOpenSettings: (
+    which: "appearance" | "behavior" | "shortcuts" | "keys" | "agent" | "security"
+  ) => void;
   /** 有设置窗口打开时高亮齿轮 */
   settingsOpen: boolean;
 }
@@ -504,7 +506,9 @@ export default function StatusBar({
     };
   }, [settingsMenuOpen]);
 
-  const pickSettings = (w: "appearance" | "behavior" | "shortcuts" | "keys" | "agent") => {
+  const pickSettings = (
+    w: "appearance" | "behavior" | "shortcuts" | "keys" | "agent" | "security"
+  ) => {
     setSettingsMenuOpen(false);
     onOpenSettings(w);
   };
@@ -660,6 +664,10 @@ export default function StatusBar({
             <button className="ctx-item" role="menuitem" onClick={() => pickSettings("agent")}>
               Nexus AI Agent…
               <span className="ctx-shortcut">把会话输出旁路给模型</span>
+            </button>
+            <button className="ctx-item" role="menuitem" onClick={() => pickSettings("security")}>
+              安全…
+              <span className="ctx-shortcut">主密码 · 凭据加密</span>
             </button>
           </div>
         )}

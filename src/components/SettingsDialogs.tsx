@@ -13,7 +13,10 @@ import type {
   AgentConfig,
   AgentExecMode,
   AgentProvider,
+  SweepReport,
+  VaultStatus,
 } from "../types";
+import MasterPasswordDialog, { type MasterPasswordMode } from "./MasterPasswordDialog";
 import {
   DEFAULT_SHORTCUTS,
   SHORTCUT_LABELS,
@@ -769,6 +772,301 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ——— 安全（主密码保险库）———
+
+/** 操作完成后给用户看的一句话。warn = 有东西需要用户动手补救，用警告色。 */
+interface VaultReport {
+  text: string;
+  warn: boolean;
+}
+
+/** `SweepReport | number | null` 三选一里挑出 SweepReport —— number 是重置返回的条数 */
+function isSweep(r: SweepReport | number | null): r is SweepReport {
+  return typeof r === "object" && r !== null;
+}
+
+/** 「12 条凭据、2 个 API Key、3 个 TOTP 种子」——为 0 的项不列，免得报告里全是「0 个」。 */
+function sweepParts(r: SweepReport): string {
+  const xs = [
+    `${r.credentials} 条凭据`,
+    r.apiKeys > 0 ? `${r.apiKeys} 个 API Key` : null,
+    r.seedsConverted > 0 ? `${r.seedsConverted} 个 TOTP 种子` : null,
+  ].filter((x): x is string => x !== null);
+  // 一条都没动过也要说话：静默成功会让用户怀疑按钮根本没生效
+  return xs.length > 0 ? xs.join("、") : "0 条凭据";
+}
+
+/**
+ * 把 `onDone` 的回值翻成人话。
+ *
+ * 先看回值类型再看 mode：`unlock` 这一屏里用户可能走的是「忘记主密码 → 重置」，
+ * 那条路返回的是 number，和解锁完全不是一回事。
+ */
+function describeDone(mode: MasterPasswordMode, r: SweepReport | number | null): VaultReport {
+  if (typeof r === "number") {
+    return {
+      text: `已重置保险库，销毁了 ${r} 条加密凭据，保险库退回未启用。旧数据的备份留在应用数据目录，日后想起主密码仍可找回。`,
+      warn: true,
+    };
+  }
+  if (isSweep(r)) {
+    if (mode === "disable") {
+      return {
+        text: `已关闭主密码保护，${sweepParts(r)}还原成明文存回 nexus.db。`,
+        warn: false,
+      };
+    }
+    // seedsUnreadable 是唯一需要用户动手的结果：那几个种子是别的机器写的，本机解不开
+    const tail =
+      r.seedsUnreadable > 0
+        ? ` ${r.seedsUnreadable} 个 TOTP 种子来自其它机器、解不开，需要重新填写。`
+        : "";
+    return { text: `已加密 ${sweepParts(r)}。${tail}`, warn: r.seedsUnreadable > 0 };
+  }
+  return mode === "change"
+    ? { text: "主密码已修改。旧密码立即失效，请记牢新密码。", warn: false }
+    : { text: "已解锁，本次运行期间凭据可正常读写。", warn: false };
+}
+
+export function SecurityDialog({ onClose }: { onClose: () => void }) {
+  const [status, setStatus] = useState<VaultStatus | null>(null);
+  /** null = 还在问系统凭据服务。不是 false —— 「没记住」和「还不知道」要分开显示 */
+  const [remembered, setRemembered] = useState<boolean | null>(null);
+  const [prompt, setPrompt] = useState<MasterPasswordMode | null>(null);
+  /** 开出去的那个弹窗里「在本机记住」要不要预先勾上 */
+  const [rememberDefault, setRememberDefault] = useState(false);
+  const [report, setReport] = useState<VaultReport | null>(null);
+  /** 每次操作完 +1，驱动下面两条 effect 重新拉状态 */
+  const [tick, setTick] = useState(0);
+
+  // 弹窗开着的时候 Escape 归它管，否则一下 Esc 会把两层一起关掉
+  useEsc(onClose, prompt === null);
+
+  // 状态是廉价的内存读，挂载即拉
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      const s = await api.vaultStatus();
+      if (alive) setStatus(s);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [tick]);
+
+  // 「本机记住」单独一条、且只在保险库启用后才问：vaultIsRemembered 会访问系统凭据服务，
+  // Linux 上没有 D-Bus 时可能卡住，绝不能让它挡住首帧。
+  useEffect(() => {
+    if (!status?.enabled) return;
+    let alive = true;
+    setRemembered(null);
+    void (async () => {
+      const r = await api.vaultIsRemembered();
+      if (alive) setRemembered(r);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [status]);
+
+  /** 打开主密码弹窗。`remember` 只影响弹窗里那个勾选框的初值。 */
+  const open = (mode: MasterPasswordMode, remember = false) => {
+    setReport(null);
+    setRememberDefault(remember);
+    setPrompt(mode);
+  };
+
+  const done = (mode: MasterPasswordMode) => (r: SweepReport | number | null) => {
+    setPrompt(null);
+    setReport(describeDone(mode, r));
+    setTick((t) => t + 1);
+  };
+
+  const lockNow = async () => {
+    await api.vaultLock();
+    setReport({ text: "已锁定。再次读写已保存的凭据需要重新输入主密码。", warn: false });
+    setTick((t) => t + 1);
+  };
+
+  /**
+   * 「在本机记住」是单向免密的：关掉只是丢钥匙，随手就能做；
+   * 打开等于往系统凭据服务里写一把能解开整个库的钥匙，必须重新验证主密码 ——
+   * 这里没有免密写入的分支，是有意为之，不要补一个。
+   */
+  const toggleRemember = (next: boolean) => {
+    if (next) {
+      open("unlock", true);
+      return;
+    }
+    setRemembered(false);
+    setReport({
+      text: "已忘掉本机记住的钥匙。当前不会锁定，下次启动时需要输入主密码。",
+      warn: false,
+    });
+    void api.vaultForget();
+  };
+
+  const enabled = status?.enabled === true;
+  const unlocked = status?.unlocked === true;
+
+  return (
+    <div className="modal-backdrop" onMouseDown={() => prompt === null && onClose()}>
+      <div className="modal settings-modal" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="settings-head">
+          <h2>安全</h2>
+          <button className="settings-x" onClick={onClose} title="关闭（Esc）">
+            ×
+          </button>
+        </div>
+        <p className="mark-hint">
+          主密码保护已保存的密码、私钥口令、API Key 和 TOTP 种子。密钥由主密码派生，
+          nexus.db 可以原样拷到另一台机器，输同一个主密码就全部打开。
+        </p>
+
+        {/* 状态行 */}
+        {status === null ? (
+          <div className="sec-state">
+            读取保险库状态…
+          </div>
+        ) : !enabled ? (
+          <div className="sec-state off">
+            未启用主密码保护
+            <em>密码、私钥口令、API Key 以明文存在 nexus.db 里</em>
+          </div>
+        ) : unlocked ? (
+          <div className="sec-state unlocked">
+            已解锁
+            <em>本次运行期间凭据可正常读写</em>
+          </div>
+        ) : (
+          <div className="sec-state locked">
+            已锁定
+            <em>需要主密码才能读写已保存的凭据</em>
+          </div>
+        )}
+
+        {/* 操作区：按状态给按钮，不给的那些是此刻根本做不了的 */}
+        <div className="settings-section">主密码</div>
+        {status === null ? (
+          <p className="ag-hint">…</p>
+        ) : !enabled ? (
+          <>
+            <div className="row">
+              <label>保险库</label>
+              <button className="btn primary" onClick={() => open("enable")}>
+                启用主密码保护…
+              </button>
+            </div>
+            <p className="ag-hint">
+              启用后会把库里已有的凭据一次性改写成密文。
+              <strong>忘记主密码将无法恢复任何凭据，也没有找回手段。</strong>
+            </p>
+          </>
+        ) : unlocked ? (
+          <div className="row">
+            <label>保险库</label>
+            <button className="btn" onClick={() => open("change")}>
+              修改主密码…
+            </button>
+            <button className="btn" onClick={() => void lockNow()}>
+              立即锁定
+            </button>
+            <button className="btn" onClick={() => open("disable")}>
+              关闭主密码保护…
+            </button>
+          </div>
+        ) : (
+          <div className="row">
+            <label>保险库</label>
+            <button className="btn primary" onClick={() => open("unlock")}>
+              输入主密码解锁…
+            </button>
+          </div>
+        )}
+
+        {/* 「在本机记住」：保险库没启用时这个开关没有意义，整块不渲染 */}
+        {enabled &&
+          (remembered === null ? (
+            <p className="ag-hint">正在检查这把钥匙有没有记在本机…</p>
+          ) : (
+            <label className="settings-check">
+              <input
+                type="checkbox"
+                checked={remembered}
+                onChange={(e) => toggleRemember(e.target.checked)}
+              />
+              <span>
+                在本机记住这把钥匙
+                <em>
+                  仅本机有效，换到其它机器仍需输入主密码。
+                  打开需要重新验证主密码（把钥匙写进系统凭据服务没有免密的路径）；
+                  关掉立即生效，当前不会锁定。
+                </em>
+              </span>
+            </label>
+          ))}
+
+        {report && (
+          <div className={`vault-report${report.warn ? " warn" : ""}`}>
+            <strong>{report.text}</strong>
+          </div>
+        )}
+
+        {/* 两栏对照：用户会默认「开了主密码 = 整个库都安全了」，而事实不是。 */}
+        <div className="settings-section">加密范围</div>
+        <div className="sec-cols">
+          <div className={`sec-col${enabled ? " on" : " off"}`}>
+            <h4>{enabled ? "已加密" : "已加密 —— 当前未加密"}</h4>
+            <ul>
+              <li>SSH 登录密码</li>
+              <li>私钥口令</li>
+              <li>LLM API Key</li>
+              <li>TOTP 种子</li>
+            </ul>
+            {enabled ? (
+              <em>
+                密钥由主密码派生，整个 nexus.db 可以拷到别的机器，输同一个主密码就能打开。
+                忘记主密码 = 以上四项全部永久无法恢复。
+              </em>
+            ) : (
+              <em>
+                保险库未启用，前三项以明文存在 nexus.db 里。
+                TOTP 种子是例外：它现在挂在本机密钥上，是加密的，但<strong>不可移植</strong>
+                —— 把 nexus.db 拷到另一台机器就解不开，必须重新填写。
+              </em>
+            )}
+          </div>
+          <div className="sec-col off">
+            <h4>未加密（启用主密码也不会加密）</h4>
+            <ul>
+              <li>命令历史（command_history）</li>
+              <li>登录脚本与会话附加设置</li>
+              <li>宏的内容与步骤</li>
+              <li>主机 / 端口 / 用户名 / 分组</li>
+            </ul>
+            <em>命令历史可能包含你手敲进命令行的密码，请留意。</em>
+          </div>
+        </div>
+
+        <div className="modal-actions">
+          <button className="btn primary" onClick={onClose}>
+            完成
+          </button>
+        </div>
+      </div>
+
+      {prompt && (
+        <MasterPasswordDialog
+          mode={prompt}
+          onClose={() => setPrompt(null)}
+          rememberDefault={rememberDefault}
+          onDone={done(prompt)}
+        />
+      )}
     </div>
   );
 }

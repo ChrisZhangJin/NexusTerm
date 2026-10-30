@@ -12,6 +12,7 @@ import {
   BehaviorDialog,
   AgentDialog,
   ShortcutsDialog,
+  SecurityDialog,
 } from "./components/SettingsDialogs";
 import KeyManagerDialog from "./components/KeyManagerDialog";
 import MacroDialog from "./components/MacroDialog";
@@ -89,9 +90,9 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<SessionRecord | null>(null);
-  /** 设置窗口：外观 / 快捷键 / 密钥管理 / AI 助手（模态，同一时刻只开一个） */
+  /** 设置窗口：外观 / 快捷键 / 密钥管理 / AI 助手 / 安全（模态，同一时刻只开一个） */
   const [settingsWin, setSettingsWin] = useState<
-    "appearance" | "behavior" | "shortcuts" | "keys" | "agent" | null
+    "appearance" | "behavior" | "shortcuts" | "keys" | "agent" | "security" | null
   >(null);
   const settingsOpen = settingsWin !== null;
   // 按 tabId 索引（而不是单个全局值）：面板必须「只在自己所属的标签前台时展示」，
@@ -1731,6 +1732,7 @@ export default function App() {
       {settingsWin === "shortcuts" && <ShortcutsDialog onClose={() => setSettingsWin(null)} />}
       {settingsWin === "agent" && <AgentDialog onClose={() => setSettingsWin(null)} />}
       {settingsWin === "keys" && <KeyManagerDialog onClose={() => setSettingsWin(null)} />}
+      {settingsWin === "security" && <SecurityDialog onClose={() => setSettingsWin(null)} />}
 
       {macroOpen && (
         <MacroDialog
