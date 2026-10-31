@@ -127,6 +127,12 @@ pub struct KeyRow {
 /// 对已经存在的旧库不会补列，必须显式检查 pragma。
 /// 每次新增列都在这里加一条，旧库升级后即可平滑读取。
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    // 终端灰字补全曾把用户敲过的命令存在这张表里。现在改读 shell 自己的历史文件，
+    // 这张表没人读了，又是明文（命令行里常带密码 / token），所以连数据一起丢掉。
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_history_key_time;
+         DROP TABLE IF EXISTS command_history;",
+    )?;
     for (column, ddl) in [
         ("connect_timeout", "ALTER TABLE sessions ADD COLUMN connect_timeout INTEGER"),
         // 密码列：默认明文，为的是跨机器迁移连接配置时密码能跟着 db 走。
@@ -226,19 +232,6 @@ impl Store {
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
-
-            -- 终端自动补全用的「session 级」命令历史。key 是会话身份
-            -- （已保存连接配置的 id，本地固定 'local'），不是临时的标签页 id ——
-            -- 这样同一台服务器下次重连、甚至重启应用后新开的标签，都能接着用
-            -- 之前在这台机器上敲过的命令做补全。
-            CREATE TABLE IF NOT EXISTS command_history (
-                key          TEXT NOT NULL,
-                command      TEXT NOT NULL,
-                use_count    INTEGER NOT NULL DEFAULT 1,
-                last_used_at INTEGER NOT NULL,
-                PRIMARY KEY (key, command)
-            );
-            CREATE INDEX IF NOT EXISTS idx_history_key_time ON command_history(key, last_used_at);
             "#,
         )
         .map_err(|e| e.to_string())?;
@@ -428,54 +421,6 @@ impl Store {
         conn.execute("DELETE FROM macros WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
         Ok(())
-    }
-
-    /// 单个会话身份最多保留多少条历史。超出的按最近使用时间裁掉。
-    const HISTORY_CAP: i64 = 300;
-
-    /// 记一条命令：已存在就顶到最近并计数，否则新插一条；随后裁掉超出
-    /// `HISTORY_CAP` 的那部分 —— 裁剪放在同一次调用里，调用方不必关心配额。
-    pub fn record_history(&self, key: &str, command: &str) -> Result<(), String> {
-        let command = command.trim();
-        if command.is_empty() {
-            return Ok(());
-        }
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT INTO command_history (key, command, use_count, last_used_at)
-             VALUES (?1, ?2, 1, ?3)
-             ON CONFLICT(key, command) DO UPDATE SET
-                use_count = use_count + 1,
-                last_used_at = excluded.last_used_at",
-            params![key, command, now_ms()],
-        )
-        .map_err(|e| e.to_string())?;
-        conn.execute(
-            "DELETE FROM command_history WHERE key = ?1 AND command NOT IN (
-                SELECT command FROM command_history WHERE key = ?1
-                ORDER BY last_used_at DESC LIMIT ?2
-             )",
-            params![key, Self::HISTORY_CAP],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    /// 取某个会话身份的历史，按最近使用时间倒序。
-    pub fn list_history(&self, key: &str) -> Result<Vec<String>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT command FROM command_history WHERE key = ?1
-                 ORDER BY last_used_at DESC LIMIT ?2",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(params![key, Self::HISTORY_CAP], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?
-            .collect::<SqlResult<Vec<_>>>()
-            .map_err(|e| e.to_string())?;
-        Ok(rows)
     }
 
     /// 加密准备写进凭据列的值；空串一律落 `NULL`。
@@ -843,15 +788,6 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// 毫秒精度的时间戳，专给 `command_history.last_used_at` 用——秒级精度在短时间内
-/// 连续敲好几条命令时会打平，`ORDER BY last_used_at DESC` 就排不出正确顺序。
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 impl Store {
     /// 一次性迁移：把旧版本存在系统凭据服务里的密码搬进 db 的明文列（仅当 db 里为空），搬完即从凭据服务删除。
     pub fn migrate_legacy_secrets(&self) {
@@ -1066,52 +1002,29 @@ mod tests {
         assert_eq!(store.get_macro(&m.id).unwrap().name, "ok");
     }
 
+    /// 旧版本留下的 `command_history` 表要在启动时被丢掉：里面是用户手敲命令的明文
+    /// （常夹带密码 / token），而且已经没有任何代码会读它。
     #[test]
-    fn history_record_and_list_roundtrip() {
-        let store = temp_store("history");
-        store.record_history("host-1", "ls -la").unwrap();
-        store.record_history("host-1", "uptime").unwrap();
-        // 不同 key 之间互不可见
-        store.record_history("host-2", "whoami").unwrap();
-        assert_eq!(
-            store.list_history("host-1").unwrap(),
-            vec!["uptime".to_string(), "ls -la".to_string()]
-        );
-        assert_eq!(store.list_history("host-2").unwrap(), vec!["whoami".to_string()]);
-    }
-
-    #[test]
-    fn history_same_command_bumps_to_recent_instead_of_duplicating() {
-        let store = temp_store("history-bump");
-        store.record_history("k", "ls").unwrap();
-        store.record_history("k", "pwd").unwrap();
-        store.record_history("k", "ls").unwrap(); // 再敲一次 ls：应该顶到最近，不是新增一条
-        let items = store.list_history("k").unwrap();
-        assert_eq!(items, vec!["ls".to_string(), "pwd".to_string()]);
-    }
-
-    /// 超过单 key 的 300 条上限要被裁掉 —— 用构造好的时间戳直接写库，
-    /// 避免同一秒内调用 300 次 `record_history` 时 `last_used_at` 打平、排序不确定。
-    #[test]
-    fn history_prunes_beyond_cap() {
-        let store = temp_store("history-cap");
+    fn legacy_command_history_table_is_dropped_on_open() {
+        let (store, db) = temp_store_at("history-drop");
+        let base = db.parent().unwrap().to_path_buf();
         {
             let conn = store.conn.lock().unwrap();
-            for i in 0..320i64 {
-                conn.execute(
-                    "INSERT INTO command_history (key, command, use_count, last_used_at)
-                     VALUES ('k', ?1, 1, ?2)",
-                    params![format!("cmd-{i}"), i],
-                )
-                .unwrap();
-            }
+            conn.execute_batch(
+                "CREATE TABLE command_history (key TEXT, command TEXT, last_used_at INTEGER);
+                 CREATE INDEX idx_history_key_time ON command_history(key, last_used_at);
+                 INSERT INTO command_history VALUES ('k', 'mysql -pSECRET', 1);",
+            )
+            .unwrap();
         }
-        // 这次记录会触发裁剪：命中一条已存在的命令，顺带把超额的老记录删掉
-        store.record_history("k", "cmd-319").unwrap();
-        let items = store.list_history("k").unwrap();
-        assert_eq!(items.len(), 300);
-        // 保留的必须是最近使用的那 300 条（cmd-20..=cmd-319），最老的 cmd-0..=cmd-19 被裁掉
-        assert!(items.contains(&"cmd-319".to_string()));
-        assert!(!items.contains(&"cmd-0".to_string()));
+        drop(store);
+        let reopened = Store::open(base).unwrap();
+        let conn = reopened.conn.lock().unwrap();
+        let exists: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE name = 'command_history'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!exists);
     }
 }

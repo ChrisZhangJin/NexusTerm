@@ -13,14 +13,6 @@ export const api = {
     return Promise.resolve();
   },
 
-  /** 历史只在 `persist` 为真时才真落盘，测试默认不走到这里 */
-  historyRecord(): Promise<void> {
-    return Promise.resolve();
-  },
-  historyList(): Promise<string[]> {
-    return Promise.resolve([]);
-  },
-
   /** 输入日志落盘用（`lib/macInput` 的现场记录）。自测里没有后端，直接吞掉 */
   appendInputLog(): Promise<void> {
     return Promise.resolve();

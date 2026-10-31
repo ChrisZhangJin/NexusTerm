@@ -255,19 +255,36 @@ pub async fn local_stats() -> Result<crate::sysstat::Stats, String> {
     crate::sysstat::collect().await
 }
 
-// ——— Console 自动补全：session 级命令历史 ———
+// ——— Console 自动补全：读 shell 自己的历史文件 ———
 //
-// 按会话身份（已保存连接配置的 id，本地固定 'local'）持久化而非临时标签页 id，
-// 这样重连甚至重启应用后新开的标签都能接着用之前敲过的命令补全。
+// 只读、只回传、不落盘：内容不进 nexus.db，也不进日志（见 `histfile` 模块说明）。
 
+/// 本机 shell 的历史（从旧到新）。读不到就是空，不报错。
 #[tauri::command]
-pub fn history_record(key: String, command: String, state: State<'_, AppState>) -> Result<(), String> {
-    state.store.record_history(&key, &command)
+pub async fn history_load_local() -> Vec<String> {
+    tokio::task::spawn_blocking(crate::histfile::load_local)
+        .await
+        .unwrap_or_default()
 }
 
+/// 远端 shell 的历史（从旧到新）。走旁路 exec 通道，所以兼容模式的连接（堡垒机）
+/// 会得到错误而不是空：前端要靠这个错误认出「服务端拒绝并行通道」。
 #[tauri::command]
-pub fn history_list(key: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    state.store.list_history(&key)
+pub async fn history_load_remote(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, SessionError> {
+    let text = state
+        .sessions
+        .run_sidecar(
+            &id,
+            "exec sh -s",
+            Some(crate::histfile::REMOTE_SCRIPT),
+            8,
+            "读取历史超时",
+        )
+        .await?;
+    Ok(crate::histfile::parse(&text))
 }
 
 // ——— 会话附加状态（跳板机登录路径 / 兼容模式）———

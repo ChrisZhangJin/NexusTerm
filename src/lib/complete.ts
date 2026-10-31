@@ -2,22 +2,25 @@
  * Console 自动补全的数据层：**完全不碰 DOM / xterm**，只回答一个问题——
  * 根据这个会话的历史，人现在敲的这半句最可能是哪条命令？
  *
+ * ## 历史从哪来
+ *
+ * 两个来源，都只在内存里，**不落盘**：
+ * - shell 自己的历史文件（后端 `history_load_*` 读 `~/.bash_history` 等），连接时拉一次；
+ * - 本次运行里人在这个会话敲过的命令（`recordCommand`）。
+ * bash 默认退出时才写文件，所以第二项不是多余的：它补上「文件里还没有的最近几条」。
+ *
  * 和渲染拆开是有意的：这件事能独立推理与验证，混进 xterm 的事件回调里就只能
  * 靠「跑起来看屏幕」来验了。
  *
  * ## key 是「会话身份」，不是标签页 id
  *
  * 本地 shell 固定是 `"local"`，已保存的 SSH 连接是它的 `SessionRecord.id`，
- * 两者都会落盘，重启应用后新开的标签也能接着用。临时 SSH 连接（手填参数、
- * 不保存就连）没有这个身份，调用方传标签页自己的 `tabId` 当 key —— 这类 key
- * 不走持久化路径，关掉标签就没了。
+ * 同一身份的多个标签共用内存里的一份。临时 SSH 连接（手填参数、不保存就连）
+ * 没有这个身份，调用方传标签页自己的 `tabId` 当 key —— 关掉标签就没了。
  */
 
-import { api } from "../api";
-
-/** 每个 key 记住多少条历史命令。够回放最近的工作节奏，又不至于吃内存；
- *  与后端 `Store::HISTORY_CAP` 保持一致。 */
-const HISTORY_CAP = 300;
+/** 每个 key 记住多少条历史命令。与后端 `histfile::MAX_ITEMS` 保持一致。 */
+const HISTORY_CAP = 1000;
 /** 少于这么多字符就预测的话，噪声远大于帮助 —— 敲一个 `d` 不该猜出 `docker ps -a` */
 const MIN_PREDICT_CHARS = 2;
 
@@ -27,10 +30,24 @@ const BS = 0x08;
 
 /** 当前正在敲的那一行（不含提示符）。 */
 export interface LineState {
+  /** 已知部分。`known` 为假时恒为空串。 */
   text: string;
+  /**
+   * 这一行从行首起的每个字符，我们是不是都亲眼见过。
+   *
+   * 补全只认**从行首开始**的前缀，所以一旦丢了前缀（Tab 交给 shell 补全、方向键翻历史、
+   * Ctrl-A/E/W/R、粘贴……画面被 shell 改写了，我们无从得知现在行里是什么），
+   * 就必须进入「未知」，直到下一次回车 / Ctrl-C 把行重置。
+   *
+   * 绝不能退化成「清空后接着攒」：那样后面敲的尾巴（`attach -t 0`）会被当成完整一行，
+   * 既拿去匹配，回车后还会记进历史，之后敲 `att` 就提示出一条从没人完整敲过的命令。
+   */
+  known: boolean;
+  /** 正处在括号粘贴（ESC[200~ … ESC[201~）里：整段都不是「敲」的，shell 也不会逐行执行。 */
+  pasting: boolean;
 }
 
-export const newLineState = (): LineState => ({ text: "" });
+export const newLineState = (): LineState => ({ text: "", known: true, pasting: false });
 
 interface History {
   /** 最近用过的排在最后 */
@@ -55,18 +72,25 @@ const ESC_CSI = 2;
 /**
  * 把一串按键喂进行状态。
  *
- * 除回车（提交）与退格外，其余控制字符（↑↓、Ctrl-U/Ctrl-W、Tab…）一律清空行
- * 状态：**画面已被改写，无从得知光标停在哪、剩下什么**，与其拿错的半句去猜，
- * 不如撤下补全，人回到提示符重敲状态立刻又准。
+ * - 回车：提交。行已知才交出命令；未知的行什么都不交（也就不会进历史），随后重置为已知。
+ * - 退格 / Ctrl-U：结果可推断（光标在行尾，Ctrl-U 删掉整行），行保持已知。
+ * - Ctrl-C：新提示符，重置为已知的空行。Ctrl-L 只重绘屏幕，不动行内容。
+ * - 其余控制字符与所有 ESC 序列（↑↓←→、Home/End、Tab…）：画面被改写，行变**未知**。
  *
  * ESC 序列必须整段吃掉：方向键是 `ESC [ A` 三个字节，只处理 ESC 的话后面的
- * `[A` 会被当普通字符接进行里，按一下 ↑ 行状态就变成 `[A`。
+ * `[A` 会被当普通字符接进行里。括号粘贴的起止标记也在这里认出来。
  *
  * @returns 本次按键里若有回车，返回被提交的那条命令；否则返回 null
  */
 export function feedKeys(state: LineState, data: string): string | null {
   let committed: string | null = null;
   let esc = ESC_NONE;
+  let params = "";
+
+  const lose = () => {
+    state.text = "";
+    state.known = false;
+  };
 
   for (const ch of data) {
     const code = ch.charCodeAt(0);
@@ -75,10 +99,17 @@ export function feedKeys(state: LineState, data: string): string | null {
     if (esc !== ESC_NONE) {
       if (esc === ESC_SEEN && (ch === "[" || ch === "O")) {
         esc = ESC_CSI;
+        params = "";
         continue;
       }
       if (esc === ESC_CSI) {
-        if (code >= 0x40 && code <= 0x7e) esc = ESC_NONE;
+        if (code >= 0x40 && code <= 0x7e) {
+          esc = ESC_NONE;
+          if (ch === "~" && params === "200") state.pasting = true;
+          else if (ch === "~" && params === "201") state.pasting = false;
+        } else {
+          params += ch;
+        }
         continue;
       }
       // ESC 后面不是 `[` / `O`：不是光标序列，按普通字符继续走下面
@@ -87,25 +118,43 @@ export function feedKeys(state: LineState, data: string): string | null {
 
     if (code === 0x1b) {
       esc = ESC_SEEN;
-      state.text = "";
+      lose();
       continue;
     }
+    // 粘贴期间一切都不算「敲」：不攒字、不提交（shell 也不会在粘贴的换行上执行）
+    if (state.pasting) continue;
+
     if (code === CR || code === 0x0a) {
-      const done = state.text.trim();
+      const done = state.known ? state.text.trim() : "";
       state.text = "";
+      state.known = true;
       if (done && committed === null) committed = done;
       continue;
     }
+    if (code === 0x03) {
+      // Ctrl-C
+      state.text = "";
+      state.known = true;
+      continue;
+    }
+    if (code === 0x0c) continue; // Ctrl-L
+    if (code === 0x15) {
+      // Ctrl-U：光标在行尾（已知的行必然如此）时删掉整行
+      if (state.known) state.text = "";
+      continue;
+    }
     if (code === DEL || code === BS) {
-      state.text = state.text.slice(0, -1);
+      if (state.known) state.text = state.text.slice(0, -1);
       continue;
     }
     if (code < 0x20) {
-      state.text = "";
+      lose();
       continue;
     }
-    state.text += ch;
+    if (state.known) state.text += ch;
   }
+  // 粘贴过的行：括号粘贴结束后行里多了我们没逐字看过的内容
+  if (state.pasting) lose();
   return committed;
 }
 
@@ -125,11 +174,9 @@ function historyOf(key: string): History {
  *
  * 只收非空且不含控制字符的输入：被打断的半句、一路 Tab 拼出来的残句，
  * 都不该混进历史 —— 它们一旦被记下，下次就会把垃圾推到最前面。
- *
- * 本地缓存同步更新（接下来几次按键的预测不用等网络往返）；`persist` 为真时
- * 再 fire-and-forget 落盘 —— 失败不影响本地体验。
+ * 只进内存，不落盘。
  */
-export function recordCommand(key: string, raw: string, persist: boolean): void {
+export function recordCommand(key: string, raw: string): void {
   const cmd = raw.trim();
   if (!cmd || cmd.length > 4096 || hasControl(cmd)) return;
 
@@ -141,23 +188,21 @@ export function recordCommand(key: string, raw: string, persist: boolean): void 
   if (h.items.length > HISTORY_CAP) {
     h.items.splice(0, h.items.length - HISTORY_CAP);
   }
-
-  if (persist) {
-    void api.historyRecord(key, cmd).catch(() => {});
-  }
 }
 
 /**
- * 从后端拉一个会话身份的全量历史，灌进本地缓存。
+ * 把 shell 历史文件里的命令并进这个 key 的历史。
  *
- * 只给**持久化**的 key 调用（本地 shell / 已保存的 SSH 连接），标签打开或重连时
- * 一次即可——之后的预测全走本地缓存，`predictHistory`/`historyMatches` 才能是同步的。
- * 失败就当这台机器以前没留下历史。
+ * `fetched` 是**从旧到新**的。它们排在已有条目**之前**：加载是异步的，等它回来时人
+ * 可能已经敲过几条，那几条一定比文件里的新；同一条命令两边都有就只留内存里那份。
+ * 失败（兼容模式、没有历史文件）就当没有，补全退化成只用本次运行里敲过的命令。
  */
-export async function loadHistory(key: string): Promise<void> {
-  const items = await api.historyList(key).catch(() => [] as string[]);
-  // 后端按「最近用过在前」返回，本地约定是「最近用过在后」，这里 reverse 对齐
-  historyOf(key).items = items.slice().reverse();
+export async function loadHistory(key: string, fetch: () => Promise<string[]>): Promise<void> {
+  const fetched = await fetch().catch(() => [] as string[]);
+  const h = historyOf(key);
+  const mine = new Set(h.items);
+  const older = fetched.filter((c) => !mine.has(c) && c.length <= 4096 && !hasControl(c));
+  h.items = [...older, ...h.items].slice(-HISTORY_CAP);
 }
 
 /**
@@ -198,12 +243,12 @@ export function historyMatches(key: string, prefix: string): string[] {
 }
 
 /**
- * 标签关掉了：只清非持久化 key 的内存历史（临时 SSH 连接，退出即忘）。
- * 持久化 key（本地 / 已保存会话）不动——可能还有别的标签共用同一个 key，
- * 真正的数据也早就落盘了，内存里留着只是热缓存，没必要清。
+ * 标签关掉了：只清临时 key 的内存历史（没保存的 SSH 连接，退出即忘）。
+ * 共享 key（本地 / 已保存会话）不动——可能还有别的标签共用同一个 key，
+ * 重开标签时也不必再读一遍文件之前先白手起家。
  */
-export function dropCompletion(key: string, persist: boolean): void {
-  if (!persist) histories.delete(key);
+export function dropCompletion(key: string, shared: boolean): void {
+  if (!shared) histories.delete(key);
 }
 
 // ——— 合成候选 ———

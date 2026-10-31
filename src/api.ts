@@ -270,13 +270,12 @@ export const api = {
       command,
     }),
 
-  // ——— Console 自动补全：session 级命令历史 ———
+  // ——— Console 自动补全：shell 自己的历史文件（只读、只在内存） ———
 
-  /** 记一条命令到某个会话身份（SessionRecord.id，本地固定 'local'）的历史里 */
-  historyRecord: (key: string, command: string) =>
-    invoke<void>("history_record", { key, command }),
-  /** 取某个会话身份的历史，最近用过的排在前面 */
-  historyList: (key: string) => invoke<string[]>("history_list", { key }),
+  /** 本机 shell 的历史，从旧到新。读不到是空数组 */
+  historyLoadLocal: () => invoke<string[]>("history_load_local"),
+  /** 远端 shell 的历史，从旧到新。兼容模式的连接会 reject（走的是旁路通道） */
+  historyLoadRemote: (id: string) => invoke<string[]>("history_load_remote", { id }),
 
   /** 把 Agent 面板浮出为独立系统窗口（已开则切会话并聚焦） */
   agentOpenWindow: (sessionId: string) =>

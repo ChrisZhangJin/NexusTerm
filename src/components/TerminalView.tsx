@@ -16,6 +16,7 @@ import {
 } from "../lib/prefs";
 import { Highlighter, MARK_COLORS, bufferText, type MarkRule } from "../lib/highlight";
 import { parseProbe } from "../lib/context";
+import { getExtras, isSidecarDenied, markCompat } from "../lib/sessionExtras";
 import { viewableKind } from "../lib/viewable";
 import {
   buildCompletions,
@@ -110,13 +111,12 @@ interface Props {
   /** ssh = 远端会话；local = 本机 PTY。两者共用同一套渲染与事件协议 */
   kind?: "ssh" | "local";
   /**
-   * 命令历史按「会话身份」存取，不是 tabId：本地 shell 固定 `"local"`，
-   * 已保存的 SSH 连接是它的 `SessionRecord.id`——这两种会持久化，重连/
-   * 重启应用都能接着用。没有保存记录的临时连接，调用方应该传 `tabId`
-   * 本身当 key：不会被持久化，行为与过去的纯内存历史一致。
+   * 补全历史按「会话身份」存取，不是 tabId：本地 shell 固定 `"local"`，
+   * 已保存的 SSH 连接是它的 `SessionRecord.id`，同一身份的标签共用一份内存历史。
+   * 没有保存记录的临时连接，调用方应该传 `tabId` 本身当 key：关掉标签就忘。
    */
   historyKey: string;
-  /** `historyKey` 是否要落盘持久化（本地 / 已保存会话为 true，临时连接为 false） */
+  /** `historyKey` 是否是多个标签共用的身份（本地 / 已保存会话为 true，临时连接为 false） */
   historyPersist: boolean;
   theme: Theme;
   fontFamily: string;
@@ -358,6 +358,13 @@ export default function TerminalView({
       }
 
       hintsRef.current = items;
+      // 回显还没到就先不画，等回显到了由 `redrawGhost` 补画。远端关了回显的场合
+      // （密码提示符）回显永远不会到，灰字也就永远不会画 —— 否则敲密码时屏幕上会
+      // 冒出一条历史命令，Tab 一按还会把它当密码发出去。
+      if (items.length && !cursorFollowsTyped(term, lineRef.current.text)) {
+        ghostRef.current.clear(term);
+        return;
+      }
       // 只画第一条：没有下拉之后建议没有「高亮项」可言，
       // 想要别的补法就继续敲字把前缀补全。
       const shownItem = items[0];
@@ -385,9 +392,11 @@ export default function TerminalView({
     if (hintRaf.current) return;
     hintRaf.current = requestAnimationFrame(() => {
       hintRaf.current = 0;
-      refreshHints(lineRef.current.text);
+      // 行丢了前缀（Tab / 方向键 / 粘贴之后）：补全只认从行首起的前缀，宁可不提示
+      if (!lineRef.current.known) dismissHints();
+      else refreshHints(lineRef.current.text);
     });
-  }, [refreshHints]);
+  }, [refreshHints, dismissHints]);
 
   // 标签页关掉 / 组件卸载时把没跑完的那一帧撤掉，否则回调会碰已 dispose 的终端
   useEffect(() => {
@@ -459,7 +468,9 @@ export default function TerminalView({
     // 走的是与「自己敲回车」同一条记账路径：行状态提交 + 进历史，再发 \r。
     const committed = feedKeys(lineRef.current, "\r");
     if (committed) {
-      if (lineEchoedRef.current) recordCommand(historyKeyRef.current, committed, historyPersistRef.current);
+      if (lineEchoedRef.current && termRef.current?.buffer.active.type === "normal") {
+        recordCommand(historyKeyRef.current, committed);
+      }
       lineEchoedRef.current = false;
     }
     sendRef.current("\r");
@@ -484,9 +495,8 @@ export default function TerminalView({
     const host = hostRef.current;
     if (!host) return;
 
-    // 只有持久化的 key（本地 / 已保存会话）才值得拉全量历史；
-    // 临时连接没有这个身份，维持现状的纯内存行为。
-    if (historyPersist) void loadHistory(historyKey).catch(() => {});
+    // 本地 shell 的历史文件现在就能读；远端要等连接建立（见下面按 status 触发的 effect）。
+    if (isLocal) void loadHistory(historyKey, api.historyLoadLocal).catch(() => {});
 
     const term = new Terminal({
       fontFamily,
@@ -730,7 +740,10 @@ export default function TerminalView({
       // 喂键攒行（同步、纯字符串运算），候选留到下一帧再算
       const committed = feedKeys(lineRef.current, d);
       if (committed) {
-        if (lineEchoedRef.current) recordCommand(historyKeyRef.current, committed, historyPersistRef.current);
+        // 全屏程序（vim / less）里敲的不是 shell 命令，不进历史
+        if (lineEchoedRef.current && term.buffer.active.type === "normal") {
+          recordCommand(historyKeyRef.current, committed);
+        }
         lineEchoedRef.current = false;
       }
       refreshHintsSoon();
@@ -892,6 +905,29 @@ export default function TerminalView({
     // 字体等外观变化通过下面的 effect 单独应用，不重建实例
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId]);
+
+  // —— 连上之后读一次远端 shell 的历史文件，给灰字补全当候选 ——
+  // 走旁路 exec 通道：兼容模式（堡垒机）一条额外通道都不开，直接跳过；
+  // 第一次被服务端拒绝时和状态栏、上下文探测一样，记下「这台只让开一条通道」。
+  const remoteHistoryLoaded = useRef(false);
+  useEffect(() => {
+    if (isLocal || status !== "connected" || remoteHistoryLoaded.current) return;
+    remoteHistoryLoaded.current = true;
+    const configId = historyPersistRef.current ? historyKeyRef.current : null;
+    if (configId && getExtras(configId).compat) return;
+    void loadHistory(historyKeyRef.current, async () => {
+      try {
+        return await api.historyLoadRemote(tabId);
+      } catch (e) {
+        if (isSidecarDenied(e) && markCompat(configId, tabId)) {
+          onNotify?.(
+            "该服务器（堡垒机）不支持并行通道，已切换为兼容模式：不再采集远端资源，下次连接也不会再开额外通道"
+          );
+        }
+        throw e;
+      }
+    });
+  }, [status, isLocal, tabId, onNotify]);
 
   // —— 会话一建立就重新对齐尺寸 ——
   // 挂载时的 fit/resize 发生在 sshConnect 完成之前，后端尚无此会话会静默丢弃；

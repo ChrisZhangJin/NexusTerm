@@ -11,6 +11,7 @@ use store::Store;
 pub mod errors;
 mod agent;
 mod cmd;
+mod histfile;
 mod keys;
 mod local;
 mod viewer;
@@ -193,8 +194,8 @@ pub fn run() {
             cmd::local_write_b64,
             cmd::ssh_stats,
             cmd::local_stats,
-            cmd::history_record,
-            cmd::history_list,
+            cmd::history_load_local,
+            cmd::history_load_remote,
             cmd::session_extras,
             cmd::set_session_extras,
             cmd::ssh_set_sidecar,

@@ -18,6 +18,7 @@ import {
   dropCompletion,
   feedKeys,
   historyMatches,
+  loadHistory,
   newLineState,
   predictHistory,
   recordCommand,
@@ -72,30 +73,120 @@ test("feedKeys 退格删一个字符", () => {
   assert.equal(s.text, "git ");
 });
 
-test("feedKeys 遇到方向键 / Ctrl-U 就清空——状态不可知时不猜", () => {
+test("feedKeys 遇到方向键就进入「未知」——不再攒字，也不交命令", () => {
   const s = newLineState();
   feedKeys(s, "kubectl get po");
   feedKeys(s, "\x1b[A"); // ↑
   assert.equal(s.text, "");
+  assert.equal(s.known, false);
 
-  feedKeys(s, "vim nginx.conf");
-  feedKeys(s, "\x15"); // Ctrl-U
+  // 之后敲的尾巴不能被当成一整行
+  feedKeys(s, "ds -A");
   assert.equal(s.text, "");
+  assert.equal(feedKeys(s, "\r"), null);
+  // 回车之后重新已知
+  assert.equal(s.known, true);
+  feedKeys(s, "ls");
+  assert.equal(s.text, "ls");
 });
 
-test("feedKeys 不清掉 Tab 之后的状态（Tab 走的是另一条路）", () => {
+test("feedKeys Ctrl-U 删掉整行，但行仍然已知", () => {
   const s = newLineState();
-  feedKeys(s, "tail -");
-  assert.equal(s.text, "tail -");
+  feedKeys(s, "vim nginx.conf");
+  feedKeys(s, "\x15");
+  assert.equal(s.text, "");
+  assert.equal(s.known, true);
+  feedKeys(s, "ls");
+  assert.equal(s.text, "ls");
+});
+
+test("feedKeys Tab（交给 shell 补全）之后行未知：残句不会进历史", () => {
+  const s = newLineState();
+  feedKeys(s, "tmux a");
+  feedKeys(s, "\t");
+  assert.equal(s.known, false);
+  feedKeys(s, "ttach -t 0");
+  assert.equal(feedKeys(s, "\r"), null);
+});
+
+test("feedKeys Ctrl-C 重置为已知的空行", () => {
+  const s = newLineState();
+  feedKeys(s, "abc");
+  feedKeys(s, "\x1b[D"); // ←
+  assert.equal(s.known, false);
+  feedKeys(s, "\x03");
+  assert.equal(s.known, true);
+  feedKeys(s, "ls");
+  assert.equal(s.text, "ls");
+});
+
+test("feedKeys 括号粘贴：整段不算敲的，粘贴里的换行不提交", () => {
+  const s = newLineState();
+  assert.equal(feedKeys(s, "\x1b[200~echo a\necho b\x1b[201~"), null);
+  assert.equal(s.known, false);
+  assert.equal(s.pasting, false);
+  assert.equal(s.text, "");
+  // 粘贴后回车：未知的行不交命令
+  assert.equal(feedKeys(s, "\r"), null);
+});
+
+test("feedKeys 粘贴标记跨两次调用也认", () => {
+  const s = newLineState();
+  feedKeys(s, "\x1b[200~echo a\n");
+  assert.equal(s.pasting, true);
+  assert.equal(feedKeys(s, "echo b\x1b[201~"), null);
+  assert.equal(s.pasting, false);
+});
+
+test("feedKeys 退格把未知的行删空也不会变回已知", () => {
+  const s = newLineState();
+  feedKeys(s, "ls");
+  feedKeys(s, "\x1b[A");
+  feedKeys(s, "\x7f\x7f\x7f");
+  assert.equal(s.known, false);
+});
+
+test("历史里不会出现只有尾巴的残句", () => {
+  const id = "tail-frag";
+  dropCompletion(id, false);
+  recordCommand(id, "tmux attach -t 0");
+  const s = newLineState();
+  feedKeys(s, "tmux a");
+  feedKeys(s, "\x1b[D\x1b[C"); // ← →：行未知
+  feedKeys(s, "ttach");
+  const done = feedKeys(s, "\r");
+  if (done) recordCommand(id, done);
+  assert.deepEqual(historyMatches(id, "attach"), []);
+  assert.deepEqual(historyMatches(id, "ttach"), []);
+});
+
+test("loadHistory：文件里的命令排在本次敲的之前，重复只留内存那份", async () => {
+  const id = "load1";
+  dropCompletion(id, false);
+  recordCommand(id, "make test");
+  await loadHistory(id, async () => ["git pull", "make test", "make build"]);
+  // 最近用过的在前：make test（本次敲的，最新）> make build > git pull
+  assert.deepEqual(historyMatches(id, "ma"), ["make test", "make build"]);
+  assert.equal(predictHistory(id, "git p"), "git pull");
+});
+
+test("loadHistory：读取失败当没有历史，不抛", async () => {
+  const id = "load2";
+  dropCompletion(id, false);
+  recordCommand(id, "uname -a");
+  await loadHistory(id, async () => {
+    throw new Error("该连接已启用兼容模式");
+  });
+  assert.equal(predictHistory(id, "una"), "uname -a");
 });
 
 // ——— 历史预测 ———
 
 test("历史：最近用过的优先，重复输入只算一次", () => {
   const id = "h1";
-  recordCommand(id, "tail -f app.log", false);
-  recordCommand(id, "tail -n 100 app.log", false);
-  recordCommand(id, "tail -f app.log", false); // 再次使用 → 应排到最前
+  recordCommand(id, "tail -f app.log");
+  recordCommand(id, "tail -n 100 app.log");
+  recordCommand(id, "tail -f app.log"); // 再次使用 → 应排到最前
 
   assert.equal(predictHistory(id, "tail -f"), "tail -f app.log");
 
@@ -105,27 +196,27 @@ test("历史：最近用过的优先，重复输入只算一次", () => {
 
 test("历史预测有两个字符的门槛：敲一个字母不该弹一堆噪声", () => {
   const id = "h2";
-  recordCommand(id, "docker ps -a", false);
+  recordCommand(id, "docker ps -a");
   assert.equal(predictHistory(id, "d"), null);
   assert.equal(predictHistory(id, "do"), "docker ps -a");
 });
 
 test("已经打完的整条不再预测（不打扰）", () => {
   const id = "h3";
-  recordCommand(id, "ls -la", false);
+  recordCommand(id, "ls -la");
   assert.equal(predictHistory(id, "ls -la"), null);
 });
 
 test("含控制字符的残句不进历史", () => {
   const id = "h4";
-  recordCommand(id, "ls\x1b[Axyz", false);
-  recordCommand(id, "  ", false);
+  recordCommand(id, "ls\x1b[Axyz");
+  recordCommand(id, "  ");
   assert.equal(predictHistory(id, "ls"), null);
 });
 
 test("dropCompletion 放掉历史与缓存", () => {
   const id = "h5";
-  recordCommand(id, "uname -a", false);
+  recordCommand(id, "uname -a");
   assert.equal(predictHistory(id, "una"), "uname -a");
   dropCompletion(id, false);
   assert.equal(predictHistory(id, "una"), null);
@@ -138,8 +229,8 @@ test("dropCompletion 放掉历史与缓存", () => {
 
 test("命令名阶段：只出历史，insert 只补缺的那一段", () => {
   const id = "c1";
-  recordCommand(id, "git status --short", false);
-  recordCommand(id, "git stash list", false);
+  recordCommand(id, "git status --short");
+  recordCommand(id, "git stash list");
   const items = buildCompletions(id, "git st");
   assert.ok(items.length >= 2, "两条历史都该出现");
   const st = items.find((i) => i.label === "git status --short");
@@ -149,7 +240,7 @@ test("命令名阶段：只出历史，insert 只补缺的那一段", () => {
 
 test("insert 绝不含已输入的前缀：token + insert 必须正好补齐整条", () => {
   const id = "c2";
-  recordCommand(id, "tail --follow /var/log/syslog", false);
+  recordCommand(id, "tail --follow /var/log/syslog");
   for (const typed of ["t", "ta", "tail ", "tail --f"]) {
     for (const it of buildCompletions(id, typed)) {
       assert.equal(typed.trimStart() + it.insert, it.label, `${typed} 补出来对不上`);
@@ -160,7 +251,7 @@ test("insert 绝不含已输入的前缀：token + insert 必须正好补齐整�
 
 test("已经打完的整条不再作为候选", () => {
   const id = "c3";
-  recordCommand(id, "docker ps -a", false);
+  recordCommand(id, "docker ps -a");
   assert.deepEqual(buildCompletions(id, "docker ps -a"), []);
 });
 
@@ -171,10 +262,10 @@ test("空行不给任何候选", () => {
 
 test("historyMatches：最近用过的排前面，且封顶 30 条", () => {
   const id = "c5";
-  recordCommand(id, "make build", false);
-  recordCommand(id, "make test", false);
+  recordCommand(id, "make build");
+  recordCommand(id, "make test");
   assert.deepEqual(historyMatches(id, "make"), ["make test", "make build"]);
-  for (let i = 0; i < 40; i++) recordCommand(id, `long-${i}`, false);
+  for (let i = 0; i < 40; i++) recordCommand(id, `long-${i}`);
   assert.equal(historyMatches(id, "long-").length, 30);
 });
 
@@ -428,7 +519,7 @@ test("端到端：敲 'tail --f' 到按 Tab，补全的那段正好接上", () =
 
   // 先让历史里有一条完整命令
   for (const ch of "tail --follow /var/log/syslog") feedKeys(s, ch);
-  recordCommand(id, feedKeys(s, "\r") ?? "", false);
+  recordCommand(id, feedKeys(s, "\r") ?? "");
 
   // 再敲半句
   for (const ch of "tail --f") feedKeys(s, ch);
@@ -449,7 +540,7 @@ test("端到端：acceptHint 之后行状态与终端内容一致", () => {
   const id = "e2e2";
   dropCompletion(id, false);
   const s = newLineState();
-  recordCommand(id, "kubectl get pods -A", false);
+  recordCommand(id, "kubectl get pods -A");
 
   for (const ch of "kubectl g") feedKeys(s, ch);
   const items = buildCompletions(id, s.text);
@@ -460,7 +551,7 @@ test("端到端：acceptHint 之后行状态与终端内容一致", () => {
   // 再回车 → 这条命令被记进历史（且不会因为补全而变成重复项）
   const committed = feedKeys(s, "\r");
   assert.equal(committed, "kubectl get pods -A");
-  recordCommand(id, committed, false);
+  recordCommand(id, committed);
   // 去重生效：历史里仍然只有一条，再敲前缀也只提示这一条
   const again = buildCompletions(id, "kubectl");
   assert.equal(again.length, 1);
