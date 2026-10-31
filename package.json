@@ -1,7 +1,7 @@
 {
   "name": "nexus-term",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "description": "原生 macOS SSH / SFTP 终端 — Rust 后端 + TypeScript 前端",
   "scripts": {
