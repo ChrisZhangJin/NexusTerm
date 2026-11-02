@@ -413,6 +413,12 @@ export interface AgentStep {
 /** `nx://agent/approve/{sessionId}` 的载荷：请人点头 */
 export interface AgentApproveRequest {
   requestId: string;
+  /**
+   * danger：危险命令（仅审批模式下出现）；
+   * scope：动作超出了本轮作用范围，任何执行模式下都要人点头。
+   * 缺省按 danger 处理（兼容旧载荷）。
+   */
+  kind?: "danger" | "scope";
   command: string;
   target: string;
   targetLabel: string;
