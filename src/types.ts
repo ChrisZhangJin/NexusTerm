@@ -314,6 +314,11 @@ export interface AgentConfig {
   activeId: string;
   /** 下令方式。后端对未知字符串降级到 approval（最安全的那一种）。 */
   execMode: AgentExecMode;
+  /**
+   * 排查开关：把推理过程与每轮请求/回复记到 `<app_data>/logs/agent.log`。
+   * 默认关 —— 日志里可能带命令输出，即便后端已脱敏也不该默认落盘。
+   */
+  trace: boolean;
 }
 
 /** 某个会话当前的旁路缓冲状态（后端 `BufferStats` 的镜像） */

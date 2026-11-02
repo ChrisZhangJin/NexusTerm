@@ -140,6 +140,8 @@ pub fn run() {
             let dir = app_data_dir(app.handle());
             // 先起日志：下面每一步（建库、恢复会话）出错都需要留下记录
             init_logging(&dir);
+            // Agent 过程日志（默认不写，用户勾选「记录推理过程」后才会落到 agent.log）
+            agent::trace::init(&dir);
             let keys_dir = dir.join(crate::keys::VAULT_DIR);
             let store = Store::open(dir).expect("SQLite 初始化失败");
             // 把旧版存在系统凭据服务里的密码迁移到 db 的凭据列。

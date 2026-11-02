@@ -761,6 +761,23 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
           )}
         </p>
 
+        <div className="settings-section">排查</div>
+        <label className="settings-check">
+          <input
+            type="checkbox"
+            checked={draft.trace}
+            disabled={!draft.enabled}
+            onChange={(e) => patch({ trace: e.target.checked })}
+          />
+          <span>
+            记录推理过程与请求/回复
+            <em>
+              把模型的推理（服务方返回时）、每轮请求与回复写入应用数据目录下 logs/agent.log。
+              内容可能含敏感信息（写入前会脱敏，但不保证万无一失），默认关闭，排查完请关掉
+            </em>
+          </span>
+        </label>
+
         {saveErr && <div className="ag-err">保存失败：{saveErr}</div>}
 
         <div className="modal-actions">

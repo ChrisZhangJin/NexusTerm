@@ -307,6 +307,13 @@ pub struct ToolCall {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LlmReply {
     pub text: String,
+    /// 模型的推理过程（`reasoning_content` / `thinking` 块），**只给过程日志用**。
+    ///
+    /// 不进界面、不进对话历史：推理文本回传给部分服务方会被拒，
+    /// 也不该把「模型怎么想的」当成「它对用户说的」。
+    ///
+    /// 能否拿到取决于服务方是否返回 —— 我们不会为此主动开启 Anthropic 的 extended thinking。
+    pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
     /// 本轮请求是否真的带上了 tools 声明。
     ///
@@ -620,6 +627,10 @@ pub enum SseAction {
     Nothing,
     /// 增量文本
     Text(String),
+    /// 增量推理文本（OpenAI 兼容层的 `reasoning_content`、Anthropic 的 `thinking_delta`）。
+    ///
+    /// **只用于过程日志**：不发给前端、不进历史。能否收到取决于服务方是否返回。
+    Reasoning(String),
     /// 流应当结束
     Done(FinishReason),
     /// 服务端在流里主动报错
@@ -680,6 +691,11 @@ struct OpenAiChoice {
 struct OpenAiDelta {
     #[serde(default)]
     content: Option<String>,
+    /// DeepSeek 等兼容层用 `reasoning_content`，OpenRouter 一类用 `reasoning`
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 
 /// 各家错误体的公共形状：OpenAI 用 `error.message`，Anthropic 也是。
@@ -700,6 +716,9 @@ struct AnthropicDelta {
 struct AnthropicTextDelta {
     #[serde(default)]
     text: Option<String>,
+    /// `thinking_delta` 的增量；只有服务方返回了 thinking 才会出现
+    #[serde(default)]
+    thinking: Option<String>,
 }
 
 /// Anthropic 的 `message_delta`：结束原因在这里，不在 text 事件里。
@@ -748,6 +767,17 @@ pub fn parse_openai_event(data: &str) -> SseAction {
                 return SseAction::Text(text.to_string());
             }
         }
+        // 推理排在正文之后、结束之前：推理阶段的 chunk 通常 content 为空或 null，
+        // 会自然落到这里；同一 chunk 两者都有时以正文为准（推理只是日志，丢一小段无妨）。
+        let reasoning = choice
+            .delta
+            .reasoning_content
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .or(choice.delta.reasoning.as_deref().filter(|t| !t.is_empty()));
+        if let Some(text) = reasoning {
+            return SseAction::Reasoning(text.to_string());
+        }
         if let Some(reason) = choice.finish_reason.as_deref() {
             return SseAction::Done(finish_reason_from(reason));
         }
@@ -773,8 +803,9 @@ pub fn parse_anthropic_event(event: Option<&str>, data: &str) -> SseAction {
 
     match name.as_str() {
         "content_block_delta" => match serde_json::from_str::<AnthropicDelta>(data) {
-            Ok(d) => match d.delta.text {
-                Some(text) if !text.is_empty() => SseAction::Text(text),
+            Ok(d) => match (d.delta.text, d.delta.thinking) {
+                (Some(text), _) if !text.is_empty() => SseAction::Text(text),
+                (_, Some(think)) if !think.is_empty() => SseAction::Reasoning(think),
                 _ => SseAction::Nothing,
             },
             Err(_) => SseAction::Nothing,
@@ -1172,17 +1203,26 @@ enum Step {
 /// [`dispatch_line`] 的薄封装：把「动作」变成「副作用 + 如何继续」。
 ///
 /// 拆出来让主循环与「末尾残行」共用同一套逻辑，[`dispatch_line`] 自身保持纯函数可单测。
+///
+/// `reasoning` 只在开了过程日志时传 `Some`：推理文本只往里攒，绝不 emit 给前端。
 fn step(
     provider: Provider,
     state: &mut SseState,
     line: &str,
     app: &AppHandle,
     session: &str,
+    reasoning: Option<&mut String>,
 ) -> Step {
     match dispatch_line(provider, state, line) {
         SseAction::Nothing => Step::Continue,
         SseAction::Text(text) => {
             emit_token(app, session, &text);
+            Step::Continue
+        }
+        SseAction::Reasoning(text) => {
+            if let Some(buf) = reasoning {
+                buf.push_str(&text);
+            }
             Step::Continue
         }
         SseAction::Done(reason) => Step::Finished(reason),
@@ -1273,6 +1313,8 @@ async fn stream_answer(
     let mut state = SseState::default();
     let mut lines: Vec<String> = Vec::with_capacity(8);
     let mut finished: Option<FinishReason> = None;
+    // 过程日志开着才攒推理文本；关着就是 None，step 里连 push 都不会发生
+    let mut reasoning = cfg.trace.then(String::new);
 
     while let Some(item) = stream.next().await {
         // 取消检查放在每段的开头：置位后最多再多处理一个网络包就停。
@@ -1290,7 +1332,7 @@ async fn stream_answer(
         };
         decoder.push(&chunk, &mut lines);
         for line in lines.drain(..) {
-            match step(provider, &mut state, &line, &app, &session) {
+            match step(provider, &mut state, &line, &app, &session, reasoning.as_mut()) {
                 Step::Continue => {}
                 Step::Finished(reason) => {
                     finished = Some(reason);
@@ -1311,7 +1353,7 @@ async fn stream_answer(
     // 冲刷残行再判一次，否则最后一段答案会丢。
     if finished.is_none() {
         if let Some(line) = decoder.finish() {
-            match step(provider, &mut state, &line, &app, &session) {
+            match step(provider, &mut state, &line, &app, &session, reasoning.as_mut()) {
                 Step::Continue => {}
                 Step::Finished(reason) => finished = Some(reason),
                 Step::Aborted(message) => {
@@ -1320,6 +1362,10 @@ async fn stream_answer(
                 }
             }
         }
+    }
+
+    if let Some(r) = reasoning.filter(|r| !r.is_empty()) {
+        super::trace::record(&session, 0, "reasoning（流式问答）", &r);
     }
 
     match finished {
@@ -1356,6 +1402,13 @@ pub fn extract_reply(provider: Provider, body: &str) -> Option<LlmReply> {
             {
                 reply.text = text.to_string();
             }
+            // DeepSeek 等用 reasoning_content，OpenRouter 一类用 reasoning；都没有就是服务方没给
+            if let Some(think) = ["reasoning_content", "reasoning"]
+                .iter()
+                .find_map(|k| value.pointer(&format!("/choices/0/message/{k}")).and_then(|v| v.as_str()))
+            {
+                reply.reasoning = think.to_string();
+            }
             if let Some(calls) =
                 value.pointer("/choices/0/message/tool_calls").and_then(|v| v.as_array())
             {
@@ -1387,6 +1440,12 @@ pub fn extract_reply(provider: Provider, body: &str) -> Option<LlmReply> {
                         "text" => {
                             if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
                                 reply.text.push_str(t);
+                            }
+                        }
+                        // 只有服务方返回了 thinking 块才有；redacted_thinking 是密文，没法读，忽略
+                        "thinking" => {
+                            if let Some(t) = b.get("thinking").and_then(|v| v.as_str()) {
+                                reply.reasoning.push_str(t);
                             }
                         }
                         "tool_use" => {
@@ -1852,6 +1911,117 @@ mod tests {
     }
 
     // —————————————— dispatch_line 状态机 ——————————————
+
+    // ——— 推理（只给过程日志用）———
+
+    #[test]
+    fn openai_reasoning_content_is_reasoning_not_text() {
+        // DeepSeek 推理阶段：content 为 null / 空串，推理在 reasoning_content 里
+        assert_eq!(
+            parse_openai_event(r#"{"choices":[{"delta":{"content":null,"reasoning_content":"先看目录"}}]}"#),
+            SseAction::Reasoning("先看目录".to_string())
+        );
+        assert_eq!(
+            parse_openai_event(r#"{"choices":[{"delta":{"content":"","reasoning_content":"嗯"}}]}"#),
+            SseAction::Reasoning("嗯".to_string())
+        );
+    }
+
+    #[test]
+    fn openai_reasoning_alias_field_is_accepted() {
+        assert_eq!(
+            parse_openai_event(r#"{"choices":[{"delta":{"reasoning":"hmm"}}]}"#),
+            SseAction::Reasoning("hmm".to_string())
+        );
+    }
+
+    #[test]
+    fn openai_empty_reasoning_is_ignored() {
+        assert_eq!(
+            parse_openai_event(r#"{"choices":[{"delta":{"reasoning_content":""}}]}"#),
+            SseAction::Nothing
+        );
+        assert_eq!(
+            parse_openai_event(r#"{"choices":[{"delta":{"reasoning_content":null}}]}"#),
+            SseAction::Nothing
+        );
+    }
+
+    #[test]
+    fn openai_text_still_wins_and_finish_is_not_swallowed() {
+        // 正文照旧是 Text，推理字段的存在不能改变它
+        assert_eq!(
+            parse_openai_event(r#"{"choices":[{"delta":{"content":"答","reasoning_content":"想"}}]}"#),
+            SseAction::Text("答".to_string())
+        );
+        // 空推理不能挡住 finish_reason
+        assert_eq!(
+            parse_openai_event(
+                r#"{"choices":[{"delta":{"reasoning_content":""},"finish_reason":"stop"}]}"#
+            ),
+            SseAction::Done(FinishReason::Stop)
+        );
+    }
+
+    #[test]
+    fn anthropic_thinking_delta_is_reasoning() {
+        assert_eq!(
+            parse_anthropic_event(
+                Some("content_block_delta"),
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"让我想想"}}"#
+            ),
+            SseAction::Reasoning("让我想想".to_string())
+        );
+    }
+
+    #[test]
+    fn anthropic_empty_thinking_is_ignored() {
+        assert_eq!(
+            parse_anthropic_event(
+                Some("content_block_delta"),
+                r#"{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":""}}"#
+            ),
+            SseAction::Nothing
+        );
+        // signature_delta 没有可读文本，同样忽略
+        assert_eq!(
+            parse_anthropic_event(
+                Some("content_block_delta"),
+                r#"{"type":"content_block_delta","delta":{"type":"signature_delta","signature":"abc"}}"#
+            ),
+            SseAction::Nothing
+        );
+    }
+
+    #[test]
+    fn anthropic_text_delta_unaffected_by_thinking_support() {
+        assert_eq!(
+            parse_anthropic_event(
+                Some("content_block_delta"),
+                r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}"#
+            ),
+            SseAction::Text("hi".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_reply_collects_reasoning_for_both_providers() {
+        let openai = r#"{"choices":[{"message":{"content":"好","reasoning_content":"先想"}}]}"#;
+        let r = extract_reply(Provider::OpenAI, openai).unwrap();
+        assert_eq!(r.text, "好");
+        assert_eq!(r.reasoning, "先想");
+
+        let anthropic = r#"{"content":[{"type":"thinking","thinking":"A"},{"type":"redacted_thinking","data":"xx"},{"type":"thinking","thinking":"B"},{"type":"text","text":"好"}]}"#;
+        let r = extract_reply(Provider::Anthropic, anthropic).unwrap();
+        assert_eq!(r.text, "好", "thinking 块不能混进正文");
+        assert_eq!(r.reasoning, "AB");
+    }
+
+    #[test]
+    fn extract_reply_without_reasoning_leaves_it_empty() {
+        let r = extract_reply(Provider::OpenAI, r#"{"choices":[{"message":{"content":"好"}}]}"#).unwrap();
+        assert!(r.reasoning.is_empty());
+    }
 
     #[test]
     fn dispatch_tracks_event_name_across_lines() {

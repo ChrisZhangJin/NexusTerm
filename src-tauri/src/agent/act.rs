@@ -61,6 +61,7 @@ use super::capture;
 use super::danger::assess;
 use super::executor::{wait_for_end, ExecEnd, ExecOutcome, WaitConfig};
 use super::llm::{self, ChatMessage, CONTEXT_BEGIN, CONTEXT_END};
+use super::trace;
 use super::{AgentConfig, AgentError};
 use crate::agent::StreamKind;
 use crate::cmd::AppState;
@@ -1672,32 +1673,29 @@ fn tab_list_feedback(tabs: &[TabInfo]) -> String {
     out
 }
 
-/// 诊断用：把每一轮模型的原始回复落盘。
+/// 过程日志：把每一轮的推理、模型原始回复和解析出的动作记到 `agent.log`。
 ///
-/// 默认关闭，只在 `/tmp/nx-agent-trace.on` 存在时才写。
+/// 只在 `cfg.trace` 打开时由调用方调用（见 `agent::trace`，写入前会脱敏）。
 ///
 /// 模型偶尔「只描述、不下令」，界面上一张卡片都没有 —— 光看界面分不清是它压根没写
-/// ```nx-exec 块，还是写了被我们的解析/执行环节拒掉。记下原文和动作数，一次就能定案。
-fn trace_round(session: &str, step: usize, reply: &str, actions: usize) {
-    use std::io::Write as _;
-    const SWITCH: &str = "/tmp/nx-agent-trace.on";
-    if !std::path::Path::new(SWITCH).exists() {
-        return;
+/// ```nx-exec 块，还是写了被我们的解析/执行环节拒掉。记下原文和解析出的动作，一次就能定案。
+fn trace_round(session: &str, step: usize, reply: &llm::LlmReply, actions: &[AgentAction]) {
+    // 推理能否看到取决于服务方是否返回，没有就不记这一段，免得日志里一堆空标题
+    if !reply.reasoning.trim().is_empty() {
+        trace::record(session, step, "reasoning", &reply.reasoning);
     }
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/nx-agent-trace.log")
-    else {
-        return;
-    };
-    let head: String = reply.chars().take(2000).collect();
-    let _ = writeln!(
-        f,
-        "\n===== step {step} · session {session} · actions={actions} · chars={} =====",
-        reply.chars().count()
-    );
-    let _ = writeln!(f, "{head}");
+    trace::record(session, step, "reply", &reply.text);
+    let mut parsed = String::new();
+    for c in &reply.tool_calls {
+        parsed.push_str(&format!("tool_call {}({})\n", c.name, c.arguments));
+    }
+    for a in actions {
+        parsed.push_str(&format!("action {a:?}\n"));
+    }
+    if parsed.is_empty() {
+        parsed.push_str("（没有解析出任何动作）\n");
+    }
+    trace::record(session, step, "actions", &parsed);
 }
 
 /// 跑完一整轮 Agentic 问答。过程中只发事件，不通过返回值交付内容。
@@ -1747,6 +1745,10 @@ pub async fn run(
     ))];
 
     let session = req.session_id.clone();
+    let trace_on = cfg.trace;
+    if trace_on {
+        trace::record(&session, 0, "question", &req.question);
+    }
     let mut step = 0usize;
     let mut feedback = String::new();
     // 动作块写歪的次数。允许模型改一次，但不许它拿这个把步数刷完。
@@ -1774,6 +1776,9 @@ pub async fn run(
         step += 1;
 
         if !feedback.is_empty() {
+            if trace_on {
+                trace::record(&session, step, "feedback", &feedback);
+            }
             messages.push(ChatMessage::user(feedback.clone()));
             feedback.clear();
         }
@@ -1784,6 +1789,9 @@ pub async fn run(
         {
             Ok(r) => r,
             Err(e) => {
+                if trace_on {
+                    trace::record(&session, step, "error", &e.to_string());
+                }
                 // 先把自己这一轮从登记表里摘掉，再报错 —— 否则会话会被永久卡住「运行中」
                 runtime.finish(&session);
                 let _ = app.emit(&format!("nx://agent/error/{session}"), e.to_string());
@@ -1803,7 +1811,9 @@ pub async fn run(
         } else {
             reply.tool_calls.iter().flat_map(actions_from_tool_call).collect()
         };
-        trace_round(&session, step, &reply.text, actions.len());
+        if trace_on {
+            trace_round(&session, step, &reply, &actions);
+        }
 
         // 进了历史的这条 assistant 消息：带工具调用时不能原样存，
         // 否则下一轮会被接口以「tool_calls 后面必须跟 tool 回执」拒掉。
@@ -1935,7 +1945,21 @@ pub async fn run(
                             target_label: target_label.into(),
                             reasons: risk.reasons.clone(),
                         };
-                        if !request_approval(app, runtime, &session, &req_payload).await {
+                        let approved = request_approval(app, runtime, &session, &req_payload).await;
+                        if trace_on {
+                            trace::record(
+                                &session,
+                                step,
+                                "approval",
+                                &format!(
+                                    "{} · 命令 `{}` · 原因 {:?}",
+                                    if approved { "已批准" } else { "未批准（拒绝或超时）" },
+                                    command.trim(),
+                                    risk.reasons
+                                ),
+                            );
+                        }
+                        if !approved {
                             emit_step(
                                 app,
                                 &session,
@@ -2820,6 +2844,7 @@ mod tests {
     fn history_records_tool_calls_as_text() {
         let reply = llm::LlmReply {
             text: "先看看有哪些标签页。".into(),
+            reasoning: String::new(),
             tool_calls: vec![llm::ToolCall {
                 name: TOOL_TAB.into(),
                 arguments: r#"{"op":"list"}"#.into(),
