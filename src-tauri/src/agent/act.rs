@@ -320,7 +320,7 @@ pub fn tool_specs() -> Vec<llm::ToolSpec> {
                     "op": {
                         "type": "string",
                         "enum": ["list", "focus", "close", "rename", "reconnect"],
-                        "description": "list = 列出所有标签页（**先做这个拿到 id**）；\
+                        "description": "list = 列出作用范围内的标签页（**先做这个拿到 id**）；\
                                         focus = 切过去；close = 关掉；\
                                         rename = 改名；reconnect = SSH 断线后重连。"
                     },
@@ -499,6 +499,9 @@ impl StepPayload {
 #[serde(rename_all = "camelCase")]
 pub struct ApprovePayload {
     pub request_id: String,
+    /// `danger`（危险命令，受 exec mode 约束） | `scope`（超出作用范围，**不受** exec mode 影响）。
+    /// 前端据此换标题与按钮文案：两种批准的含义不同，不能让人一眼分不清自己在批什么。
+    pub kind: &'static str,
     pub command: String,
     pub target: String,
     pub target_label: String,
@@ -860,7 +863,7 @@ pub const ACTION_PROTOCOL: &str = concat!(
     "【要操作标签页（tab）时】用 tab 动作 —— 标签页是界面上的东西，", 
     "**没有任何 shell 命令能操作它**，别试着用命令绕：\n",
     "```nx-exec\n{\"action\":\"tab\",\"op\":\"list\"}\n```\n",
-    "`op` 取值：`list`（列出所有标签页，**先做这个拿到 id**）、`focus`（切过去）、",
+    "`op` 取值：`list`（列出作用范围内的标签页，**先做这个拿到 id**）、`focus`（切过去）、",
     "`close`（关掉，里面的程序会被结束）、`rename`（配 `name` 改名）、",
     "`reconnect`（SSH 断线后重连）。后四个都要带 `target`：\n",
     "```nx-exec\n{\"action\":\"tab\",\"op\":\"focus\",\"target\":\"<标签页id>\"}\n```\n",
@@ -868,6 +871,10 @@ pub const ACTION_PROTOCOL: &str = concat!(
     "标签页 id 与 exec 的 target 是同一套会话 id。关掉自己当前所在的那个标签页也是允许的，\n",
     "但注意：关掉之后它就不在了，这一轮里后面再有 exec 动作省略 target、想隐式落到",
     "这个会话上会失败，需要的话换一个明确的 target。\n\n",
+    "【作用范围】你只能操作上面列出的「作用范围内」会话（含省略 target 时落到的当前会话）。",
+    "对范围外会话的 exec / export / tab 动作，以及任何 open 新会话的动作，都会被拦截或弹窗交给用户确认，",
+    "用户拒绝就是拒绝：不要重试、不要换个说法或换条路径绕过去，改为在结论里告诉用户",
+    "需要把哪个会话加入作用范围，或请他自己操作。tab 的 list 也只会列出范围内的标签页。\n\n",
     "【规则】\n",
     "1) exec 的 command 必须是**单条单行**命令，不许用换行或 && 串联互不相关的操作；",
     "需要分几步就分几轮，每轮都会收到上一条的真实输出；\n",
@@ -1636,20 +1643,136 @@ fn resolve_targets(req: &AgentRunRequest) -> Vec<AgentTarget> {
     }
 }
 
+/// 范围外会话在卡片里的占位展示名：后端只认 uuid，范围外的会话前端没有交过名字。
+const OUT_OF_SCOPE_LABEL: &str = "范围外会话";
+
+/// `id` 是否在本轮作用范围内。
+///
+/// 范围只有一个来源：前端 `targets`（用户用 `@` / 选择器勾的），外加用户在越界弹窗里
+/// 点过头的会话。模型自己说「用户同意了」不算数 —— 它的话和终端输出里被注入的话没有区别。
+fn in_scope(id: &str, targets: &[AgentTarget]) -> bool {
+    targets.iter().any(|t| t.id == id)
+}
+
 /// 把 `target` 落到真实会话 id 与展示名上。
-fn locate<'a>(id: Option<&str>, targets: &'a [AgentTarget], fallback: &str) -> (String, &'a str) {
-    match id {
-        Some(want) => targets
-            .iter()
-            .find(|t| t.id == want)
-            .map(|t| (t.id.clone(), t.label.as_str()))
-            .unwrap_or_else(|| (want.to_string(), "未知会话")),
-        None => targets
-            .iter()
-            .find(|t| t.id == fallback)
-            .map(|t| (t.id.clone(), t.label.as_str()))
-            .unwrap_or_else(|| (fallback.to_string(), "当前会话")),
+///
+/// 省略 `target` 时落到 `fallback`（用户当前会话），**但它也必须在范围内**：
+/// 前端允许把当前会话移出范围，那时「默认当前会话」同样算越界。
+/// `Err(id)` = 这个 id 不在范围内，调用方必须先过越界批准才能动它。
+fn locate(
+    id: Option<&str>,
+    targets: &[AgentTarget],
+    fallback: &str,
+) -> Result<(String, String), String> {
+    let want = id.unwrap_or(fallback);
+    match targets.iter().find(|t| t.id == want) {
+        Some(t) => Ok((t.id.clone(), t.label.clone())),
+        None => Err(want.to_string()),
     }
+}
+
+/// 越界批准通过后把会话并入范围：同一会话本轮之内不再重复弹窗。
+fn admit(targets: &mut Vec<AgentTarget>, id: &str, label: &str) {
+    if !in_scope(id, targets) {
+        targets.push(AgentTarget { id: id.to_string(), label: label.to_string() });
+    }
+}
+
+/// 范围外会话的展示名：带上 id 前 8 位，让人在弹窗里至少能和标签页对上号。
+fn out_of_scope_label(id: &str) -> String {
+    let short: String = id.chars().take(8).collect();
+    format!("{OUT_OF_SCOPE_LABEL}（{short}）")
+}
+
+/// 只留范围内的标签页，返回 `(范围内清单, 被藏起来的个数)`。
+///
+/// `TabInfo.id` 就是 `AgentTarget.id`（前端两边都用 tab.id）。
+/// 范围外的 id 一个都不给模型：终端输出里被注入的指令正好能拿它当跳板。
+fn scoped_tabs(tabs: Vec<TabInfo>, targets: &[AgentTarget]) -> (Vec<TabInfo>, usize) {
+    let total = tabs.len();
+    let kept: Vec<TabInfo> = tabs.into_iter().filter(|t| in_scope(&t.id, targets)).collect();
+    let hidden = total - kept.len();
+    (kept, hidden)
+}
+
+/// 越界弹窗里「要做什么」的一句话。给人看，所以要点名会话与命令。
+fn describe_open(
+    kind: &OpenKind,
+    label: &str,
+    command: Option<&str>,
+    ssh_desc: Option<&str>,
+) -> String {
+    let what = match kind {
+        OpenKind::Local => "本地终端".to_string(),
+        OpenKind::Ssh { session_record_id } => ssh_desc
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("SSH 配置 {session_record_id}")),
+    };
+    match command.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) => format!("打开新会话「{label}」（{what}）并执行：{c}"),
+        None => format!("打开新会话「{label}」（{what}）"),
+    }
+}
+
+/// 会话是否真的还活着（本地 pty 或 SSH）。
+///
+/// 范围外且根本不存在的 id（模型编的 / 已关闭的）不值得打扰人去批。
+fn session_alive(state: &AppState, id: &str) -> bool {
+    state.sessions.contains(id) || state.local.contains(id)
+}
+
+/// 越界被拒后喂回模型的话。
+fn beyond_scope_feedback(what: &str) -> String {
+    format!(
+        "「{what}」超出本轮作用范围，用户没有批准（或等待超时），没有执行。\
+         请让用户把该会话加入作用范围，或由他自己操作；不要重试，也不要换个说法或换条路径绕过去。\n"
+    )
+}
+
+/// 越界批准：动作超出了本轮作用范围，必须人点头。
+///
+/// 与 `danger` 那条批准**刻意分开**：danger 只在「审批」模式下才弹，而作用范围是
+/// 用户明确划的边界，自动模式也不能替他越过去。拒绝 / 超时 / 窗口没了一律按拒绝，
+/// 落一张 `skip` 卡，并告诉模型别重试、别绕。
+///
+/// `target` 为 `None` 表示动作的对象还不存在（`open`）。
+#[allow(clippy::too_many_arguments)]
+async fn ask_beyond_scope(
+    app: &AppHandle,
+    runtime: &ActRuntime,
+    session: &str,
+    step: usize,
+    target: Option<(&str, &str)>,
+    what: &str,
+    mut reasons: Vec<String>,
+    feedback: &mut String,
+) -> bool {
+    reasons.insert(0, "超出作用范围：用户没有把它加入本轮作用范围".into());
+    let (target_id, target_label) = target.unwrap_or(("", "新会话"));
+    let payload = ApprovePayload {
+        request_id: uuid::Uuid::new_v4().simple().to_string(),
+        kind: "scope",
+        command: what.to_string(),
+        target: target_id.to_string(),
+        target_label: target_label.to_string(),
+        reasons: reasons.clone(),
+    };
+    if request_approval(app, runtime, session, &payload).await {
+        return true;
+    }
+    emit_step(
+        app,
+        session,
+        StepPayload {
+            target: (!target_id.is_empty()).then(|| target_id.to_string()),
+            target_label: Some(target_label.to_string()),
+            command: Some(what.to_string()),
+            reasons: Some(reasons),
+            ..StepPayload::new("skip", step)
+        },
+    );
+    feedback.push_str(&beyond_scope_feedback(what));
+    false
 }
 
 /// 把前端回执里的标签页清单整理成模型好读的一段。
@@ -1726,7 +1849,8 @@ pub async fn run(
         acct.max_context_bytes
     } as usize;
 
-    let targets = resolve_targets(req);
+    // mut：越界动作经人批准后，目标会并入范围（见 `admit`），本轮后续不再重复弹窗。
+    let mut targets = resolve_targets(req);
 
     // 当前会话停在全屏程序里时，屏幕上只剩程序自己画的东西 —— 真实输出在
     // alternate buffer 里，旁路缓冲和前端快照都拿不到。动手规划之前先补一次
@@ -1905,7 +2029,13 @@ pub async fn run(
                     ));
                 }
                 AgentAction::Exec { target, command } => {
-                    let (target_id, target_label) = locate(target.as_deref(), &targets, &session);
+                    let located = locate(target.as_deref(), &targets, &session);
+                    let out_of_scope = located.is_err();
+                    let (target_id, label_owned) = located.unwrap_or_else(|id| {
+                        let label = out_of_scope_label(&id);
+                        (id, label)
+                    });
+                    let target_label = label_owned.as_str();
 
                     if let Some(why) = reject_command(&command) {
                         // 静默拒绝是最糟的失败方式：原因只喂回模型，界面上什么都没有，
@@ -1926,10 +2056,54 @@ pub async fn run(
                     }
 
                     let risk = assess(&command);
-                    if cfg.exec_mode.is_approval() && risk.dangerous {
+                    // 越界闸门：不看 exec mode，自动模式也要弹。
+                    // 越界又危险的命令只弹**一次**：把风险原因并进同一张卡，
+                    // 批准即同时覆盖两件事，别让人连点两下还分不清各批的什么。
+                    let mut danger_cleared = false;
+                    if out_of_scope {
+                        if !session_alive(state, &target_id) {
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    target: Some(target_id.clone()),
+                                    command: Some(command.trim().into()),
+                                    reasons: Some(vec!["会话不存在，且不在作用范围内".into()]),
+                                    ..StepPayload::new("skip", step)
+                                },
+                            );
+                            feedback.push_str(&format!(
+                                "会话 {target_id} 不在作用范围内，也不存在，命令 `{}` 没有执行。\
+                                 只能操作作用范围内的会话。\n",
+                                command.trim()
+                            ));
+                            continue;
+                        }
+                        let what = format!("在「{target_label}」执行：{}", command.trim());
+                        let reasons = if risk.dangerous { risk.reasons.clone() } else { Vec::new() };
+                        if !ask_beyond_scope(
+                            app,
+                            runtime,
+                            &session,
+                            step,
+                            Some((&target_id, target_label)),
+                            &what,
+                            reasons,
+                            &mut feedback,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+                        admit(&mut targets, &target_id, target_label);
+                        danger_cleared = risk.dangerous;
+                    }
+
+                    if cfg.exec_mode.is_approval() && risk.dangerous && !danger_cleared {
                         let request_id = uuid::Uuid::new_v4().simple().to_string();
                         let req_payload = ApprovePayload {
                             request_id: request_id.clone(),
+                            kind: "danger",
                             command: command.trim().into(),
                             target: target_id.clone(),
                             target_label: target_label.into(),
@@ -1992,6 +2166,34 @@ pub async fn run(
                 }
 
                 AgentAction::Tab { op, target, name } => {
+                    // 越界闸门：除 list 外，目标不在范围内就要人批准。
+                    // list 不指名道姓，改在拿到回执后按范围过滤（见下）。
+                    if let Some(id) = target.as_deref() {
+                        if !in_scope(id, &targets) {
+                            let label = out_of_scope_label(id);
+                            let what = match name.as_deref() {
+                                Some(n) => format!("{}「{label}」→「{n}」", op.label()),
+                                None => format!("{}「{label}」", op.label()),
+                            };
+                            if !ask_beyond_scope(
+                                app,
+                                runtime,
+                                &session,
+                                step,
+                                Some((id, &label)),
+                                &what,
+                                Vec::new(),
+                                &mut feedback,
+                            )
+                            .await
+                            {
+                                continue;
+                            }
+                            admit(&mut targets, id, &label);
+                        }
+                    }
+
+                    // 走到这里 target 要么是 None（list），要么已在范围内。
                     let where_ = target
                         .as_deref()
                         .map(|id| {
@@ -2001,7 +2203,7 @@ pub async fn run(
                                 .map(|t| t.label.clone())
                                 .unwrap_or_else(|| id.to_string())
                         })
-                        .unwrap_or_else(|| "全部标签页".into());
+                        .unwrap_or_else(|| "范围内的标签页".into());
 
                     emit_step(
                         app,
@@ -2027,7 +2229,25 @@ pub async fn run(
                         Some(reply) if reply.ok => {
                             // list 的结果既进卡片也喂回模型 —— 后者才是重点：
                             // 模型拿到清单才知道下一步该点哪个 id。
-                            let detail = if reply.detail.trim().is_empty() {
+                            //
+                            // list 要先按作用范围过滤，且 detail 也得重写：前端那句
+                            // 「当前共 N 个标签页」带着全量个数，会把范围外的存在泄露出去。
+                            let (tabs, hidden) = if op == TabOp::List {
+                                scoped_tabs(reply.tabs.clone(), &targets)
+                            } else {
+                                (reply.tabs.clone(), 0)
+                            };
+                            let detail = if op == TabOp::List {
+                                format!(
+                                    "作用范围内共 {} 个标签页{}",
+                                    tabs.len(),
+                                    if hidden > 0 {
+                                        format!("（另有 {hidden} 个在作用范围之外，不能操作，也不会列出）")
+                                    } else {
+                                        String::new()
+                                    }
+                                )
+                            } else if reply.detail.trim().is_empty() {
                                 format!("{}完成", op.label())
                             } else {
                                 reply.detail.clone()
@@ -2043,8 +2263,8 @@ pub async fn run(
                                 },
                             );
                             feedback.push_str(&format!("{detail}\n"));
-                            if !reply.tabs.is_empty() {
-                                feedback.push_str(&tab_list_feedback(&reply.tabs));
+                            if !tabs.is_empty() {
+                                feedback.push_str(&tab_list_feedback(&tabs));
                             }
                         }
                         Some(reply) => {
@@ -2094,7 +2314,51 @@ pub async fn run(
                 }
 
                 AgentAction::Export { target, deep } => {
-                    let (target_id, target_label) = locate(target.as_deref(), &targets, &session);
+                    let located = locate(target.as_deref(), &targets, &session);
+                    let out_of_scope = located.is_err();
+                    let (target_id, label_owned) = located.unwrap_or_else(|id| {
+                        let label = out_of_scope_label(&id);
+                        (id, label)
+                    });
+                    let target_label = label_owned.as_str();
+
+                    // 导出 = 把整份会话记录交给模型，比 exec 一条命令泄露得更彻底，同样要过越界闸门。
+                    if out_of_scope {
+                        if !session_alive(state, &target_id) {
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    target: Some(target_id.clone()),
+                                    command: Some("export".into()),
+                                    reasons: Some(vec!["会话不存在，且不在作用范围内".into()]),
+                                    ..StepPayload::new("skip", step)
+                                },
+                            );
+                            feedback.push_str(&format!(
+                                "会话 {target_id} 不在作用范围内，也不存在，没有导出。\
+                                 只能操作作用范围内的会话。\n"
+                            ));
+                            continue;
+                        }
+                        let what = format!("导出「{target_label}」的完整会话记录");
+                        if !ask_beyond_scope(
+                            app,
+                            runtime,
+                            &session,
+                            step,
+                            Some((&target_id, target_label)),
+                            &what,
+                            Vec::new(),
+                            &mut feedback,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+                        admit(&mut targets, &target_id, target_label);
+                    }
+
                     emit_step(
                         app,
                         &session,
@@ -2124,6 +2388,41 @@ pub async fn run(
 
                 AgentAction::Open { kind, label, command } => {
                     let label = label.unwrap_or_else(|| "新会话".to_string());
+
+                    // 前端对 session-opened 只负责接标签页、不做任何确认，所以这里是 open 唯一的
+                    // 人工关口：新会话不在任何人划的范围里，开它（尤其带命令）必须先点头。
+                    // 弹窗里写明会连到哪、跑什么；SSH 配置名从库里查，查不到才退回 id。
+                    let ssh_desc = match &kind {
+                        OpenKind::Ssh { session_record_id } => state
+                            .store
+                            .get(session_record_id)
+                            .ok()
+                            .map(|r| format!("SSH：{} {}@{}:{}", r.name, r.username, r.host, r.port)),
+                        OpenKind::Local => None,
+                    };
+                    let what = describe_open(&kind, &label, command.as_deref(), ssh_desc.as_deref());
+                    // 带的命令若本身危险，把原因一并摆在这张卡上
+                    let reasons = command
+                        .as_deref()
+                        .map(assess)
+                        .filter(|r| r.dangerous)
+                        .map(|r| r.reasons)
+                        .unwrap_or_default();
+                    if !ask_beyond_scope(
+                        app,
+                        runtime,
+                        &session,
+                        step,
+                        None,
+                        &what,
+                        reasons,
+                        &mut feedback,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+
                     emit_step(
                         app,
                         &session,
@@ -2135,6 +2434,8 @@ pub async fn run(
                     let spec = OpenSpec { kind, label, command };
                     match open_session(app, state, &session, spec).await {
                         Ok(outcome) => {
+                            // 人点过头的新会话并入范围：之后对它 exec / tab 不再重复弹窗。
+                            admit(&mut targets, &outcome.session_id, &outcome.label);
                             // 成功也要补一条：前端确实会接出标签页，但那张卡片
                             // 留在「正在打开」上会让人以为它还没完成。
                             emit_step(
@@ -2576,15 +2877,101 @@ mod tests {
         assert!(text.contains("alive"));
     }
 
-    #[test]
-    fn locate_prefers_named_target_and_falls_back() {
-        let targets = vec![
+    fn scope_targets() -> Vec<AgentTarget> {
+        vec![
             AgentTarget { id: "a".into(), label: "web-01".into() },
             AgentTarget { id: "b".into(), label: "db-01".into() },
-        ];
-        assert_eq!(locate(Some("b"), &targets, "a"), ("b".to_string(), "db-01"));
-        assert_eq!(locate(Some("ghost"), &targets, "a"), ("ghost".to_string(), "未知会话"));
-        assert_eq!(locate(None, &targets, "a"), ("a".to_string(), "web-01"));
+        ]
+    }
+
+    fn tab(id: &str, active: bool) -> TabInfo {
+        TabInfo {
+            id: id.into(),
+            title: format!("tab-{id}"),
+            kind: "ssh".into(),
+            status: "connected".into(),
+            active,
+        }
+    }
+
+    #[test]
+    fn locate_passes_in_scope_targets() {
+        let targets = scope_targets();
+        assert_eq!(locate(Some("b"), &targets, "a"), Ok(("b".to_string(), "db-01".to_string())));
+        assert!(in_scope("a", &targets) && in_scope("b", &targets));
+    }
+
+    /// 范围外的 id 不能再被原样放行成「未知会话」：这是越界的口子
+    #[test]
+    fn locate_rejects_out_of_scope_targets() {
+        let targets = scope_targets();
+        assert_eq!(locate(Some("ghost"), &targets, "a"), Err("ghost".to_string()));
+        assert!(!in_scope("ghost", &targets));
+    }
+
+    #[test]
+    fn locate_without_target_uses_current_session_only_if_in_scope() {
+        let targets = scope_targets();
+        assert_eq!(locate(None, &targets, "a"), Ok(("a".to_string(), "web-01".to_string())));
+        // 当前会话被用户移出了范围：省略 target 的默认落点同样算越界
+        assert_eq!(locate(None, &targets, "cur"), Err("cur".to_string()));
+    }
+
+    #[test]
+    fn admitted_target_joins_scope_once() {
+        let mut targets = scope_targets();
+        assert!(locate(Some("c"), &targets, "a").is_err());
+        admit(&mut targets, "c", "cache-01");
+        assert_eq!(locate(Some("c"), &targets, "a"), Ok(("c".to_string(), "cache-01".to_string())));
+        // 重复批准同一会话不产生重复项
+        admit(&mut targets, "c", "cache-01");
+        assert_eq!(targets.iter().filter(|t| t.id == "c").count(), 1);
+        assert_eq!(targets.len(), 3);
+    }
+
+    #[test]
+    fn scoped_tabs_hides_out_of_scope_ids() {
+        let targets = scope_targets();
+        let (kept, hidden) = scoped_tabs(vec![tab("a", true), tab("x", false), tab("b", false)], &targets);
+        assert_eq!(kept.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(hidden, 1);
+        // 范围外的 id 不会出现在喂回模型的文本里
+        let text = tab_list_feedback(&kept);
+        assert!(!text.contains("tab-x") && !text.contains("「tab-x」"));
+    }
+
+    #[test]
+    fn scoped_tabs_follows_admitted_targets() {
+        let mut targets = scope_targets();
+        let tabs = vec![tab("a", true), tab("new", false)];
+        assert_eq!(scoped_tabs(tabs.clone(), &targets).0.len(), 1);
+        admit(&mut targets, "new", "新会话");
+        assert_eq!(scoped_tabs(tabs, &targets).0.len(), 2);
+    }
+
+    #[test]
+    fn describe_open_names_session_and_command() {
+        let local = describe_open(&OpenKind::Local, "排查", Some(" uptime "), None);
+        assert!(local.contains("排查") && local.contains("本地终端") && local.contains("uptime"));
+        let ssh = OpenKind::Ssh { session_record_id: "rec-1".into() };
+        let with_desc = describe_open(&ssh, "db", None, Some("SSH：db root@10.0.0.1:22"));
+        assert!(with_desc.contains("10.0.0.1") && !with_desc.contains("并执行"));
+        // 查不到配置名时退回 id，而不是空着
+        assert!(describe_open(&ssh, "db", None, None).contains("rec-1"));
+    }
+
+    #[test]
+    fn beyond_scope_feedback_forbids_retry_and_workarounds() {
+        let text = beyond_scope_feedback("在「x」执行：ls");
+        assert!(text.contains("超出本轮作用范围") && text.contains("不要重试"));
+        assert!(text.contains("作用范围"));
+    }
+
+    #[test]
+    fn prompt_tells_model_about_scope_enforcement() {
+        for key in ["作用范围", "拦截", "不要重试"] {
+            assert!(ACTION_PROTOCOL.contains(key), "协议缺少作用范围要点：{key}");
+        }
     }
 
     #[test]

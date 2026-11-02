@@ -1085,24 +1085,31 @@ function ApproveCard({
   onDecide: (approved: boolean) => void;
 }) {
   const settled = result !== undefined;
+  // 越界批准与危险命令批准含义不同：前者批的是「动这台不在范围里的会话」，
+  // 标题与文案必须直说，别让人以为只是又一次命令风险提示。
+  const scope = req.kind === "scope";
   return (
     <div className={`ap-approve${settled ? (result ? " ok" : " no") : ""}`}>
       <div className="ap-step-head">
-        <span className="ap-step-tag">需要批准</span>
+        <span className="ap-step-tag">{scope ? "超出作用范围 · 需要批准" : "需要批准"}</span>
         <span className="ap-step-where" title={req.target}>
           {req.targetLabel || "未知会话"}
         </span>
       </div>
       <pre className="ap-code">{req.command}</pre>
       {req.reasons.length > 0 && (
-        <div className="ap-step-why">风险提示：{req.reasons.join("；")}</div>
+        <div className="ap-step-why">
+          {scope ? "越界原因" : "风险提示"}：{req.reasons.join("；")}
+        </div>
       )}
       {settled ? (
-        <div className="ap-approve-done">{result ? "已允许执行" : "已拒绝 / 已超时"}</div>
+        <div className="ap-approve-done">
+          {result ? (scope ? "已允许，该会话已并入本轮作用范围" : "已允许执行") : "已拒绝 / 已超时"}
+        </div>
       ) : (
         <div className="ap-approve-row">
           <button className="btn primary" disabled={!busy} onClick={() => onDecide(true)}>
-            允许执行
+            {scope ? "允许越界操作" : "允许执行"}
           </button>
           <button className="btn" disabled={!busy} onClick={() => onDecide(false)}>
             拒绝
