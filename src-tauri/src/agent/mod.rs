@@ -21,6 +21,7 @@ pub mod danger;
 pub mod executor;
 pub mod llm;
 pub mod redact;
+pub mod trace;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -181,6 +182,12 @@ pub struct AgentConfig {
     /// Agent 的下令方式：`agentic`（全自动）/ `approval`（危险命令先问人）。
     #[serde(default, deserialize_with = "deserialize_exec_mode")]
     pub exec_mode: ExecMode,
+    /// 排查开关：把推理过程与每轮请求/回复记到 `<app_data>/logs/agent.log`（见 `trace`）。
+    ///
+    /// **默认关**：日志里会有命令输出，即便过了脱敏也可能含敏感信息。
+    /// 旧配置没有这个字段，靠 `serde(default)` 落到 false，不会让整份配置反序列化失败。
+    #[serde(default)]
+    pub trace: bool,
 }
 
 impl Default for AgentConfig {
@@ -196,6 +203,7 @@ impl Default for AgentConfig {
             active_id: acct.id.clone(),
             accounts: vec![acct],
             exec_mode: ExecMode::Approval,
+            trace: false,
         }
     }
 }
@@ -338,6 +346,7 @@ fn migrate_legacy_config(raw: &str) -> AgentConfig {
         accounts: vec![acct],
         // 旧配置没有这一项，按最保守的「人在回路」给
         exec_mode: ExecMode::Approval,
+        trace: false,
     }
 }
 
@@ -679,6 +688,25 @@ mod tests {
         assert_eq!(json["execMode"], "agentic");
         let back: AgentConfig = serde_json::from_value(json).expect("应能反序列化");
         assert_eq!(back.exec_mode, ExecMode::Agentic);
+    }
+
+    /// 旧配置没有 trace 字段：必须默认关，且不能让整份配置（含 API Key）反序列化失败
+    #[test]
+    fn trace_defaults_off_for_old_config() {
+        let raw = r#"{"enabled":true,"accounts":[{"id":"x","model":"m","apiKey":"k"}]}"#;
+        let cfg: AgentConfig = serde_json::from_str(raw).expect("旧配置必须仍能解析");
+        assert!(!cfg.trace);
+        assert_eq!(cfg.accounts[0].api_key, "k");
+        assert!(!AgentConfig::default().trace);
+    }
+
+    #[test]
+    fn trace_round_trips_as_camel_case_bool() {
+        let cfg = AgentConfig { trace: true, ..Default::default() };
+        let json = serde_json::to_value(&cfg).expect("应能序列化");
+        assert_eq!(json["trace"], true);
+        let back: AgentConfig = serde_json::from_value(json).expect("应能反序列化");
+        assert!(back.trace);
     }
 
     /// 认不得的值必须落在「审批」上，而且**不能连累整份配置**

@@ -37,6 +37,7 @@ export const DEFAULT_AGENT_CONFIG: AgentConfig = {
   accounts: [defaultAccount()],
   activeId: "default",
   execMode: "approval",
+  trace: false,
 };
 
 const PROVIDERS: readonly AgentProvider[] = ["openai", "anthropic", "custom"];
@@ -90,6 +91,8 @@ function normalize(raw: Partial<AgentConfig> | null | undefined): AgentConfig {
     // 认不得的值一律收敛到 approval —— 与后端 `ExecMode::parse` 的降级方向一致。
     // 宁可多问一句，也不要默认全自动去动别人的机器。
     execMode: c.execMode === "agentic" ? "agentic" : "approval",
+    // 旧配置没有这一项：缺省就是关（后端 serde(default) 同样落在 false）
+    trace: c.trace === true,
   };
 }
 
