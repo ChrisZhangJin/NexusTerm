@@ -60,6 +60,76 @@ const fmtSize = (n: number) =>
       ? `${(n / 1024 / 1024).toFixed(1)} MB`
       : `${(n / 1024).toFixed(1)} KB`;
 
+/**
+ * zmodem.js 接收会话里我们要碰的内部成员。库没有公开 API 能改「ZFIN 之后」的行为，
+ * 只能在实例上包一层；这些名字随库版本变（package.json 里锁在 ^0.1.10），
+ * 所以集中声明在这里，改版本时只需要看这一处。
+ */
+interface ZReceiveInternals {
+  _got_ZFIN?: boolean;
+  _input_buffer: number[];
+  _bytes_after_OO?: number[];
+  _parse_and_consume_header: () => unknown;
+  _before_consume: (octets: number[]) => void;
+  _strip_and_enqueue_input: (octets: number[]) => void;
+  _on_session_end: () => void;
+  consume: (octets: number[]) => void;
+  aborted: () => boolean;
+}
+
+const LETTER_O = 0x4f;
+
+/**
+ * 加固接收会话的收尾（ZFIN 之后）。
+ *
+ * 现场症状：sz 下载偶尔报
+ * `PROTOCOL: Only thing after ZFIN should be “OO” (79,79), not: 27,91,63,50,48,48,52,104…`
+ * —— 后面是 shell 提示符。zmodem.js 的两处缺陷叠在一起：
+ *
+ * 1. 一次 `consume()` 里解完 ZFIN 后，do-while 还会接着按 header 解析；紧跟在 ZFIN
+ *    后面的 `OO` 被当成垃圾吞掉（还会当 garbage 回显到终端），会话因此永远收不了尾。
+ * 2. 下一块数据（提示符）进来时，`_consume_first` 要求 ZFIN 之后必须以 `OO` 开头，
+ *    否则直接 throw —— 整个会话报废，终端也被我们的 catch 复位成一团。
+ *
+ * 这里改成：ZFIN 一到就不再按 header 解析；之后的字节自己判：
+ * - `OO` 开头 → 会话结束，`OO` 之后的字节还给终端；
+ * - 只有半个 `O` → 再等一块；
+ * - 别的东西（对端没发 OO，直接就是提示符）→ 同样视为结束，字节原样还给终端。
+ *   宁可早一点收尾，也不能因为对端少发两个字节就把会话判成协议错误。
+ *
+ * 结束后的字节由 Sentry 通过 `get_trailing_bytes()` 取走，所以只要置好
+ * `_bytes_after_OO` 再触发 `session_end` 即可，和库自己收尾的路径一致。
+ */
+function hardenZfinTail(zsession: ZSession): void {
+  const z = zsession as unknown as ZReceiveInternals;
+
+  const parseHeader = z._parse_and_consume_header.bind(z);
+  z._parse_and_consume_header = () => (z._got_ZFIN ? undefined : parseHeader());
+
+  const settle = () => {
+    const buf = z._input_buffer;
+    if (buf.length === 0) return;
+    if (buf[0] === LETTER_O && buf.length < 2) return; // 半个 OO，等下一块
+    const tail = buf[0] === LETTER_O && buf[1] === LETTER_O ? buf.slice(2) : buf.slice();
+    buf.length = 0;
+    // 先置 _bytes_after_OO 再发事件：session_end 的处理函数里 has_ended() 要为真
+    z._bytes_after_OO = tail;
+    z._on_session_end();
+  };
+
+  const consume = z.consume.bind(z);
+  z.consume = (octets) => {
+    if (z._got_ZFIN) {
+      // 库自己的 _consume_first 在这个状态下会 throw，绕开它
+      z._before_consume(octets);
+      z._strip_and_enqueue_input(octets);
+    } else {
+      consume(octets);
+    }
+    if (z._got_ZFIN && !z._bytes_after_OO && !z.aborted()) settle();
+  };
+}
+
 export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
   let active = false;
   let disposed = false;
@@ -379,6 +449,7 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
         active = false;
       });
       if (zsession.type === "receive") {
+        hardenZfinTail(zsession);
         hooks.termWrite(`\r\n\x1b[33m[ZMODEM] 检测到远端发送（sz）\x1b[0m`);
         zsession.on("offer", (x) => handleOffer(zsession, x));
         zsession.start();
