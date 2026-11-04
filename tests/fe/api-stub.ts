@@ -27,6 +27,11 @@ export function stringToBytes(s: string): number[] {
   return Array.from(new TextEncoder().encode(s));
 }
 
+/** 与 `src/api.ts` 同语义：字节 → base64（`lib/zmodem` 的上传路径用） */
+export function bytesToBase64(bytes: ArrayLike<number>): string {
+  return Buffer.from(Array.from(bytes)).toString("base64");
+}
+
 /** FileManager 订阅用；自测里没有真实的后端事件流，给个 no-op unlisten */
 export function onSftpProgress(): Promise<() => void> {
   return Promise.resolve(() => {});
