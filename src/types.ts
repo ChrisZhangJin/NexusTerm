@@ -713,8 +713,28 @@ export type SkillRunOutcome =
   | { kind: "cancelled" }
   | { kind: "declined" }
   | { kind: "took_over" }
+  /** 4.4：当前会话超出技能的适用主机范围，没有执行任何操作 */
+  | { kind: "out_of_scope"; reason: string }
   | { kind: "failed"; reason: string }
   | { kind: "error"; reason: string };
+
+/** 4.4 信任档位：confirm 每个写步骤都确认；trusted 只读且连续干净成功 N 次（自动模式下免逐步确认）；guarded 非只读，永远逐步确认 */
+export type SkillTrustLevel = "confirm" | "trusted" | "guarded";
+
+/** `skill_trust` 的单项：后端算出的信任结论 + 当前会话是否在适用主机范围内 */
+export interface SkillTrustView {
+  id: string;
+  level: SkillTrustLevel;
+  /** 当前连续干净成功次数 */
+  streak: number;
+  /** 免逐步确认所需次数 */
+  needed: number;
+  /** 中文原因（给 tooltip） */
+  reason: string;
+  /** 传了会话才有：true 在范围内、false 超出（运行会被拒绝）；未传为 null */
+  scopeOk: boolean | null;
+  scopeReason: string | null;
+}
 
 /** `skill_run` 的返回：完整运行报告。`suggestedUpdates` 只是建议，后端不会改 skill。 */
 export interface SkillRunReport {

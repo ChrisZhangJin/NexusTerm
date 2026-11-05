@@ -31,6 +31,7 @@ import type {
   HostNote,
   HostNoteKind,
   SkillRunReport,
+  SkillTrustView,
   SkillInput,
   SweepReport,
   TotpPreview,
@@ -236,6 +237,12 @@ export const api = {
    */
   skillRun: (skillId: string, params: Record<string, string>, sessionId: string, targetLabel?: string) =>
     invoke<SkillRunReport>("skill_run", { skillId, params, sessionId, targetLabel: targetLabel ?? null }),
+  /**
+   * 4.4：所有技能的信任档位（只读，后端按成功次数 / 风险 / 内容指纹算出，前端无法改写）。
+   * 传 `sessionId` 时同时给出该会话是否在各技能的适用主机范围内（超出则运行会被拒绝）。
+   */
+  skillTrust: (sessionId?: string, targetLabel?: string) =>
+    invoke<SkillTrustView[]>("skill_trust", { sessionId: sessionId ?? null, targetLabel: targetLabel ?? null }),
   /**
    * 3.3：让 Agent 把录制草稿整理成 skill 草稿（不保存）。草稿按账号 redact 标志脱敏后出网；
    * 模型输出在后端被夹紧并校验，失败重试一次、再失败退回机械草稿（`fallback`）。

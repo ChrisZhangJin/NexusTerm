@@ -48,10 +48,12 @@ use super::llm::{self, ChatMessage, CONTEXT_BEGIN, CONTEXT_END};
 use super::prompt;
 use super::redact::redact;
 use super::secret::{self, SecretStatus};
+use super::hostmem::{host_display, resolve_host};
 use super::skill::{
-    placeholder_names, render_check, render_step, resolve_params, OnUnexpected, RenderedAction,
-    RenderedStep, ResolvedParams, Respond, Skill,
+    placeholder_names, render_check, render_step, resolve_params, trust_fingerprint, trust_info,
+    HostScope, OnUnexpected, RenderedAction, RenderedStep, ResolvedParams, Respond, Skill, TrustLevel,
 };
+use super::skill_refine::host_entry;
 use super::timeline::{self, Kind as TlKind};
 use super::AgentConfig;
 use crate::cmd::AppState;
@@ -73,21 +75,44 @@ const SUMMARY_CHARS: usize = 100;
 
 // ——————————————————————————————— 公开类型 ———————————————————————————————
 
-/// 信任策略。4.4 会按 skill 的历史成功次数 / 风险放宽；现在只实现默认的 `ConfirmEachStep`。
+/// 信任策略（4.4）。由 skill 的信任档位（[`skill::trust_info`]）决定，调用方不能自抬：
+/// [`run_skill`] 取「调用方给的」与「skill 自己挣来的」中**更严**的那个。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrustPolicy {
-    /// 默认：审批模式下每个写步骤都问；其余模式只有危险步骤问。
+    /// 默认（首次运行 / 被改过 / 导入 / 失败过 / 风险不是只读）：每个写步骤都问。
     #[default]
     ConfirmEachStep,
-    /// 保留给 4.4：只有危险步骤问。**当前没有任何入口会选它**（不对前端暴露）。
-    #[allow(dead_code)]
+    /// 只读且连续干净成功够次数：自动模式下只有危险步骤问。审批模式照旧每步问（见 [`needs_approval`]）。
     ConfirmDangerousOnly,
+}
+
+impl TrustPolicy {
+    pub fn for_level(level: TrustLevel) -> Self {
+        match level {
+            TrustLevel::Trusted => Self::ConfirmDangerousOnly,
+            TrustLevel::Confirm | TrustLevel::Guarded => Self::ConfirmEachStep,
+        }
+    }
+
+    /// 两个策略里更严的那个（任何一边要逐步确认就逐步确认）。
+    pub fn stricter(self, other: Self) -> Self {
+        if self == Self::ConfirmEachStep || other == Self::ConfirmEachStep {
+            Self::ConfirmEachStep
+        } else {
+            Self::ConfirmDangerousOnly
+        }
+    }
 }
 
 /// 一次回放的选项。
 #[derive(Debug, Clone)]
 pub struct RunOpts {
     pub trust: TrustPolicy,
+    /// 信任档位的一句话原因（审批卡上用：为什么这一步要问你）。
+    pub trust_note: String,
+    /// 目标会话不在技能的适用主机范围内时的拒绝原因；`Some` 则整次运行**不做任何写**，
+    /// 结局 [`RunOutcome::OutOfScope`]。由 [`run_skill`] 按 `host_scope` 填写（不信任调用方留空）。
+    pub scope_violation: Option<String>,
     /// 全局执行模式是否为「审批」（`AgentConfig.exec_mode`）。
     pub approval_mode: bool,
     /// 给 LLM 的内容是否脱敏（账号的 `redact` 开关）。
@@ -102,6 +127,8 @@ impl Default for RunOpts {
     fn default() -> Self {
         Self {
             trust: TrustPolicy::default(),
+            trust_note: String::new(),
+            scope_violation: None,
             approval_mode: true,
             redact: true,
             max_llm_interventions: DEFAULT_MAX_LLM_INTERVENTIONS,
@@ -185,6 +212,8 @@ pub enum RunOutcome {
     Failed { reason: String },
     /// 环境问题（会话没了、写入失败）：不记成技能的失败。
     Error { reason: String },
+    /// 目标会话不在技能的适用主机范围内（4.4）：一步都没做，不计功过。
+    OutOfScope { reason: String },
 }
 
 /// 验证（`verify`）的结果。
@@ -443,14 +472,94 @@ pub fn next_action(
     }
 }
 
-/// 这一步写之前要不要请人批准。
+/// 这一步写之前要不要请人批准（4.4 阶梯）。三个条件**任一**成立就问，信任只能去掉第三个：
 ///
-/// 危险一律问（包括自动模式——技能不能比人手点出来的更宽松）；审批模式下每个写步骤都问。
+/// 1. 危险：任何模式、任何信任档位都问（技能不能比人手点出来的更宽松）；
+/// 2. 审批模式（全局「每个写动作都要批准」）：每个写步骤都问，信任**不能**把它放宽；
+/// 3. 信任策略是 `ConfirmEachStep`（首次运行 / 被改过 / 导入 / 失败过 / 不是只读）：每个写步骤都问。
+///
+/// 所以只有「自动模式 + 已获信任 + 非危险」才免确认。
 pub fn needs_approval(trust: TrustPolicy, approval_mode: bool, dangerous: bool) -> bool {
-    match trust {
-        TrustPolicy::ConfirmEachStep => approval_mode || dangerous,
-        TrustPolicy::ConfirmDangerousOnly => dangerous,
+    dangerous || approval_mode || trust == TrustPolicy::ConfirmEachStep
+}
+
+/// 这次运行是否算「干净成功」，可以给信任阶梯加一级：完整成功（含验证）且全程没有偏离
+/// （偏离后被人 / 模型放行继续的也不算）。
+pub fn is_clean_success(r: &SkillRunReport) -> bool {
+    matches!(r.outcome, RunOutcome::Completed)
+        && r.deviations.is_empty()
+        && r.steps.iter().all(|s| matches!(s.result, StepResult::Ok))
+}
+
+// ——————————————————————————————— 适用主机范围（4.4） ———————————————————————————————
+
+/// 目标会话「是谁」：会话 id + 标签 + 推导出的主机键（`hostmem::host_key`，SSH = `ssh:user@host:port`，
+/// 本机 = `local`，认不出 = `tab:标签`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostIdentity {
+    pub session_id: String,
+    pub label: String,
+    pub host_key: Option<String>,
+}
+
+impl HostIdentity {
+    /// 查登记表（与主机备忘同一套推导；前端不拼键）。
+    pub fn resolve(state: &AppState, session_id: &str, label: &str) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            label: label.to_string(),
+            host_key: resolve_host(state, session_id, label).map(|h| h.key),
+        }
     }
+
+    /// 可以拿去和 `hostScope` 条目比的名字：主机键本身、SSH 的 `host` / `user@host` / `host:port`、
+    /// 本机的 `local` / `localhost`，以及标签的第一个词（3.3 录制时默认就是把它写进 `hostScope` 的）。
+    pub fn names(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if let Some(k) = &self.host_key {
+            v.push(k.clone());
+            if let Some(rest) = k.strip_prefix("ssh:") {
+                if let Some((user, hostport)) = rest.rsplit_once('@') {
+                    if let Some((host, _port)) = hostport.rsplit_once(':') {
+                        v.push(host.to_string());
+                        v.push(format!("{user}@{host}"));
+                    }
+                    v.push(hostport.to_string());
+                }
+            } else if k == "local" {
+                v.push("localhost".to_string());
+            }
+        }
+        if let Some(e) = host_entry(&self.label) {
+            v.push(e);
+        }
+        v
+    }
+
+    fn display(&self) -> String {
+        match (&self.host_key, self.label.trim()) {
+            (Some(k), _) => host_display(k),
+            (None, l) if !l.is_empty() => format!("标签「{l}」"),
+            _ => format!("会话 {}", self.session_id),
+        }
+    }
+}
+
+/// 技能能不能在这个会话上跑。`Any` 一律放行；`List` 要求会话 id 或任一名字命中某个条目
+/// （条目支持 `*` 通配、不区分大小写）；**没有任何可比对的名字就拒绝**（宁可拒，不猜）。
+/// 局限：按标签匹配时标签是用户自己起的，强度只和标签一样；要强约束请写 `user@host` 或主机名。
+pub fn check_scope(scope: &HostScope, who: &HostIdentity) -> Result<(), String> {
+    let HostScope::List { hosts } = scope else { return Ok(()) };
+    let names = who.names();
+    let hit = scope.allows(&who.session_id, "") || names.iter().any(|n| scope.allows(&who.session_id, n));
+    if hit {
+        return Ok(());
+    }
+    Err(format!(
+        "超出技能的适用主机范围：该技能只适用于 {}，当前会话是 {}。没有执行任何操作",
+        hosts.join("、"),
+        who.display()
+    ))
 }
 
 /// 这次运行是否记入成功 / 失败计数。
@@ -469,7 +578,8 @@ pub fn record_decision(outcome: &RunOutcome) -> Option<bool> {
         | RunOutcome::Cancelled
         | RunOutcome::Declined
         | RunOutcome::TookOver
-        | RunOutcome::Error { .. } => None,
+        | RunOutcome::Error { .. }
+        | RunOutcome::OutOfScope { .. } => None,
     }
 }
 
@@ -757,6 +867,7 @@ pub fn report_text(r: &SkillRunReport) -> String {
         RunOutcome::TookOver => format!("技能「{}」运行中你接管了终端且一直没交还，已停止（已完成 {done}/{} 步）。", r.skill_name, r.steps.len()),
         RunOutcome::Failed { reason } => format!("技能「{}」运行失败：{reason}", r.skill_name),
         RunOutcome::Error { reason } => format!("技能「{}」运行出错：{reason}", r.skill_name),
+        RunOutcome::OutOfScope { reason } => format!("技能「{}」没有运行：{reason}", r.skill_name),
     };
     let mut s = head;
     if !r.deviations.is_empty() {
@@ -857,7 +968,13 @@ pub async fn execute<I: SkillIo>(
         deviations: Vec::new(),
     };
     eng.io.mark();
-    let (outcome, verify) = eng.drive(params).await;
+    // 适用主机范围（4.4）：在任何写之前拒绝，原因推给面板（步骤卡）并写进报告
+    let (outcome, verify) = if let Some(reason) = &opts.scope_violation {
+        eng.note(0, format!("已拒绝运行：{reason}"));
+        (RunOutcome::OutOfScope { reason: reason.clone() }, None)
+    } else {
+        eng.drive(params).await
+    };
 
     // 没轮到的步骤补成 Skipped，报告里步骤数始终等于 skill 的步骤数
     for i in eng.records.len()..eng.total {
@@ -1099,10 +1216,14 @@ impl<I: SkillIo> Engine<'_, I> {
         let covered = scope == ScopeVerdict::Crossed && w.dangerous;
         let ask = !covered && (w.always_ask || needs_approval(self.opts.trust, self.opts.approval_mode, w.dangerous));
         if ask {
-            let reasons = if w.reasons.is_empty() {
-                vec!["技能回放：审批模式下每个写步骤都需要确认".to_string()]
-            } else {
+            let reasons = if !w.reasons.is_empty() {
                 w.reasons.clone()
+            } else if self.opts.approval_mode {
+                vec!["技能回放：审批模式下每个写步骤都需要确认".to_string()]
+            } else if !self.opts.trust_note.is_empty() {
+                vec![format!("技能回放：{}", self.opts.trust_note)]
+            } else {
+                vec!["技能回放：这个技能还没有获得免确认的信任，每个写步骤都需要确认".to_string()]
             };
             let ask = ApprovalAsk {
                 kind: if w.dangerous { "danger" } else { "skill" },
@@ -1761,6 +1882,7 @@ pub async fn run_skill(
     target_label: &str,
     opts: RunOpts,
 ) -> Result<SkillRunReport, String> {
+    let mut opts = opts;
     let resolved = resolve_params(&skill.params, params).map_err(|e| e.join("\n"))?;
     if skill.steps.is_empty() {
         return Err("技能没有步骤".into());
@@ -1779,6 +1901,19 @@ pub async fn run_skill(
     }
     ctx.runtime.runlog.start(target_session, &format!("运行技能「{}」", skill.name));
     let _runlog = RunLogGuard { state: ctx.state, run: target_session.to_string() };
+
+    // 信任与范围（4.4）：都由后端按 skill 自己的状态定，调用方给的只能更严、不能更宽
+    let trust = trust_info(skill);
+    opts.trust = opts.trust.stricter(TrustPolicy::for_level(trust.level));
+    if trust.level != TrustLevel::Trusted {
+        opts.trust_note = trust.reason.clone();
+    }
+    if opts.scope_violation.is_none() {
+        let who = HostIdentity::resolve(ctx.state, target_session, target_label);
+        opts.scope_violation = check_scope(&skill.host_scope, &who).err();
+    }
+    // 跑的是哪一版内容：运行途中被编辑过的话，这次成功不给信任加分
+    let ran_fingerprint = trust_fingerprint(skill);
 
     let mut io = TauriIo {
         app: ctx.app,
@@ -1799,9 +1934,16 @@ pub async fn run_skill(
     // 只在「完整成功 / 明确失败」时记一次；记录失败只打日志，不影响报告
     report.recorded = record_decision(&report.outcome);
     if let (Some(ok), false) = (report.recorded, skill.id.is_empty()) {
-        if let Err(e) = ctx.state.store.skill_record_run_result(&skill.id, ok) {
+        // 信任阶梯：只有干净成功加一级；失败 / 偏离 / 内容变了都清零
+        let clean = is_clean_success(&report);
+        if let Err(e) = ctx.state.store.skill_record_run(&skill.id, ok, clean, &ran_fingerprint) {
             tracing::warn!("记录技能运行结果失败：{e}");
             report.recorded = None;
+        }
+    } else if !report.deviations.is_empty() && !skill.id.is_empty() {
+        // 偏离过又被中止 / 取消：不计成败，但信任要掉
+        if let Err(e) = ctx.state.store.skill_drop_trust(&skill.id) {
+            tracing::warn!("清零技能信任失败：{e}");
         }
     }
     // 收尾总结走 `answer`：面板据此结束「运行中」状态，运行摘要也由它得出结论
@@ -1972,8 +2114,14 @@ mod tests {
         resolve_params(&s.params, &BTreeMap::new()).unwrap()
     }
 
+    /// 自动模式 + 已获信任：只有危险步骤问（旧测试沿用这个起点；首次运行档见 `ladder_*` 测试）。
     fn opts() -> RunOpts {
-        RunOpts { approval_mode: false, ..RunOpts::default() }
+        RunOpts { approval_mode: false, trust: TrustPolicy::ConfirmDangerousOnly, ..RunOpts::default() }
+    }
+
+    /// 自动模式 + 首次运行档（每个写步骤都问）。
+    fn first_run_opts() -> RunOpts {
+        RunOpts { approval_mode: false, trust: TrustPolicy::ConfirmEachStep, ..RunOpts::default() }
     }
 
     async fn run(io: &mut FakeIo, s: &Skill, o: &RunOpts) -> SkillRunReport {
@@ -2026,13 +2174,195 @@ mod tests {
     #[test]
     fn approval_policy() {
         use TrustPolicy::*;
-        assert!(needs_approval(ConfirmEachStep, true, false));
-        assert!(needs_approval(ConfirmEachStep, true, true));
-        assert!(!needs_approval(ConfirmEachStep, false, false));
-        // 危险一律问，自动模式也不例外
-        assert!(needs_approval(ConfirmEachStep, false, true));
+        // 穷举 trust × 审批模式 × 危险：只有「自动模式 + 已获信任 + 非危险」不问
+        for trust in [ConfirmEachStep, ConfirmDangerousOnly] {
+            for approval in [false, true] {
+                for danger in [false, true] {
+                    let expect = !(trust == ConfirmDangerousOnly && !approval && !danger);
+                    assert_eq!(needs_approval(trust, approval, danger), expect, "{trust:?} approval={approval} danger={danger}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trust_never_lowers_what_the_mode_demands() {
+        use TrustPolicy::*;
+        // 审批模式：哪怕完全信任也每步问
+        assert!(needs_approval(ConfirmDangerousOnly, true, false));
+        // 危险：任何模式 / 任何信任都问
         assert!(needs_approval(ConfirmDangerousOnly, false, true));
-        assert!(!needs_approval(ConfirmDangerousOnly, true, false));
+        assert!(needs_approval(ConfirmDangerousOnly, true, true));
+    }
+
+    #[test]
+    fn trust_policy_stricter_and_levels() {
+        use TrustPolicy::*;
+        assert_eq!(ConfirmDangerousOnly.stricter(ConfirmDangerousOnly), ConfirmDangerousOnly);
+        assert_eq!(ConfirmDangerousOnly.stricter(ConfirmEachStep), ConfirmEachStep);
+        assert_eq!(ConfirmEachStep.stricter(ConfirmDangerousOnly), ConfirmEachStep);
+        assert_eq!(TrustPolicy::for_level(TrustLevel::Trusted), ConfirmDangerousOnly);
+        assert_eq!(TrustPolicy::for_level(TrustLevel::Confirm), ConfirmEachStep);
+        assert_eq!(TrustPolicy::for_level(TrustLevel::Guarded), ConfirmEachStep);
+    }
+
+    // ——— 4.4 信任阶梯（引擎行为） ———
+
+    #[tokio::test]
+    async fn ladder_first_run_asks_before_every_write_step_in_auto_mode() {
+        let s = skill(serde_json::json!([{"kind":"exec","command":"ls"},{"kind":"exec","command":"pwd"}]), None);
+        let mut io = FakeIo::new();
+        let r = run(&mut io, &s, &first_run_opts()).await;
+        assert_eq!(r.outcome, RunOutcome::Completed);
+        assert_eq!(io.asked.len(), 2, "首次运行：自动模式下每个写步骤也要问");
+        assert!(io.asked.iter().all(|a| a.kind == "skill"));
+    }
+
+    #[tokio::test]
+    async fn ladder_card_explains_why_it_asks() {
+        let s = skill(serde_json::json!([{"kind":"exec","command":"ls"}]), None);
+        let mut io = FakeIo::new();
+        let o = RunOpts { trust_note: "还没有运行过".into(), ..first_run_opts() };
+        run(&mut io, &s, &o).await;
+        assert!(io.asked[0].reasons[0].contains("还没有运行过"), "{:?}", io.asked[0].reasons);
+        // 审批模式下理由是审批模式（用户的总开关优先说明）
+        let mut io = FakeIo::new();
+        let o = RunOpts { trust_note: "还没有运行过".into(), approval_mode: true, ..first_run_opts() };
+        run(&mut io, &s, &o).await;
+        assert!(io.asked[0].reasons[0].contains("审批模式"), "{:?}", io.asked[0].reasons);
+    }
+
+    #[tokio::test]
+    async fn ladder_trusted_skips_non_dangerous_but_always_asks_dangerous() {
+        let s = skill(
+            serde_json::json!([{"kind":"exec","command":"ls"},{"kind":"exec","command":"rm -rf /var/data"},{"kind":"keys","keys":"yes<Enter>"}]),
+            None,
+        );
+        let mut io = FakeIo::new();
+        let r = run(&mut io, &s, &opts()).await;
+        assert_eq!(r.outcome, RunOutcome::Completed);
+        assert_eq!(io.asked.len(), 1, "已信任：只有危险步骤问");
+        assert_eq!(io.asked[0].kind, "danger");
+    }
+
+    #[tokio::test]
+    async fn ladder_dangerous_keys_always_ask_even_when_trusted() {
+        // 终端当前行 + 回车：keys_risk 判危险
+        let s = skill(serde_json::json!([{"kind":"keys","keys":"rm -rf /<Enter>"}]), None);
+        let mut io = FakeIo::new();
+        io.approvals.push_back(false);
+        let r = run(&mut io, &s, &opts()).await;
+        assert_eq!(r.outcome, RunOutcome::Declined);
+        assert_eq!(io.asked.len(), 1);
+        assert_eq!(io.asked[0].kind, "danger");
+        assert!(io.keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ladder_approval_mode_wins_over_trust() {
+        let s = skill(serde_json::json!([{"kind":"exec","command":"ls"},{"kind":"exec","command":"pwd"}]), None);
+        let mut io = FakeIo::new();
+        let o = RunOpts { approval_mode: true, trust: TrustPolicy::ConfirmDangerousOnly, ..RunOpts::default() };
+        let r = run(&mut io, &s, &o).await;
+        assert_eq!(r.outcome, RunOutcome::Completed);
+        assert_eq!(io.asked.len(), 2, "审批模式：信任不能放宽");
+    }
+
+    // ——— 4.4 适用主机范围 ———
+
+    fn who(session: &str, label: &str, key: Option<&str>) -> HostIdentity {
+        HostIdentity { session_id: session.into(), label: label.into(), host_key: key.map(str::to_string) }
+    }
+
+    fn list(hosts: &[&str]) -> HostScope {
+        HostScope::List { hosts: hosts.iter().map(|h| h.to_string()).collect() }
+    }
+
+    #[test]
+    fn scope_any_allows_everything() {
+        assert!(check_scope(&HostScope::Any, &who("t1", "", None)).is_ok());
+        assert!(check_scope(&HostScope::Any, &who("t1", "prod", Some("ssh:root@a:22"))).is_ok());
+    }
+
+    #[test]
+    fn scope_list_matches_ssh_host_user_host_and_glob() {
+        let w = who("t1", "tab 1", Some("ssh:root@Web1.Prod.Example.com:22"));
+        assert!(check_scope(&list(&["web1.prod.example.com"]), &w).is_ok());
+        assert!(check_scope(&list(&["*.prod.example.com"]), &w).is_ok());
+        assert!(check_scope(&list(&["root@web1.prod.example.com"]), &w).is_ok());
+        assert!(check_scope(&list(&["web1.prod.example.com:22"]), &w).is_ok());
+        assert!(check_scope(&list(&["ssh:root@web1.prod.example.com:22"]), &w).is_ok());
+        assert!(check_scope(&list(&["other", "*.staging.example.com"]), &w).is_err());
+    }
+
+    #[test]
+    fn scope_list_matches_session_id_and_label_first_word() {
+        assert!(check_scope(&list(&["abc-123"]), &who("ABC-123", "x", None)).is_ok());
+        // 3.3 录制时默认把标签第一个词写进 hostScope
+        assert!(check_scope(&list(&["prod-web"]), &who("t9", "root@prod-web (2)", Some("tab:root@prod-web (2)"))).is_ok());
+        assert!(check_scope(&list(&["prod-web"]), &who("t9", "prod-db", Some("tab:prod-db"))).is_err());
+    }
+
+    #[test]
+    fn scope_local_matches_local_and_localhost() {
+        let w = who("t1", "终端", Some("local"));
+        assert!(check_scope(&list(&["local"]), &w).is_ok());
+        assert!(check_scope(&list(&["localhost"]), &w).is_ok());
+        assert!(check_scope(&list(&["prod-web"]), &w).is_err());
+    }
+
+    #[test]
+    fn scope_refusal_message_names_scope_and_target_without_leaking_more() {
+        let e = check_scope(&list(&["a.example.com", "b.example.com"]), &who("t1", "tab", Some("ssh:root@c.example.com:2222"))).unwrap_err();
+        assert!(e.contains("a.example.com、b.example.com") && e.contains("root@c.example.com:2222") && e.contains("没有执行任何操作"), "{e}");
+    }
+
+    #[test]
+    fn scope_fails_closed_when_nothing_to_compare() {
+        // 没有主机键、标签也是空：只能比会话 id，比不上就拒绝
+        assert!(check_scope(&list(&["prod"]), &who("t1", "", None)).is_err());
+        // 空列表（校验会拦，但库被改坏时也不能放行）
+        assert!(check_scope(&HostScope::List { hosts: vec![] }, &who("t1", "prod", Some("local"))).is_err());
+    }
+
+    #[tokio::test]
+    async fn out_of_scope_run_does_nothing_and_reports_reason() {
+        let s = skill(serde_json::json!([{"kind":"exec","command":"ls"},{"kind":"exec","command":"pwd"}]), None);
+        let mut io = FakeIo::new();
+        let o = RunOpts { scope_violation: Some("超出范围：只适用于 a".into()), ..opts() };
+        let r = run(&mut io, &s, &o).await;
+        assert_eq!(r.outcome, RunOutcome::OutOfScope { reason: "超出范围：只适用于 a".into() });
+        assert_eq!(results(&r), ["skipped", "skipped"]);
+        assert!(io.cmds.is_empty() && io.keys.is_empty() && io.asked.is_empty());
+        assert!(io.log.iter().all(|l| !l.starts_with("exec:") && !l.starts_with("drive") && !l.starts_with("scope:")), "{:?}", io.log);
+        assert_eq!(record_decision(&r.outcome), None, "拒绝运行不计功过");
+        assert!(!is_clean_success(&r));
+        // 原因推给了面板（步骤卡的旁白）
+        assert!(io.events.iter().any(|e| e.status == ProgressStatus::Note && e.text.contains("超出范围")));
+        assert!(report_text(&r).contains("没有运行") && report_text(&r).contains("超出范围"));
+        let v = serde_json::to_value(&r.outcome).unwrap();
+        assert_eq!(v["kind"], "out_of_scope");
+    }
+
+    #[test]
+    fn clean_success_requires_no_deviation() {
+        let mk = |outcome: RunOutcome, devs: usize, res: StepResult| SkillRunReport {
+            skill_id: "s".into(),
+            skill_name: "n".into(),
+            outcome,
+            steps: vec![StepRecord { index: 0, kind: "exec", summary: "x".into(), result: res, note: String::new(), attempts: 1 }],
+            verify: None,
+            deviations: (0..devs)
+                .map(|_| DeviationRecord { step_index: 0, expected: "e".into(), saw_tail: "s".into(), resolution: "r".into() })
+                .collect(),
+            llm_interventions: 0,
+            suggested_updates: vec![],
+            recorded: None,
+        };
+        assert!(is_clean_success(&mk(RunOutcome::Completed, 0, StepResult::Ok)));
+        assert!(!is_clean_success(&mk(RunOutcome::Completed, 1, StepResult::Ok)));
+        assert!(!is_clean_success(&mk(RunOutcome::Completed, 0, StepResult::Deviated { expected: "e".into(), saw_tail: "s".into() })));
+        assert!(!is_clean_success(&mk(RunOutcome::VerifyFailed, 0, StepResult::Ok)));
     }
 
     #[test]

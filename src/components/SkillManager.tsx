@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { api } from "../api";
-import type { Skill, SkillInput } from "../types";
+import type { Skill, SkillInput, SkillTrustView } from "../types";
 import {
   describeHostScope,
   exportFileName,
@@ -9,7 +9,7 @@ import {
   SOURCE_LABEL,
   splitProblems,
 } from "../lib/skillForm";
-import { RISK_LABEL } from "../lib/skill";
+import { RISK_LABEL, scopeBlock, trustBadge } from "../lib/skill";
 import ConfirmDialog from "./ConfirmDialog";
 import SkillEditor from "./SkillEditor";
 import { Highlighted, RiskBadge, StepPreview } from "./SkillParts";
@@ -33,6 +33,11 @@ export interface SkillManagerProps {
    * 缺省（没有可用会话 / 正忙）时「运行」按钮置灰。`params` 只含非 secret 参数。
    */
   onRunSkill?: (skill: Skill, params: Record<string, string>) => void;
+  /**
+   * 当前会话（4.4）：给了就按它判断各技能的适用主机范围——超出的行显示「超出范围」并置灰「运行」。
+   * 不给则不做范围判断（只显示信任档位）。
+   */
+  scopeTarget?: { sessionId: string; label: string };
 }
 
 /** 与后端 `MAX_IMPORT_BYTES` 一致；本地先拦一道，省得读一个巨大的文件 */
@@ -47,13 +52,18 @@ const SkillRow = memo(function SkillRow({
   onExport,
   onDelete,
   onRun,
+  trust,
 }: {
   skill: Skill;
+  /** 4.4：后端算出的信任结论（含范围判断）；还没加载到时为空 */
+  trust?: SkillTrustView;
   onRun?: (s: Skill) => void;
   onEdit: (s: Skill) => void;
   onExport: (s: Skill) => void;
   onDelete: (s: Skill) => void;
 }) {
+  const badge = trustBadge(trust);
+  const blocked = scopeBlock(trust);
   return (
     <div
       className="sk-row"
@@ -77,6 +87,16 @@ const SkillRow = memo(function SkillRow({
       <div className="sk-c-risk">
         <RiskBadge risk={skill.risk} />
       </div>
+      <div className="sk-c-trust">
+        <span className={`sk-trust ${badge.tone}`} title={badge.title}>
+          {badge.label}
+        </span>
+        {blocked && (
+          <span className="sk-trust scope" title={blocked}>
+            超出范围
+          </span>
+        )}
+      </div>
       <div className="sk-c-host" title={describeHostScope(skill.hostScope)}>
         {describeHostScope(skill.hostScope)}
       </div>
@@ -90,8 +110,8 @@ const SkillRow = memo(function SkillRow({
       <div className="sk-c-act" onClick={(e) => e.stopPropagation()}>
         <button
           className="sk-ibtn"
-          title={onRun ? "在当前会话运行" : "没有可用的会话，或 Agent 正忙"}
-          disabled={!onRun}
+          title={blocked ? `不能在当前会话运行：${blocked}` : onRun ? "在当前会话运行" : "没有可用的会话，或 Agent 正忙"}
+          disabled={!onRun || !!blocked}
           onClick={() => onRun?.(skill)}
         >
           ▶
@@ -298,8 +318,12 @@ function RunDialog({
 
 // ——————————————————————————————— 管理器 ———————————————————————————————
 
-export default function SkillManager({ onClose, initialDraft, onRunSkill }: SkillManagerProps) {
+export default function SkillManager({ onClose, initialDraft, onRunSkill, scopeTarget }: SkillManagerProps) {
   const [skills, setSkills] = useState<Skill[] | null>(null);
+  // 4.4：id → 信任结论。失败 / 没加载到就是空表，徽标按最严的「需逐步确认」显示
+  const [trust, setTrust] = useState<Record<string, SkillTrustView>>({});
+  const scopeSid = scopeTarget?.sessionId;
+  const scopeLabel = scopeTarget?.label;
   const [query, setQuery] = useState("");
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ text: string; kind: "ok" | "err" } | null>(null);
@@ -326,14 +350,18 @@ export default function SkillManager({ onClose, initialDraft, onRunSkill }: Skil
   const load = useCallback(async (q: string) => {
     const my = ++seq.current;
     try {
-      const list = await api.skillList(q.trim() || undefined);
+      const [list, tv] = await Promise.all([
+        api.skillList(q.trim() || undefined),
+        api.skillTrust(scopeSid, scopeLabel).catch(() => [] as SkillTrustView[]),
+      ]);
       if (my !== seq.current) return;
       setSkills(list);
+      setTrust(Object.fromEntries(tv.map((v) => [v.id, v])));
       setLoadErr(null);
     } catch (e) {
       if (my === seq.current) setLoadErr(String(e));
     }
-  }, []);
+  }, [scopeSid, scopeLabel]);
   useEffect(() => {
     const t = window.setTimeout(() => void load(query), skills === null ? 0 : SEARCH_DEBOUNCE);
     return () => window.clearTimeout(t);
@@ -481,6 +509,7 @@ export default function SkillManager({ onClose, initialDraft, onRunSkill }: Skil
             <div className="sk-row sk-head">
               <div className="sk-c-name">名称</div>
               <div className="sk-c-risk">风险</div>
+              <div className="sk-c-trust">信任</div>
               <div className="sk-c-host">适用主机</div>
               <div className="sk-c-src">来源</div>
               <div className="sk-c-cnt">成功 / 失败</div>
@@ -494,7 +523,7 @@ export default function SkillManager({ onClose, initialDraft, onRunSkill }: Skil
               </div>
             )}
             {skills?.map((s) => (
-              <SkillRow key={s.id} skill={s} onRun={onRunSkill ? askRun : undefined} onEdit={edit} onExport={doExport} onDelete={setConfirmDel} />
+              <SkillRow key={s.id} skill={s} trust={trust[s.id]} onRun={onRunSkill ? askRun : undefined} onEdit={edit} onExport={doExport} onDelete={setConfirmDel} />
             ))}
           </div>
         </div>
