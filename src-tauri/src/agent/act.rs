@@ -58,6 +58,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::capture;
+use super::budget::{self, BudgetCheck, BudgetSpent, PauseCause, PhaseEvent, RunPhase};
 use super::control::{self, ControlState};
 use super::danger::assess;
 use super::hostmem::{self, MemoryCall};
@@ -77,11 +78,8 @@ use crate::cmd::AppState;
 use crate::ssh::session::{AuthMethod, ConnectRequest};
 use crate::store;
 
-/// 一次 run 最多允许多少轮「思考 → 动作 → 再思考」。
-///
-/// 取 8：真正在排查问题时通常 3~5 步就收敛了；再多说明模型在打转，
-/// 让它继续跑只会烧钱，不如停下来把现状交给人。
-const MAX_STEPS: usize = 8;
+// 运行预算（步数 / 时间 / 输出字符）见 `budget.rs`，来自 `AgentConfig.budget`；
+// 原先写死的 `MAX_STEPS = 8` 已取消：预算用尽时本轮暂停等用户「继续 / 停止」，而不是直接收场。
 
 /// 单一步骤里最多允许多少个动作（防止模型一口气吐出五十条命令）。
 const MAX_ACTIONS: usize = 12;
@@ -723,7 +721,7 @@ pub fn tool_label(name: &str, args: &str) -> &'static str {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StepPayload {
-    /// `plan` | `tool` | `exec` | `result` | `skip` | `note` | `answer`
+    /// `plan` | `tool` | `exec` | `result` | `skip` | `note` | `answer` | `paused` | `resumed`
     pub kind: &'static str,
     pub step: usize,
     /// `kind:"tool"` 专用：模型调用的工具名。
@@ -765,6 +763,9 @@ pub struct StepPayload {
     /// `kind:"skill"` 专用：这一步技能回放的状态码（`skill_run::ProgressStatus::code`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_status: Option<String>,
+    /// `kind:"paused"` 专用：为什么暂停（`steps` | `time` | `output` | `user`）。只有分类，没有内容。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_kind: Option<String>,
 }
 
 impl StepPayload {
@@ -786,6 +787,7 @@ impl StepPayload {
             secret_status: None,
             memory_id: None,
             skill_status: None,
+            pause_kind: None,
         }
     }
 }
@@ -2300,6 +2302,8 @@ pub struct ActRuntime {
     pub control: control::ControlTable,
     /// 进行中各轮运行的流水账，结束时收成摘要落库，见 `history.rs`
     pub runlog: super::history::RunLogs,
+    /// 进行中各轮运行的相位（在跑 / 暂停 / 待暂停），见 `budget.rs`。只在内存里。
+    pub phases: budget::PhaseTable,
 }
 
 impl ActRuntime {
@@ -2312,6 +2316,7 @@ impl ActRuntime {
             secret_acks: Mutex::new(HashMap::new()),
             control: control::ControlTable::new(),
             runlog: super::history::RunLogs::default(),
+            phases: budget::PhaseTable::default(),
         }
     }
 
@@ -2519,6 +2524,76 @@ impl Drop for RunLogGuard<'_> {
     }
 }
 
+/// 一轮运行的相位登记：任何出口 drop 时摘掉，免得表里留着已结束的运行。
+pub(super) struct PhaseGuard<'a> {
+    pub(super) rt: &'a ActRuntime,
+    pub(super) run: String,
+}
+
+impl Drop for PhaseGuard<'_> {
+    fn drop(&mut self) {
+        self.rt.phases.finish(&self.run);
+    }
+}
+
+/// 暂停期间轮询相位的间隔。
+const PHASE_POLL: Duration = Duration::from_millis(200);
+
+/// 暂停在这里，直到用户「继续」/「停止」（取消）/ 挂太久。
+///
+/// 1. 推一张 `paused` 卡（做了什么 / 还差什么 / 怎么继续；动作摘要已脱敏）；
+/// 2. **把控制权还给用户**（`release_control`）：暂停期间用户在终端里想干什么都行，不会被当成「抢 Agent 的方向盘」；
+/// 3. 轮询相位；收到「继续」后**重新获取**发起会话的控制权（与开局同一条 `acquire` 路径），
+///    其余被驾驶的会话在下一个动作前由 `gate_drive` 照常重新获取并检查 Paused。
+///    审批 / 作用范围 / 危险判断都在动作路径里，不会因为恢复而被绕过。
+///
+/// 返回 `Ready` = 已恢复；`Cancelled` = 用户停止；`TookOver` = 挂太久（沿用 `wait_unpaused` 的命名）。
+async fn hold_paused(
+    app: &AppHandle,
+    runtime: &ActRuntime,
+    run: &str,
+    step: usize,
+    cause: PauseCause,
+    steps_done: u32,
+    cancel: &AtomicBool,
+) -> control::PauseWait {
+    let recent = runtime.runlog.recent_actions(run, 5);
+    let kind = match cause {
+        PauseCause::Budget { reason } => reason.code(),
+        PauseCause::User => "user",
+    };
+    emit_step(
+        app,
+        run,
+        StepPayload {
+            text: Some(budget::paused_text(&cause, steps_done, &recent)),
+            pause_kind: Some(kind.to_string()),
+            ..StepPayload::new("paused", step)
+        },
+    );
+    runtime.release_control(app, run);
+    let waited = control::wait_unpaused(
+        || runtime.phases.is_paused(run),
+        || cancel.load(Ordering::Relaxed),
+        Duration::from_secs(budget::PAUSE_IDLE_LIMIT_SECS),
+        PHASE_POLL,
+        tokio::time::sleep,
+    )
+    .await;
+    if waited == control::PauseWait::Ready {
+        // 与开局相同的重新获取路径：用户若在暂停期间动过终端，之后的 gate_drive 照常生效
+        if let Some(st) = runtime.control.acquire(run, run) {
+            emit_control(app, run, &[run.to_string()], st);
+        }
+        emit_step(
+            app,
+            run,
+            StepPayload { text: Some("继续运行，已换上一份新预算。".into()), ..StepPayload::new("resumed", step) },
+        );
+    }
+    waited
+}
+
 /// 暂停时最多等多久用户交还。到点仍没交还就按「用户接管了终端」告知模型。
 const PAUSE_MAX_WAIT: Duration = Duration::from_secs(300);
 /// 暂停等待的轮询间隔。
@@ -2565,6 +2640,8 @@ const MAX_TOOK_OVER: usize = 2;
 /// 返回「确有一轮在跑」。
 pub async fn stop_run(app: &AppHandle, state: &AppState, run: &str, send_ctrl_c: bool) -> bool {
     let was_running = state.act.cancel(run);
+    // 取消标记已置位之后再把相位置为终态：停止优先于「继续」，暂停中的运行不会被陈旧的点击复活
+    state.act.phases.apply(run, PhaseEvent::Stop);
     if send_ctrl_c {
         for session in state.act.control.sessions_of(run) {
             if let Err(e) = write_to(state, &session, &[0x03]).await {
@@ -2875,6 +2952,8 @@ pub async fn run(
     };
     // 这一轮开始驾驶发起会话；任何出口（含出错 return）drop 时都会还给用户
     let _lease = ControlLease { app, rt: runtime, run: req.session_id.clone() };
+    runtime.phases.start(&req.session_id);
+    let _phase = PhaseGuard { rt: runtime, run: req.session_id.clone() };
     if let Some(st) = runtime.control.acquire(&req.session_id, &req.session_id) {
         emit_control(app, &req.session_id, &[req.session_id.clone()], st);
     }
@@ -2923,6 +3002,10 @@ pub async fn run(
     }
     let mut step = 0usize;
     let mut feedback = String::new();
+    // 运行预算（4.6）：自本轮开始 / 最近一次「继续」起累计；用尽即暂停等用户，不是收场。
+    let limits = cfg.budget.clamped();
+    let mut spent = BudgetSpent::default();
+    let mut seg_start = std::time::Instant::now();
     // 会话 id → 本轮里上一次动过它（exec / 按键 / 等待）之后缓冲的位置，供 `nx_wait` 当起点：
     // 模型思考的那几秒里到达的输出也该算「新输出」，否则等的提示早出现了反而永远等不到。
     let mut marks: HashMap<String, u64> = HashMap::new();
@@ -2966,16 +3049,42 @@ pub async fn run(
             );
             break;
         }
-        if step >= MAX_STEPS {
-            emit_step(
-                app,
-                &session,
-                StepPayload {
-                    text: Some(format!("已达到本轮步数上限（{MAX_STEPS} 步），先停下来：由你确认是否继续。")),
-                    ..StepPayload::new("note", step)
-                },
-            );
-            break;
+        // 步骤边界：预算用尽 / 用户点了「暂停」→ 暂停在这里，等「继续」或「停止」。
+        // 对话历史（messages）、已做的动作、控制权等都留在本函数的局部变量里，继续 = 换新预算接着转。
+        spent.elapsed_secs = seg_start.elapsed().as_secs();
+        let pause_cause = match budget::check_budget(&spent, &limits) {
+            BudgetCheck::Exhausted(reason) => {
+                runtime.phases.apply(&session, PhaseEvent::BudgetExhausted(reason));
+                Some(PauseCause::Budget { reason })
+            }
+            BudgetCheck::Continue => match runtime.phases.apply(&session, PhaseEvent::Boundary) {
+                Some(RunPhase::Paused(cause)) => Some(cause),
+                _ => None,
+            },
+        };
+        if let Some(cause) = pause_cause {
+            match hold_paused(app, runtime, &session, step, cause, spent.steps, &cancel).await {
+                control::PauseWait::Ready => {
+                    spent = BudgetSpent::default();
+                    seg_start = std::time::Instant::now();
+                    feedback.push_str(budget::RESUME_FEEDBACK);
+                }
+                control::PauseWait::Cancelled => {
+                    emit_step(app, &session, StepPayload { text: Some("已取消。".into()), ..StepPayload::new("note", step) });
+                    break;
+                }
+                control::PauseWait::TookOver => {
+                    emit_step(
+                        app,
+                        &session,
+                        StepPayload {
+                            text: Some("暂停太久没有继续，本轮已结束；需要的话重新提问即可。".into()),
+                            ..StepPayload::new("note", step)
+                        },
+                    );
+                    break;
+                }
+            }
         }
         step += 1;
 
@@ -2985,6 +3094,7 @@ pub async fn run(
             }
             // 所有喂回模型的终端内容（命令输出、屏幕、错误、命令原文）都在这唯一的入口脱敏：
             // 各个动作分支往 feedback 里拼的是原文，漏一处分支就是一次外泄，所以不在分支里逐个处理。
+            spent.output_chars += feedback.chars().count() as u64;
             messages.push(ChatMessage::user(scrub(acct.redact, &feedback)));
             feedback.clear();
         }
@@ -3025,6 +3135,7 @@ pub async fn run(
         // 进了历史的这条 assistant 消息：带工具调用时不能原样存，
         // 否则下一轮会被接口以「tool_calls 后面必须跟 tool 回执」拒掉。
         messages.push(ChatMessage::assistant(describe_tool_calls(&reply)));
+        spent.output_chars += reply.text.chars().count() as u64;
 
         if actions.is_empty() {
             // 调了工具但一个动作都没产出（多半是缺必填参数，比如 nx_tab 没给 op）。
@@ -3102,6 +3213,19 @@ pub async fn run(
                 feedback.push_str("（用户取消了后续动作，请直接给出结论。）\n");
                 break;
             }
+            // 动作边界：预算用尽 / 待生效的手动暂停 → 余下动作不执行，回到循环顶去暂停。
+            // 这一步本身要先算进去（做满 N 步就停，不多做第 N+1 步）。
+            spent.elapsed_secs = seg_start.elapsed().as_secs();
+            if matches!(budget::check_budget(&spent, &limits), BudgetCheck::Exhausted(_))
+                || runtime.phases.phase(&session) == Some(RunPhase::Running { pause_pending: true })
+            {
+                feedback.push_str(
+                    "（本轮运行被暂停（预算用尽或用户要求暂停），这一步及其后的动作都没有执行；\
+                     恢复后请按现状重新规划，不要假设它们已完成。）\n",
+                );
+                break;
+            }
+            spent.steps += 1;
             // 开始下一个动作之前先看控制权：用户正在终端里操作时不抢（读屏 / 等待也算，
             // 此刻的屏幕是用户在打字的屏幕）。发起会话始终是被驾驶的。
             drive_gate!(&session);

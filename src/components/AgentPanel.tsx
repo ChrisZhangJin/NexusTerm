@@ -16,6 +16,7 @@ import {
   onAgentToken,
 } from "../api";
 import { isAgentReady, useAgentConfig } from "../lib/agent";
+import { nextPause, pauseBannerText, type PauseKind } from "../lib/agentBudget";
 import { toFriendlyError } from "../lib/errors";
 import {
   applyControl,
@@ -70,6 +71,11 @@ interface Conversation {
   busy: boolean;
   /** 上一次是被「切走会话 / 收起面板」打断的 —— 半截答案不可信，要提示 */
   interrupted: boolean;
+  /**
+   * 这一轮此刻停在暂停上（预算用尽 / 手动暂停）。后端同一轮还占着会话、等「继续」或「停止」。
+   * 只从 `paused` / `resumed` 步骤推出；一轮结束时对话状态被整体重建，标记随之消失。
+   */
+  paused?: PauseKind;
 }
 
 /** 「停止时同时发 Ctrl-C」的本机偏好（"1" = 开，默认关） */
@@ -82,7 +88,7 @@ const TRUNCATED_HINT = "\n\n— 回答被长度限制截断，可以让它继续
 /** 一个字都没收到就 done 了（被过滤 / 空回复）：不能给用户留一个空气泡 */
 const EMPTY_ANSWER = "（本次没有返回内容）";
 const CANCELLED_ANSWER = "（已取消）";
-/** 一轮跑完却没等到结论（多半是撞到步数上限）时补的那句话 */
+/** 一轮跑完却没等到结论（多半是用户点了停止）时补的那句话 */
 const NO_CONCLUSION = "（这一轮没有给出结论：上面的步骤就是它做过的全部事情。）";
 
 let seq = 0;
@@ -305,6 +311,12 @@ function withSecretResult(
   };
 }
 
+/** 暂停 / 继续步骤改变对话的暂停标记（其余步骤原样，不产生新对象）。 */
+function withPauseState(c: Conversation, step: AgentStep): Conversation {
+  const next = nextPause(c.paused, step);
+  return next === c.paused ? c : { ...c, paused: next };
+}
+
 /** Agentic 一轮的结束语落地：既不置也不用补 markup，直接作为一条完整助手消息。 */
 function withConclusion(c: Conversation, text: string): Conversation {
   const trimmed = text.trim();
@@ -319,7 +331,7 @@ function withConclusion(c: Conversation, text: string): Conversation {
 }
 
 /**
- * 一轮结束却**没等到**结论时兜的那一步（多半撞到步数上限）。判据是「busy 仍为
+ * 一轮结束却**没等到**结论时兜的那一步（多半是用户点了停止）。判据是「busy 仍为
  * true」：有结论的话 kind=answer 走 `withConclusion` 早把它置回 false 了。
  * 不补这一步界面会永远转圈。
  */
@@ -505,7 +517,7 @@ export function AgentPanel({
             patch((c) =>
               step.kind === "answer"
                 ? withConclusion(c, step.text ?? "")
-                : withStep(c, step)
+                : withPauseState(withStep(c, step), step)
             );
           }),
           onAgentApprove(runSession, (req) => {
@@ -741,6 +753,28 @@ export function AgentPanel({
     }
   };
 
+  /** 手动「暂停」：当前这一步做完后停下，把终端还给用户。 */
+  const pauseRun = async () => {
+    const sid = runSession ?? sessionId;
+    if (!sid) return;
+    try {
+      await api.agentRunPause(sid);
+    } catch (e) {
+      setErr(`暂停失败：${toFriendlyError(e).message}`);
+    }
+  };
+
+  /** 「继续」：同一轮、同一段对话，换一份新预算接着做。 */
+  const resumeRun = async () => {
+    const sid = runSession ?? sessionId;
+    if (!sid) return;
+    try {
+      await api.agentRunResume(sid);
+    } catch (e) {
+      setErr(`继续失败：${toFriendlyError(e).message}`);
+    }
+  };
+
   /** 「接管」：让 Agent 立刻让路（等同于自己敲了键）。对所有正被驾驶的会话生效。 */
   const takeover = () => {
     for (const id of drivingIds) void api.agentControlTakeover(id).catch(() => {});
@@ -953,7 +987,7 @@ export function AgentPanel({
               );
             })}
             {/* Agentic 没有占位泡，过程中的「还在跑」要靠这一行说出来 */}
-            {busy && (
+            {busy && !conv.paused && (
               <div className="ap-running">
                 <span className="ap-typing">
                   <i />
@@ -972,7 +1006,14 @@ export function AgentPanel({
 
           {/* 控制权横幅：谁在操作终端要一眼看得出。用户一敲键盘 Agent 就自动暂停，
               只有点「交还」它才会继续；「接管」则是不用敲键盘也能让它让路。 */}
-          {pausedIds.length > 0 ? (
+          {busy && conv.paused ? (
+            <div className="ap-control paused" role="status">
+              <span className="ap-control-text">{pauseBannerText(conv.paused)}</span>
+              <button className="btn primary" onClick={() => void resumeRun()}>
+                继续
+              </button>
+            </div>
+          ) : pausedIds.length > 0 ? (
             <div className="ap-control paused" role="status">
               <span className="ap-control-text">
                 你正在操作终端，Agent 已暂停（不会往终端里写入）。
@@ -1166,6 +1207,15 @@ export function AgentPanel({
                     />
                     同时发 Ctrl-C
                   </label>
+                  {!conv.paused && (
+                    <button
+                      className="btn"
+                      title="当前这一步做完后暂停，终端还给你；之后可以「继续」"
+                      onClick={() => void pauseRun()}
+                    >
+                      暂停
+                    </button>
+                  )}
                   <button className="btn danger" onClick={() => void cancel()}>
                     停止
                   </button>
@@ -1310,8 +1360,12 @@ const SECRET_STATUS_LABELS: Record<string, string> = {
  * 可以同时在好几个会话上下令，只显示命令的话分不清输出来自哪台机器。
  */
 function StepCard({ step }: { step: AgentStep }) {
-  if (step.kind === "note") {
+  if (step.kind === "note" || step.kind === "resumed") {
     return <div className="ap-note">{step.text ?? ""}</div>;
+  }
+  // 运行暂停（预算用尽 / 手动暂停）：做了什么 / 还差什么 / 怎么继续，多行原样展示
+  if (step.kind === "paused") {
+    return <div className="ap-note ap-paused">{step.text ?? ""}</div>;
   }
   if (step.kind === "memory") return <MemoryStepCard step={step} />;
   // 工具调用卡片：把「调了哪个工具、传了什么参数」原样摆出来，让调用过程看得见。
