@@ -59,9 +59,13 @@ use tauri::{AppHandle, Emitter};
 
 use super::capture;
 use super::danger::assess;
-use super::executor::{wait_for_end, ExecEnd, ExecOutcome, WaitConfig};
+use super::executor::{
+    wait_for_end, ExecEnd, ExecOutcome, WaitConfig, CLASSIFY_TAIL_BYTES,
+};
 use super::interact::{self, Pattern, WaitEnd, WaitSpec};
 use super::llm::{self, ChatMessage, CONTEXT_BEGIN, CONTEXT_END};
+use super::prompt::{self, PromptGuess};
+use super::secret::{self, SecretAnswer};
 use super::trace;
 use super::{AgentConfig, AgentError};
 use crate::agent::StreamKind;
@@ -131,13 +135,14 @@ pub struct AgentRunRequest {
     pub console_alt: bool,
 }
 
-/// 模型下发的一个动作。八选一：
+/// 模型下发的一个动作。九选一：
 ///
 /// - `Exec`：在某个会话上跑一条命令。
 /// - `Export`：把某个会话迄今为止的全部输出要回来（`agent::capture`）。
 /// - `Open`：开一个新会话（本地或某个已保存的 SSH 主机），可选顺手发一条命令。
 /// - `Tab`：操作窗口上的标签页（列出 / 切换 / 关闭 / 改名 / 重连）。
 /// - `Keys` / `Wait` / `Screen`：对终端的「手和眼」——发原始按键、等文字出现、读当前屏幕。
+/// - `Secret`：请用户输入一个密码（密码通道，见 `secret.rs`）。模型只能「请求」，永远拿不到值。
 /// - `Reject`：模型把界面动作写成了 shell 命令，被拦下来了（见 `pseudo_command_hint`）。
 ///
 /// `Tab` 与 `Exec` 有个本质区别：**它不由后端执行**。tab 是前端 React state，
@@ -161,6 +166,9 @@ pub enum AgentAction {
     },
     /// 读目标会话此刻的 xterm 屏幕（含 alt screen）。
     Screen { target: Option<String> },
+    /// 请用户在面板里输入一个密码，由后端直接写进目标会话的 pty。
+    /// 动作里**只有 reason**：没有、也不接受任何「值」字段 —— 模型不知道密码，也不该经手。
+    Secret { target: Option<String>, reason: Option<String> },
     /// 不是「命令有风险」，而是「这条命令根本不该出现」。
     ///
     /// 它照样占一个动作位、照样例行走反馈链路 —— 让模型看到自己错在哪，
@@ -249,6 +257,9 @@ struct ExecBlock {
     /// `tab` + `op:"rename"` 专用：新名字。
     #[serde(default)]
     name: Option<String>,
+    /// `secret` 专用：为什么要用户输入密码（给人看的一句话）。
+    #[serde(default)]
+    reason: Option<String>,
     /// `keys` 专用：按键串（转义语法见 `interact::parse_keys`）。
     #[serde(default)]
     keys: Option<String>,
@@ -277,6 +288,7 @@ pub const TOOL_TAB: &str = "nx_tab";
 pub const TOOL_KEYS: &str = "nx_send_keys";
 pub const TOOL_WAIT: &str = "nx_wait";
 pub const TOOL_SCREEN: &str = "nx_screen";
+pub const TOOL_SECRET: &str = "nx_secret";
 
 /// 声明给模型的全部工具。
 ///
@@ -371,7 +383,7 @@ pub fn tool_specs() -> Vec<llm::ToolSpec> {
                           用于 nx_exec 做不到的事：vim 里按 Esc 与 :wq、回应 [Y/n] 之类的交互提示、\
                           Ctrl-C 打断卡住的进程、Ctrl-D 退出 REPL、方向键 / Tab 补全、\
                           在 python / mysql 等 REPL 里输入。普通的「跑一条命令看输出」仍用 nx_exec。\
-                          **绝不要用它输入密码**：遇到密码提示请停下，让用户自己在终端里输入。".into(),
+                          **绝不要用它输入密码**：遇到密码提示请改用 nx_secret，让用户本人输入。".into(),
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -435,6 +447,29 @@ pub fn tool_specs() -> Vec<llm::ToolSpec> {
                 }
             }),
         },
+        llm::ToolSpec {
+            name: TOOL_SECRET,
+            description: "请用户本人输入一个密码 / 口令 / 验证码：面板会弹出一个带掩码输入框的卡片，\
+                          用户输入后由后端**直接写进目标终端并回车**，输入内容不会经过你、也不会回显。\
+                          只在终端正停在密码类提示（`Password:` / `[sudo] password` / `passphrase` / 验证码）时用。\
+                          你只能「请求」：没有任何参数能让你提供或看到密码；\
+                          用户可能拒绝或超时，结果会告诉你。**绝不要用 nx_send_keys / nx_exec 输入密码**。".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "要输入密码的会话 id。省略表示当前会话。"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "一句话告诉用户为什么需要密码（会显示在卡片上），\
+                                        例如「sudo 需要你的登录密码才能安装 nginx」。"
+                    }
+                },
+                "required": ["reason"]
+            }),
+        },
     ]
 }
 
@@ -462,6 +497,7 @@ fn tool_action_name(name: &str) -> Option<&'static str> {
         TOOL_KEYS => Some("keys"),
         TOOL_WAIT => Some("wait"),
         TOOL_SCREEN => Some("screen"),
+        TOOL_SECRET => Some("secret"),
         _ => None,
     }
 }
@@ -501,6 +537,7 @@ pub fn actions_from_tool_call(call: &llm::ToolCall) -> Vec<AgentAction> {
         "keys" => parse_keys_action(block),
         "wait" => parse_wait(block),
         "screen" => parse_screen(block),
+        "secret" => parse_secret(block),
         _ => parse_exec(block),
     }
 }
@@ -530,6 +567,7 @@ pub fn tool_label(name: &str, args: &str) -> &'static str {
         TOOL_KEYS => "发送按键",
         TOOL_WAIT => "等待输出",
         TOOL_SCREEN => "读取屏幕",
+        TOOL_SECRET => "请求输入密码",
         TOOL_TAB => match serde_json::from_str::<serde_json::Value>(args)
             .ok()
             .and_then(|v| v.get("op").and_then(|o| o.as_str()).map(|s| s.to_string()))
@@ -583,6 +621,14 @@ pub struct StepPayload {
     /// 纯展示用，让面板上的「执行中」卡片能看出还活着、不是卡死。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_secs: Option<u64>,
+    /// 终端此刻停在什么上（`prompt::PromptKind` 的 snake_case 名字）。
+    /// 给 exec / wait / screen / keys 的结果卡打标签用，与喂给模型的 `prompt_kind` 同源。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_kind: Option<String>,
+    /// `kind:"secret"` 专用：这次密码请求的结局（`secret::SecretStatus::code`）。
+    /// **只有状态，绝无密码**。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_status: Option<String>,
 }
 
 impl StepPayload {
@@ -600,6 +646,8 @@ impl StepPayload {
             text: None,
             reasons: None,
             elapsed_secs: None,
+            prompt_kind: None,
+            secret_status: None,
         }
     }
 }
@@ -624,6 +672,9 @@ pub struct ApprovePayload {
 pub struct ExecResult {
     pub output: String,
     pub reason: ExecEnd,
+    /// 收尾时终端停在什么上（`prompt::PromptKind` 的 snake_case 名字）；取消时没有。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_kind: Option<String>,
 }
 
 /// `nx://agent/tab` 的载荷：请前端动一下标签页。
@@ -711,6 +762,27 @@ pub struct ScreenReply {
     pub detail: String,
 }
 
+/// `nx://agent/secret/{session}` 的载荷：请用户输入一个密码。
+///
+/// 与审批同一个思路（per-session 事件，面板里渲染成卡片），区别是答复里带一个值，
+/// 且这个值**只走 `agent_secret_ack` → 后端 → pty**。这里没有、也不能有任何值字段。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretRequest {
+    pub request_id: String,
+    /// 要往哪个会话输入
+    pub target: String,
+    pub target_label: String,
+    /// 模型给的理由（已清洗成单行、限长）
+    pub reason: String,
+    /// 请求发出时对目标终端的分类。不是 `password` 时卡片要提醒用户：
+    /// 终端当前似乎并没在要密码，输进去可能会被回显。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_kind: Option<String>,
+    /// 多少秒内必须答复（卡片上显示倒计时用）
+    pub timeout_secs: u64,
+}
+
 fn emit_step(app: &AppHandle, session: &str, payload: StepPayload) {
     let _ = app.emit(&format!("nx://agent/step/{session}"), payload);
 }
@@ -771,6 +843,7 @@ fn parse_block(raw: &str) -> Vec<AgentAction> {
             "keys" => parse_keys_action(block),
             "wait" => parse_wait(block),
             "screen" => parse_screen(block),
+            "secret" => parse_secret(block),
             _ => parse_exec(block),
         },
         Err(_) => parse_raw_shell(raw),
@@ -900,6 +973,13 @@ fn parse_screen(block: ExecBlock) -> Vec<AgentAction> {
         .collect()
 }
 
+/// `action:"secret"`：请用户输入密码。只认 `target` / `reason`；
+/// 一次只对一个会话发起（多目标没有意义：一张卡片对应一次输入）。
+fn parse_secret(block: ExecBlock) -> Vec<AgentAction> {
+    let target = fan_targets(block.target, block.targets).into_iter().next().flatten();
+    vec![AgentAction::Secret { target, reason: block.reason }]
+}
+
 /// `action:"open"`：开一个新会话。`kind:"ssh"` 必须带 `sessionRecordId`，
 /// 否则宁可什么都不做（也不要凭空连一个模型编出来的主机）。
 fn parse_open(block: ExecBlock) -> Option<AgentAction> {
@@ -1027,7 +1107,7 @@ pub const AGENTIC_SYSTEM_PROMPT_INTRO: &str = concat!(
 /// 之前自定义路径用的是压缩版说明，结果用户的提示词里写着「只给结论与必要命令」，
 /// 模型就真把 shell 直接抄进围栏 —— 协议写歪了，界面上什么都不发生。
 pub const ACTION_PROTOCOL: &str = concat!(
-    "【优先用工具】你有 nx_exec / nx_send_keys / nx_wait / nx_screen / nx_export / nx_open_tab / nx_tab 七个工具。",
+    "【优先用工具】你有 nx_exec / nx_send_keys / nx_wait / nx_screen / nx_secret / nx_export / nx_open_tab / nx_tab 八个工具。",
     "能用工具调用时**直接用工具**，不要写成下面的围栏文本；",
     "只有当你确认自己无法发起工具调用时，才退化成围栏代码块。\n",
     "**绝不要把界面动作当成 shell 命令**：`new-tab`、`reconnect`、`close-tab`、",
@@ -1079,12 +1159,22 @@ pub const ACTION_PROTOCOL: &str = concat!(
     "返回命中与否 + 期间输出的尾部。超时默认 15 秒、最多 60 秒，没命中就如实说没等到，不要假装成功。\n",
     "· **nx_screen{}**：读目标会话**此刻的屏幕**（含 vim / less / tmux 等全屏程序的当前画面）。",
     "拿不准「现在屏幕上是什么 / 它在等我输入什么」时先读屏，不要凭记忆盲敲按键。\n",
-    "**绝不要用 send_keys / exec 输入密码、口令、验证码、私钥口令**：看到 `Password:` / `passphrase` / `[sudo] password` 这类提示，",
-    "立刻停手，在结论里请**用户自己在终端里输入**（之后会有专门的密码通道，目前没有），输完再继续；",
+    "· **nx_secret{target?, reason}**：**密码通道**。看到 `Password:` / `passphrase` / `[sudo] password` / 验证码 这类提示，",
+    "（nx_exec / nx_wait / nx_screen / nx_send_keys 的结果里 `prompt_kind=password` 就是这个信号）调用它：",
+    "面板会弹出一张带掩码输入框的卡片，用户本人输入后由后端**直接写进终端并回车**，",
+    "输入内容不会经过你、不会回显、也不会进任何记录；你只会收到「已提供 / 已拒绝 / 超时」和之后的一段新输出。",
+    "`reason` 用一句话说清为什么需要它（显示在卡片上）。围栏写法 `{\"action\":\"secret\",\"reason\":\"…\"}`。",
+    "用户拒绝或超时就是拒绝：不要再次索要同一个密码，也不要换别的办法绕过，在结论里说明这一步需要他自己完成；",
+    "提示再次出现（输错了）可以再请求一次，但同一个任务里别反复纠缠。\n",
+    "**绝不要用 send_keys / exec 输入密码、口令、验证码、私钥口令，也不要把密码写进任何命令或参数里**；",
     "也不要尝试猜密码、读取用户的密码文件来代填。\n",
+    "· 上述工具的结果里都带 `prompt_kind`（password / yes_no / pager / menu / repl / shell_prompt / unknown）、",
+    "`confidence` 与一句 `提示`：它是对终端尾部的启发式判断，拿来当线索，拿不准就 nx_screen 读屏确认。",
+    "nx_exec 还可能返回「状态：终端停在等待输入的提示上」——命令**没有**结束，是卡在了交互提示，",
+    "按 `prompt_kind` 与 `提示` 处理（yes_no → send_keys 回答；password → nx_secret；pager → `q`；repl → 在里面输入或 `<C-d>`）。\n",
     "send_keys 与 exec 一样受作用范围与审批约束；审批模式下含回车的按键会弹窗让人确认。\n\n",
     "【作用范围】你只能操作上面列出的「作用范围内」会话（含省略 target 时落到的当前会话）。",
-    "对范围外会话的 exec / send_keys / wait / screen / export / tab 动作，以及任何 open 新会话的动作，都会被拦截或弹窗交给用户确认，",
+    "对范围外会话的 exec / send_keys / wait / screen / secret / export / tab 动作，以及任何 open 新会话的动作，都会被拦截或弹窗交给用户确认，",
     "用户拒绝就是拒绝：不要重试、不要换个说法或换条路径绕过去，改为在结论里告诉用户",
     "需要把哪个会话加入作用范围，或请他自己操作。tab 的 list 也只会列出范围内的标签页。\n\n",
     "【规则】\n",
@@ -1321,11 +1411,30 @@ fn feedback_for(command: &str, label: &str, outcome: &ExecOutcome) -> String {
         ExecEnd::Confirmed => s.push_str("状态：已确认执行完毕（提示符已回到终端）\n"),
         ExecEnd::Silence => s.push_str("状态：长时间没有新输出，按执行完毕处理（未能确认是否真的结束）\n"),
         ExecEnd::Timeout => s.push_str("状态：等待超时，命令可能仍在运行\n"),
+        ExecEnd::AwaitingInput => s.push_str(AWAITING_INPUT_STATUS),
         ExecEnd::Cancelled => return format!("{s}结果：已被用户取消，不要重试这条命令。\n"),
     }
     // 保留头部：报错与关键信息通常在最前面，尾部往往是无关的重复
     s.push_str(&format!("输出：\n{}\n", head_chars(&outcome.output, MAX_FEEDBACK_CHARS)));
+    push_guess(&mut s, outcome.prompt.as_ref());
     s
+}
+
+/// `ExecEnd::AwaitingInput` 的状态行：必须说清「命令没结束」，免得模型当成跑完了。
+const AWAITING_INPUT_STATUS: &str =
+    "状态：命令**还没有结束**——终端停在一个等待输入的交互提示上（详见下方 prompt_kind / 提示）\n";
+
+/// 把终端分类（`prompt_kind` / `confidence` / `提示`）附到反馈末尾。没有分类就什么都不加。
+fn push_guess(s: &mut String, guess: Option<&PromptGuess>) {
+    if let Some(g) = guess {
+        s.push_str(&g.feedback());
+    }
+}
+
+/// 对一个会话此刻的缓冲尾部分类。旁路缓冲没开 / 没内容时按空串分类（得到 Unknown）。
+fn classify_session(state: &AppState, id: &str, alt: bool) -> PromptGuess {
+    let tail = state.agent.context(id, CLASSIFY_TAIL_BYTES).unwrap_or_default();
+    prompt::classify(&tail, alt)
 }
 
 /// 写入超时的提示文案。独立于 `is_channel_closed`：只是一次写超时，
@@ -1492,6 +1601,7 @@ pub async fn run_one(
         prompt.as_deref(),
         || state.agent.pushed(session_id).unwrap_or_default(),
         || state.agent.last_line(session_id).unwrap_or_default(),
+        || state.agent.context(session_id, CLASSIFY_TAIL_BYTES).unwrap_or_default(),
         || state.agent.since(session_id, mark).unwrap_or_default(),
         || cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false),
     ));
@@ -1539,6 +1649,7 @@ pub async fn run_one(
                 target_label: Some(label.into()),
                 command: Some(cmd.into()),
                 output: Some(outcome.output.clone()),
+                prompt_kind: outcome.prompt.as_ref().map(|g| g.kind.as_str().to_string()),
                 ..StepPayload::new("result", step)
             },
         );
@@ -1604,17 +1715,25 @@ pub fn keys_risk(bytes: &[u8]) -> Option<Vec<String>> {
 }
 
 /// 发按键的反馈。
-fn keys_feedback(label: &str, shown: &str, tail: &str) -> String {
+fn keys_feedback(label: &str, shown: &str, tail: &str, guess: Option<&PromptGuess>) -> String {
     let tail = tail.trim();
-    format!(
+    let mut s = format!(
         "已向会话「{label}」发送按键：`{shown}`（只写入，不等命令结束，也不保证对方已处理）。\n\
          约 300ms 后的新输出：\n{}\n",
         if tail.is_empty() { "（暂无新输出）".to_string() } else { tail_chars(tail, KEYS_TAIL_BYTES) }
-    )
+    );
+    push_guess(&mut s, guess);
+    s
 }
 
 /// 等待的结论（给人看，也给模型看）。
-fn wait_feedback(label: &str, pattern: Option<&str>, end: WaitEnd, output: &str) -> String {
+fn wait_feedback(
+    label: &str,
+    pattern: Option<&str>,
+    end: WaitEnd,
+    output: &str,
+    guess: Option<&PromptGuess>,
+) -> String {
     let what = pattern.map(|p| format!("「{p}」")).unwrap_or_else(|| "输出静止".to_string());
     let verdict = match end {
         WaitEnd::Matched => format!("命中：新输出里出现了 {what}"),
@@ -1626,14 +1745,22 @@ fn wait_feedback(label: &str, pattern: Option<&str>, end: WaitEnd, output: &str)
         WaitEnd::Cancelled => return format!("等待会话「{label}」的输出时被用户取消。\n"),
     };
     let out = output.trim();
-    format!(
+    let mut s = format!(
         "等待会话「{label}」：{verdict}。\n等待期间的新输出（尾部）：\n{}\n",
         if out.is_empty() { "（无）".to_string() } else { tail_chars(out, SCREEN_MAX_BYTES) }
-    )
+    );
+    push_guess(&mut s, guess);
+    s
 }
 
 /// 读屏的反馈。`rendered=true` 是前端 xterm 渲染后的画面，否则是旁路缓冲的转录（全屏程序里不可信）。
-fn screen_feedback(label: &str, text: &str, alt: bool, rendered: bool) -> String {
+fn screen_feedback(
+    label: &str,
+    text: &str,
+    alt: bool,
+    rendered: bool,
+    guess: Option<&PromptGuess>,
+) -> String {
     let body = text.trim_matches('\n');
     let mut s = if rendered {
         format!(
@@ -1652,6 +1779,7 @@ fn screen_feedback(label: &str, text: &str, alt: bool, rendered: bool) -> String
         tail_chars(body, SCREEN_MAX_BYTES)
     });
     s.push('\n');
+    push_guess(&mut s, guess);
     s
 }
 
@@ -1668,6 +1796,7 @@ fn emit_interact(
     command: Option<&str>,
     text: Option<String>,
     output: Option<String>,
+    guess: Option<&PromptGuess>,
 ) {
     emit_step(
         app,
@@ -1678,6 +1807,7 @@ fn emit_interact(
             command: command.map(str::to_string),
             text,
             output,
+            prompt_kind: guess.map(|g| g.kind.as_str().to_string()),
             ..StepPayload::new(kind, step)
         },
     );
@@ -1906,12 +2036,15 @@ fn feedback_for_open_command(outcome: &ExecOutcome) -> String {
         ExecEnd::Confirmed => "已确认执行完毕（该会话已没有前台进程在跑）".to_string(),
         ExecEnd::Silence => "长时间没有新输出，按执行完毕处理（未能确认是否真的结束）".into(),
         ExecEnd::Timeout => "等待超时，命令可能仍在运行".into(),
+        ExecEnd::AwaitingInput => "命令还没有结束——终端停在一个等待输入的交互提示上".into(),
         ExecEnd::Cancelled => return "该命令已被用户取消。\n".into(),
     };
-    format!(
+    let mut s = format!(
         "状态：{status}\n输出：\n{}\n",
         head_chars(&outcome.output, MAX_FEEDBACK_CHARS)
-    )
+    );
+    push_guess(&mut s, outcome.prompt.as_ref());
+    s
 }
 
 // ——————————————————————————————— 审批 ———————————————————————————————
@@ -1925,6 +2058,8 @@ pub struct ActRuntime {
     tab_acks: Mutex<HashMap<String, tokio::sync::oneshot::Sender<TabReply>>>,
     /// request_id → 谁来收前端对读屏请求的回执
     screen_acks: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ScreenReply>>>,
+    /// request_id → 谁来收用户对密码请求的答复（值经它直达 `run`，再写进 pty）
+    secret_acks: Mutex<HashMap<String, tokio::sync::oneshot::Sender<SecretAnswer>>>,
 }
 
 impl ActRuntime {
@@ -1934,6 +2069,7 @@ impl ActRuntime {
             approvals: Mutex::new(HashMap::new()),
             tab_acks: Mutex::new(HashMap::new()),
             screen_acks: Mutex::new(HashMap::new()),
+            secret_acks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2013,6 +2149,37 @@ impl ActRuntime {
 
     fn unregister_screen(&self, request_id: &str) {
         self.screen_acks.lock().remove(request_id);
+    }
+
+    /// 收用户对密码请求的答复。`value = None` 是「跳过」。
+    ///
+    /// 返回 false = 这个请求已经没人接了（超时 / 本轮已被取消 / id 不对）。
+    /// 值在这里就被 `sanitize_secret` 装进 `Zeroizing`，之后不论走哪条分支（校验失败、没人接）
+    /// 都会在 drop 时被擦掉。校验失败返回 `Err(原因)` 且**不消耗**登记：让用户改了再提交一次。
+    pub fn answer_secret(
+        &self,
+        request_id: &str,
+        value: Option<String>,
+    ) -> Result<bool, &'static str> {
+        let answer = match value {
+            Some(raw) => SecretAnswer::Provided(secret::sanitize_secret(raw)?),
+            None => SecretAnswer::Declined,
+        };
+        let Some(tx) = self.secret_acks.lock().remove(request_id) else {
+            return Ok(false);
+        };
+        // 接收端已经因为超时 / 取消被 drop → send 把答复原样退回 Err，随即 drop 擦掉
+        Ok(tx.send(answer).is_ok())
+    }
+
+    fn register_secret(&self, request_id: &str) -> tokio::sync::oneshot::Receiver<SecretAnswer> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.secret_acks.lock().insert(request_id.to_string(), tx);
+        rx
+    }
+
+    fn unregister_secret(&self, request_id: &str) {
+        self.secret_acks.lock().remove(request_id);
     }
 
     /// 挂一个待批请求，返回用来等答复的接收端。
@@ -2916,18 +3083,19 @@ pub async fn run(
                         }
                     }
 
-                    emit_interact(app, &session, "keys", step, &target_id, &label, Some(&shown), None, None);
+                    emit_interact(app, &session, "keys", step, &target_id, &label, Some(&shown), None, None, None);
                     match send_keys(state, &target_id, &bytes).await {
                         Ok(tail) => {
                             if trace_on {
                                 trace::record(&session, step, "keys", &format!("{label}（{target_id}）← {shown}\n{tail}"));
                             }
                             marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
+                            let guess = classify_session(state, &target_id, false);
                             emit_interact(
                                 app, &session, "keys", step, &target_id, &label, Some(&shown),
-                                Some("已发送".into()), Some(tail.clone()),
+                                Some("已发送".into()), Some(tail.clone()), Some(&guess),
                             );
-                            feedback.push_str(&keys_feedback(&label, &shown, &tail));
+                            feedback.push_str(&keys_feedback(&label, &shown, &tail, Some(&guess)));
                             feedback.push('\n');
                         }
                         Err(e) => {
@@ -2998,7 +3166,7 @@ pub async fn run(
                         .unwrap_or_default();
                     emit_interact(
                         app, &session, "wait", step, &target_id, &label, Some(&shown),
-                        Some(format!("等待中（最长 {} 秒）……", spec.timeout_ms / 1000)), None,
+                        Some(format!("等待中（最长 {} 秒）……", spec.timeout_ms / 1000)), None, None,
                     );
                     let res = interact::wait_for_pattern(
                         &spec,
@@ -3008,7 +3176,8 @@ pub async fn run(
                     )
                     .await;
                     marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
-                    let fb = wait_feedback(&label, pattern.as_deref(), res.end, &res.output);
+                    let guess = classify_session(state, &target_id, false);
+                    let fb = wait_feedback(&label, pattern.as_deref(), res.end, &res.output, Some(&guess));
                     if trace_on {
                         trace::record(&session, step, "wait", &format!("{label}（{target_id}）{:?} {shown}\n{}", res.end, res.output));
                     }
@@ -3021,6 +3190,7 @@ pub async fn run(
                     emit_interact(
                         app, &session, "wait", step, &target_id, &label, Some(&shown),
                         Some(verdict.into()), Some(tail_chars(res.output.trim(), SCREEN_MAX_BYTES)),
+                        Some(&guess),
                     );
                     feedback.push_str(&fb);
                     feedback.push('\n');
@@ -3044,7 +3214,7 @@ pub async fn run(
                     else {
                         continue;
                     };
-                    emit_interact(app, &session, "screen", step, &target_id, &label, None, Some("正在读取屏幕……".into()), None);
+                    emit_interact(app, &session, "screen", step, &target_id, &label, None, Some("正在读取屏幕……".into()), None, None);
                     let payload = ScreenRequest {
                         request_id: uuid::Uuid::new_v4().simple().to_string(),
                         session_id: session.clone(),
@@ -3071,6 +3241,8 @@ pub async fn run(
                     if trace_on {
                         trace::record(&session, step, "screen", &format!("{label}（{target_id}）{}\n{text}", if rendered { "xterm" } else { "旁路缓冲" }));
                     }
+                    // 渲染后的屏幕才是真画面；退回旁路缓冲时同样按缓冲分类（全屏程序里不可信，置信度本就低）
+                    let guess = prompt::classify(&text, alt);
                     emit_interact(
                         app, &session, "screen", step, &target_id, &label, None,
                         Some(match (rendered, alt) {
@@ -3079,8 +3251,105 @@ pub async fn run(
                             (false, _) => "界面未回应，改读旁路缓冲".into(),
                         }),
                         Some(tail_chars(text.trim_matches('\n'), SCREEN_MAX_BYTES)),
+                        Some(&guess),
                     );
-                    feedback.push_str(&screen_feedback(&label, &text, alt, rendered));
+                    feedback.push_str(&screen_feedback(&label, &text, alt, rendered, Some(&guess)));
+                    feedback.push('\n');
+                }
+
+                AgentAction::Secret { target, reason } => {
+                    let reason = secret::clean_reason(reason.as_deref());
+                    // 与 Keys / Wait / Screen 同一道范围闸门：越界要先人批准。
+                    // 批准的只是「往那个会话输入」；密码本身还要用户在卡片里亲手输。
+                    let Some((target_id, label, _)) = gate_target(
+                        app,
+                        state,
+                        runtime,
+                        &session,
+                        step,
+                        &mut targets,
+                        target.as_deref(),
+                        |l| format!("请你向「{l}」输入密码（原因：{reason}）"),
+                        "nx_secret",
+                        Vec::new(),
+                        &mut feedback,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    if !session_alive(state, &target_id) {
+                        feedback.push_str(&format!("会话「{label}」不存在或已关闭，无法输入密码。\n"));
+                        continue;
+                    }
+                    state.agent.set_enabled(&target_id, true);
+
+                    // 卡片上提示终端是否真的在要密码：不是时输入可能被回显。
+                    let guess = classify_session(state, &target_id, false);
+                    let request_id = uuid::Uuid::new_v4().simple().to_string();
+                    let rx = runtime.register_secret(&request_id);
+                    emit_interact(
+                        app, &session, "secret", step, &target_id, &label, Some(&reason),
+                        Some("等待用户输入密码……".into()), None, Some(&guess),
+                    );
+                    let _ = app.emit(
+                        &format!("nx://agent/secret/{session}"),
+                        SecretRequest {
+                            request_id: request_id.clone(),
+                            target: target_id.clone(),
+                            target_label: label.clone(),
+                            reason: reason.clone(),
+                            prompt_kind: Some(guess.kind.as_str().to_string()),
+                            timeout_secs: secret::SECRET_TIMEOUT.as_secs(),
+                        },
+                    );
+                    let answered =
+                        secret::await_secret(rx, secret::SECRET_TIMEOUT, || cancel.load(Ordering::Relaxed))
+                            .await;
+                    runtime.unregister_secret(&request_id);
+
+                    // 写入前记起点：之后的才是这个密码引出的输出
+                    let mark = state.agent.pushed(&target_id).unwrap_or_default();
+                    let (status, tail) = secret::deliver(
+                        answered,
+                        |payload| {
+                            let target_id = target_id.clone();
+                            async move { write_to(state, &target_id, &payload).await }
+                        },
+                        secret::SECRET_SETTLE,
+                        || state.agent.since(&target_id, mark).unwrap_or_default(),
+                    )
+                    .await;
+                    marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
+                    let after = classify_session(state, &target_id, false);
+                    // trace 里只记状态与脱敏后的尾部，**没有**密码（`trace::record` 还会再脱敏一遍）
+                    if trace_on {
+                        trace::record(
+                            &session,
+                            step,
+                            "secret",
+                            &format!("{label}（{target_id}）{}\n{tail}", status.code()),
+                        );
+                    }
+                    emit_step(
+                        app,
+                        &session,
+                        StepPayload {
+                            target: Some(target_id.clone()),
+                            target_label: Some(label.clone()),
+                            command: Some(reason.clone()),
+                            text: Some(status.label()),
+                            output: if tail.trim().is_empty() {
+                                None
+                            } else {
+                                Some(tail_chars(tail.trim(), SCREEN_MAX_BYTES))
+                            },
+                            prompt_kind: Some(after.kind.as_str().to_string()),
+                            secret_status: Some(status.code().to_string()),
+                            ..StepPayload::new("secret", step)
+                        },
+                    );
+                    feedback.push_str(&secret::secret_feedback(&label, &status, &tail, Some(&after)));
                     feedback.push('\n');
                 }
 
@@ -3626,6 +3895,7 @@ mod tests {
         let out = ExecOutcome {
             output: "err\n".into(),
             reason: ExecEnd::Confirmed,
+            prompt: None,
         };
         let text = feedback_for("false", "web-01", &out);
         assert!(text.contains("false"));
@@ -3636,13 +3906,13 @@ mod tests {
 
     #[test]
     fn cancellation_feedback_tells_model_not_to_retry() {
-        let out = ExecOutcome { output: String::new(), reason: ExecEnd::Cancelled };
+        let out = ExecOutcome { output: String::new(), reason: ExecEnd::Cancelled, prompt: None };
         assert!(feedback_for("sleep 100", "x", &out).contains("不要重试"));
     }
 
     #[test]
     fn silence_fallback_is_worded_as_unconfirmed() {
-        let out = ExecOutcome { output: "alive".into(), reason: ExecEnd::Silence };
+        let out = ExecOutcome { output: "alive".into(), reason: ExecEnd::Silence, prompt: None };
         let text = feedback_for("top", "x", &out);
         assert!(text.contains("未能确认"));
         assert!(text.contains("alive"));
@@ -3972,7 +4242,7 @@ mod tests {
     #[test]
     fn new_tools_are_declared_with_unique_names() {
         let specs = tool_specs();
-        for n in [TOOL_KEYS, TOOL_WAIT, TOOL_SCREEN] {
+        for n in [TOOL_KEYS, TOOL_WAIT, TOOL_SCREEN, TOOL_SECRET] {
             assert!(specs.iter().any(|s| s.name == n), "缺少工具 {n}");
         }
         let mut names: Vec<_> = specs.iter().map(|s| s.name).collect();
@@ -4101,28 +4371,28 @@ mod tests {
 
     #[test]
     fn keys_feedback_says_sent_and_shows_tail() {
-        let f = keys_feedback("web-1", "<C-c>", "^C\n$ ");
+        let f = keys_feedback("web-1", "<C-c>", "^C\n$ ", None);
         assert!(f.contains("已向会话「web-1」发送按键"));
         assert!(f.contains("^C"));
-        assert!(keys_feedback("w", "x", "  ").contains("暂无新输出"));
+        assert!(keys_feedback("w", "x", "  ", None).contains("暂无新输出"));
     }
 
     #[test]
     fn wait_feedback_distinguishes_outcomes() {
-        assert!(wait_feedback("w", Some("ok"), WaitEnd::Matched, "all ok").contains("命中"));
-        let miss = wait_feedback("w", Some("ok"), WaitEnd::Timeout, "x");
+        assert!(wait_feedback("w", Some("ok"), WaitEnd::Matched, "all ok", None).contains("命中"));
+        let miss = wait_feedback("w", Some("ok"), WaitEnd::Timeout, "x", None);
         assert!(miss.contains("未命中") && miss.contains("超时"));
-        assert!(wait_feedback("w", Some("ok"), WaitEnd::Quiet, "").contains("未命中"));
-        assert!(wait_feedback("w", None, WaitEnd::Quiet, "x").contains("输出已静止"));
-        assert!(wait_feedback("w", Some("ok"), WaitEnd::Cancelled, "").contains("取消"));
+        assert!(wait_feedback("w", Some("ok"), WaitEnd::Quiet, "", None).contains("未命中"));
+        assert!(wait_feedback("w", None, WaitEnd::Quiet, "x", None).contains("输出已静止"));
+        assert!(wait_feedback("w", Some("ok"), WaitEnd::Cancelled, "", None).contains("取消"));
     }
 
     #[test]
     fn screen_feedback_marks_alt_and_fallback() {
-        assert!(screen_feedback("w", "hello", true, true).contains("alternate screen"));
-        let fb = screen_feedback("w", "hello", false, false);
+        assert!(screen_feedback("w", "hello", true, true, None).contains("alternate screen"));
+        let fb = screen_feedback("w", "hello", false, false, None);
         assert!(fb.contains("旁路缓冲") && fb.contains("hello"));
-        assert!(screen_feedback("w", "\n\n", false, true).contains("没有文字"));
+        assert!(screen_feedback("w", "\n\n", false, true, None).contains("没有文字"));
     }
 
     #[test]
@@ -4149,9 +4419,190 @@ mod tests {
             assert!(ACTION_PROTOCOL.contains(key), "协议缺少：{key}");
         }
         assert!(ACTION_PROTOCOL.contains("绝不要用 send_keys / exec 输入密码"));
-        assert!(ACTION_PROTOCOL.contains("用户自己在终端里输入"));
+        // 密码通道上线了：不再让用户「自己在终端里输入」，也不再说「目前没有」通道
+        assert!(!ACTION_PROTOCOL.contains("目前没有"));
+        assert!(!ACTION_PROTOCOL.contains("用户自己在终端里输入"));
+        for key in ["nx_secret", "密码通道", "prompt_kind", "不会经过你", "不要再次索要"] {
+            assert!(ACTION_PROTOCOL.contains(key), "协议缺少：{key}");
+        }
         assert!(ACTION_PROTOCOL.contains(&format!("一次最多给 {MAX_ACTIONS} 条动作")));
         assert!(IfAgentic::pick("只给结论").contains("nx_send_keys"));
+        assert!(IfAgentic::pick("只给结论").contains("nx_secret"));
+    }
+
+    // —————————————— 接入分类器（1.6） ——————————————
+
+    fn guess_of(tail: &str) -> PromptGuess {
+        prompt::classify(tail, false)
+    }
+
+    #[test]
+    fn feedback_for_carries_prompt_kind_confidence_and_hint() {
+        let g = guess_of("Do you want to continue? [Y/n]");
+        assert_eq!(g.kind, prompt::PromptKind::YesNo);
+        let out = ExecOutcome {
+            output: "Do you want to continue? [Y/n]".into(),
+            reason: ExecEnd::AwaitingInput,
+            prompt: Some(g),
+        };
+        let text = feedback_for("apt install nginx", "web", &out);
+        assert!(text.contains("还没有结束"), "{text}");
+        assert!(text.contains("prompt_kind=yes_no"), "{text}");
+        assert!(text.contains("confidence="), "{text}");
+        assert!(text.contains("提示："), "{text}");
+        // 已结束的命令同样带上分类
+        let done = ExecOutcome {
+            output: "ok".into(),
+            reason: ExecEnd::Confirmed,
+            prompt: Some(guess_of("chris@web:~$ ")),
+        };
+        assert!(feedback_for("true", "web", &done).contains("prompt_kind=shell_prompt"));
+        // 取消不带分类
+        let c = ExecOutcome { output: String::new(), reason: ExecEnd::Cancelled, prompt: None };
+        assert!(!feedback_for("x", "web", &c).contains("prompt_kind"));
+    }
+
+    #[test]
+    fn open_command_feedback_handles_awaiting_input() {
+        let out = ExecOutcome {
+            output: "[sudo] password for chris:".into(),
+            reason: ExecEnd::AwaitingInput,
+            prompt: Some(guess_of("[sudo] password for chris:")),
+        };
+        let t = feedback_for_open_command(&out);
+        assert!(t.contains("还没有结束") && t.contains("prompt_kind=password"), "{t}");
+        assert!(t.contains("nx_secret"), "密码提示的建议应当指向 nx_secret：{t}");
+    }
+
+    #[test]
+    fn keys_wait_screen_feedback_include_prompt_line() {
+        let g = guess_of("Password:");
+        assert!(keys_feedback("w", "x", "Password:", Some(&g)).contains("prompt_kind=password"));
+        assert!(wait_feedback("w", Some("a"), WaitEnd::Timeout, "", Some(&g)).contains("prompt_kind=password"));
+        assert!(screen_feedback("w", "Password:", false, true, Some(&g)).contains("prompt_kind=password"));
+        // 没有分类就不加这一行
+        assert!(!keys_feedback("w", "x", "", None).contains("prompt_kind"));
+    }
+
+    // —————————————— 密码通道（1.7） ——————————————
+
+    #[test]
+    fn secret_tool_is_declared_and_takes_only_target_and_reason() {
+        let spec = tool_specs().into_iter().find(|s| s.name == TOOL_SECRET).expect("缺少 nx_secret");
+        let props = spec.schema["properties"].as_object().unwrap();
+        let mut keys: Vec<_> = props.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["reason", "target"], "密码通道不许有任何能带值的参数");
+        assert_eq!(tool_label(TOOL_SECRET, "{}"), "请求输入密码");
+    }
+
+    #[test]
+    fn secret_tool_call_parses_reason_and_target() {
+        let acts = actions_from_tool_call(&call(
+            TOOL_SECRET,
+            r#"{"target":"s1","reason":"  sudo 需要密码\n安装 nginx "}"#,
+        ));
+        assert_eq!(
+            acts,
+            vec![AgentAction::Secret {
+                target: Some("s1".into()),
+                reason: Some("  sudo 需要密码\n安装 nginx ".into())
+            }]
+        );
+        // 缺 reason 也产生动作（卡片用默认说明），不会让这一轮白白蒸发
+        let bare = actions_from_tool_call(&call(TOOL_SECRET, "{}"));
+        assert_eq!(bare, vec![AgentAction::Secret { target: None, reason: None }]);
+    }
+
+    #[test]
+    fn secret_never_picks_up_a_value_from_model_args() {
+        // 模型就算塞了 value / password 字段，动作里也没有地方放它
+        let acts = actions_from_tool_call(&call(
+            TOOL_SECRET,
+            r#"{"reason":"x","value":"hunter2hunter2","password":"hunter2hunter2"}"#,
+        ));
+        assert_eq!(acts.len(), 1);
+        assert!(!format!("{acts:?}").contains("hunter2hunter2"));
+    }
+
+    #[test]
+    fn fence_protocol_supports_secret_action() {
+        let acts = extract_actions(&block(r#"{"action":"secret","target":"s2","reason":"ssh 口令"}"#));
+        assert_eq!(
+            acts,
+            vec![AgentAction::Secret { target: Some("s2".into()), reason: Some("ssh 口令".into()) }]
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_ack_round_trip_delivers_value_once() {
+        let rt = ActRuntime::new();
+        let rx = rt.register_secret("r1");
+        assert_eq!(rt.answer_secret("r1", Some("hunter2hunter2\n".into())), Ok(true));
+        match rx.await.unwrap() {
+            SecretAnswer::Provided(v) => assert_eq!(v.as_str(), "hunter2hunter2"),
+            other => panic!("{other:?}"),
+        }
+        // 登记已被消耗：同一个请求不能答两次
+        assert_eq!(rt.answer_secret("r1", Some("again".into())), Ok(false));
+    }
+
+    #[tokio::test]
+    async fn secret_ack_skip_is_declined() {
+        let rt = ActRuntime::new();
+        let rx = rt.register_secret("r2");
+        assert_eq!(rt.answer_secret("r2", None), Ok(true));
+        assert!(matches!(rx.await.unwrap(), SecretAnswer::Declined));
+    }
+
+    #[test]
+    fn secret_ack_unknown_or_expired_request_reports_false() {
+        let rt = ActRuntime::new();
+        assert_eq!(rt.answer_secret("nope", Some("x".into())), Ok(false));
+        // 接收端已因超时 / 取消被丢弃
+        drop(rt.register_secret("gone"));
+        assert_eq!(rt.answer_secret("gone", Some("x".into())), Ok(false));
+    }
+
+    #[test]
+    fn secret_ack_invalid_input_keeps_request_alive_and_names_no_value() {
+        let rt = ActRuntime::new();
+        let _rx = rt.register_secret("r3");
+        let err = rt.answer_secret("r3", Some("hunter2hunter2\nrm -rf /".into())).unwrap_err();
+        assert!(!err.contains("hunter2hunter2"));
+        // 校验失败不消耗登记：用户改完能再交一次
+        assert_eq!(rt.answer_secret("r3", Some("fixedpass".into())), Ok(true));
+    }
+
+    #[test]
+    fn secret_payloads_and_cards_carry_no_secret_field() {
+        // 事件载荷与步骤卡只有状态，序列化出来没有任何 value / secret / password 键
+        let req = serde_json::to_string(&SecretRequest {
+            request_id: "r".into(),
+            target: "t".into(),
+            target_label: "web".into(),
+            reason: "sudo".into(),
+            prompt_kind: Some("password".into()),
+            timeout_secs: 120,
+        })
+        .unwrap();
+        let step = serde_json::to_string(&StepPayload {
+            secret_status: Some("provided".into()),
+            ..StepPayload::new("secret", 1)
+        })
+        .unwrap();
+        for j in [req, step] {
+            for bad in ["\"value\":", "\"password\":", "\"secret\":"] {
+                assert!(!j.contains(bad), "{j}");
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_hint_for_password_points_at_nx_secret_not_send_keys() {
+        let g = guess_of("[sudo] password for chris:");
+        assert!(g.hint.contains("nx_secret"));
+        assert!(g.hint.contains("不要用 nx_send_keys"));
     }
 
     // —————————————— 出网脱敏（1.1） ——————————————
@@ -4214,11 +4665,11 @@ mod tests {
             feedback_for(
                 "echo hi",
                 "web",
-                &ExecOutcome { output: "key sk-ABCDEFGH12345678".into(), reason: ExecEnd::Confirmed },
+                &ExecOutcome { output: "key sk-ABCDEFGH12345678".into(), reason: ExecEnd::Confirmed, prompt: None },
             ),
             failure_feedback("echo bob@example.com", "web", "连接 10.1.2.3 失败"),
-            keys_feedback("web", "x", "password=hunter2hunter2"),
-            wait_feedback("web", Some("p"), WaitEnd::Matched, "from 10.9.8.7"),
+            keys_feedback("web", "x", "password=hunter2hunter2", None),
+            wait_feedback("web", Some("p"), WaitEnd::Matched, "from 10.9.8.7", None),
         ];
         for f in all {
             let clean = scrub(true, &f);

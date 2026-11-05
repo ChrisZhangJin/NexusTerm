@@ -27,8 +27,8 @@
 - [x] **1.3 `nx_wait`**：等某段文字出现（子串或 `/regex/`）或输出静止，带超时，返回命中与否 + 此刻屏幕尾部。
 - [x] **1.4 `nx_screen`**：运行中随时读取目标会话的当前 xterm 屏幕（含 alt screen）。复用 `request_tab` + `nx://agent/tab` + `agent_tab_ack` 的前端往返模式，前端用 `snapshotConsole`。
 - [x] **1.5 交互提示分类器**（纯函数，`agent/prompt.rs`）：把屏幕尾部 / 最后一行分类为 `Password | YesNo | Pager | Menu | Repl | ShellPrompt | Unknown`，并给出建议应答。大量单测。
-- [ ] **1.6 接入分类器**：`nx_exec` / `nx_wait` / `nx_screen` 的返回里带 `prompt_kind`；`wait_for_end` 在检出非 ShellPrompt 的交互提示时提前返回，而不是等满超时。
-- [ ] **1.7 密码通道**：Agent 只能发起 `nx_secret{reason}`，由用户在审批卡里输入（或选保险库条目），后端直接写入 pty；密文不进模型上下文、不进 trace、不进 side buffer 的 `$ ` 转录。
+- [x] **1.6 接入分类器**：`nx_exec` / `nx_wait` / `nx_screen` 的返回里带 `prompt_kind`；`wait_for_end` 在检出非 ShellPrompt 的交互提示时提前返回，而不是等满超时。（`nx_send_keys` 同样带；输出静默 1s 后置信度 >= 0.8 的非 ShellPrompt 提示以 `awaiting_input` 提前返回，提示行 `prompt_kind= confidence= 提示：` 进反馈；面板步骤卡带提示标签。）
+- [x] **1.7 密码通道**：Agent 只能发起 `nx_secret{reason}`，由用户在审批卡里输入（或选保险库条目），后端直接写入 pty；密文不进模型上下文、不进 trace、不进 side buffer 的 `$ ` 转录。（`agent/secret.rs` + `act.rs` 的 `nx_secret`：事件 `nx://agent/secret/{session}` → 面板掩码输入卡 → `agent_secret_ack` → 后端 `write_to` 写 pty；120s 超时、停止即取消。保险库条目选择暂未做，只支持手输 / 跳过。）
 - [x] **1.8 系统提示更新**：告知新工具的用法与边界（何时 send_keys、何时 secret、何时 screen）。
 
 ## 阶段 2 · 共同在场（共享控制权）

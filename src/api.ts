@@ -8,6 +8,7 @@ import type {
   AgentExecResult,
   AgentRunRequest,
   AgentScreenRequest,
+  AgentSecretRequest,
   AgentStep,
   AgentTabInfo,
   AgentTabRequest,
@@ -248,6 +249,16 @@ export const api = {
     detail?: string
   ) => invoke<boolean>("agent_screen_ack", { requestId, ok, text, alt, detail }),
   /**
+   * 答复一次密码请求（`nx_secret`）。`value` 省略 = 跳过。
+   *
+   * **这是密码唯一的出口**：值直接进后端、写进目标终端，不经过模型、不回显、不进任何记录。
+   * resolve(true) = 已交给后端；resolve(false) = 请求已经没人接了（超时 / 本轮被停止）；
+   * reject(原因) = 输入没通过校验（含换行 / 控制字符 / 过长），请求仍有效，可以改了再交。
+   * 调用方拿到结果后应立刻丢掉自己手里的值。
+   */
+  agentSecretAck: (requestId: string, value?: string) =>
+    invoke<boolean>("agent_secret_ack", { requestId, value }),
+  /**
    * 不经模型、直接在会话里跑一条命令并拿回结果。
    *
    * 这条会给终端**真的下发输入** —— 只有用户点「执行」时才被调用。
@@ -482,6 +493,14 @@ export async function onAgentApprove(
   return listen<AgentApproveRequest>(`nx://agent/approve/${id}`, (ev) =>
     handler(ev.payload)
   );
+}
+
+/** Agent 请用户输入一个密码（`nx_secret`）。处理完用 `api.agentSecretAck(...)` 答复。 */
+export async function onAgentSecret(
+  id: string,
+  handler: (req: AgentSecretRequest) => void
+): Promise<UnlistenFn> {
+  return listen<AgentSecretRequest>(`nx://agent/secret/${id}`, (ev) => handler(ev.payload));
 }
 
 /**
