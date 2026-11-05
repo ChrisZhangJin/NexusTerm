@@ -25,6 +25,7 @@ pub mod prompt;
 pub mod redact;
 pub mod secret;
 pub mod trace;
+pub mod usercmd;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +36,7 @@ use serde::{Deserialize, Serialize};
 // 接线点（ssh/session.rs、local/mod.rs、cmd.rs）只需要这个来源标记
 pub use self::buffer::StreamKind;
 use self::buffer::{BufferStats, SessionBuffer, DEFAULT_CAPACITY};
+use self::usercmd::UserCommandEntry;
 use crate::store::Store;
 
 /// 单次喂给模型的默认上下文字节数（远小于缓冲容量 `buffer::DEFAULT_CAPACITY`）。
@@ -502,6 +504,60 @@ impl AgentManager {
         self.sessions.lock().get(session_id).map(|b| b.last_line())
     }
 
+    /// 记一条用户提交的命令（回车时前端推来）。与 `feed` 同样的开关语义：
+    /// 总开关关着 / 该会话旁路关闭则忽略；未登记的会话按 autoAttach 建缓冲。
+    /// `no_echo` 为真或屏幕在等密码时只存占位，见 `SessionBuffer::record_user_command`。
+    pub fn record_user_command(
+        &self,
+        session_id: &str,
+        line: &str,
+        no_echo: bool,
+    ) -> Option<UserCommandEntry> {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let ts = usercmd::now_ms();
+        let mut guard = self.sessions.lock();
+        if !guard.contains_key(session_id) {
+            if !self.auto_attach.load(Ordering::Relaxed) {
+                return None;
+            }
+            guard.insert(session_id.to_string(), SessionBuffer::with_attach(true));
+        }
+        let buf = guard.get_mut(session_id)?;
+        if !buf.is_enabled() {
+            return None;
+        }
+        buf.record_user_command(line, no_echo, ts)
+    }
+
+    /// 最近 `limit` 条用户命令（时间正序）。**原文**；喂模型前必须过
+    /// [`Self::user_commands_redacted`] 或 `UserCommandEntry::redacted`。
+    pub fn user_commands(&self, session_id: &str, limit: usize) -> Vec<UserCommandEntry> {
+        self.sessions
+            .lock()
+            .get(session_id)
+            .map(|b| b.user_commands(limit))
+            .unwrap_or_default()
+    }
+
+    /// 同 [`Self::user_commands`]，但 `line` 已脱敏。给模型 / trace 用这个。
+    pub fn user_commands_redacted(&self, session_id: &str, limit: usize) -> Vec<UserCommandEntry> {
+        self.user_commands(session_id, limit)
+            .iter()
+            .map(UserCommandEntry::redacted)
+            .collect()
+    }
+
+    /// `seq` 大于 `after` 的用户命令（增量读取，给时间线 / 录制器）。
+    pub fn user_commands_since(&self, session_id: &str, after: u64) -> Vec<UserCommandEntry> {
+        self.sessions
+            .lock()
+            .get(session_id)
+            .map(|b| b.user_commands_since(after))
+            .unwrap_or_default()
+    }
+
     /// 丢弃已缓冲的内容，但保留开关状态（用户「让 agent 忘掉刚才的事」）。
     pub fn clear(&self, session_id: &str) {
         if let Some(buf) = self.sessions.lock().get_mut(session_id) {
@@ -545,6 +601,29 @@ mod tests {
             ..Default::default()
         });
         m
+    }
+
+    #[test]
+    fn user_command_respects_global_switch_and_is_readable() {
+        let off = mgr(false, true);
+        assert!(off.record_user_command("s1", "ls", false).is_none());
+        assert!(off.user_commands("s1", 10).is_empty());
+
+        let m = mgr(true, true);
+        m.feed("s1", b"$ ", StreamKind::Out);
+        m.record_user_command("s1", "echo hi", false).unwrap();
+        m.record_user_command("s1", "TOKEN=abcdef0123456789abcdef0123456789 run", false);
+        m.record_user_command("s1", "pw", true).unwrap();
+        let all = m.user_commands("s1", 10);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].line, "echo hi");
+        assert_eq!(m.user_commands_since("s1", all[0].seq).len(), 2);
+        // 给模型的副本脱敏，原文仍在
+        let red = m.user_commands_redacted("s1", 10);
+        assert!(!red[1].line.contains("abcdef0123456789abcdef0123456789"), "{}", red[1].line);
+        assert!(all[1].line.contains("abcdef0123456789abcdef0123456789"));
+        m.remove("s1");
+        assert!(m.user_commands("s1", 10).is_empty());
     }
 
     #[test]

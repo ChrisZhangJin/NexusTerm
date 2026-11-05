@@ -36,7 +36,7 @@
 - [ ] **2.1 控制权状态机**：`UserDriving | AgentDriving | Paused`，按会话维护；前后端同步。
 - [ ] **2.2 用户输入仲裁**：Agent 运行期间用户一敲键盘 → 自动 Paused，面板出现「接管 / 交还」。Agent 写入前检查状态。
 - [ ] **2.3 停止语义**：「停止」可选同时发 Ctrl-C；停止后状态回到 UserDriving。
-- [ ] **2.4 提交命令事件**：前端 `onCommandCommitted`（已有于 `TerminalView`）推给后端；后端 side buffer 增加分段后的 user command 记录，且不记录无回显（密码）输入。
+- [x] **2.4 提交命令事件**：前端 `onCommandCommitted`（已有于 `TerminalView`）推给后端；后端 side buffer 增加分段后的 user command 记录，且不记录无回显（密码）输入。（回车时 `agent_user_command{sessionId,line,noEcho}` fire-and-forget；`agent/usercmd.rs` 的 `UserCommandEntry{seq,tsMs,actor,kind,line,truncated,at}` 环形 256 条；无回显（前端 `lineEchoedRef`）或后端 `prompt::classify` 判 Password >= 0.8 → 只存 `secret_input` 占位；读取走 `AgentManager::user_commands / _redacted / _since`，给模型必须用脱敏版。）
 - [ ] **2.5 统一时间线**：终端会话的事件流 `{actor: user|agent, kind: command|keys|prompt|output, ts}`；面板展示，并标明谁做的。
 - [ ] **2.6 对话与运行持久化**：跨重载保留对话；`act::run` 能带上上一轮摘要。
 
