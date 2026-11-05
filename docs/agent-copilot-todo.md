@@ -33,9 +33,9 @@
 
 ## 阶段 2 · 共同在场（共享控制权）
 
-- [ ] **2.1 控制权状态机**：`UserDriving | AgentDriving | Paused`，按会话维护；前后端同步。
-- [ ] **2.2 用户输入仲裁**：Agent 运行期间用户一敲键盘 → 自动 Paused，面板出现「接管 / 交还」。Agent 写入前检查状态。
-- [ ] **2.3 停止语义**：「停止」可选同时发 Ctrl-C；停止后状态回到 UserDriving。
+- [x] **2.1 控制权状态机**：`UserDriving | AgentDriving | Paused`，按会话维护；前后端同步。（`agent/control.rs` 纯状态机 + 登记表，`ActRuntime.control`；事件 `nx://agent/control/{session}`（载荷 `{session,state}`，同时发给被驾驶会话与发起会话），查询 `agent_control_get`；运行开始即 AgentDriving，结束 / 出错 / 停止由 `ControlLease` Drop 还给用户。）
+- [x] **2.2 用户输入仲裁**：Agent 运行期间用户一敲键盘 → 自动 Paused，面板出现「接管 / 交还」。Agent 写入前检查状态。（前端 `lib/control.ts` 键盘闸：闸关时每键仅一次布尔判断，Agent 驾驶时首次真键入才发一次 `agent_control_user_input`，xterm 自动应答不算；后端在每个动作开始前与 exec / keys / secret 写入前 `gate_drive`，Paused 轮询等待（可取消，上限 5 分钟，超时告知模型「用户接管」，累计 2 次收束本轮）；面板横幅：Paused 显示「交还」，Agent 驾驶中显示「接管」。键盘字节从不被拦、不被延迟。）
+- [x] **2.3 停止语义**：「停止」可选同时发 Ctrl-C；停止后状态回到 UserDriving。（面板「同时发 Ctrl-C」复选框，localStorage 持久、默认关；`agent_run_cancel(sessionId, sendCtrlC)` → `act::stop_run`：置取消、可选向被驾驶会话写 `\x03`（绕过暂停闸）、立即释放控制权。）
 - [ ] **2.4 提交命令事件**：前端 `onCommandCommitted`（已有于 `TerminalView`）推给后端；后端 side buffer 增加分段后的 user command 记录，且不记录无回显（密码）输入。
 - [ ] **2.5 统一时间线**：终端会话的事件流 `{actor: user|agent, kind: command|keys|prompt|output, ts}`；面板展示，并标明谁做的。
 - [ ] **2.6 对话与运行持久化**：跨重载保留对话；`act::run` 能带上上一轮摘要。

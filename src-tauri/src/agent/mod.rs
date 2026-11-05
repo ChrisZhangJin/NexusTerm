@@ -17,6 +17,7 @@ pub mod act;
 pub mod buffer;
 pub mod capture;
 pub mod cmd;
+pub mod control;
 pub mod danger;
 pub mod executor;
 pub mod interact;

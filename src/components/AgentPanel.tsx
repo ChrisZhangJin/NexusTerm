@@ -4,6 +4,7 @@ import ConfirmDialog, { type ConfirmOptions } from "./ConfirmDialog";
 import {
   api,
   onAgentApprove,
+  onAgentControl,
   onAgentDone,
   onAgentError,
   onAgentSecret,
@@ -12,6 +13,12 @@ import {
 } from "../api";
 import { isAgentReady, useAgentConfig } from "../lib/agent";
 import { toFriendlyError } from "../lib/errors";
+import {
+  applyControl,
+  drivingSessions,
+  pausedSessions,
+  type ControlState,
+} from "../lib/control";
 import { enterVerdict, ImeGuard, isImeKey, keyInfoFrom } from "../lib/ime";
 import { matchSessions, scanMention } from "../lib/mention";
 import type {
@@ -58,7 +65,10 @@ interface Conversation {
   interrupted: boolean;
 }
 
-const EMPTY_CONV: Conversation = { messages: [], busy: false, interrupted: false };
+/** 「停止时同时发 Ctrl-C」的本机偏好（"1" = 开，默认关） */
+const LS_STOP_CTRL_C = "nx.agent.stopCtrlC";
+
+const EMPTY_CONV: Conversation ={ messages: [], busy: false, interrupted: false };
 
 /** 撞到 max_tokens 时追加在答案末尾的说明 */
 const TRUNCATED_HINT = "\n\n— 回答被长度限制截断，可以让它继续，或缩小问题范围再问一次。";
@@ -387,6 +397,21 @@ export function AgentPanel({
     setConv((prev) => fn(prev));
   }, []);
 
+  // ——— 终端控制权（人 / Agent / 暂停） ———
+
+  /** 本轮涉及的各会话的控制权状态（只留活跃的；userDriving 的会被删掉） */
+  const [control, setControl] = useState<Record<string, ControlState>>({});
+  const pausedIds = pausedSessions(control);
+  const drivingIds = drivingSessions(control);
+  /** 「停止」时是否同时给被驾驶的终端发 Ctrl-C。默认关，选择记在本机 */
+  const [stopCtrlC, setStopCtrlC] = useState<boolean>(
+    () => localStorage.getItem(LS_STOP_CTRL_C) === "1"
+  );
+  const toggleStopCtrlC = (on: boolean) => {
+    setStopCtrlC(on);
+    localStorage.setItem(LS_STOP_CTRL_C, on ? "1" : "0");
+  };
+
   // ——— 会话切换 / 收起时的收尾 ———
 
   /**
@@ -422,7 +447,7 @@ export function AgentPanel({
 
     void (async () => {
       try {
-        const [offToken, offDone, offError, offStep, offApprove, offSecret] = await Promise.all([
+        const [offToken, offDone, offError, offStep, offApprove, offSecret, offControl] = await Promise.all([
           onAgentToken(runSession, (chunk) => {
             if (!disposed) patch((c) => withToken(c, chunk));
           }),
@@ -448,6 +473,9 @@ export function AgentPanel({
           onAgentSecret(runSession, (req) => {
             if (!disposed) patch((c) => withSecret(c, req));
           }),
+          onAgentControl(runSession, (p) => {
+            if (!disposed) setControl((s) => applyControl(s, p));
+          }),
         ]);
         // 竞态：listen 是异步的，等它 resolve 时这一轮可能已经结束了 —— 这时要立刻退订
         if (disposed) {
@@ -457,9 +485,17 @@ export function AgentPanel({
           offStep();
           offApprove();
           offSecret();
+          offControl();
           return;
         }
-        unlisteners.push(offToken, offDone, offError, offStep, offApprove, offSecret);
+        unlisteners.push(offToken, offDone, offError, offStep, offApprove, offSecret, offControl);
+        // 订阅之前就已经在跑的一轮（面板刚打开 / 重新挂载）：对一次账，补上发起会话的状态
+        api
+          .agentControlGet(runSession)
+          .then((st) => {
+            if (!disposed) setControl((s) => applyControl(s, { session: runSession, state: st }));
+          })
+          .catch(() => {});
       } catch {
         // 订阅失败：提问时会在 agentRun 上抛出真错误，这里不必再弹一次
       }
@@ -468,6 +504,8 @@ export function AgentPanel({
     return () => {
       disposed = true;
       unlisteners.forEach((f) => f());
+      // 订阅断了就收不到后续变化，留着旧状态只会让横幅卡在屏幕上
+      setControl({});
     };
   }, [runSession, visible, patch]);
 
@@ -624,10 +662,19 @@ export function AgentPanel({
     if (!sid) return;
     try {
       // 幂等：没有在跑时后端什么都不做
-      await api.agentRunCancel(sid);
+      await api.agentRunCancel(sid, stopCtrlC);
     } catch (e) {
       setErr(`取消失败：${toFriendlyError(e).message}`);
     }
+  };
+
+  /** 「接管」：让 Agent 立刻让路（等同于自己敲了键）。对所有正被驾驶的会话生效。 */
+  const takeover = () => {
+    for (const id of drivingIds) void api.agentControlTakeover(id).catch(() => {});
+  };
+  /** 「交还」：Paused → Agent 继续。 */
+  const handback = () => {
+    for (const id of pausedIds) void api.agentControlHandback(id).catch(() => {});
   };
 
   /** 用户在审批卡片上的选择。后端收不到（超时）也照样把卡片置成终态。 */
@@ -803,6 +850,28 @@ export function AgentPanel({
             )}
           </div>
 
+          {/* 控制权横幅：谁在操作终端要一眼看得出。用户一敲键盘 Agent 就自动暂停，
+              只有点「交还」它才会继续；「接管」则是不用敲键盘也能让它让路。 */}
+          {pausedIds.length > 0 ? (
+            <div className="ap-control paused" role="status">
+              <span className="ap-control-text">
+                你正在操作终端，Agent 已暂停（不会往终端里写入）。
+              </span>
+              <button className="btn primary" onClick={handback}>
+                交还
+              </button>
+            </div>
+          ) : busy && drivingIds.length > 0 ? (
+            <div className="ap-control driving" role="status">
+              <span className="ap-control-text">
+                Agent 正在操作终端。你在终端里一敲键盘它就会自动暂停。
+              </span>
+              <button className="btn" onClick={takeover}>
+                接管
+              </button>
+            </div>
+          ) : null}
+
           {/* 作用范围。放在输入框上方而不是藏在卡片里：
               勾选了哪些机器，是下一次发送前**必须**看得见的东西。 */}
           <div className="ap-scope">
@@ -965,9 +1034,22 @@ export function AgentPanel({
             <div className="ap-input-row">
               <span className="ap-input-hint">Enter 发送 · Shift+Enter 换行</span>
               {busy ? (
-                <button className="btn danger" onClick={() => void cancel()}>
-                  停止
-                </button>
+                <>
+                  <label
+                    className="ap-stop-ctrlc"
+                    title="停止时同时往正在被驾驶的终端发送 Ctrl-C，打断它正在跑的命令"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={stopCtrlC}
+                      onChange={(e) => toggleStopCtrlC(e.target.checked)}
+                    />
+                    同时发 Ctrl-C
+                  </label>
+                  <button className="btn danger" onClick={() => void cancel()}>
+                    停止
+                  </button>
+                </>
               ) : (
                 <button
                   className="btn primary"

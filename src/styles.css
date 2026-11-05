@@ -1837,6 +1837,24 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .ap-input-row { display: flex; align-items: center; gap: 8px; margin-top: 7px; }
 .ap-input-hint { flex: 1; min-width: 0; color: var(--text-dim); font-size: 11px; }
 .ap-input-row .btn { padding: 5px 14px; font-size: 12px; }
+.ap-stop-ctrlc {
+  display: flex; align-items: center; gap: 4px; flex: none;
+  color: var(--text-dim); font-size: 11px; cursor: pointer; user-select: none;
+}
+.ap-stop-ctrlc input { margin: 0; }
+
+/* 控制权横幅：Paused 用强调色（需要你做决定），Agent 驾驶中只是安静的提示条 */
+.ap-control {
+  display: flex; align-items: center; gap: 8px; margin: 6px 0 0; padding: 6px 9px;
+  border: 1px solid var(--border); border-radius: 6px; font-size: 11.5px;
+  color: var(--text-dim);
+}
+.ap-control.paused {
+  color: var(--text); border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.ap-control-text { flex: 1; min-width: 0; }
+.ap-control .btn { flex: none; padding: 3px 12px; font-size: 12px; }
 
 /* 引导态：未配置时整块替换掉对话区与输入区 */
 .ap-setup { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 14px; }
