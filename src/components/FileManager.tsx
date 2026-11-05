@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as RMouseEvent, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as RMouseEvent, type MutableRefObject, type ReactNode } from "react";
 import { homeDir } from "@tauri-apps/api/path";
 import { api, onSftpProgress } from "../api";
 import { resolveAuth } from "../lib/auth";
@@ -7,6 +7,8 @@ import { isWindows } from "../lib/platform";
 import { getPrefs } from "../lib/prefs";
 import type { AuthMethod, RemoteEntry, SessionRecord } from "../types";
 import { kindIcon, viewableKind } from "../lib/viewable";
+import { nameMatcher } from "../lib/nameFilter";
+import { registerSftpActivity } from "../lib/sftpActivity";
 
 export function formatSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -202,6 +204,92 @@ function PathInput({
   );
 }
 
+interface RowCbs {
+  onSelect: (e: RemoteEntry) => void;
+  onActivate: (e: RemoteEntry) => void;
+  onContext?: (ev: RMouseEvent, e: RemoteEntry | null) => void;
+}
+
+/**
+ * 单行。回调走 ref、`selected` 传布尔，这样 props 在重渲染之间保持稳定，
+ * 进度事件 / 点选 / 拖动传输栏时 memo 能整行跳过——否则万级目录每次都要重建所有行。
+ */
+const Row = memo(function Row({
+  e,
+  selected,
+  cbs,
+}: {
+  e: RemoteEntry;
+  selected: boolean;
+  cbs: MutableRefObject<RowCbs>;
+}) {
+  return (
+    <div
+      className={`fm-row ${selected ? "selected" : ""}`}
+      onClick={() => cbs.current.onSelect(e)}
+      onDoubleClick={() => cbs.current.onActivate(e)}
+      onContextMenu={(ev) => {
+        const { onSelect, onContext } = cbs.current;
+        if (!onContext) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        onSelect(e);
+        onContext(ev, e);
+      }}
+    >
+      <span className="fm-icon">{e.isDir ? "📁" : kindIcon(viewableKind(e.name))}</span>
+      <span className="fm-name">{e.name}</span>
+      <span className="fm-size">{e.isDir ? "" : formatSize(e.size)}</span>
+      <span className="fm-type">{typeLabel(e)}</span>
+      <span className="fm-mtime">{formatTime(e.mtime)}</span>
+    </div>
+  );
+});
+
+/** 搜索框。草稿放在这里而不是 Pane：敲字不该牵动整张文件列表重渲染。 */
+function FindBar({
+  focusToken,
+  onApply,
+  onClose,
+}: {
+  focusToken: number;
+  onApply: (q: string) => void;
+  onClose: () => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    ref.current?.focus();
+    ref.current?.select();
+  }, [focusToken]);
+  return (
+    <div className="fm-find" onMouseDown={(e) => e.stopPropagation()}>
+      <input
+        ref={ref}
+        className="fm-find-input"
+        value={draft}
+        spellCheck={false}
+        placeholder="精确匹配；* 通配，如 *.txt"
+        title="不带 * 是整名精确匹配（07.txt）；带 * 为通配（*07.txt = 以 07.txt 结尾）"
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") onApply(draft);
+          else if (e.key === "Escape") {
+            e.stopPropagation();
+            onClose();
+          }
+        }}
+      />
+      <button className="btn" onClick={() => onApply(draft)}>
+        过滤
+      </button>
+      <button className="btn fm-find-x" onClick={onClose} title="关闭 (Esc)">
+        ✕
+      </button>
+    </div>
+  );
+}
+
 function Pane({
   title,
   path,
@@ -228,20 +316,15 @@ function Pane({
 
   // 搜索 = 按文件名过滤当前目录。点「过滤」或回车才生效（同 Xftp），Esc / × 关闭并还原
   const rootRef = useRef<HTMLDivElement>(null);
-  const findRef = useRef<HTMLInputElement>(null);
   const [findOpen, setFindOpen] = useState(false);
-  const [draft, setDraft] = useState("");
+  const [findFocus, setFindFocus] = useState(0);
   const [filter, setFilter] = useState("");
   const openFind = useCallback(() => {
     setFindOpen(true);
-    requestAnimationFrame(() => {
-      findRef.current?.focus();
-      findRef.current?.select();
-    });
+    setFindFocus((n) => n + 1);
   }, []);
   const closeFind = () => {
     setFindOpen(false);
-    setDraft("");
     setFilter("");
     rootRef.current?.focus();
   };
@@ -251,13 +334,14 @@ function Pane({
   // 换了目录，旧的过滤词就没意义了
   useEffect(() => {
     setFindOpen(false);
-    setDraft("");
     setFilter("");
   }, [path]);
   const visible = useMemo(() => {
-    const q = filter.trim().toLowerCase();
-    return q ? sorted.filter((e) => e.name.toLowerCase().includes(q)) : sorted;
+    const match = nameMatcher(filter);
+    return filter.trim() ? sorted.filter((e) => match(e.name)) : sorted;
   }, [sorted, filter]);
+  const cbs = useRef<RowCbs>({ onSelect, onActivate, onContext });
+  cbs.current = { onSelect, onActivate, onContext };
 
   return (
     <div
@@ -314,54 +398,10 @@ function Pane({
             <div className="empty">无匹配项</div>
           )}
           {visible.map((e) => (
-            <div
-              key={e.path}
-              className={`fm-row ${selected === e.path ? "selected" : ""}`}
-              onClick={() => onSelect(e)}
-              onDoubleClick={() => onActivate(e)}
-              onContextMenu={(ev) => {
-                if (!onContext) return;
-                ev.preventDefault();
-                ev.stopPropagation();
-                onSelect(e);
-                onContext(ev, e);
-              }}
-            >
-              <span className="fm-icon">{e.isDir ? "📁" : kindIcon(viewableKind(e.name))}</span>
-              <span className="fm-name">{e.name}</span>
-              <span className="fm-size">
-                {e.isDir ? "" : formatSize(e.size)}
-              </span>
-              <span className="fm-type">{typeLabel(e)}</span>
-              <span className="fm-mtime">{formatTime(e.mtime)}</span>
-            </div>
+            <Row key={e.path} e={e} selected={selected === e.path} cbs={cbs} />
           ))}
         </div>
-        {findOpen && (
-          <div className="fm-find" onMouseDown={(e) => e.stopPropagation()}>
-            <input
-              ref={findRef}
-              className="fm-find-input"
-              value={draft}
-              spellCheck={false}
-              placeholder="按文件名过滤"
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") setFilter(draft);
-                else if (e.key === "Escape") {
-                  e.stopPropagation();
-                  closeFind();
-                }
-              }}
-            />
-            <button className="btn" onClick={() => setFilter(draft)}>
-              过滤
-            </button>
-            <button className="btn fm-find-x" onClick={closeFind} title="关闭 (Esc)">
-              ✕
-            </button>
-          </div>
-        )}
+        {findOpen && <FindBar focusToken={findFocus} onApply={setFilter} onClose={closeFind} />}
       </div>
 
       {children && <div className="fm-actions">{children}</div>}
@@ -426,12 +466,19 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
     const startH = xferRef.current?.getBoundingClientRect().height ?? 0;
     const el = ev.currentTarget;
     el.setPointerCapture(ev.pointerId);
+    let last = startH;
     const move = (e: PointerEvent) => {
-      // 往上拖 = 变高
-      const h = startH + (startY - e.clientY);
-      setXferH(Math.max(70, Math.min(h, window.innerHeight * 0.75)));
+      // 往上拖 = 变高。拖动过程直接写 DOM，不走 state：否则每个 pointermove
+      // 都让整个面板（含两张文件列表）重渲染；松手时再把最终值落进 state。
+      last = Math.max(70, Math.min(startH + (startY - e.clientY), window.innerHeight * 0.75));
+      const box = xferRef.current;
+      if (box) {
+        box.style.height = `${last}px`;
+        box.style.maxHeight = "none";
+      }
     };
     const up = () => {
+      setXferH(last);
       el.removeEventListener("pointermove", move);
       el.removeEventListener("pointerup", up);
       el.removeEventListener("pointercancel", up);
@@ -449,24 +496,35 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
   /** 正在等取消生效的 id：取消是异步的（要等拷贝循环下一轮才检查标志），
    *  这段等待期里后端返回的还是「失败」，不是「已取消」——靠这个集合纠正状态。 */
   const cancelingRef = useRef<Set<string>>(new Set());
+  // 登记传输活动，App 关标签前据此确认
+  const activityRef = useRef({ running: 0, queued: 0 });
+  activityRef.current = {
+    running: transfers.filter((t) => t.status === "running").length,
+    queued: transfers.filter((t) => t.status === "queued").length,
+  };
+  useEffect(() => registerSftpActivity(tabId, () => activityRef.current), [tabId]);
 
   useEffect(() => {
     const sub = onSftpProgress(({ transferId, transferred, total }) => {
+      // 事件是全局广播：别的标签（display:none 但仍挂载）的传输不是我的，
+      // 原样返回旧数组，避免白白重渲染
       setTransfers((prev) =>
-        prev.map((t) => {
-          if (t.id !== transferId) return t;
-          const now = Date.now();
-          const dt = (now - t.lastSampleAt) / 1000;
-          const speed = dt > 0.2 ? (transferred - t.lastSampleBytes) / dt : t.speed;
-          return {
-            ...t,
-            transferred,
-            size: total || t.size,
-            speed: dt > 0.2 ? speed : t.speed,
-            lastSampleAt: dt > 0.2 ? now : t.lastSampleAt,
-            lastSampleBytes: dt > 0.2 ? transferred : t.lastSampleBytes,
-          };
-        })
+        !prev.some((t) => t.id === transferId)
+          ? prev
+          : prev.map((t) => {
+              if (t.id !== transferId) return t;
+              const now = Date.now();
+              const dt = (now - t.lastSampleAt) / 1000;
+              const speed = dt > 0.2 ? (transferred - t.lastSampleBytes) / dt : t.speed;
+              return {
+                ...t,
+                transferred,
+                size: total || t.size,
+                speed: dt > 0.2 ? speed : t.speed,
+                lastSampleAt: dt > 0.2 ? now : t.lastSampleAt,
+                lastSampleBytes: dt > 0.2 ? transferred : t.lastSampleBytes,
+              };
+            })
       );
     });
     return () => void sub.then((u) => u());
@@ -790,12 +848,12 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
     ]);
   };
 
-  // 队列按加入顺序（列表是新的在前，所以从尾部找）一次放行一个
+  // 队列按加入顺序（列表是新的在前，所以从尾部找）一次放行一个，
+  // 而且要等手动「传输」的那些也结束——排队就是排在所有正在传的后面
   useEffect(() => {
     if (status !== "ready") return;
-    const q = transfers.filter((t) => t.viaQueue);
-    if (q.some((t) => t.status === "running")) return;
-    const next = [...q].reverse().find((t) => t.status === "queued");
+    if (transfers.some((t) => t.status === "running")) return;
+    const next = [...transfers].reverse().find((t) => t.status === "queued");
     if (next) runTransfer(next.kind, next.name, next.localPath, next.remotePath, next.size, next.id, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [transfers, status]);
