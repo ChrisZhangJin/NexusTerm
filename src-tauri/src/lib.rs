@@ -279,6 +279,7 @@ pub fn run() {
             agent::cmd::agent_approve,
             agent::cmd::agent_tab_ack,
             agent::cmd::agent_screen_ack,
+            agent::cmd::agent_secret_ack,
             agent::cmd::agent_exec,
             agent::cmd::agent_export_session,
             agent::cmd::agent_open_session,

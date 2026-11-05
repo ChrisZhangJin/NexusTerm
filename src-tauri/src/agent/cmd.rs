@@ -250,6 +250,27 @@ pub fn agent_screen_ack(
     ))
 }
 
+/// 用户对一次密码请求（`nx_secret`）的答复。`value = None` 表示「跳过」。
+///
+/// **这是密码唯一的入口，也是唯一的去向**：值在这里被装进 `Zeroizing`，经 oneshot 交给
+/// 等着的 `act::run`，由它直接写进目标 pty。不返回给前端、不进日志（本函数与下游都不打印参数）、
+/// 不进模型上下文 / trace / 旁路缓冲。
+///
+/// - `Ok(true)`：已交给后端；`Ok(false)`：请求已经没人接了（超时 / 本轮被停止），前端把卡片置灰；
+/// - `Err(原因)`：输入没通过校验（含换行 / 控制字符 / 过长），请求仍然有效，用户可以改了再交。
+///   原因文案不含输入内容。
+#[tauri::command]
+pub fn agent_secret_ack(
+    request_id: String,
+    value: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    state
+        .act
+        .answer_secret(&request_id, value)
+        .map_err(|e| e.to_string())
+}
+
 /// 在指定会话里手动跑一条命令（UI 上的「帮我执行」按钮、结果卡重试）。
 ///
 /// 与 `agent_run` 共用同一条执行链路，但不调用模型：用户点哪条就跑哪条。
@@ -281,6 +302,7 @@ pub async fn agent_exec(
         e
     })?;
     Ok(ExecResult {
+        prompt_kind: outcome.prompt.as_ref().map(|g| g.kind.as_str().to_string()),
         output: outcome.output,
         reason: outcome.reason,
     })

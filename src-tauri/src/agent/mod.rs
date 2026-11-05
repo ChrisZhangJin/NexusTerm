@@ -23,6 +23,7 @@ pub mod interact;
 pub mod llm;
 pub mod prompt;
 pub mod redact;
+pub mod secret;
 pub mod trace;
 
 use std::collections::HashMap;

@@ -18,9 +18,6 @@
 //! - **拿不准就返回 `Unknown` + 低置信度**，绝不 panic，
 //!   超长输入只看末尾 [`TAIL_BYTES`] 字节。
 
-// 调用方（1.6 接入 nx_exec / nx_wait / nx_screen）尚未落地，接线前不报 dead_code。
-#![allow(dead_code)]
-
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -58,6 +55,21 @@ pub enum PromptKind {
     Unknown,
 }
 
+impl PromptKind {
+    /// 与 serde 序列化一致的 snake_case 名字（喂给模型的 `prompt_kind` 字段用）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::YesNo => "yes_no",
+            Self::Pager => "pager",
+            Self::Menu => "menu",
+            Self::Repl => "repl",
+            Self::ShellPrompt => "shell_prompt",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// 分类结果。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct PromptGuess {
@@ -68,8 +80,21 @@ pub struct PromptGuess {
     pub hint: &'static str,
 }
 
+impl PromptGuess {
+    /// 喂给模型的一行反馈：`prompt_kind=… confidence=0.90 提示：…`，以换行结尾。
+    /// 工具结果（exec / wait / screen / send_keys / secret）共用这一行，格式只此一处。
+    pub fn feedback(&self) -> String {
+        format!(
+            "prompt_kind={} confidence={:.2} 提示：{}\n",
+            self.kind.as_str(),
+            self.confidence,
+            self.hint
+        )
+    }
+}
+
 const HINT_PASSWORD: &str =
-    "这是密码/口令/验证码输入提示：不要猜测或编造，请让用户本人输入（或走密码通道），输入内容不会回显。";
+    "这是密码/口令/验证码输入提示：不要猜测或编造，**不要用 nx_send_keys / nx_exec 输入**；请调用 nx_secret 让用户本人输入（输入内容不会经过你，也不会回显）。";
 const HINT_YESNO: &str =
     "这是是/否确认提示：先核对操作风险；同意发送 y（或 yes）加回车，拒绝发送 n。ssh 首次连接的指纹确认必须回复完整的 yes。";
 const HINT_PAGER: &str =
@@ -605,6 +630,27 @@ fn shell_confidence(t: &str) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn as_str_matches_serde_names_and_feedback_line() {
+        for k in [
+            PromptKind::Password,
+            PromptKind::YesNo,
+            PromptKind::Pager,
+            PromptKind::Menu,
+            PromptKind::Repl,
+            PromptKind::ShellPrompt,
+            PromptKind::Unknown,
+        ] {
+            let json = serde_json::to_string(&k).unwrap();
+            assert_eq!(json, format!("\"{}\"", k.as_str()));
+        }
+        let g = classify("[sudo] password for chris:", false);
+        let fb = g.feedback();
+        assert!(fb.starts_with("prompt_kind=password confidence="));
+        assert!(fb.contains("nx_secret"));
+        assert!(fb.ends_with('\n'));
+    }
+
     use super::*;
 
     fn k(s: &str) -> PromptKind {
