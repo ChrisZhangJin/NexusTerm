@@ -56,7 +56,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::interact::parse_keys;
 use super::prompt::classify;
@@ -93,7 +93,7 @@ pub const ALLOWED_KEYS: &[&str] = &["<C-c>", "<C-d>", "<C-z>", "<Enter>"];
 // ——————————————————————————————— 草稿模型 ———————————————————————————————
 
 /// 录制发生在哪个会话 / 主机。`label` 由前端按标签名传入（可能为空）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordingHost {
     pub session_id: String,
@@ -101,7 +101,7 @@ pub struct RecordingHost {
 }
 
 /// 某一步的输出尾部（候选的 `expectAfter` 依据）。已脱敏、限长。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StepHint {
     pub step_index: usize,
@@ -109,7 +109,7 @@ pub struct StepHint {
 }
 
 /// 整理过程的统计，给界面 / 测试看。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DraftStats {
     /// 参与转换的时间线事件数
@@ -121,7 +121,7 @@ pub struct DraftStats {
 }
 
 /// 录制草稿。见模块文档。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordingDraft {
     pub session: String,

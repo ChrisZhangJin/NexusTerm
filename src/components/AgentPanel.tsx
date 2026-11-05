@@ -812,7 +812,11 @@ export function AgentPanel({
       </div>
 
       {view === "timeline" && (
-        <Timeline sessionId={sessionId} hostLabel={sessions.find((s) => s.id === sessionId)?.label} />
+        <Timeline
+          sessionId={sessionId}
+          hostLabel={sessions.find((s) => s.id === sessionId)?.label}
+          onOpenSkillDraft={(draft) => setSkillUi({ draft })}
+        />
       )}
 
       <div className="ap-status">

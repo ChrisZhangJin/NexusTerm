@@ -14,6 +14,7 @@ import {
   type TimelineEvent,
   type TimelineRow,
 } from "../lib/timeline";
+import type { SkillInput } from "../types";
 
 /** 首屏拉取多少条（后端环形上限 512，这里取最近一段就够看） */
 const INITIAL_LIMIT = 300;
@@ -77,7 +78,16 @@ const Row = memo(
  * - 自动滚动只在贴底时生效，用户往上翻了就不再抢滚动条，并提示有几条新事件；
  * - 密码永远只有占位，这里拿不到也不会显示任何密文。
  */
-export default function Timeline({ sessionId, hostLabel }: { sessionId: string; hostLabel?: string }) {
+export default function Timeline({
+  sessionId,
+  hostLabel,
+  onOpenSkillDraft,
+}: {
+  sessionId: string;
+  hostLabel?: string;
+  /** 录制草稿卡「整理为技能 / 直接编辑」：交给上层打开技能管理器并预填 */
+  onOpenSkillDraft?: (draft: SkillInput) => void;
+}) {
   const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [opened, setOpened] = useState<ReadonlySet<number>>(() => new Set());
   const [unseen, setUnseen] = useState(0);
@@ -180,7 +190,7 @@ export default function Timeline({ sessionId, hostLabel }: { sessionId: string; 
           刷新
         </button>
       </div>
-      <RecorderDraftCard sessionId={sessionId} />
+      <RecorderDraftCard sessionId={sessionId} onOpenSkillDraft={onOpenSkillDraft} />
       <div className="tl-list" ref={listRef} onScroll={onScroll}>
         {rows.length === 0 ? (
           <div className="ap-empty">

@@ -35,6 +35,7 @@ import type {
 import type { ControlPayload, ControlState } from "./lib/control";
 import type { TimelineEvent } from "./lib/timeline";
 import type { RecorderStatus, RecordingDraft } from "./lib/recorder";
+import type { RefinedSkillDraft } from "./lib/skillRefine";
 
 export const api = {
   health: () => invoke<string>("health"),
@@ -224,6 +225,13 @@ export const api = {
   skillImportPreview: (text: string) => invoke<Skill>("skill_import_preview", { text }),
   /** 导入并保存：新 id、来源 imported、计数为 0 */
   skillImport: (text: string) => invoke<Skill>("skill_import", { text }),
+  /**
+   * 3.3：让 Agent 把录制草稿整理成 skill 草稿（不保存）。草稿按账号 redact 标志脱敏后出网；
+   * 模型输出在后端被夹紧并校验，失败重试一次、再失败退回机械草稿（`fallback`）。
+   * 总开关未启用 / 没配 Key / 模型调用失败会 reject（中文句子）。
+   */
+  skillRefineDraft: (draft: RecordingDraft, hint?: string) =>
+    invoke<RefinedSkillDraft>("skill_refine_draft", { draft, hint: hint?.trim() || null }),
   // ——— 旧宏迁移（Phase 3.5）。`ids` 省略 = 全部宏；原宏永远不会被改动或删除。———
   /** 预览转换结果（草稿 + 警告），不写入任何东西 */
   macrosMigratePreview: (ids?: string[]) =>
