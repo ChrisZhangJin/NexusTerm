@@ -1813,6 +1813,58 @@ pub async fn run_skill(
     Ok(report)
 }
 
+/// 在**已经开始的一轮 Agent 运行**里回放一份 skill（`nx_skill run`，4.1）。
+///
+/// 与 [`run_skill`] 的区别只有「谁登记运行时」：Agent 这一轮已经占了 inflight 槽、拿了控制权、
+/// 开了运行日志，这里**不再** `begin` / `acquire`，直接借用那一轮的取消标志与作用范围
+///（`targets`，越界批准并入的会话会写回给调用方）。引擎、闸门（范围 / 危险 / 审批 / 控制权 / 密码通道）、
+/// 进度卡、成功失败计数全部同 [`run_skill`]；不发 `answer` 收尾（那一轮还没结束，结论由模型给）。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_skill_in_round(
+    ctx: &SkillRunCtx<'_>,
+    skill: &Skill,
+    params: &BTreeMap<String, String>,
+    run_session: &str,
+    target_session: &str,
+    target_label: &str,
+    targets: &mut Vec<AgentTarget>,
+    cancel: Arc<AtomicBool>,
+    opts: RunOpts,
+) -> Result<SkillRunReport, String> {
+    let resolved = resolve_params(&skill.params, params).map_err(|e| e.join("\n"))?;
+    if skill.steps.is_empty() {
+        return Err("技能没有步骤".into());
+    }
+    if target_session.trim().is_empty() || !session_alive(ctx.state, target_session) {
+        return Err("目标会话不存在或已关闭".into());
+    }
+    let mut io = TauriIo {
+        app: ctx.app,
+        state: ctx.state,
+        runtime: ctx.runtime,
+        cfg: ctx.cfg,
+        run: run_session.to_string(),
+        target: target_session.to_string(),
+        label: if target_label.trim().is_empty() { "当前会话".into() } else { target_label.trim().to_string() },
+        targets: std::mem::take(targets),
+        cancel,
+        mark: 0,
+        step: 0,
+        skill_name: skill.name.clone(),
+    };
+    let mut report = execute(&mut io, skill, &resolved, &opts).await;
+    *targets = std::mem::take(&mut io.targets);
+
+    report.recorded = record_decision(&report.outcome);
+    if let (Some(ok), false) = (report.recorded, skill.id.is_empty()) {
+        if let Err(e) = ctx.state.store.skill_record_run_result(&skill.id, ok) {
+            tracing::warn!("记录技能运行结果失败：{e}");
+            report.recorded = None;
+        }
+    }
+    Ok(report)
+}
+
 // ——————————————————————————————— 测试 ———————————————————————————————
 
 #[cfg(test)]
