@@ -309,6 +309,7 @@ pub fn run() {
             agent::skill_cmd::skill_export,
             agent::skill_cmd::skill_import_preview,
             agent::skill_cmd::skill_import,
+            agent::skill_cmd::skill_refine_draft,
             agent::macro_migrate::macros_migrate_preview,
             agent::macro_migrate::macros_migrate,
         ])

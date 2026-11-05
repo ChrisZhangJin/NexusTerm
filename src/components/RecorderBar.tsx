@@ -1,5 +1,8 @@
 import { useEffect, useState } from "react";
+import { api } from "../api";
 import { useRecorder } from "../lib/useRecorder";
+import type { SkillInput } from "../types";
+import { cleanLines, mechanicalInput, refineHeadline, type RefinedSkillDraft } from "../lib/skillRefine";
 import {
   describeStep,
   draftDurationMs,
@@ -76,13 +79,47 @@ export function RecorderControls({
 }
 
 /**
- * 录制错误 + 最近一份草稿的预览。草稿留在 `useRecorder` 的 store 里，
- * 3.3（LLM 整理）/ 3.4（保存为 Skill）从 `useRecorder(sessionId).draft` 取用。
+ * 录制错误 + 最近一份草稿的预览。草稿留在 `useRecorder` 的 store 里。
  * 密码步骤只显示说明，永远没有内容；hint 是命令输出的末尾几行（已脱敏）。
+ *
+ * 两条路都只是「打开 SkillManager 预填草稿」，保存永远由用户在编辑器里点：
+ * - 整理为技能（3.3）：让模型整理，后端夹紧并校验后返回；先在卡片里展示说明 / 警告，用户确认再打开；
+ * - 直接编辑：不经模型，机械草稿原样进编辑器。
  */
-export function RecorderDraftCard({ sessionId }: { sessionId: string }) {
+export function RecorderDraftCard({
+  sessionId,
+  onOpenSkillDraft,
+}: {
+  sessionId: string;
+  onOpenSkillDraft?: (draft: SkillInput) => void;
+}) {
   const { draft, error, dismissDraft } = useRecorder(sessionId);
   const [showHints, setShowHints] = useState(false);
+  const [refineHint, setRefineHint] = useState("");
+  const [refining, setRefining] = useState(false);
+  const [refineErr, setRefineErr] = useState<string | null>(null);
+  const [refined, setRefined] = useState<RefinedSkillDraft | null>(null);
+
+  // 草稿换了 / 没了，旧的整理结果就不再对应它
+  useEffect(() => {
+    setRefined(null);
+    setRefineErr(null);
+  }, [draft]);
+
+  const refine = async () => {
+    if (!draft || refining) return;
+    setRefining(true);
+    setRefineErr(null);
+    setRefined(null);
+    try {
+      setRefined(await api.skillRefineDraft(draft, refineHint));
+    } catch (e) {
+      setRefineErr(String(e));
+    } finally {
+      setRefining(false);
+    }
+  };
+
   if (error) {
     return <div className="rec-card rec-err">录制失败：{error}</div>;
   }
@@ -99,10 +136,68 @@ export function RecorderDraftCard({ sessionId }: { sessionId: string }) {
         <button className="ap-mini" onClick={() => setShowHints((v) => !v)} disabled={draft.hints.length === 0}>
           {showHints ? "隐藏输出" : "输出提示"}
         </button>
-        <button className="ap-mini" onClick={dismissDraft} title="丢弃这份草稿">
+        <button className="ap-mini" onClick={dismissDraft} disabled={refining} title="丢弃这份草稿">
           丢弃
         </button>
       </div>
+      {draft.steps.length > 0 && (
+        <div className="rec-actions">
+          <input
+            className="rec-hint-input"
+            value={refineHint}
+            maxLength={500}
+            disabled={refining}
+            placeholder="给模型的提示（可选），例如：把主机名做成参数"
+            onChange={(e) => setRefineHint(e.target.value)}
+          />
+          <button
+            className="ap-mini rec-refine"
+            disabled={refining}
+            onClick={() => void refine()}
+            title="让模型把这份录制整理成可复用的技能：提取参数、加期望与验证。整理结果会再经过后端校验，保存前你可以在编辑器里修改"
+          >
+            {refining ? "整理中…" : "✨ 整理为技能"}
+          </button>
+          <button
+            className="ap-mini"
+            disabled={refining || !onOpenSkillDraft}
+            onClick={() => onOpenSkillDraft?.(mechanicalInput(draft))}
+            title="不经模型，把录制的步骤原样放进编辑器自己改"
+          >
+            直接编辑
+          </button>
+        </div>
+      )}
+      {refineErr && <div className="rec-err-line">整理失败：{refineErr}</div>}
+      {refined && (
+        <div className={`rec-refined${refined.fallback ? " fb" : ""}`}>
+          <div className="rec-refined-head">
+            <span>{refineHeadline(refined)}</span>
+            <button
+              className="ap-mini"
+              disabled={!onOpenSkillDraft}
+              onClick={() => onOpenSkillDraft?.(refined.draft)}
+              title="在技能编辑器里打开整理结果；保存由你在编辑器里确认"
+            >
+              打开编辑器
+            </button>
+          </div>
+          {cleanLines(refined.warnings).length > 0 && (
+            <ul className="rec-warn">
+              {cleanLines(refined.warnings).map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+          )}
+          {cleanLines(refined.notes).length > 0 && (
+            <ul className="rec-refine-notes tl-dim">
+              {cleanLines(refined.notes).map((n, i) => (
+                <li key={i}>{n}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
       {draft.warnings.length > 0 && (
         <ul className="rec-warn">
           {draft.warnings.map((w, i) => (
