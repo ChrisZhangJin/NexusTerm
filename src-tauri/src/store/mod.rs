@@ -15,6 +15,9 @@ pub use vault_ops::SweepReport;
 /// Agent 对话与运行摘要的持久化（Phase 2.6）。
 mod agent_history;
 
+/// Skill（可回放的操作流程）的持久化（Phase 3.1）。
+mod skills;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
@@ -241,6 +244,7 @@ impl Store {
 
         migrate(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
         agent_history::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
+        skills::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
 
         // 一次主键查找就能判定要不要弹解锁框。刻意不做 KDF、不碰系统凭据服务 ——
         // 这条路径在 `lib.rs` 的 setup 里是 `expect`，不能慢也不能阻塞。

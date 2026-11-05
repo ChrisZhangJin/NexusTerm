@@ -42,7 +42,7 @@
 
 ## 阶段 3 · 学习（操作 → skill）
 
-- [ ] **3.1 Skill 数据模型与存储**：`skills` 表（名称、描述、参数、步骤、验证条件、风险等级、适用主机范围、创建/更新时间）；步骤 = `exec | keys | expect+respond | secret | screen_check`，含 `on_unexpected: ask|stop|llm`。CRUD 命令。
+- [x] **3.1 Skill 数据模型与存储**：`skills` 表（名称、描述、参数、步骤、验证条件、风险等级、适用主机范围、创建/更新时间）；步骤 = `exec | keys | expect+respond | secret | screen_check`，含 `on_unexpected: ask|stop|llm`。CRUD 命令。（`agent/skill.rs` 纯模型 + 校验 + `render_step` + `assess_risk` + `export_text / import_text`，顶部注释即模型文档；`store/skills.rs` 的 `skills` 表（`CREATE IF NOT EXISTS` 纯增量，params / steps / verify / host_scope 为 JSON 列，上限 200 条 / 每条 100 步）与 `skill_create / update / delete / get / list(query) / record_run_result`；命令 `agent/skill_cmd.rs`：`skill_list / get / create / update / delete / validate / export / import_preview / import`，**不暴露** `record_run_result`；前端类型在 `types.ts`、封装在 `api.ts`、辅助在 `lib/skill.ts`。skill 里永远没有密码值：secret 步骤只有 reason + 参数引用名，结构 `deny_unknown_fields`，secret 参数无默认值且只能用于 secret 通道；导入是不受信输入，新 id、来源 imported、计数清零、风险重评；编辑回放相关内容会清零计数。）
 - [ ] **3.2 录制器**：基于 2.5 时间线录制一段操作（开始/结束），密码步骤只记 `secret` 占位。替代旧宏录制中「录下密码」的问题。
 - [ ] **3.3 Agent 整理 skill**：录制 → LLM 提取参数、前置条件、每步期望、验证 → 草稿 skill，用户可编辑后保存。
 - [ ] **3.4 Skill 管理界面**：列表 / 查看 / 编辑 / 删除 / 导入导出（文本文件）。
