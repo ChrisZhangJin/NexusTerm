@@ -20,6 +20,7 @@ pub mod cmd;
 pub mod danger;
 pub mod executor;
 pub mod llm;
+pub mod prompt;
 pub mod redact;
 pub mod trace;
 
