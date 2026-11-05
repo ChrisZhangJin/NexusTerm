@@ -67,6 +67,7 @@ use super::interact::{self, Pattern, WaitEnd, WaitSpec};
 use super::llm::{self, ChatMessage, CONTEXT_BEGIN, CONTEXT_END};
 use super::prompt::{self, PromptGuess};
 use super::secret::{self, SecretAnswer};
+use super::timeline::{self, Kind as TlKind};
 use super::trace;
 use super::{AgentConfig, AgentError};
 use crate::agent::StreamKind;
@@ -1254,7 +1255,19 @@ fn plan_message(
             (t, raw)
         })
         .collect();
-    build_plan_message(req, &blocks, capture, &saved_hosts_hint(state), redact)
+    // 用户最近在终端里做了什么（统一时间线 2.5 的摘要，已按账户开关脱敏、限长）。
+    // 并进「主机提示」位置：同样是不再二次脱敏的附加段落。
+    let mut extra = saved_hosts_hint(state);
+    for t in targets {
+        let d = state.agent.timeline_digest(&t.id, redact);
+        if !d.is_empty() {
+            extra.push_str(&format!(
+                "\n【用户最近在「{}」里的操作】（按时间从早到晚，仅供参考；Agent 自己的动作不在此列）：\n{d}\n",
+                t.label
+            ));
+        }
+    }
+    build_plan_message(req, &blocks, capture, &extra, redact)
 }
 
 /// 出网前的脱敏闸门：`redact` 为真时过 `redact::redact`。
@@ -3012,6 +3025,7 @@ pub async fn run(
 
                     // 审批都过了、真要写之前最后看一眼：别往用户正在打的字里插命令
                     drive_gate!(&target_id);
+                    let tl_seq = timeline::begin(app, &state.agent, &target_id, TlKind::Command, command.trim(), None);
                     match run_one(
                         state,
                         app,
@@ -3026,6 +3040,10 @@ pub async fn run(
                     .await
                     {
                         Ok(outcome) => {
+                            timeline::finish(
+                                app, &state.agent, &target_id, tl_seq, &outcome.output,
+                                outcome.prompt.as_ref(), outcome.reason == ExecEnd::AwaitingInput,
+                            );
                             marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
                             let text = feedback_for(&command, target_label, &outcome);
                             feedback.push_str(&text);
@@ -3279,6 +3297,7 @@ pub async fn run(
 
                     drive_gate!(&target_id);
                     emit_interact(app, &session, "keys", step, &target_id, &label, Some(&shown), None, None, None);
+                    let tl_seq = timeline::begin(app, &state.agent, &target_id, TlKind::Keys, &shown, None);
                     match send_keys(state, &target_id, &bytes).await {
                         Ok(tail) => {
                             if trace_on {
@@ -3286,6 +3305,7 @@ pub async fn run(
                             }
                             marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
                             let guess = classify_session(state, &target_id, false);
+                            timeline::finish(app, &state.agent, &target_id, tl_seq, &tail, Some(&guess), false);
                             emit_interact(
                                 app, &session, "keys", step, &target_id, &label, Some(&shown),
                                 Some("已发送".into()), Some(tail.clone()), Some(&guess),
@@ -3382,6 +3402,8 @@ pub async fn run(
                         WaitEnd::Timeout => "超时未命中",
                         WaitEnd::Cancelled => "已取消",
                     };
+                    let tl_seq = timeline::begin(app, &state.agent, &target_id, TlKind::Wait, &shown, Some(verdict));
+                    timeline::finish(app, &state.agent, &target_id, tl_seq, &res.output, Some(&guess), false);
                     emit_interact(
                         app, &session, "wait", step, &target_id, &label, Some(&shown),
                         Some(verdict.into()), Some(tail_chars(res.output.trim(), SCREEN_MAX_BYTES)),
@@ -3438,6 +3460,11 @@ pub async fn run(
                     }
                     // 渲染后的屏幕才是真画面；退回旁路缓冲时同样按缓冲分类（全屏程序里不可信，置信度本就低）
                     let guess = prompt::classify(&text, alt);
+                    let tl_seq = timeline::begin(
+                        app, &state.agent, &target_id, TlKind::Screen, "",
+                        Some(if rendered { "xterm 屏幕" } else { "旁路缓冲" }),
+                    );
+                    timeline::finish(app, &state.agent, &target_id, tl_seq, &text, Some(&guess), false);
                     emit_interact(
                         app, &session, "screen", step, &target_id, &label, None,
                         Some(match (rendered, alt) {
@@ -3521,6 +3548,12 @@ pub async fn run(
                     .await;
                     marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
                     let after = classify_session(state, &target_id, false);
+                    // 时间线只记占位 + 原因 + 结局码，没有密码，也不记其后的输出尾部
+                    let tl_seq = timeline::begin(
+                        app, &state.agent, &target_id, TlKind::Secret, "",
+                        Some(&format!("{reason} · {}", status.code())),
+                    );
+                    timeline::finish(app, &state.agent, &target_id, tl_seq, "", Some(&after), false);
                     // trace 里只记状态与脱敏后的尾部，**没有**密码（`trace::record` 还会再脱敏一遍）
                     if trace_on {
                         trace::record(

@@ -41,6 +41,9 @@ const SECRET_PROBE_BYTES: usize = 512;
 /// 后端按屏幕尾部判为密码提示所需的最低置信度。
 const SECRET_CONFIDENCE: f32 = 0.8;
 
+/// [`SessionBuffer::out_since`] 最多回看多少原始字节。
+const OUTPUT_SLICE_MAX_BYTES: u64 = 64 * 1024;
+
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 
@@ -309,6 +312,30 @@ impl SessionBuffer {
                 continue;
             }
             push_transcript(&mut out, &chunk.text_from(skip), chunk.kind, &mut at_line_start);
+            skip = 0;
+        }
+        out
+    }
+
+    /// 从位置 `mark` 往后**只含程序输出（Out）**的文本，不含人敲的输入（`$ ` 行）。
+    ///
+    /// 给时间线（2.5）切「某条命令对应的输出段」用：命令之后用户可能已经在敲下一条，
+    /// 那些输入不该算进上一条命令的输出里。最多回看 [`OUTPUT_SLICE_MAX_BYTES`] 原始字节，
+    /// 持锁时间有上界。
+    pub fn out_since(&self, mark: u64) -> String {
+        let start = self.pushed - self.bytes as u64;
+        let floor = self.pushed.saturating_sub(OUTPUT_SLICE_MAX_BYTES);
+        let mut skip = mark.max(floor).saturating_sub(start).min(self.bytes as u64) as usize;
+        let mut out = String::new();
+        for chunk in &self.chunks {
+            let len = chunk.data.len();
+            if skip >= len {
+                skip -= len;
+                continue;
+            }
+            if chunk.kind == StreamKind::Out {
+                out.push_str(&chunk.text_from(skip));
+            }
             skip = 0;
         }
         out
