@@ -1973,6 +1973,7 @@ pub async fn run_skill_in_round(
     cancel: Arc<AtomicBool>,
     opts: RunOpts,
 ) -> Result<SkillRunReport, String> {
+    let mut opts = opts;
     let resolved = resolve_params(&skill.params, params).map_err(|e| e.join("\n"))?;
     if skill.steps.is_empty() {
         return Err("技能没有步骤".into());
@@ -1980,6 +1981,18 @@ pub async fn run_skill_in_round(
     if target_session.trim().is_empty() || !session_alive(ctx.state, target_session) {
         return Err("目标会话不存在或已关闭".into());
     }
+    // 信任与范围（4.4），与 `run_skill` 一致：由后端按 skill 自己的状态定，模型 / 调用方只能更严
+    let trust = trust_info(skill);
+    opts.trust = opts.trust.stricter(TrustPolicy::for_level(trust.level));
+    if trust.level != TrustLevel::Trusted {
+        opts.trust_note = trust.reason.clone();
+    }
+    if opts.scope_violation.is_none() {
+        let who = HostIdentity::resolve(ctx.state, target_session, target_label);
+        opts.scope_violation = check_scope(&skill.host_scope, &who).err();
+    }
+    let ran_fingerprint = trust_fingerprint(skill);
+
     let mut io = TauriIo {
         app: ctx.app,
         state: ctx.state,
@@ -1999,9 +2012,14 @@ pub async fn run_skill_in_round(
 
     report.recorded = record_decision(&report.outcome);
     if let (Some(ok), false) = (report.recorded, skill.id.is_empty()) {
-        if let Err(e) = ctx.state.store.skill_record_run_result(&skill.id, ok) {
+        let clean = is_clean_success(&report);
+        if let Err(e) = ctx.state.store.skill_record_run(&skill.id, ok, clean, &ran_fingerprint) {
             tracing::warn!("记录技能运行结果失败：{e}");
             report.recorded = None;
+        }
+    } else if !report.deviations.is_empty() && !skill.id.is_empty() {
+        if let Err(e) = ctx.state.store.skill_drop_trust(&skill.id) {
+            tracing::warn!("清零技能信任失败：{e}");
         }
     }
     Ok(report)

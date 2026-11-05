@@ -352,6 +352,7 @@ fn outcome_label(o: &RunOutcome) -> String {
         RunOutcome::TookOver => "用户接管了终端，已停止".into(),
         RunOutcome::Failed { reason } => format!("失败：{}", clip(reason, NOTE_CHARS)),
         RunOutcome::Error { reason } => format!("出错：{}", clip(reason, NOTE_CHARS)),
+        RunOutcome::OutOfScope { reason } => format!("已拒绝运行：{}", clip(reason, NOTE_CHARS)),
     }
 }
 
@@ -533,6 +534,8 @@ mod tests {
             source: SkillSource::Manual,
             success_count: 0,
             fail_count: 0,
+            trust_streak: 0,
+            trust_hash: String::new(),
             last_run_ts: None,
             created_at: 1,
             updated_at: 1,
@@ -833,12 +836,13 @@ mod tests {
         // 审批模式：每个写步骤都问（导入的技能也不例外）
         assert!(opts.approval_mode);
         assert!(needs_approval(opts.trust, opts.approval_mode, false));
-        // 自动模式：危险步骤仍然要问
+        // 自动模式：危险步骤要问；默认策略也逐步问——只有 `run_skill_in_round` 按技能自己的信任
+        //（4.4，后端按状态定）才可能放宽，调用方 / 模型放不宽
         cfg.exec_mode = ExecMode::Agentic;
         let opts = RunOpts::from_config(&cfg);
         assert!(!opts.approval_mode);
         assert!(needs_approval(opts.trust, opts.approval_mode, true));
-        assert!(!needs_approval(opts.trust, opts.approval_mode, false));
+        assert!(needs_approval(opts.trust, opts.approval_mode, false));
     }
 
     #[test]
