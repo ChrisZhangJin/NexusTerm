@@ -92,6 +92,33 @@ pub fn agent_clear(session_id: String, state: State<'_, AppState>) -> Result<(),
     Ok(())
 }
 
+// ——— 对话持久化（2.6）：面板的全局对话跨重载 / 重启保留 ———
+
+/// 读回已保存的面板对话（消息对象数组，结构由前端定义，后端只透传）。
+#[tauri::command]
+pub fn agent_history_load(state: State<'_, AppState>) -> Vec<serde_json::Value> {
+    state.store.agent_conv_load()
+}
+
+/// 覆盖保存面板对话。落盘前由后端统一清洗：只留最近若干条、文本脱敏并截断、
+/// 丢掉任何 value / password 形态的键（见 `agent::history::sanitize_messages`）。
+///
+/// 做成 async：脱敏是 CPU 活，别占主线程。
+#[tauri::command]
+pub async fn agent_history_save(
+    messages: Vec<serde_json::Value>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let cleaned = super::history::sanitize_messages(messages);
+    state.store.agent_conv_save(&cleaned)
+}
+
+/// 「清空对话」：真删已保存的对话与运行摘要。
+#[tauri::command]
+pub fn agent_history_clear(state: State<'_, AppState>) -> Result<(), String> {
+    state.store.agent_history_clear()
+}
+
 /// 缓冲统计（字节数 / 累计丢弃量 / 是否已被截断）。
 #[tauri::command]
 pub fn agent_stats(session_id: String, state: State<'_, AppState>) -> Option<BufferStats> {
