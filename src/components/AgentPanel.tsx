@@ -165,6 +165,27 @@ function withStep(c: Conversation, step: AgentStep): Conversation {
       }
     }
   }
+  // 「手和眼」三类卡（按键 / 等待 / 读屏）：收尾（output 有值）合并回同一目标、同一内容的进行中卡片，
+  // 与 exec → result 同理，别把一次动作拆成两张卡。
+  if (
+    (step.kind === "keys" || step.kind === "wait" || step.kind === "screen") &&
+    step.output !== undefined
+  ) {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      const s = m.step;
+      if (
+        s &&
+        s.kind === step.kind &&
+        s.output === undefined &&
+        s.target === step.target &&
+        s.command === step.command
+      ) {
+        msgs[i] = { ...m, step };
+        return { ...c, messages: msgs };
+      }
+    }
+  }
   // 纯展示用的「还在等」心跳：合并进对应的 exec 卡片，不单独起一张卡；
   // 对应的卡片已经收尾（或从没出现过，比如面板是后打开的）就直接丢弃，
   // 不能退化成下面的"推一条新消息"，那样会在对话里冒出一张没头没尾的孤卡。
@@ -1003,6 +1024,47 @@ function StepCard({ step }: { step: AgentStep }) {
           ) : null}
         </div>
         <div className="ap-step-why">{step.text ?? ""}</div>
+      </div>
+    );
+  }
+  // 手和眼：发按键 / 等输出 / 读屏幕。output 为空 = 进行中，有值（含空串）= 已收尾。
+  if (step.kind === "keys" || step.kind === "wait" || step.kind === "screen") {
+    const tag = step.kind === "keys" ? "按键" : step.kind === "wait" ? "等待" : "读屏";
+    const finished = step.output !== undefined;
+    const out = step.output ?? "";
+    const lines = out.split("\n").length;
+    return (
+      <div className={`ap-step${finished ? "" : " pending"}`}>
+        <div className="ap-step-head">
+          <span className="ap-step-tag">{tag}</span>
+          {step.targetLabel ? (
+            <span className="ap-step-where" title={step.target}>
+              {step.targetLabel}
+            </span>
+          ) : null}
+        </div>
+        {step.command ? <pre className="ap-code">{step.command}</pre> : null}
+        {step.text ? <div className="ap-step-why">{step.text}</div> : null}
+        {finished && out.trim() ? (
+          lines > 10 ? (
+            <details className="ap-out">
+              <summary>{step.kind === "screen" ? "屏幕" : "输出"} {lines} 行</summary>
+              <pre className="ap-code">{out}</pre>
+            </details>
+          ) : (
+            <pre className="ap-code ap-out-plain">{out}</pre>
+          )
+        ) : null}
+        {!finished ? (
+          <div className="ap-running">
+            <span className="ap-typing">
+              <i />
+              <i />
+              <i />
+            </span>
+            进行中…
+          </div>
+        ) : null}
       </div>
     );
   }

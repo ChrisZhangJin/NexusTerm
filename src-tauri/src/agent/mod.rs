@@ -19,6 +19,7 @@ pub mod capture;
 pub mod cmd;
 pub mod danger;
 pub mod executor;
+pub mod interact;
 pub mod llm;
 pub mod prompt;
 pub mod redact;

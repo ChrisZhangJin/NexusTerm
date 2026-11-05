@@ -7,6 +7,7 @@ import type {
   AgentDonePayload,
   AgentExecResult,
   AgentRunRequest,
+  AgentScreenRequest,
   AgentStep,
   AgentTabInfo,
   AgentTabRequest,
@@ -235,6 +236,17 @@ export const api = {
     detail?: string,
     tabs?: AgentTabInfo[]
   ) => invoke<boolean>("agent_tab_ack", { requestId, ok, detail, tabs }),
+  /**
+   * 回执一次读屏请求（`nx_screen`）。后端 3 秒等不到就退回旁路缓冲，所以**每条分支都要回**。
+   * `ok=false` 时 `detail` 写原因。返回 false 表示请求已超时被丢弃，不是错误。
+   */
+  agentScreenAck: (
+    requestId: string,
+    ok: boolean,
+    text?: string,
+    alt?: boolean,
+    detail?: string
+  ) => invoke<boolean>("agent_screen_ack", { requestId, ok, text, alt, detail }),
   /**
    * 不经模型、直接在会话里跑一条命令并拿回结果。
    *
@@ -484,6 +496,16 @@ export async function onAgentTab(
   handler: (req: AgentTabRequest) => void
 ): Promise<UnlistenFn> {
   return listen<AgentTabRequest>("nx://agent/tab", (ev) => handler(ev.payload));
+}
+
+/**
+ * Agent 要读某个会话此刻的 xterm 屏幕（`nx_screen`）。xterm 只在前端，后端读不到渲染后的画面。
+ * 处理完务必 `api.agentScreenAck(...)`，后端在等回执（全局事件，同 `onAgentTab`）。
+ */
+export async function onAgentScreen(
+  handler: (req: AgentScreenRequest) => void
+): Promise<UnlistenFn> {
+  return listen<AgentScreenRequest>("nx://agent/screen", (ev) => handler(ev.payload));
 }
 
 /**

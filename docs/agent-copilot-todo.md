@@ -22,14 +22,14 @@
 
 ## 阶段 1 · 手和眼（对终端的操作原语）
 
-- [ ] **1.1 脱敏补洞**：agentic 路径上，`plan_message` / `console_text` / 命令输出反馈 / 错误，凡发往 LLM 的内容在 `acct.redact` 为真时过 `redact::redact`。加测试。
-- [ ] **1.2 `nx_send_keys`**：原始按键与控制字符（`\x03` Ctrl-C、`\x04`、`\x1b`、方向键、Tab、不带回车的文本）。新 `AgentAction::Keys`；与 `nx_exec` 区分——Keys 不等命令结束，只写入并返回「已发送」。过 danger / scope；`reject_command` 的单行限制只对 Exec 保留。
-- [ ] **1.3 `nx_wait`**：等某段文字出现（子串或 `/regex/`）或输出静止，带超时，返回命中与否 + 此刻屏幕尾部。
-- [ ] **1.4 `nx_screen`**：运行中随时读取目标会话的当前 xterm 屏幕（含 alt screen）。复用 `request_tab` + `nx://agent/tab` + `agent_tab_ack` 的前端往返模式，前端用 `snapshotConsole`。
+- [x] **1.1 脱敏补洞**：agentic 路径上，`plan_message` / `console_text` / 命令输出反馈 / 错误，凡发往 LLM 的内容在 `acct.redact` 为真时过 `redact::redact`。加测试。
+- [x] **1.2 `nx_send_keys`**：原始按键与控制字符（`\x03` Ctrl-C、`\x04`、`\x1b`、方向键、Tab、不带回车的文本）。新 `AgentAction::Keys`；与 `nx_exec` 区分——Keys 不等命令结束，只写入并返回「已发送」。过 danger / scope；`reject_command` 的单行限制只对 Exec 保留。
+- [x] **1.3 `nx_wait`**：等某段文字出现（子串或 `/regex/`）或输出静止，带超时，返回命中与否 + 此刻屏幕尾部。
+- [x] **1.4 `nx_screen`**：运行中随时读取目标会话的当前 xterm 屏幕（含 alt screen）。复用 `request_tab` + `nx://agent/tab` + `agent_tab_ack` 的前端往返模式，前端用 `snapshotConsole`。
 - [x] **1.5 交互提示分类器**（纯函数，`agent/prompt.rs`）：把屏幕尾部 / 最后一行分类为 `Password | YesNo | Pager | Menu | Repl | ShellPrompt | Unknown`，并给出建议应答。大量单测。
 - [ ] **1.6 接入分类器**：`nx_exec` / `nx_wait` / `nx_screen` 的返回里带 `prompt_kind`；`wait_for_end` 在检出非 ShellPrompt 的交互提示时提前返回，而不是等满超时。
 - [ ] **1.7 密码通道**：Agent 只能发起 `nx_secret{reason}`，由用户在审批卡里输入（或选保险库条目），后端直接写入 pty；密文不进模型上下文、不进 trace、不进 side buffer 的 `$ ` 转录。
-- [ ] **1.8 系统提示更新**：告知新工具的用法与边界（何时 send_keys、何时 secret、何时 screen）。
+- [x] **1.8 系统提示更新**：告知新工具的用法与边界（何时 send_keys、何时 secret、何时 screen）。
 
 ## 阶段 2 · 共同在场（共享控制权）
 

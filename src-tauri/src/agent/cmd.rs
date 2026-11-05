@@ -226,6 +226,30 @@ pub fn agent_tab_ack(
     ))
 }
 
+/// 前端对一次读屏请求（`nx_screen`）的回执。
+///
+/// 必须回：后端在等它，3 秒没等到就退回旁路缓冲。`ok=false` 时 `detail` 写原因（如终端不存在）。
+/// 返回 false 表示这个请求已经超时被丢掉了 —— 前端忽略即可，不是错误。
+#[tauri::command]
+pub fn agent_screen_ack(
+    request_id: String,
+    ok: bool,
+    text: Option<String>,
+    alt: Option<bool>,
+    detail: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    Ok(state.act.answer_screen(
+        &request_id,
+        crate::agent::act::ScreenReply {
+            ok,
+            text: text.unwrap_or_default(),
+            alt: alt.unwrap_or(false),
+            detail: detail.unwrap_or_default(),
+        },
+    ))
+}
+
 /// 在指定会话里手动跑一条命令（UI 上的「帮我执行」按钮、结果卡重试）。
 ///
 /// 与 `agent_run` 共用同一条执行链路，但不调用模型：用户点哪条就跑哪条。

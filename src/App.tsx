@@ -17,7 +17,7 @@ import {
 import KeyManagerDialog from "./components/KeyManagerDialog";
 import MacroDialog from "./components/MacroDialog";
 import AuthPromptDialog from "./components/AuthPromptDialog";
-import { api, onAuthPrompt, onAgentTab, stringToBytes } from "./api";
+import { api, onAuthPrompt, onAgentScreen, onAgentTab, stringToBytes } from "./api";
 import { loadAgentConfig } from "./lib/agent";
 import {
   folderMoveItems,
@@ -1173,6 +1173,32 @@ export default function App() {
     });
     return () => void un.then((f) => f());
   }, [handleAgentTab]);
+
+  /**
+   * Agent 读屏请求（`nx_screen`）：把目标会话此刻的 xterm 屏幕抓出来回给后端。
+   *
+   * 后端 3 秒等不到回执就退回旁路缓冲，所以**每条分支都必须 ack**（含终端不存在、抓取抛错），
+   * 否则 Agent 会白等满 3 秒。
+   */
+  useEffect(() => {
+    const un = onAgentScreen((req) => {
+      let snap: { text: string; alt: boolean } | null = null;
+      try {
+        snap = snapshotConsole(req.target, req.maxChars);
+      } catch (e) {
+        void api.agentScreenAck(req.requestId, false, undefined, undefined, `读取屏幕出错：${String(e)}`).catch(() => false);
+        return;
+      }
+      if (!snap) {
+        void api
+          .agentScreenAck(req.requestId, false, undefined, undefined, `没有 id 为「${req.target}」的终端`)
+          .catch(() => false);
+        return;
+      }
+      void api.agentScreenAck(req.requestId, true, snap.text, snap.alt).catch(() => false);
+    });
+    return () => void un.then((f) => f());
+  }, []);
 
   const saveSession = useCallback(
     async (payload: NewSession, secrets: SessionSecrets) => {
