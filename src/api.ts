@@ -19,6 +19,8 @@ import type {
   DiscoveredKey,
   GenerateKeyOptions,
   KeyInfo,
+  MacroMigrationPreview,
+  MacroMigrationResult,
   MacroRecord,
   MacroStep,
   NewSession,
@@ -221,6 +223,13 @@ export const api = {
   skillImportPreview: (text: string) => invoke<Skill>("skill_import_preview", { text }),
   /** 导入并保存：新 id、来源 imported、计数为 0 */
   skillImport: (text: string) => invoke<Skill>("skill_import", { text }),
+  // ——— 旧宏迁移（Phase 3.5）。`ids` 省略 = 全部宏；原宏永远不会被改动或删除。———
+  /** 预览转换结果（草稿 + 警告），不写入任何东西 */
+  macrosMigratePreview: (ids?: string[]) =>
+    invoke<MacroMigrationPreview[]>("macros_migrate_preview", { ids: ids ?? null }),
+  /** 转成技能并保存；已迁移过的宏会跳过（幂等） */
+  macrosMigrate: (ids?: string[]) =>
+    invoke<MacroMigrationResult[]>("macros_migrate", { ids: ids ?? null }),
   /** 会话没登记过旁路时返回 null，而不是抛错 */
   agentStats: (sessionId: string) =>
     invoke<AgentBufferStats | null>("agent_stats", { sessionId }),

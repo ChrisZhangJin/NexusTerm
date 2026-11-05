@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { MacroRecord, MacroStep } from "../types";
+import MacroMigrateDialog from "./MacroMigrateDialog";
 
 interface Props {
   macros: MacroRecord[];
@@ -66,6 +67,8 @@ export default function MacroDialog({
   /** 会话当前绑定的宏。本地存一份：切换选中项时复选框要跟着变，而绑定关系
       不在宏列表里，拿不到重渲染信号 */
   const [bound, setBound] = useState<string | null>(boundId);
+  /** 「转为技能 / 全部迁移」窗口：ids 为 null = 全部；窗口没开时为 undefined */
+  const [mig, setMig] = useState<{ ids: string[] | null } | undefined>(undefined);
   const timer = useRef<number | undefined>(undefined);
   /** 刚新建、但 props 里的列表还没刷新过来的宏 id */
   const justCreated = useRef<string | null>(null);
@@ -170,13 +173,14 @@ export default function MacroDialog({
   // Esc 关闭：录制中先不响应，避免用户想停止录制却把窗口关了
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || recording) return;
+      // 迁移窗口开着时 Esc 归它管
+      if (e.key !== "Escape" || recording || mig) return;
       e.stopPropagation();
       onClose();
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [onClose, recording]);
+  }, [onClose, recording, mig]);
 
   const createNew = async () => {
     setBusy(true);
@@ -464,12 +468,29 @@ export default function MacroDialog({
           <button className={`btn${recording ? " primary" : ""}`} onClick={onRecord}>
             {recording ? "停止录制" : "录制"}
           </button>
+          <button
+            className="btn"
+            disabled={!current}
+            title="把这条宏转成技能（原宏保留；录下的密码不会被复制）"
+            onClick={() => current && setMig({ ids: [current.id] })}
+          >
+            转为技能
+          </button>
+          <button
+            className="btn"
+            disabled={macros.length === 0}
+            title="把所有宏转成技能（已迁移过的会跳过；原宏保留）"
+            onClick={() => setMig({ ids: null })}
+          >
+            全部迁移
+          </button>
           <span className="macro-spacer" />
           <button className="btn primary" onClick={onClose}>
             关闭
           </button>
         </div>
       </div>
+      {mig && <MacroMigrateDialog ids={mig.ids} onClose={() => setMig(undefined)} />}
     </div>
   );
 }

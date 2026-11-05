@@ -23,6 +23,7 @@ pub mod executor;
 pub mod history;
 pub mod interact;
 pub mod llm;
+pub mod macro_migrate;
 pub mod prompt;
 pub mod redact;
 pub mod secret;

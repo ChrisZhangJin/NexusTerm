@@ -543,7 +543,7 @@ fn has_control(s: &str, allow_tab: bool) -> bool {
 }
 
 /// 疑似写死的口令。返回命中的说明。宁可少报：只抓形状很确定的。
-fn literal_secret_hint(text: &str) -> Option<&'static str> {
+pub(crate) fn literal_secret_hint(text: &str) -> Option<&'static str> {
     static RES: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     let res = RES.get_or_init(|| {
         [
@@ -580,13 +580,13 @@ fn literal_secret_hint(text: &str) -> Option<&'static str> {
     None
 }
 
-fn looks_like_password_prompt(expect: &str) -> bool {
+pub(crate) fn looks_like_password_prompt(expect: &str) -> bool {
     let l = expect.to_lowercase();
     l.contains("password") || l.contains("passphrase") || l.contains("口令") || l.contains("密码")
 }
 
 /// pattern 是否会被当成 `/regex/`（按占位符换成 `x` 后的形状判断）。语法错返回原因。
-fn pattern_is_regex(template: &str) -> Result<bool, String> {
+pub(crate) fn pattern_is_regex(template: &str) -> Result<bool, String> {
     Pattern::parse(&dummy(template)).map(|p| matches!(p, Pattern::Regex(_)))
 }
 

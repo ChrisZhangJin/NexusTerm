@@ -631,3 +631,28 @@ export interface SkillInput {
   source?: SkillSource;
 }
 
+// ——————————————————————————————— 旧宏迁移（Phase 3.5） ———————————————————————————————
+// 与 Rust `agent::macro_migrate` 对应。警告从不引用被怀疑为口令的原文。
+
+/** 单条宏的迁移预览（不写库）：有 draft = 会保存的草稿；否则看 skipReason / errors */
+export interface MacroMigrationPreview {
+  macroId: string;
+  macroName: string;
+  draft: SkillInput | null;
+  skipReason: string | null;
+  errors: string[];
+  warnings: string[];
+}
+
+export type MacroMigrationOutcome =
+  | { kind: "migrated"; skillId: string }
+  | { kind: "skipped"; reason: string }
+  | { kind: "failed"; errors: string[] };
+
+export interface MacroMigrationResult {
+  macroId: string;
+  macroName: string;
+  outcome: MacroMigrationOutcome;
+  warnings: string[];
+}
+
