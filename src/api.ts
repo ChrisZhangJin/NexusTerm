@@ -199,6 +199,12 @@ export const api = {
   agentStats: (sessionId: string) =>
     invoke<AgentBufferStats | null>("agent_stats", { sessionId }),
   /**
+   * 用户在终端提交了一行命令（只在回车时调，fire-and-forget）。
+   * `noEcho` = 这行没被回显过（密码提示）：后端只存占位，行内容不会被记录。
+   */
+  agentUserCommand: (sessionId: string, line: string, noEcho: boolean) =>
+    invoke<void>("agent_user_command", { sessionId, line, noEcho }),
+  /**
    * 提问。**resolve 只代表流已启动，不代表回答完成** ——
    * 答案要走 `onAgentToken` / `onAgentDone` / `onAgentError` 事件收。
    */

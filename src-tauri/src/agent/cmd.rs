@@ -97,6 +97,25 @@ pub fn agent_stats(session_id: String, state: State<'_, AppState>) -> Option<Buf
     state.agent.stats(&session_id)
 }
 
+/// 用户在终端里提交（回车）了一行命令。前端 `onCommandCommitted` 路径推来，
+/// 只在回车时调一次，fire-and-forget。
+///
+/// `no_echo` 为真 = 前端判定这行没被终端回显过（密码提示）：此时 `line` 会被
+/// 直接丢弃，只存 `secret_input` 占位。后端还会按屏幕尾部再兜一道底。
+/// 同步命令、不返回条目：这条路径必须尽可能便宜，调用方也不关心结果。
+#[tauri::command]
+pub fn agent_user_command(
+    session_id: String,
+    line: String,
+    no_echo: Option<bool>,
+    state: State<'_, AppState>,
+) {
+    let no_echo = no_echo.unwrap_or(false);
+    // 无回显时内容不该走到任何存储，这里先清掉，后面谁改了实现也碰不到
+    let line = if no_echo { String::new() } else { line };
+    state.agent.record_user_command(&session_id, &line, no_echo);
+}
+
 // ——— 提问 / 取消 / 测试连接 ———
 
 /// 向绑定在该会话上的 AI 助手提问。

@@ -29,6 +29,7 @@ import {
 } from "../lib/complete";
 import { GhostText, cursorAtLineEnd, cursorFollowsTyped } from "../lib/ghost";
 import { ImeGuard, type KeyLike } from "../lib/ime";
+import { buildUserCommandReport } from "../lib/userCommand";
 
 import {
   api,
@@ -198,6 +199,16 @@ function debounce<A extends unknown[]>(fn: (...a: A) => void, ms: number) {
     if (t) window.clearTimeout(t);
     t = window.setTimeout(() => fn(...a), ms);
   };
+}
+
+/**
+ * 回车提交的整行推给后端 side buffer（agent 时间线 / 录制器的数据源）。
+ * 只在回车时调一次，fire-and-forget；无回显的行只发「无回显」标记，不发内容。
+ */
+function pushUserCommand(sessionId: string, committed: string, echoed: boolean, altScreen: boolean): void {
+  const r = buildUserCommandReport(committed, echoed, altScreen);
+  if (!r) return;
+  void api.agentUserCommand(sessionId, r.line, r.noEcho).catch(() => {});
 }
 
 export default function TerminalView({
@@ -471,6 +482,7 @@ export default function TerminalView({
       if (lineEchoedRef.current && termRef.current?.buffer.active.type === "normal") {
         recordCommand(historyKeyRef.current, committed);
       }
+      pushUserCommand(tabId, committed, lineEchoedRef.current, termRef.current?.buffer.active.type !== "normal");
       lineEchoedRef.current = false;
     }
     sendRef.current("\r");
@@ -744,6 +756,7 @@ export default function TerminalView({
         if (lineEchoedRef.current && term.buffer.active.type === "normal") {
           recordCommand(historyKeyRef.current, committed);
         }
+        pushUserCommand(tabId, committed, lineEchoedRef.current, term.buffer.active.type !== "normal");
         lineEchoedRef.current = false;
       }
       refreshHintsSoon();
