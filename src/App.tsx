@@ -98,6 +98,8 @@ export default function App() {
   // 按 tabId 索引（而不是单个全局值）：面板必须「只在自己所属的标签前台时展示」，
   // 单槽做不到 —— 切标签时它既不隐藏也不跟着换。
   const [sftpTabs, setSftpTabs] = useState<Record<string, SessionRecord>>({});
+  /** 每次从终端点「SFTP 文件管理」递增，让已开着的面板重新同步到终端当前目录 */
+  const [sftpNav, setSftpNav] = useState<Record<string, number>>({});
   /**
    * AI 助手侧栏是否展开。
    * 与「面板是否挂载」是两件事：面板始终挂载、只切 visible，
@@ -1433,6 +1435,7 @@ export default function App() {
       if (!s) return;
       setActiveTab(tabId);
       setSftpTabs((prev) => ({ ...prev, [tabId]: s }));
+      setSftpNav((prev) => ({ ...prev, [tabId]: (prev[tabId] ?? 0) + 1 }));
     },
     [sessions, tabs]
   );
@@ -1586,6 +1589,8 @@ export default function App() {
                 active={tabId === activeTab}
                 session={s}
                 passphrase={passphraseRef.current.get(s.id)}
+                navToken={sftpNav[tabId] ?? 0}
+                getCwd={() => probeTab(tabId).then((c) => c?.cwd)}
                 onClose={() => closeSftpTab(tabId)}
               />
             ))}

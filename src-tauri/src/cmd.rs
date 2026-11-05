@@ -812,6 +812,19 @@ pub async fn list_local_dir(path: String) -> Result<Vec<RemoteEntry>, String> {
     read_dir_entries(expanded).await
 }
 
+/// 本地重命名。目标已存在时拒绝——`fs::rename` 在 Unix 上会直接覆盖同名文件。
+#[tauri::command]
+pub async fn rename_local(from: String, to: String) -> Result<(), String> {
+    let from = crate::keys::expand_tilde(&from);
+    let to = crate::keys::expand_tilde(&to);
+    if tokio::fs::symlink_metadata(&to).await.is_ok() {
+        return Err(format!("目标已存在：{}", to));
+    }
+    tokio::fs::rename(&from, &to)
+        .await
+        .map_err(|e| format!("重命名失败: {}", e))
+}
+
 /// 读取目录内容。`list_local_dir` 与非 Windows 的 `list_drives` 共用；
 /// 独立成函数是为了避免两者互相调用形成 async 递归环（编译器报 E0733）。
 async fn read_dir_entries(expanded: String) -> Result<Vec<RemoteEntry>, String> {

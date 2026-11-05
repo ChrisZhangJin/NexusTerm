@@ -783,6 +783,23 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   border-right: 1px solid var(--border);
 }
 .fm-pane:last-child { border-right: none; }
+.fm-pane:focus { outline: none; }
+.fm-list-wrap { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+/* 搜索框：贴在列表右下角，同 Xftp 的「输入框 + 过滤 + ✕」 */
+.fm-find {
+  position: absolute; right: 16px; bottom: 10px; z-index: 5;
+  display: flex; align-items: center; gap: 6px; padding: 6px;
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.fm-find-input {
+  width: 200px; background: var(--bg-panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px;
+  font-size: 12.5px; outline: none;
+}
+.fm-find-input:focus { border-color: var(--accent); }
+.fm-find .btn { padding: 4px 12px; font-size: 12px; }
+.fm-find .fm-find-x { padding: 4px 9px; }
 
 .fm-pane-head {
   display: flex;
@@ -900,6 +917,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .fm-xfer-status-done { color: #2da44e; }
 .fm-xfer-status-error { color: var(--danger); }
 .fm-xfer-status-canceled { color: var(--text-dim); }
+.fm-xfer-status-queued { color: var(--text-dim); }
 .fm-xfer-progress { display: flex; align-items: center; gap: 6px; color: var(--text-dim); }
 .fm-xfer-bar {
   flex: 1;

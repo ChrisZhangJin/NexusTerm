@@ -233,6 +233,7 @@ pub fn run() {
             cmd::has_totp_seed,
             cmd::totp_preview,
             cmd::list_local_dir,
+            cmd::rename_local,
             cmd::sftp_connect,
             cmd::sftp_list,
             cmd::sftp_home,

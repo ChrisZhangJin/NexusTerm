@@ -137,6 +137,8 @@ export const api = {
     invoke<void>("sftp_connect", { id, req }),
   sftpList: (id: string, path: string) =>
     invoke<RemoteEntry[]>("sftp_list", { id, path }),
+  renameLocal: (from: string, to: string) =>
+    invoke<void>("rename_local", { from, to }),
   sftpHome: (id: string) => invoke<string>("sftp_home", { id }),
   sftpDownload: (id: string, remote: string, local: string, transferId: string) =>
     invoke<number>("sftp_download", { id, remote, local, transferId }),
