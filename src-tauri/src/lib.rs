@@ -295,6 +295,15 @@ pub fn run() {
             agent::cmd::agent_open_window,
             agent::cmd::agent_close_window,
             agent::cmd::agent_window_open,
+            agent::skill_cmd::skill_list,
+            agent::skill_cmd::skill_get,
+            agent::skill_cmd::skill_create,
+            agent::skill_cmd::skill_update,
+            agent::skill_cmd::skill_delete,
+            agent::skill_cmd::skill_validate,
+            agent::skill_cmd::skill_export,
+            agent::skill_cmd::skill_import_preview,
+            agent::skill_cmd::skill_import,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

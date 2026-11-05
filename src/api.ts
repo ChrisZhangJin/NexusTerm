@@ -24,6 +24,8 @@ import type {
   NewSession,
   RemoteEntry,
   SessionRecord,
+  Skill,
+  SkillInput,
   SweepReport,
   TotpPreview,
   VaultStatus,
@@ -203,6 +205,22 @@ export const api = {
   agentHistorySave: (messages: unknown[]) => invoke<void>("agent_history_save", { messages }),
   /** 「清空对话」：真删已保存的对话与运行摘要。 */
   agentHistoryClear: () => invoke<void>("agent_history_clear"),
+  // ——— Skill（Phase 3.1）。校验失败的 reject 文案是换行分隔的全部问题。———
+  /** 最近更新在前；`query` 非空时按名称 / 描述子串搜索 */
+  skillList: (query?: string) => invoke<Skill[]>("skill_list", { query: query ?? null }),
+  skillGet: (id: string) => invoke<Skill | null>("skill_get", { id }),
+  skillCreate: (input: SkillInput) => invoke<Skill>("skill_create", { input }),
+  skillUpdate: (id: string, input: SkillInput) => invoke<Skill>("skill_update", { id, input }),
+  /** 返回是否真删了 */
+  skillDelete: (id: string) => invoke<boolean>("skill_delete", { id }),
+  /** 只校验不保存（编辑器实时提示）；空数组 = 通过 */
+  skillValidate: (input: SkillInput) => invoke<string[]>("skill_validate", { input }),
+  /** 导出为带版本头的美化 JSON 文本；写文件由前端负责 */
+  skillExport: (id: string) => invoke<string>("skill_export", { id }),
+  /** 解析并校验导入文本，不保存（预览 / 改名用） */
+  skillImportPreview: (text: string) => invoke<Skill>("skill_import_preview", { text }),
+  /** 导入并保存：新 id、来源 imported、计数为 0 */
+  skillImport: (text: string) => invoke<Skill>("skill_import", { text }),
   /** 会话没登记过旁路时返回 null，而不是抛错 */
   agentStats: (sessionId: string) =>
     invoke<AgentBufferStats | null>("agent_stats", { sessionId }),

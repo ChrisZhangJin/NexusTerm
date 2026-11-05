@@ -547,3 +547,87 @@ export interface SweepReport {
   apiKeys: number;
 }
 
+// ——————————————————————————————— Skill（Phase 3.1） ———————————————————————————————
+// 与 Rust `agent::skill` 的 serde 形状一一对应（字段 camelCase，枚举值 snake_case）。
+// 模型、校验规则与安全约束见该模块顶部注释。skill 里永远没有密码值：
+// `secret` 步骤只有理由与参数引用名。
+
+export type SkillRisk = "low" | "medium" | "high";
+export type SkillOnUnexpected = "ask" | "stop" | "llm";
+export type SkillSource = "recorded" | "migrated_macro" | "manual" | "imported";
+
+/** 适用主机范围：不限，或「会话 id / 主机名 glob（`*` 通配）」列表 */
+export type SkillHostScope = { kind: "any" } | { kind: "list"; hosts: string[] };
+
+export interface SkillParam {
+  /** `[A-Za-z_][A-Za-z0-9_]*`，≤64 字符，在 skill 内唯一 */
+  name: string;
+  description: string;
+  /** secret 参数不得有默认值 */
+  default?: string;
+  required: boolean;
+  /** 为真：值运行时走密码通道，不随调用传入、不存库、不进模型上下文 */
+  secret: boolean;
+}
+
+/** 每个步骤共有的字段 */
+interface SkillStepCommon {
+  /** 本步最多等多久（100..=600000） */
+  timeoutMs?: number;
+  /** 做完这步后屏幕上应出现的 pattern（子串或 `/regex/i`） */
+  expectAfter?: string;
+  /** 偏离期望时：问用户（缺省）/ 停止 / 交给 LLM */
+  onUnexpected?: SkillOnUnexpected;
+}
+
+export type SkillStep =
+  /** 敲一行命令并等结束；`command` 单行，可含 `{{param}}` */
+  | ({ kind: "exec"; command: string } & SkillStepCommon)
+  /** 原始按键，语法同 `nx_send_keys`（`<C-c>` `<Enter>` `\x03`…） */
+  | ({ kind: "keys"; keys: string } & SkillStepCommon)
+  /** 等屏幕出现 expect 再应答；`secret` 为真时 `respond` 只能是空串或唯一一个 `{{secret 参数}}` */
+  | ({ kind: "expect_respond"; expect: string; respond: string; secret: boolean } & SkillStepCommon)
+  /** 密码占位：运行时由用户输入。没有 value 字段 */
+  | ({ kind: "secret"; reason: string; param?: string } & SkillStepCommon)
+  /** 只检查屏幕 */
+  | ({ kind: "screen_check"; expect: string } & SkillStepCommon);
+
+export interface SkillCheck {
+  expect: string;
+  timeoutMs?: number;
+}
+
+/** 库里的完整 skill。时间为 Unix 秒。 */
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  params: SkillParam[];
+  steps: SkillStep[];
+  verify: SkillCheck | null;
+  /** 后端保证不低于自动评估值（sudo / rm / 重定向覆盖 / 参数决定程序名 → high） */
+  risk: SkillRisk;
+  hostScope: SkillHostScope;
+  source: SkillSource;
+  /** 只有后端回放引擎能增加；步骤 / 参数 / 验证 / 范围被编辑后清零；导入的永远从 0 开始 */
+  successCount: number;
+  failCount: number;
+  lastRunTs: number | null;
+  createdAt: number;
+  updatedAt: number;
+  schemaVersion: number;
+}
+
+/** 创建 / 更新提交的内容：没有 id、计数、时间戳（由后端铸造，无法伪造） */
+export interface SkillInput {
+  name: string;
+  description: string;
+  params: SkillParam[];
+  steps: SkillStep[];
+  verify: SkillCheck | null;
+  risk: SkillRisk;
+  hostScope: SkillHostScope;
+  /** 仅创建时有效（缺省 manual）；更新时忽略 */
+  source?: SkillSource;
+}
+
