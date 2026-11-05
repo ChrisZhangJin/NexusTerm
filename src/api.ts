@@ -34,6 +34,7 @@ import type {
 } from "./types";
 import type { ControlPayload, ControlState } from "./lib/control";
 import type { TimelineEvent } from "./lib/timeline";
+import type { RecorderStatus, RecordingDraft } from "./lib/recorder";
 
 export const api = {
   health: () => invoke<string>("health"),
@@ -249,6 +250,20 @@ export const api = {
       sinceSeq: sinceSeq ?? null,
       limit: limit ?? null,
     }),
+  // ——— 录制器（Phase 3.2）。草稿只经 `agentRecordStop` 的返回值交给前端，后端不留存。———
+  /** 开始录制这个终端。总开关未启用 / 已在录制中会 reject */
+  agentRecordStart: (sessionId: string, hostLabel?: string) =>
+    invoke<RecorderStatus>("agent_record_start", { sessionId, hostLabel: hostLabel ?? null }),
+  /** 结束录制，返回草稿（见 `lib/recorder.RecordingDraft`）。没在录制会 reject */
+  agentRecordStop: (sessionId: string) =>
+    invoke<RecordingDraft>("agent_record_stop", { sessionId }),
+  agentRecordStatus: (sessionId: string) =>
+    invoke<RecorderStatus>("agent_record_status", { sessionId }),
+  /** 放弃录制、不产出草稿；返回之前是否在录制 */
+  agentRecordCancel: (sessionId: string) => invoke<boolean>("agent_record_cancel", { sessionId }),
+  /** 录制中上报一次无文字的用户操作（Ctrl-C / Ctrl-D / Ctrl-Z / 空回车），fire-and-forget */
+  agentUserKeys: (sessionId: string, keys: string) =>
+    invoke<void>("agent_user_keys", { sessionId, keys }),
   /**
    * 提问。**resolve 只代表流已启动，不代表回答完成** ——
    * 答案要走 `onAgentToken` / `onAgentDone` / `onAgentError` 事件收。
@@ -582,6 +597,14 @@ export async function onAgentTimeline(
   handler: (events: TimelineEvent[]) => void
 ): Promise<UnlistenFn> {
   return listen<TimelineEvent[]>(`nx://agent/timeline/${id}`, (ev) => handler(ev.payload));
+}
+
+/** 录制状态变化（开始 / 结束 / 取消）。载荷是完整的 `RecorderStatus`。 */
+export async function onAgentRecorder(
+  id: string,
+  handler: (st: RecorderStatus) => void
+): Promise<UnlistenFn> {
+  return listen<RecorderStatus>(`nx://agent/recorder/${id}`, (ev) => handler(ev.payload));
 }
 
 /** Agent 请用户输入一个密码（`nx_secret`）。处理完用 `api.agentSecretAck(...)` 答复。 */

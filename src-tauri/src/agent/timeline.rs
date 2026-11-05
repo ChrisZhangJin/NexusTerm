@@ -185,6 +185,21 @@ impl Timeline {
         self.push(ev)
     }
 
+    /// 并入一条用户的按键事件（只在录制期间由录制器写入，`text` 是 `nx_send_keys` 语法的
+    /// 白名单按键，如 `<C-c>`）。调用方须保证 `text` 来自白名单，这里照单限长。
+    pub fn push_user_keys(&mut self, text: &str, ts_ms: u64) -> TimelineEvent {
+        let (text, truncated) = clip_text(text);
+        let mut ev = TimelineEvent::new(Actor::User, Kind::Keys, text, ts_ms);
+        ev.truncated = truncated;
+        self.push(ev)
+    }
+
+    /// 最近一条事件的 seq（没有事件时为 0）。`next_seq` 与环形裁剪无关、只增不减，
+    /// 录制器用它标记「从哪之后算我这段录制」。
+    pub fn last_seq(&self) -> u64 {
+        self.next_seq
+    }
+
     /// 取走「待落账输出」的那条用户命令，返回 `(命令 seq, 提交时坐标)`。
     pub fn take_pending(&mut self) -> Option<(u64, u64)> {
         self.pending.take().map(|p| (p.cmd_seq, p.at))
