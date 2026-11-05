@@ -16,6 +16,7 @@ import type {
   SweepReport,
   VaultStatus,
 } from "../types";
+import { normalizeBudget, parseBudgetInput, type RunBudget } from "../lib/agentBudget";
 import MasterPasswordDialog, { type MasterPasswordMode } from "./MasterPasswordDialog";
 import {
   DEFAULT_SHORTCUTS,
@@ -519,7 +520,7 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
     try {
       // 先写盘、后关窗：saveAgentConfig 写成功才更新内存缓存，不会出现「界面显示已保存、库里其实没变」。
       // autoAttach 恒为 true：界面已没有置 false 的入口，这里兜住旧配置里残留的 false。
-      await saveAgentConfig({ ...draft, autoAttach: true });
+      await saveAgentConfig({ ...draft, autoAttach: true, budget: normalizeBudget(draft.budget) });
       onClose();
     } catch (e) {
       setSaveErr(String(e ?? "保存失败"));
@@ -759,6 +760,36 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
               会先弹出卡片等你点头；只读命令照常执行。
             </>
           )}
+        </p>
+
+        <div className="settings-section">运行预算</div>
+        {(
+          [
+            ["maxSteps", "最多步数", "步", 1],
+            ["maxMinutes", "最长时间（分钟，0 = 不限）", "分钟", 0],
+            ["maxOutputChars", "输出字符上限（0 = 不限）", "字符", 0],
+          ] as [keyof RunBudget, string, string, number][]
+        ).map(([key, label, unit, min]) => (
+          <div className="row" key={key}>
+            <label>{label}</label>
+            <input
+              type="number"
+              min={min}
+              step={1}
+              disabled={!draft.enabled}
+              value={Number.isFinite(draft.budget[key]) ? draft.budget[key] : ""}
+              title={unit}
+              onChange={(e) =>
+                patch({ budget: { ...draft.budget, [key]: parseBudgetInput(e.target.value) } })
+              }
+              onBlur={() => patch({ budget: normalizeBudget(draft.budget) })}
+            />
+          </div>
+        ))}
+        <p className="ag-hint">
+          一轮 Agent 运行最多做这么多步（一次 <code>nx_skill</code> 运行算 1 步）、最多跑这么久、最多读写这么多字符；
+          任何一项用完都不会直接失败，而是<strong>暂停</strong>并说明已做了什么，由你点「继续」（换一份新预算接着做）或「停止」。
+          运行中也可以随时手动「暂停」。
         </p>
 
         <div className="settings-section">排查</div>

@@ -183,6 +183,12 @@ impl RunLog {
         self.errored = true;
     }
 
+    /// 最近 `n` 条动作（摘要行，截断 + 脱敏）。暂停卡片用：落到界面 / 事件里的文本一律先脱敏。
+    pub fn recent_actions(&self, n: usize) -> Vec<String> {
+        let skip = self.actions.len().saturating_sub(n);
+        self.actions[skip..].iter().map(|a| redact(&head_chars(a, ACTION_CHARS))).collect()
+    }
+
     /// 记一个步骤事件。只取摘要要用的字段；`tool` / `waiting` 这类纯展示事件忽略。
     pub fn record(&mut self, p: &StepPayload) {
         let label = p.target_label.as_deref().unwrap_or("当前会话");
@@ -288,6 +294,11 @@ impl RunLogs {
         if let Some(log) = self.inner.lock().get_mut(session) {
             log.mark_error();
         }
+    }
+
+    /// 进行中那一轮最近 `n` 条动作摘要（没在记 = 空）。
+    pub fn recent_actions(&self, session: &str, n: usize) -> Vec<String> {
+        self.inner.lock().get(session).map(|l| l.recent_actions(n)).unwrap_or_default()
     }
 
     pub fn take(&self, session: &str) -> Option<RunLog> {

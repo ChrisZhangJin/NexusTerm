@@ -1,3 +1,4 @@
+import type { RunBudget } from "./lib/agentBudget";
 /** 会话持久化记录 */
 export interface SessionRecord {
   id: string;
@@ -319,6 +320,11 @@ export interface AgentConfig {
    * 默认关 —— 日志里可能带命令输出，即便后端已脱敏也不该默认落盘。
    */
   trace: boolean;
+  /**
+   * 一轮运行的预算（步数 / 时间 / 输出字符）。用尽即暂停等用户「继续」，不是失败。
+   * 旧配置没有这一项，后端 serde(default) 与前端 normalize 都落到默认（25 步 / 10 分钟 / 输出不限）。
+   */
+  budget: RunBudget;
 }
 
 /** 某个会话当前的旁路缓冲状态（后端 `BufferStats` 的镜像） */
@@ -397,7 +403,7 @@ export interface AgentRunRequest {
 export interface AgentStep {
   /**
    * plan | tool | exec | result | skip | note | answer | open | export | tab | waiting
-   * | keys | wait | screen | skill（技能回放的一步，`command` 形如「2/5 执行：…」）| secret（前三者是「手和眼」：发按键 / 等输出 / 读屏幕；
+   * | paused（运行暂停，等用户继续 / 停止）| resumed | keys | wait | screen | skill（技能回放的一步，`command` 形如「2/5 执行：…」）| secret（前三者是「手和眼」：发按键 / 等输出 / 读屏幕；
    * secret 是密码通道：请用户输入密码，`command` 是理由，`secretStatus` 是结局。
    * `output` 为空 = 进行中，有值（哪怕是空串）= 已收尾，`text` 是一句话结论）
    */
@@ -428,6 +434,8 @@ export interface AgentStep {
   memoryId?: string;
   /** kind:"skill"（技能回放进度卡）专用：running | ok | deviated | failed | skipped | declined */
   skillStatus?: string;
+  /** kind:"paused" 专用：为什么暂停（steps | time | output | user）。`text` 是「做了什么 / 还差什么」 */
+  pauseKind?: string;
 }
 
 /** 终端尾部的交互提示分类（与后端 `prompt::PromptKind` 的 snake_case 名字一致） */

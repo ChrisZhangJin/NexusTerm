@@ -286,6 +286,8 @@ pub fn run() {
             agent::cmd::agent_test,
             agent::cmd::agent_run,
             agent::cmd::agent_run_cancel,
+            agent::cmd::agent_run_pause,
+            agent::cmd::agent_run_resume,
             agent::cmd::agent_control_get,
             agent::cmd::agent_control_user_input,
             agent::cmd::agent_control_takeover,

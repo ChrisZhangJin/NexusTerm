@@ -276,6 +276,40 @@ pub async fn agent_run_cancel(
     Ok(())
 }
 
+/// 手动「暂停」这一轮：在下一个步骤边界（下一次模型调用前 / 下一个动作前）停下，
+/// 把控制权还给用户，等「继续」或「停止」。正在执行的那一步不会被打断。
+/// 返回是否确有一轮在跑；幂等（已暂停 / 已请求时再点无害）。
+#[tauri::command]
+pub fn agent_run_pause(session_id: String, state: State<'_, AppState>, app: AppHandle) -> Result<bool, String> {
+    if session_id.trim().is_empty() {
+        return Err(AgentError::NoSession(session_id).to_string());
+    }
+    let fresh = state.act.phases.phase(&session_id) == Some(super::budget::RunPhase::RUNNING);
+    let ok = state.act.phases.request_pause(&session_id);
+    if ok && fresh {
+        act::emit_step(
+            &app,
+            &session_id,
+            act::StepPayload {
+                text: Some("已请求暂停：当前这一步做完后会停下。".into()),
+                ..act::StepPayload::new("note", 0)
+            },
+        );
+    }
+    Ok(ok)
+}
+
+/// 「继续」一轮已暂停（预算用尽 / 手动暂停）的运行：同一轮、同一段对话上下文，换一份新预算接着跑。
+/// 只有确实处于暂停时才返回 true（陈旧点击 / 重复点击无害）。
+/// 控制权由运行循环自己经正常的重新获取路径拿回，审批 / 作用范围 / 危险判断一律照旧。
+#[tauri::command]
+pub fn agent_run_resume(session_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    if session_id.trim().is_empty() {
+        return Err(AgentError::NoSession(session_id).to_string());
+    }
+    Ok(state.act.phases.resume(&session_id))
+}
+
 // ——— 终端控制权（人 / Agent / 暂停） ———
 
 /// 查询某会话此刻的控制权状态。终端挂载 / 面板打开时对一次账（事件只在变化时推）。

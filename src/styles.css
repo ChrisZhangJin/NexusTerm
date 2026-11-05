@@ -1714,6 +1714,10 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   background: var(--bg-elev); border: 1px dashed var(--border);
 }
 
+.ap-note.ap-paused {
+  white-space: pre-wrap; color: var(--text); border-style: solid; border-color: var(--accent);
+}
+
 /* 建议命令卡片：插入前必须过确认框 */
 .ap-sug {
   margin: 7px 0 0; border-radius: 6px; overflow: hidden;

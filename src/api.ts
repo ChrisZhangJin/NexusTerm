@@ -325,6 +325,16 @@ export const api = {
    */
   agentRunCancel: (sessionId: string, sendCtrlC?: boolean) =>
     invoke<void>("agent_run_cancel", { sessionId, sendCtrlC: sendCtrlC ?? false }),
+  /**
+   * 手动暂停该会话正在进行的一轮：在下一个步骤边界停下并把终端还给用户（4.6）。
+   * 返回是否确有一轮在跑；幂等。
+   */
+  agentRunPause: (sessionId: string) => invoke<boolean>("agent_run_pause", { sessionId }),
+  /**
+   * 继续一轮已暂停（预算用尽 / 手动暂停）的运行：同一段对话上下文，换一份新预算接着跑。
+   * 只有确实处于暂停时才返回 true。
+   */
+  agentRunResume: (sessionId: string) => invoke<boolean>("agent_run_resume", { sessionId }),
   /** 查询会话的控制权状态（事件只在变化时推，挂载时用它对账）。 */
   agentControlGet: (sessionId: string) =>
     invoke<ControlState>("agent_control_get", { sessionId }),

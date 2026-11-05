@@ -9,6 +9,7 @@
 import { useSyncExternalStore } from "react";
 import { api } from "../api";
 import type { AgentAccount, AgentConfig, AgentProvider } from "../types";
+import { DEFAULT_RUN_BUDGET, normalizeBudget } from "./agentBudget";
 
 /** 生成一个账号 id：时间戳 + 随机尾巴，够用且不依赖 crypto.randomUUID 的可用性。 */
 export function newAccountId(): string {
@@ -38,6 +39,7 @@ export const DEFAULT_AGENT_CONFIG: AgentConfig = {
   activeId: "default",
   execMode: "approval",
   trace: false,
+  budget: { ...DEFAULT_RUN_BUDGET },
 };
 
 const PROVIDERS: readonly AgentProvider[] = ["openai", "anthropic", "custom"];
@@ -93,6 +95,8 @@ function normalize(raw: Partial<AgentConfig> | null | undefined): AgentConfig {
     execMode: c.execMode === "agentic" ? "agentic" : "approval",
     // 旧配置没有这一项：缺省就是关（后端 serde(default) 同样落在 false）
     trace: c.trace === true,
+    // 旧配置没有预算：落到默认（25 步 / 10 分钟 / 输出不限），越界值夹紧
+    budget: normalizeBudget(c.budget),
   };
 }
 

@@ -14,6 +14,7 @@
 //!    HTTP 请求、磁盘 IO 一律拿到释放之后再发生。
 
 pub mod act;
+pub mod budget;
 pub mod buffer;
 pub mod capture;
 pub mod cmd;
@@ -206,6 +207,10 @@ pub struct AgentConfig {
     /// 旧配置没有这个字段，靠 `serde(default)` 落到 false，不会让整份配置反序列化失败。
     #[serde(default)]
     pub trace: bool,
+    /// 一轮 Agentic 运行的预算（步数 / 时间 / 输出字符），见 `budget`。
+    /// 旧配置没有这个字段，靠 `serde(default)` 落到默认值（25 步 / 10 分钟 / 输出不限）。
+    #[serde(default)]
+    pub budget: budget::RunBudget,
 }
 
 impl Default for AgentConfig {
@@ -222,6 +227,7 @@ impl Default for AgentConfig {
             accounts: vec![acct],
             exec_mode: ExecMode::Approval,
             trace: false,
+            budget: budget::RunBudget::default(),
         }
     }
 }
@@ -256,6 +262,7 @@ impl AgentConfig {
         if !self.accounts.iter().any(|a| a.id == self.active_id) {
             self.active_id = self.accounts[0].id.clone();
         }
+        self.budget = self.budget.clamped();
     }
 }
 
@@ -365,6 +372,7 @@ fn migrate_legacy_config(raw: &str) -> AgentConfig {
         // 旧配置没有这一项，按最保守的「人在回路」给
         exec_mode: ExecMode::Approval,
         trace: false,
+        budget: budget::RunBudget::default(),
     }
 }
 
@@ -646,6 +654,30 @@ mod tests {
         assert!(all[1].line.contains("abcdef0123456789abcdef0123456789"));
         m.remove("s1");
         assert!(m.user_commands("s1", 10).is_empty());
+    }
+
+    /// 4.6：旧配置（没有 budget 字段）仍能反序列化，落到默认预算；越界值被夹紧。
+    #[test]
+    fn old_config_without_budget_gets_defaults() {
+        let raw = r#"{"enabled":true,"autoAttach":false,"accounts":[{"id":"a","name":"x"}],"activeId":"a","execMode":"approval","trace":false}"#;
+        let mut cfg: AgentConfig = serde_json::from_str(raw).expect("旧配置必须能解析");
+        cfg.normalize();
+        assert_eq!(cfg.budget, budget::RunBudget::default());
+        assert!(cfg.budget.max_steps > 8);
+    }
+
+    #[test]
+    fn budget_in_config_round_trips_and_is_clamped_on_normalize() {
+        let raw = r#"{"accounts":[{"id":"a"}],"activeId":"a","budget":{"maxSteps":0,"maxMinutes":999999,"maxOutputChars":5000}}"#;
+        let mut cfg: AgentConfig = serde_json::from_str(raw).unwrap();
+        cfg.normalize();
+        assert_eq!(cfg.budget.max_steps, budget::DEFAULT_MAX_STEPS);
+        assert_eq!(cfg.budget.max_minutes, budget::MAX_MINUTES_CEIL);
+        assert_eq!(cfg.budget.max_output_chars, 5000);
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(v["budget"]["maxOutputChars"], 5000);
+        let back: AgentConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(back.budget, cfg.budget);
     }
 
     #[test]
