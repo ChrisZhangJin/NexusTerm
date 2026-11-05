@@ -28,6 +28,11 @@ import "./SkillManager.css";
 export interface SkillManagerProps {
   onClose: () => void;
   initialDraft?: SkillInput;
+  /**
+   * 「运行」回调（4.2）。由面板提供：它持有当前会话与事件订阅，运行进度 / 审批 / 密码卡片都显示在面板里。
+   * 缺省（没有可用会话 / 正忙）时「运行」按钮置灰。`params` 只含非 secret 参数。
+   */
+  onRunSkill?: (skill: Skill, params: Record<string, string>) => void;
 }
 
 /** 与后端 `MAX_IMPORT_BYTES` 一致；本地先拦一道，省得读一个巨大的文件 */
@@ -41,8 +46,10 @@ const SkillRow = memo(function SkillRow({
   onEdit,
   onExport,
   onDelete,
+  onRun,
 }: {
   skill: Skill;
+  onRun?: (s: Skill) => void;
   onEdit: (s: Skill) => void;
   onExport: (s: Skill) => void;
   onDelete: (s: Skill) => void;
@@ -81,6 +88,14 @@ const SkillRow = memo(function SkillRow({
       </div>
       <div className="sk-c-last">{formatLastRun(skill.lastRunTs)}</div>
       <div className="sk-c-act" onClick={(e) => e.stopPropagation()}>
+        <button
+          className="sk-ibtn"
+          title={onRun ? "在当前会话运行" : "没有可用的会话，或 Agent 正忙"}
+          disabled={!onRun}
+          onClick={() => onRun?.(skill)}
+        >
+          ▶
+        </button>
         <button className="sk-ibtn" title="导出为文件" onClick={() => onExport(skill)}>
           ⤒
         </button>
@@ -203,9 +218,87 @@ function ImportDialog({
   );
 }
 
+// ——————————————————————————————— 运行参数对话框 ———————————————————————————————
+
+/** 运行前填参数：只列非 secret 参数（有默认值就预填）；secret 参数运行时由密码卡片向你索取，不在这里出现。 */
+function RunDialog({
+  skill,
+  onRun,
+  onClose,
+}: {
+  skill: Skill;
+  onRun: (params: Record<string, string>) => void;
+  onClose: () => void;
+}) {
+  const plain = skill.params.filter((p) => !p.secret);
+  const secrets = skill.params.filter((p) => p.secret);
+  const [vals, setVals] = useState<Record<string, string>>(() =>
+    Object.fromEntries(plain.map((p) => [p.name, p.default ?? ""]))
+  );
+  const missing = plain.filter((p) => p.required && !(vals[p.name] ?? "").trim());
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      onClose();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [onClose]);
+
+  const go = () => {
+    if (missing.length > 0) return;
+    // 空串视为没填：让后端用默认值 / 按 required 报错
+    onRun(Object.fromEntries(Object.entries(vals).filter(([, v]) => v !== "")));
+  };
+
+  return (
+    <div className="modal-backdrop sk-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="modal sk-modal sk-import" onMouseDown={(e) => e.stopPropagation()}>
+        <h2>运行「{skill.name}」</h2>
+        <div className="sk-body">
+          <div className="sk-warn">
+            将在当前会话里按步骤执行。每一步仍会经过危险命令检查与审批；审批模式下每个写入步骤都要你确认。
+          </div>
+          {plain.map((p) => (
+            <div className="sk-field" key={p.name}>
+              <label className="sk-lbl">
+                {p.name}
+                {p.required ? " *" : ""}
+                {p.description ? `　${p.description}` : ""}
+              </label>
+              <input
+                className="sk-input mono"
+                value={vals[p.name] ?? ""}
+                onChange={(e) => setVals({ ...vals, [p.name]: e.target.value })}
+                onKeyDown={(e) => e.key === "Enter" && go()}
+              />
+            </div>
+          ))}
+          {secrets.length > 0 && (
+            <div className="sk-note">
+              secret 参数（{secrets.map((p) => p.name).join("、")}）不在这里填：运行到需要时会弹出密码卡片，由你输入。
+            </div>
+          )}
+        </div>
+        <div className="sk-foot">
+          <div className="sk-foot-msg sk-note">{missing.length > 0 ? `请填写：${missing.map((p) => p.name).join("、")}` : ""}</div>
+          <button className="btn" onClick={onClose}>
+            取消
+          </button>
+          <button className="btn primary" onClick={go} disabled={missing.length > 0}>
+            运行
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ——————————————————————————————— 管理器 ———————————————————————————————
 
-export default function SkillManager({ onClose, initialDraft }: SkillManagerProps) {
+export default function SkillManager({ onClose, initialDraft, onRunSkill }: SkillManagerProps) {
   const [skills, setSkills] = useState<Skill[] | null>(null);
   const [query, setQuery] = useState("");
   const [loadErr, setLoadErr] = useState<string | null>(null);
@@ -219,6 +312,7 @@ export default function SkillManager({ onClose, initialDraft }: SkillManagerProp
   const [confirmDel, setConfirmDel] = useState<Skill | null>(null);
   const [imp, setImp] = useState<ImportState | null>(null);
   const [impBusy, setImpBusy] = useState(false);
+  const [runTarget, setRunTarget] = useState<Skill | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   // 之后传入的新草稿也要弹出编辑器（首个草稿已在初始 state 里处理）
@@ -255,7 +349,7 @@ export default function SkillManager({ onClose, initialDraft }: SkillManagerProp
   }, [notice]);
 
   // Esc：下层（编辑器 / 导入 / 确认）开着时由它们自己处理
-  const childOpen = !!editing || !!imp || !!confirmDel;
+  const childOpen = !!editing || !!imp || !!confirmDel || !!runTarget;
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || childOpen) return;
@@ -265,6 +359,16 @@ export default function SkillManager({ onClose, initialDraft }: SkillManagerProp
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
   }, [onClose, childOpen]);
+
+  // 没有声明非 secret 参数就直接运行，不弹对话框
+  const askRun = useCallback(
+    (s: Skill) => {
+      if (!onRunSkill) return;
+      if (s.params.some((p) => !p.secret)) setRunTarget(s);
+      else onRunSkill(s, {});
+    },
+    [onRunSkill]
+  );
 
   const edit = useCallback((s: Skill) => setEditing(open({ skill: s })), []);
 
@@ -390,7 +494,7 @@ export default function SkillManager({ onClose, initialDraft }: SkillManagerProp
               </div>
             )}
             {skills?.map((s) => (
-              <SkillRow key={s.id} skill={s} onEdit={edit} onExport={doExport} onDelete={setConfirmDel} />
+              <SkillRow key={s.id} skill={s} onRun={onRunSkill ? askRun : undefined} onEdit={edit} onExport={doExport} onDelete={setConfirmDel} />
             ))}
           </div>
         </div>
@@ -419,6 +523,18 @@ export default function SkillManager({ onClose, initialDraft }: SkillManagerProp
               kind: "ok",
             });
             void load(query);
+          }}
+        />
+      )}
+
+      {runTarget && onRunSkill && (
+        <RunDialog
+          skill={runTarget}
+          onClose={() => setRunTarget(null)}
+          onRun={(p) => {
+            const sk = runTarget;
+            setRunTarget(null);
+            onRunSkill(sk, p);
           }}
         />
       )}

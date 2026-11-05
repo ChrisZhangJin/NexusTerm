@@ -681,6 +681,9 @@ pub struct StepPayload {
     /// `kind:"memory"` 专用：被新增 / 删除的主机备忘 id（卡片上「删除」按钮用）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_id: Option<String>,
+    /// `kind:"skill"` 专用：这一步技能回放的状态码（`skill_run::ProgressStatus::code`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_status: Option<String>,
 }
 
 impl StepPayload {
@@ -701,6 +704,7 @@ impl StepPayload {
             prompt_kind: None,
             secret_status: None,
             memory_id: None,
+            skill_status: None,
         }
     }
 }
@@ -836,7 +840,7 @@ pub struct SecretRequest {
     pub timeout_secs: u64,
 }
 
-fn emit_step(app: &AppHandle, session: &str, payload: StepPayload) {
+pub(super) fn emit_step(app: &AppHandle, session: &str, payload: StepPayload) {
     // 顺手记进这一轮的流水账，结束时收成运行摘要（2.6）。不在 `run` 里的步骤会被忽略。
     if let Some(st) = app.try_state::<AppState>() {
         st.act.runlog.record(session, &payload);
@@ -1536,7 +1540,7 @@ fn push_guess(s: &mut String, guess: Option<&PromptGuess>) {
 }
 
 /// 对一个会话此刻的缓冲尾部分类。旁路缓冲没开 / 没内容时按空串分类（得到 Unknown）。
-fn classify_session(state: &AppState, id: &str, alt: bool) -> PromptGuess {
+pub(super) fn classify_session(state: &AppState, id: &str, alt: bool) -> PromptGuess {
     let tail = state.agent.context(id, CLASSIFY_TAIL_BYTES).unwrap_or_default();
     prompt::classify(&tail, alt)
 }
@@ -1623,7 +1627,7 @@ const AGENT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_PROMPT_CHARS: usize = 200;
 
 /// 往任意一种会话写字节。会话不存在时才报错。
-async fn write_to(state: &AppState, id: &str, data: &[u8]) -> Result<(), String> {
+pub(super) async fn write_to(state: &AppState, id: &str, data: &[u8]) -> Result<(), String> {
     match sink_of(state, id) {
         Some(Sink::Local) => state.local.write(id, data),
         Some(Sink::Ssh) => tokio::time::timeout(
@@ -1773,13 +1777,23 @@ const KEYS_SETTLE: Duration = Duration::from_millis(300);
 const KEYS_TAIL_BYTES: usize = 2000;
 
 /// 读屏结果 / 等待输出尾部的字节上限（喂回模型与向前端索取的都是它）。
-const SCREEN_MAX_BYTES: usize = 6 * 1024;
+pub(super) const SCREEN_MAX_BYTES: usize = 6 * 1024;
 
 /// 往目标会话写原始按键。**不追加换行、不等命令结束**，只在 ~300ms 后回一段输出尾部。
 ///
 /// 与 `run_one` 一样把发出去的字节喂进旁路缓冲（`In`），审计与 `since(mark)` 才对得上；
 /// 区别是这里没有命令边界，缓冲里这一段只是一串按键。
 pub async fn send_keys(state: &AppState, session_id: &str, data: &[u8]) -> Result<String, String> {
+    send_keys_marked(state, session_id, data).await.map(|(tail, _)| tail)
+}
+
+/// 同 [`send_keys`]，并把「写入之后」的缓冲位置一并返回（技能回放拿它当后续等待的起点，
+/// 这样 pty 回显 / 键入本身不会被当成「新输出」误命中）。
+pub async fn send_keys_marked(
+    state: &AppState,
+    session_id: &str,
+    data: &[u8],
+) -> Result<(String, u64), String> {
     state.agent.set_enabled(session_id, true);
     write_to(state, session_id, data).await?;
     state.agent.feed(session_id, data, StreamKind::In);
@@ -1787,7 +1801,7 @@ pub async fn send_keys(state: &AppState, session_id: &str, data: &[u8]) -> Resul
     let mark = state.agent.pushed(session_id).unwrap_or_default();
     tokio::time::sleep(KEYS_SETTLE).await;
     let out = state.agent.since(session_id, mark).unwrap_or_default();
-    Ok(out.trim().to_string())
+    Ok((out.trim().to_string(), mark))
 }
 
 /// 按键串会不会「提交一行」，以及这样做的风险原因。`None` = 没有回车，只是往行里加字，无需把关。
@@ -1890,7 +1904,7 @@ fn screen_feedback(
 /// 一张「手和眼」类步骤卡：`output` 为 `None` 是开始（执行中），`Some` 是收尾。
 /// 前端按 (kind, target, command) 把收尾合并回开始那张卡上。
 #[allow(clippy::too_many_arguments)]
-fn emit_interact(
+pub(super) fn emit_interact(
     app: &AppHandle,
     session: &str,
     kind: &'static str,
@@ -1923,7 +1937,7 @@ fn emit_interact(
 /// `what` 是越界弹窗里「要做什么」（拿展示名拼）；`skip_cmd` 是未执行卡上的命令位文本；
 /// `reasons` 并进越界弹窗（越界又危险只弹一次，同 Exec）。
 #[allow(clippy::too_many_arguments)]
-async fn gate_target(
+pub(super) async fn gate_target(
     app: &AppHandle,
     state: &AppState,
     runtime: &ActRuntime,
@@ -2206,7 +2220,7 @@ impl ActRuntime {
     }
 
     /// 登记一轮运行。返回 `None` 表示该会话已经有一轮在跑。
-    fn begin(&self, session_id: &str) -> Option<Arc<AtomicBool>> {
+    pub(super) fn begin(&self, session_id: &str) -> Option<Arc<AtomicBool>> {
         let mut guard = self.inflight.lock();
         if guard.contains_key(session_id) {
             return None;
@@ -2216,7 +2230,7 @@ impl ActRuntime {
         Some(flag)
     }
 
-    fn finish(&self, session_id: &str) {
+    pub(super) fn finish(&self, session_id: &str) {
         self.inflight.lock().remove(session_id);
     }
 
@@ -2304,13 +2318,13 @@ impl ActRuntime {
         Ok(tx.send(answer).is_ok())
     }
 
-    fn register_secret(&self, request_id: &str) -> tokio::sync::oneshot::Receiver<SecretAnswer> {
+    pub(super) fn register_secret(&self, request_id: &str) -> tokio::sync::oneshot::Receiver<SecretAnswer> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.secret_acks.lock().insert(request_id.to_string(), tx);
         rx
     }
 
-    fn unregister_secret(&self, request_id: &str) {
+    pub(super) fn unregister_secret(&self, request_id: &str) {
         self.secret_acks.lock().remove(request_id);
     }
 
@@ -2343,7 +2357,7 @@ struct ControlPayload {
 
 /// 推控制权变化。同时发给会话自己的频道（终端据此开关键盘闸）和每个驾驶它的运行的频道
 /// （面板据此出「接管 / 交还」横幅 —— 面板订阅的是发起会话，不一定是被驾驶的那个）。
-fn emit_control(app: &AppHandle, session: &str, runs: &[String], state: ControlState) {
+pub(super) fn emit_control(app: &AppHandle, session: &str, runs: &[String], state: ControlState) {
     let payload = ControlPayload { session: session.to_string(), state };
     let _ = app.emit(&format!("nx://agent/control/{session}"), payload.clone());
     for run in runs.iter().filter(|r| r.as_str() != session) {
@@ -2353,10 +2367,10 @@ fn emit_control(app: &AppHandle, session: &str, runs: &[String], state: ControlS
 
 /// 一轮运行持有的控制权：Drop 时（正常结束 / 出错 / 提前 return）一律还给用户，
 /// 免得哪条出口漏了就让会话永远卡在「Agent 驾驶中」。
-struct ControlLease<'a> {
-    app: &'a AppHandle,
-    rt: &'a ActRuntime,
-    run: String,
+pub(super) struct ControlLease<'a> {
+    pub(super) app: &'a AppHandle,
+    pub(super) rt: &'a ActRuntime,
+    pub(super) run: String,
 }
 
 impl Drop for ControlLease<'_> {
@@ -2367,9 +2381,9 @@ impl Drop for ControlLease<'_> {
 
 /// 一轮运行的收尾：任何出口（含出错 return）drop 时，把流水账收成摘要落库（2.6）。
 /// 落库失败只记日志，绝不影响这一轮的结果。
-struct RunLogGuard<'a> {
-    state: &'a AppState,
-    run: String,
+pub(super) struct RunLogGuard<'a> {
+    pub(super) state: &'a AppState,
+    pub(super) run: String,
 }
 
 impl Drop for RunLogGuard<'_> {
@@ -2395,7 +2409,7 @@ const PAUSE_POLL: Duration = Duration::from_millis(150);
 /// Agent 写 pty 之前的闸：先登记驾驶（首次对某个目标动手时），再在 `Paused` 时等用户交还。
 ///
 /// 只在 Agent 这一侧等待，**从不**拦用户的键盘。取消优先。
-async fn gate_drive(
+pub(super) async fn gate_drive(
     app: &AppHandle,
     runtime: &ActRuntime,
     run: &str,
@@ -2445,7 +2459,7 @@ pub async fn stop_run(app: &AppHandle, state: &AppState, run: &str, send_ctrl_c:
 }
 
 /// 请人点头。超时（或 UI 崩了导致发送端被 drop）一律按**拒绝**处理。
-async fn request_approval(
+pub(super) async fn request_approval(
     app: &AppHandle,
     runtime: &ActRuntime,
     session_id: &str,
@@ -2508,7 +2522,7 @@ async fn request_tab(
 const SCREEN_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 请前端读一个会话的屏幕。`None` = 超时或前端没接，调用方退回旁路缓冲。
-async fn request_screen(
+pub(super) async fn request_screen(
     app: &AppHandle,
     runtime: &ActRuntime,
     session_id: &str,
@@ -2619,7 +2633,7 @@ fn describe_open(
 /// 会话是否真的还活着（本地 pty 或 SSH）。
 ///
 /// 范围外且根本不存在的 id（模型编的 / 已关闭的）不值得打扰人去批。
-fn session_alive(state: &AppState, id: &str) -> bool {
+pub(super) fn session_alive(state: &AppState, id: &str) -> bool {
     state.sessions.contains(id) || state.local.contains(id)
 }
 

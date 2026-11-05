@@ -34,6 +34,7 @@ pub mod secret;
 pub mod skill;
 pub mod skill_cmd;
 pub mod skill_refine;
+pub mod skill_run;
 pub mod timeline;
 pub mod trace;
 pub mod usercmd;

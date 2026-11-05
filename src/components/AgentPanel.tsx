@@ -33,6 +33,7 @@ import type {
   AgentSecretRequest,
   AgentStep,
   AgentTarget,
+  Skill,
   SkillInput,
 } from "../types";
 
@@ -221,6 +222,17 @@ function withStep(c: Conversation, step: AgentStep): Conversation {
         s.command === step.command
       ) {
         msgs[i] = { ...m, step };
+        return { ...c, messages: msgs };
+      }
+    }
+  }
+  // 技能回放进度卡：同一步（同 command）的进行中卡片原地更新为收尾；重试时上一张已收尾，另起一张。
+  if (step.kind === "skill") {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const s = msgs[i].step;
+      if (s && s.kind === "skill" && s.target === step.target && s.command === step.command) {
+        if (s.output === undefined) msgs[i] = { ...msgs[i], step };
+        else msgs.push({ id: uid(), role: "assistant", text: "", ts: Date.now(), step });
         return { ...c, messages: msgs };
       }
     }
@@ -690,6 +702,27 @@ export function AgentPanel({
         consoleText: snap?.text,
         consoleAlt: snap?.alt,
       });
+    } catch (e) {
+      patch((c) => withError(c, toFriendlyError(e).message));
+    } finally {
+      patch((c) => (c.busy ? finishWithoutAnswer(c) : c));
+    }
+  };
+
+  /**
+   * 技能管理器里点「运行」：关掉管理器，在当前会话上回放。
+   * 与 runAgentic 同构（订阅挂到本次会话、busy 转圈、停止按钮同一条取消路径）；
+   * 进度 / 审批 / 密码卡片都走这条会话的事件频道，所以必须由面板而不是管理器自己发起。
+   */
+  const runSkill = async (skill: Skill, params: Record<string, string>) => {
+    const sid = sessionId;
+    if (!sid || busy) return;
+    setSkillUi(null);
+    setRunSession(sid);
+    startRun(`运行技能「${skill.name}」`);
+    const label = sessions.find((x) => x.id === sid)?.label ?? "当前会话";
+    try {
+      await api.skillRun(skill.id, params, sid, label);
     } catch (e) {
       patch((c) => withError(c, toFriendlyError(e).message));
     } finally {
@@ -1182,7 +1215,11 @@ export function AgentPanel({
         />
       )}
 
-      {skillUi && <SkillManager initialDraft={skillUi.draft} onClose={() => setSkillUi(null)} />}
+      {skillUi && <SkillManager
+          initialDraft={skillUi.draft}
+          onClose={() => setSkillUi(null)}
+          onRunSkill={sessionId && !busy ? (sk, p) => void runSkill(sk, p) : undefined}
+        />}
       {memOpen && (
         <HostMemoryDialog
           sessionId={sessionId}
@@ -1344,6 +1381,34 @@ function StepCard({ step }: { step: AgentStep }) {
       </div>
     );
   }
+  // 技能回放的一步：command = 「n/N 摘要」，skillStatus 是进度，text 是一句话说明
+  if (step.kind === "skill") {
+    const st = step.skillStatus ?? "running";
+    const label: Record<string, string> = {
+      running: "进行中",
+      ok: "完成",
+      deviated: "偏离",
+      failed: "失败",
+      skipped: "跳过",
+      declined: "未获批",
+    };
+    return (
+      <div className={`ap-step${st === "running" ? " pending" : ""}`}>
+        <div className="ap-step-head">
+          <span className="ap-step-tag">技能</span>
+          {step.targetLabel ? (
+            <span className="ap-step-where" title={step.target}>
+              {step.targetLabel}
+            </span>
+          ) : null}
+          <span className="ap-step-where">{label[st] ?? st}</span>
+        </div>
+        {step.command ? <pre className="ap-code">{step.command}</pre> : null}
+        {step.text && st !== "running" ? <div className="ap-step-why">{step.text}</div> : null}
+        {st === "running" ? <div className="ap-running">{step.text ?? "执行中……"}</div> : null}
+      </div>
+    );
+  }
   // 手和眼：发按键 / 等输出 / 读屏幕。output 为空 = 进行中，有值（含空串）= 已收尾。
   if (step.kind === "keys" || step.kind === "wait" || step.kind === "screen") {
     const tag = step.kind === "keys" ? "按键" : step.kind === "wait" ? "等待" : "读屏";
@@ -1469,10 +1534,12 @@ function ApproveCard({
   // 越界批准与危险命令批准含义不同：前者批的是「动这台不在范围里的会话」，
   // 标题与文案必须直说，别让人以为只是又一次命令风险提示。
   const scope = req.kind === "scope";
+  // skill：技能回放的逐步确认 / 偏离选择，按钮文案按语义写成「确认 / 拒绝」
+  const skill = req.kind === "skill";
   return (
     <div className={`ap-approve${settled ? (result ? " ok" : " no") : ""}`}>
       <div className="ap-step-head">
-        <span className="ap-step-tag">{scope ? "超出作用范围 · 需要批准" : "需要批准"}</span>
+        <span className="ap-step-tag">{scope ? "超出作用范围 · 需要批准" : skill ? "技能 · 需要确认" : "需要批准"}</span>
         <span className="ap-step-where" title={req.target}>
           {req.targetLabel || "未知会话"}
         </span>
@@ -1480,17 +1547,17 @@ function ApproveCard({
       <pre className="ap-code">{req.command}</pre>
       {req.reasons.length > 0 && (
         <div className="ap-step-why">
-          {scope ? "越界原因" : "风险提示"}：{req.reasons.join("；")}
+          {scope ? "越界原因" : skill ? "说明" : "风险提示"}：{req.reasons.join("；")}
         </div>
       )}
       {settled ? (
         <div className="ap-approve-done">
-          {result ? (scope ? "已允许，该会话已并入本轮作用范围" : "已允许执行") : "已拒绝 / 已超时"}
+          {result ? (scope ? "已允许，该会话已并入本轮作用范围" : skill ? "已确认" : "已允许执行") : "已拒绝 / 已超时"}
         </div>
       ) : (
         <div className="ap-approve-row">
           <button className="btn primary" disabled={!busy} onClick={() => onDecide(true)}>
-            {scope ? "允许越界操作" : "允许执行"}
+            {scope ? "允许越界操作" : skill ? "确认" : "允许执行"}
           </button>
           <button className="btn" disabled={!busy} onClick={() => onDecide(false)}>
             拒绝

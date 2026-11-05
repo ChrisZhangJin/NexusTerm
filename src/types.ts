@@ -397,7 +397,7 @@ export interface AgentRunRequest {
 export interface AgentStep {
   /**
    * plan | tool | exec | result | skip | note | answer | open | export | tab | waiting
-   * | keys | wait | screen | secret（前三者是「手和眼」：发按键 / 等输出 / 读屏幕；
+   * | keys | wait | screen | skill（技能回放的一步，`command` 形如「2/5 执行：…」）| secret（前三者是「手和眼」：发按键 / 等输出 / 读屏幕；
    * secret 是密码通道：请用户输入密码，`command` 是理由，`secretStatus` 是结局。
    * `output` 为空 = 进行中，有值（哪怕是空串）= 已收尾，`text` 是一句话结论）
    */
@@ -426,6 +426,8 @@ export interface AgentStep {
   secretStatus?: AgentSecretStatus;
   /** kind:"memory" 专用：被新增 / 删除的主机备忘 id（`command` 是操作 add | forget | read） */
   memoryId?: string;
+  /** kind:"skill"（技能回放进度卡）专用：running | ok | deviated | failed | skipped | declined */
+  skillStatus?: string;
 }
 
 /** 终端尾部的交互提示分类（与后端 `prompt::PromptKind` 的 snake_case 名字一致） */
@@ -464,10 +466,11 @@ export interface AgentApproveRequest {
   requestId: string;
   /**
    * danger：危险命令（仅审批模式下出现）；
-   * scope：动作超出了本轮作用范围，任何执行模式下都要人点头。
+   * scope：动作超出了本轮作用范围，任何执行模式下都要人点头；
+   * skill：技能回放里的逐步确认（审批模式）/ 偏离后让用户选「继续 / 重试 / 中止」。
    * 缺省按 danger 处理（兼容旧载荷）。
    */
-  kind?: "danger" | "scope";
+  kind?: "danger" | "scope" | "skill";
   command: string;
   target: string;
   targetLabel: string;
@@ -688,4 +691,53 @@ export interface HostMemoryView {
   notes: HostNote[];
   maxNotes: number;
   maxChars: number;
+}
+
+// ———————————————————————————— 技能回放（Phase 4.2 / 4.3） ————————————————————————————
+
+/** 单步结果（`status` 为判别字段） */
+export type SkillStepResult =
+  | { status: "ok" }
+  | { status: "deviated"; expected: string; sawTail: string }
+  | { status: "failed"; reason: string }
+  | { status: "skipped" }
+  | { status: "declined" };
+
+/** 整次运行的结局（`kind` 为判别字段） */
+export type SkillRunOutcome =
+  | { kind: "completed" }
+  | { kind: "verify_failed" }
+  | { kind: "deviation_stopped" }
+  | { kind: "aborted_by_user" }
+  | { kind: "aborted_by_llm" }
+  | { kind: "cancelled" }
+  | { kind: "declined" }
+  | { kind: "took_over" }
+  | { kind: "failed"; reason: string }
+  | { kind: "error"; reason: string };
+
+/** `skill_run` 的返回：完整运行报告。`suggestedUpdates` 只是建议，后端不会改 skill。 */
+export interface SkillRunReport {
+  skillId: string;
+  skillName: string;
+  outcome: SkillRunOutcome;
+  steps: {
+    index: number;
+    kind: string;
+    summary: string;
+    result: SkillStepResult;
+    note: string;
+    attempts: number;
+  }[];
+  verify?: { expected: string; ok: boolean; sawTail: string } | null;
+  deviations: { stepIndex: number; expected: string; sawTail: string; resolution: string }[];
+  llmInterventions: number;
+  suggestedUpdates: {
+    stepIndex?: number | null;
+    field: string;
+    message: string;
+    suggestedValue?: string | null;
+  }[];
+  /** true 已记成功 / false 已记失败 / 未记 */
+  recorded?: boolean | null;
 }

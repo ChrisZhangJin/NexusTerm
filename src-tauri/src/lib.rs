@@ -310,6 +310,7 @@ pub fn run() {
             agent::skill_cmd::skill_import_preview,
             agent::skill_cmd::skill_import,
             agent::skill_cmd::skill_refine_draft,
+            agent::skill_cmd::skill_run,
             agent::macro_migrate::macros_migrate_preview,
             agent::macro_migrate::macros_migrate,
             agent::hostmem_cmd::host_memory_list,

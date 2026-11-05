@@ -13,6 +13,7 @@ use super::load_config;
 use super::recorder::RecordingDraft;
 use super::skill::{self, Skill, SkillInput};
 use super::skill_refine::{self, RefineLlm, RefinedSkillDraft};
+use super::skill_run;
 use super::AgentAccount;
 use crate::cmd::AppState;
 
@@ -113,4 +114,27 @@ pub async fn skill_refine_draft(
     let redact_on = acct.redact;
     let mut llm = AccountLlm(acct);
     skill_refine::refine(&mut llm, &draft, hint.as_deref(), redact_on).await
+}
+
+/// 4.2/4.3：在指定会话上回放一份 skill（UI「运行」按钮触发）。
+///
+/// 与 `agent_run` 走同一套运行时登记（同一会话同时只有一轮、面板「停止」可取消、控制权仲裁、审批 / 密码卡片），
+/// 步骤进度以 `skill` 类步骤卡推给面板，结束时发一条 `answer` 收尾。secret 参数的值永远不经过这里：
+/// 前端不会传，传了也不会被代入（只能经密码通道由用户输入）。
+/// 返回完整的运行报告（含偏离记录与对 skill 的修改建议；不会自动改 skill）。
+#[tauri::command]
+pub async fn skill_run(
+    skill_id: String,
+    params: std::collections::BTreeMap<String, String>,
+    session_id: String,
+    target_label: Option<String>,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<skill_run::SkillRunReport, String> {
+    let skill = state.store.skill_get(&skill_id).ok_or_else(|| "技能不存在".to_string())?;
+    let cfg = load_config(&state.store);
+    let opts = skill_run::RunOpts::from_config(&cfg);
+    let ctx = skill_run::SkillRunCtx { app: &app, state: &state, runtime: &state.act, cfg: &cfg };
+    let label = target_label.unwrap_or_default();
+    skill_run::run_skill(&ctx, &skill, &params, &session_id, &label, opts).await
 }

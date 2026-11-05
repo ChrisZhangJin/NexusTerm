@@ -30,6 +30,7 @@ import type {
   HostMemoryView,
   HostNote,
   HostNoteKind,
+  SkillRunReport,
   SkillInput,
   SweepReport,
   TotpPreview,
@@ -228,6 +229,13 @@ export const api = {
   skillImportPreview: (text: string) => invoke<Skill>("skill_import_preview", { text }),
   /** 导入并保存：新 id、来源 imported、计数为 0 */
   skillImport: (text: string) => invoke<Skill>("skill_import", { text }),
+  /**
+   * 4.2/4.3：在会话上回放技能。走与 Agent 同一套闸门（范围 / 危险 / 审批 / 控制权 / 取消）；
+   * 进度与审批 / 密码卡片经该会话的 agent 事件频道推送，`await` 到的是整次运行结束。
+   * `params` 只放非 secret 参数；secret 参数运行时走密码卡片，传了也不会被代入。
+   */
+  skillRun: (skillId: string, params: Record<string, string>, sessionId: string, targetLabel?: string) =>
+    invoke<SkillRunReport>("skill_run", { skillId, params, sessionId, targetLabel: targetLabel ?? null }),
   /**
    * 3.3：让 Agent 把录制草稿整理成 skill 草稿（不保存）。草稿按账号 redact 标志脱敏后出网；
    * 模型输出在后端被夹紧并校验，失败重试一次、再失败退回机械草稿（`fallback`）。
