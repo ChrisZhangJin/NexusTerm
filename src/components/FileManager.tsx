@@ -417,6 +417,29 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
   localPathRef.current = localPath;
   const remotePathRef = useRef(remotePath);
   remotePathRef.current = remotePath;
+  /** 传输栏高度：null = 随内容增长（上限见 CSS），拖过分隔条后固定为用户定的值 */
+  const [xferH, setXferH] = useState<number | null>(null);
+  const xferRef = useRef<HTMLDivElement>(null);
+  const startXferResize = (ev: React.PointerEvent<HTMLDivElement>) => {
+    ev.preventDefault();
+    const startY = ev.clientY;
+    const startH = xferRef.current?.getBoundingClientRect().height ?? 0;
+    const el = ev.currentTarget;
+    el.setPointerCapture(ev.pointerId);
+    const move = (e: PointerEvent) => {
+      // 往上拖 = 变高
+      const h = startH + (startY - e.clientY);
+      setXferH(Math.max(70, Math.min(h, window.innerHeight * 0.75)));
+    };
+    const up = () => {
+      el.removeEventListener("pointermove", move);
+      el.removeEventListener("pointerup", up);
+      el.removeEventListener("pointercancel", up);
+    };
+    el.addEventListener("pointermove", move);
+    el.addEventListener("pointerup", up);
+    el.addEventListener("pointercancel", up);
+  };
   const [localFind, setLocalFind] = useState(0);
   const [remoteFind, setRemoteFind] = useState(0);
 
@@ -923,6 +946,9 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
           <button className="btn" onClick={doUpload} disabled={status !== "ready"}>
             上传 →
           </button>
+          <button className="btn" onClick={() => void loadLocal(localPath)}>
+            刷新
+          </button>
         </Pane>
 
         <Pane
@@ -946,6 +972,9 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
           <button className="btn" onClick={doDownload} disabled={status !== "ready"}>
             ← 下载
           </button>
+          <button className="btn" onClick={() => void loadRemote(remotePath)} disabled={status !== "ready"}>
+            刷新
+          </button>
           <button className="btn" onClick={doMkdir} disabled={status !== "ready"}>
             新建目录
           </button>
@@ -965,7 +994,17 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
       {transferMsg && <div className="fm-transfer">{transferMsg}</div>}
 
       {transfers.length > 0 && (
-        <div className="fm-xfer">
+        <div
+          ref={xferRef}
+          className="fm-xfer"
+          style={xferH != null ? { height: xferH, maxHeight: "none" } : undefined}
+        >
+          <div
+            className="fm-xfer-resize"
+            title="上下拖动调整高度，双击还原"
+            onPointerDown={startXferResize}
+            onDoubleClick={() => setXferH(null)}
+          />
           <div className="fm-xfer-head">
             <span>名称</span>
             <span>状态</span>

@@ -908,7 +908,14 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   font-size: 11px;
   line-height: 1;
 }
-.fm-xfer-list { overflow-y: auto; }
+.fm-xfer-list { flex: 1; min-height: 0; overflow-y: auto; }
+/* 顶边的拖动条：盖在边框上，加大可点区域 */
+.fm-xfer { position: relative; }
+.fm-xfer-resize {
+  position: absolute; left: 0; right: 0; top: -3px; height: 7px;
+  cursor: ns-resize; z-index: 2; touch-action: none;
+}
+.fm-xfer-resize:hover { background: var(--accent); opacity: 0.5; }
 .fm-xfer-row { color: var(--text); border-bottom: 1px solid var(--border); }
 .fm-xfer-row:hover { background: var(--bg-elev); }
 .fm-xfer-name, .fm-xfer-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
