@@ -675,6 +675,8 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
     if (e.isDir) {
       setLocalSel(null);
       setLocalPath(e.path);
+    } else {
+      transferEntry("local", e, false);
     }
   };
 
@@ -683,8 +685,9 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
       setRemoteSel(null);
       setRemotePath(e.path);
       loadRemote(e.path);
-    } else if (viewableKind(e.name)) {
-      void doView(e);
+    } else {
+      // 双击文件 = 传输（原先是浏览可预览的类型；浏览仍在右键菜单里）
+      transferEntry("remote", e, false);
     }
   };
 
