@@ -45,7 +45,7 @@
 - [x] **3.1 Skill 数据模型与存储**：`skills` 表（名称、描述、参数、步骤、验证条件、风险等级、适用主机范围、创建/更新时间）；步骤 = `exec | keys | expect+respond | secret | screen_check`，含 `on_unexpected: ask|stop|llm`。CRUD 命令。（`agent/skill.rs` 纯模型 + 校验 + `render_step` + `assess_risk` + `export_text / import_text`，顶部注释即模型文档；`store/skills.rs` 的 `skills` 表（`CREATE IF NOT EXISTS` 纯增量，params / steps / verify / host_scope 为 JSON 列，上限 200 条 / 每条 100 步）与 `skill_create / update / delete / get / list(query) / record_run_result`；命令 `agent/skill_cmd.rs`：`skill_list / get / create / update / delete / validate / export / import_preview / import`，**不暴露** `record_run_result`；前端类型在 `types.ts`、封装在 `api.ts`、辅助在 `lib/skill.ts`。skill 里永远没有密码值：secret 步骤只有 reason + 参数引用名，结构 `deny_unknown_fields`，secret 参数无默认值且只能用于 secret 通道；导入是不受信输入，新 id、来源 imported、计数清零、风险重评；编辑回放相关内容会清零计数。）
 - [ ] **3.2 录制器**：基于 2.5 时间线录制一段操作（开始/结束），密码步骤只记 `secret` 占位。替代旧宏录制中「录下密码」的问题。
 - [ ] **3.3 Agent 整理 skill**：录制 → LLM 提取参数、前置条件、每步期望、验证 → 草稿 skill，用户可编辑后保存。
-- [ ] **3.4 Skill 管理界面**：列表 / 查看 / 编辑 / 删除 / 导入导出（文本文件）。
+- [x] **3.4 Skill 管理界面**：列表 / 查看 / 编辑 / 删除 / 导入导出（文本文件）。（`components/SkillManager.tsx` 列表 + 搜索 + 删除确认 + 导入（文件 → `skill_import_preview` → 确认 → `skill_import`）/ 导出（`skill_export` → 保存对话框 → `write_file`）；`SkillEditor.tsx` 查看 / 编辑（参数编辑器、按种类的步骤编辑器含增删 / 上下移 / 复制、verify、主机范围、占位符高亮、后端校验问题按步骤 / 参数逐条显示）；入口为 AgentPanel 头部「技能」按钮；风险只读（后端评估只会抬高）；secret 参数在 UI 里不能填默认值；`SkillManager` 接受 `initialDraft?: SkillInput` 供 3.2 / 3.3 / 3.5 预填新建编辑器；纯逻辑在 `lib/skillForm.ts`，自测 `tests/fe/skillform.test.ts`。）
 - [ ] **3.5 旧宏迁移**：`macros` 表数据可一键转成 skill。
 
 ## 阶段 4 · 独立执行（混合回放 + 记忆）
