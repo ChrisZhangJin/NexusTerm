@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import ConfirmDialog, { type ConfirmOptions } from "./ConfirmDialog";
+import SkillManager from "./SkillManager";
 import Timeline from "./Timeline";
 import {
   api,
@@ -30,6 +31,7 @@ import type {
   AgentSecretRequest,
   AgentStep,
   AgentTarget,
+  SkillInput,
 } from "../types";
 
 export interface AgentPanelProps {
@@ -341,6 +343,8 @@ export function AgentPanel({
   const ready = isAgentReady(cfg);
   // 对话 / 时间线（2.5）视图切换。时间线只在选中时挂载（才订阅事件）；对话区只是被 CSS 藏起来，状态不丢
   const [view, setView] = useState<"chat" | "timeline">("chat");
+  // 技能管理器（3.4）。`draft` 给了就直接弹出预填的「新建技能」编辑器（录制器 / LLM 草稿 / 宏迁移用）
+  const [skillUi, setSkillUi] = useState<{ draft?: SkillInput } | null>(null);
 
   /**
    * Agent 面向全局：整个应用只有**一份**对话。
@@ -792,6 +796,9 @@ export function AgentPanel({
             时间线
           </button>
         </div>
+        <button className="ap-skill-btn" onClick={() => setSkillUi({})} title="管理技能（可回放的操作流程）">
+          技能
+        </button>
         {onFloatOut && (
           <button className="ap-x ap-float" onClick={onFloatOut} title="浮出为独立窗口">
             ⧉
@@ -1157,6 +1164,8 @@ export function AgentPanel({
           onResult={onConfirm}
         />
       )}
+
+      {skillUi && <SkillManager initialDraft={skillUi.draft} onClose={() => setSkillUi(null)} />}
     </div>
   );
 }
