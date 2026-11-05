@@ -354,6 +354,10 @@ export interface AgentMessage {
   approve?: AgentApproveRequest;
   /** 审批结果：true 已允许 / false 已拒绝 / undefined 还在等人 */
   approveResult?: boolean;
+  /** 模型请求用户输入密码（nx_secret）；卡片里有掩码输入框。值只活在卡片组件的本地 state，绝不进这里 */
+  secret?: AgentSecretRequest;
+  /** 密码卡片的结局：submitted 已提交 / skipped 已跳过 / expired 已超时或已失效 / undefined 还在等人 */
+  secretResult?: "submitted" | "skipped" | "expired";
 }
 
 // ———————————————————————————— Agentic（会动手的那种） ————————————————————————————
@@ -393,7 +397,8 @@ export interface AgentRunRequest {
 export interface AgentStep {
   /**
    * plan | tool | exec | result | skip | note | answer | open | export | tab | waiting
-   * | keys | wait | screen（后三者是「手和眼」：发按键 / 等输出 / 读屏幕。
+   * | keys | wait | screen | secret（前三者是「手和眼」：发按键 / 等输出 / 读屏幕；
+   * secret 是密码通道：请用户输入密码，`command` 是理由，`secretStatus` 是结局。
    * `output` 为空 = 进行中，有值（哪怕是空串）= 已收尾，`text` 是一句话结论）
    */
   kind: string;
@@ -412,6 +417,44 @@ export interface AgentStep {
   reasons?: string[];
   /** kind:"waiting" 专用：命令发出去之后已经等了多少秒，还没收到结果 */
   elapsedSecs?: number;
+  /** 终端此刻停在什么上（对输出尾部的启发式分类），见 `AgentPromptKind` */
+  promptKind?: AgentPromptKind;
+  /**
+   * kind:"secret" 收尾时专用：provided（已输入并写入终端）| declined | timeout | cancelled | failed。
+   * 只有状态——密码本身不会出现在任何事件里。
+   */
+  secretStatus?: AgentSecretStatus;
+}
+
+/** 终端尾部的交互提示分类（与后端 `prompt::PromptKind` 的 snake_case 名字一致） */
+export type AgentPromptKind =
+  | "password"
+  | "yes_no"
+  | "pager"
+  | "menu"
+  | "repl"
+  | "shell_prompt"
+  | "unknown";
+
+export type AgentSecretStatus = "provided" | "declined" | "timeout" | "cancelled" | "failed";
+
+/**
+ * `nx://agent/secret/{sessionId}` 的载荷：Agent 请用户输入一个密码（`nx_secret`）。
+ *
+ * 用户在掩码输入框里输入后走 `agentSecretAck(requestId, value)`，值**直接进后端、写进 pty**，
+ * 不经过模型。这里**没有**任何值字段。
+ */
+export interface AgentSecretRequest {
+  requestId: string;
+  /** 要往哪个会话输入 */
+  target: string;
+  targetLabel: string;
+  /** 模型给的理由（后端已清洗成单行） */
+  reason: string;
+  /** 请求发出时终端的分类；不是 password 时卡片要提醒「终端似乎没在要密码」 */
+  promptKind?: AgentPromptKind;
+  /** 多少秒内必须答复，超时按拒绝处理 */
+  timeoutSecs: number;
 }
 
 /** `nx://agent/approve/{sessionId}` 的载荷：请人点头 */
@@ -478,7 +521,10 @@ export type AgentRunMode = "ask" | "act";
  *  "confirmed" 是活体确认过「真的没有前台进程了」，"silence" 是静默兜底（问不出确定答案）。 */
 export interface AgentExecResult {
   output: string;
-  reason: "confirmed" | "silence" | "timeout" | "cancelled";
+  /** "awaiting_input"：命令没结束，终端停在一个等待输入的交互提示上（见 `promptKind`） */
+  reason: "confirmed" | "silence" | "timeout" | "awaiting_input" | "cancelled";
+  /** 收尾时终端停在什么上；取消时没有 */
+  promptKind?: AgentPromptKind;
 }
 
 /**

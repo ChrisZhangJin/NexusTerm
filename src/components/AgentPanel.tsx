@@ -6,6 +6,7 @@ import {
   onAgentApprove,
   onAgentDone,
   onAgentError,
+  onAgentSecret,
   onAgentStep,
   onAgentToken,
 } from "../api";
@@ -17,6 +18,7 @@ import type {
   AgentApproveRequest,
   AgentDoneReason,
   AgentMessage,
+  AgentSecretRequest,
   AgentStep,
   AgentTarget,
 } from "../types";
@@ -160,7 +162,28 @@ function withStep(c: Conversation, step: AgentStep): Conversation {
         s.target === step.target &&
         s.command === step.command
       ) {
-        msgs[i] = { ...m, step: { ...s, kind: "result", output: step.output } };
+        msgs[i] = {
+          ...m,
+          step: { ...s, kind: "result", output: step.output, promptKind: step.promptKind ?? s.promptKind },
+        };
+        return { ...c, messages: msgs };
+      }
+    }
+  }
+  // 密码通道：收尾步骤（带 secretStatus）并回同一目标、同一理由的进行中卡片。
+  // 注意不能用 output 判断进行中——收尾时可能没有输出尾部（undefined）。
+  if (step.kind === "secret" && step.secretStatus !== undefined) {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      const s = m.step;
+      if (
+        s &&
+        s.kind === "secret" &&
+        s.secretStatus === undefined &&
+        s.target === step.target &&
+        s.command === step.command
+      ) {
+        msgs[i] = { ...m, step };
         return { ...c, messages: msgs };
       }
     }
@@ -228,6 +251,28 @@ function withDecision(
     ...c,
     messages: c.messages.map((m) =>
       m.approve?.requestId === requestId ? { ...m, approveResult: approved } : m
+    ),
+  };
+}
+
+/** 追加一张密码卡片（模型请求用户输入密码）。卡片里的输入值只在组件本地 state，不进会话。 */
+function withSecret(c: Conversation, req: AgentSecretRequest): Conversation {
+  return {
+    ...c,
+    messages: [...c.messages, { id: uid(), role: "assistant", text: "", ts: Date.now(), secret: req }],
+  };
+}
+
+/** 记录密码卡片的结局（卡片据此变成终态，输入框消失） */
+function withSecretResult(
+  c: Conversation,
+  requestId: string,
+  result: "submitted" | "skipped" | "expired"
+): Conversation {
+  return {
+    ...c,
+    messages: c.messages.map((m) =>
+      m.secret?.requestId === requestId ? { ...m, secretResult: result } : m
     ),
   };
 }
@@ -377,7 +422,7 @@ export function AgentPanel({
 
     void (async () => {
       try {
-        const [offToken, offDone, offError, offStep, offApprove] = await Promise.all([
+        const [offToken, offDone, offError, offStep, offApprove, offSecret] = await Promise.all([
           onAgentToken(runSession, (chunk) => {
             if (!disposed) patch((c) => withToken(c, chunk));
           }),
@@ -400,6 +445,9 @@ export function AgentPanel({
           onAgentApprove(runSession, (req) => {
             if (!disposed) patch((c) => withApprove(c, req));
           }),
+          onAgentSecret(runSession, (req) => {
+            if (!disposed) patch((c) => withSecret(c, req));
+          }),
         ]);
         // 竞态：listen 是异步的，等它 resolve 时这一轮可能已经结束了 —— 这时要立刻退订
         if (disposed) {
@@ -408,9 +456,10 @@ export function AgentPanel({
           offError();
           offStep();
           offApprove();
+          offSecret();
           return;
         }
-        unlisteners.push(offToken, offDone, offError, offStep, offApprove);
+        unlisteners.push(offToken, offDone, offError, offStep, offApprove, offSecret);
       } catch {
         // 订阅失败：提问时会在 agentRun 上抛出真错误，这里不必再弹一次
       }
@@ -593,6 +642,28 @@ export function AgentPanel({
   };
 
   /**
+   * 用户在密码卡片上的选择：`value` 给了就是提交密码，`undefined` 是跳过。
+   * 值经 `agent_secret_ack` 直达后端写进 pty —— 不进对话 state、不进模型上下文。
+   * 返回 `null` 表示已处理（卡片已置成终态），否则返回要在卡片内联显示的错误文案
+   * （例如密码含控制字符被后端拒绝：这种情况后端没消耗登记，卡片保持打开可重输）。
+   */
+  const answerSecret = async (
+    req: AgentSecretRequest,
+    value?: string
+  ): Promise<string | null> => {
+    try {
+      const accepted = await api.agentSecretAck(req.requestId, value);
+      // false：这个请求已经超时 / 被取消 / 重复提交，后端不再等了
+      patch((c) =>
+        withSecretResult(c, req.requestId, accepted ? (value === undefined ? "skipped" : "submitted") : "expired")
+      );
+      return null;
+    } catch (e) {
+      return toFriendlyError(e).message;
+    }
+  };
+
+  /**
    * 把命令写进终端。**这是全组件唯一会碰到 pty 的出口** ——
    * 调用链上必然已经经过：用户点「插入到终端」→ 确认框里点「插入」。
    * 此处刻意不加换行：只做插入，回车执行留给用户在终端里自己按。
@@ -668,6 +739,17 @@ export function AgentPanel({
                     result={m.approveResult}
                     busy={busy}
                     onDecide={(ok) => void decide(m.approve!, ok)}
+                  />
+                );
+              }
+              if (m.secret) {
+                return (
+                  <SecretCard
+                    key={m.id}
+                    req={m.secret}
+                    result={m.secretResult}
+                    busy={busy}
+                    onAnswer={(value) => answerSecret(m.secret!, value)}
                   />
                 );
               }
@@ -977,6 +1059,34 @@ function prettyToolArgs(raw: string): string {
   }
 }
 
+/** 终端停在交互提示上时（密码 / 确认 / 分页 / 菜单 / REPL）给步骤卡片挂的小标签；shell_prompt / unknown 不显示 */
+const PROMPT_LABELS: Record<string, string> = {
+  password: "等待密码",
+  yes_no: "等待确认",
+  pager: "分页器",
+  menu: "菜单",
+  repl: "REPL",
+};
+
+function PromptBadge({ kind }: { kind?: string }) {
+  const label = kind ? PROMPT_LABELS[kind] : undefined;
+  if (!label) return null;
+  return (
+    <span className="ap-prompt-badge" title={`终端当前停在：${kind}`}>
+      {label}
+    </span>
+  );
+}
+
+/** 密码通道结局 → 卡片上的中文短语 */
+const SECRET_STATUS_LABELS: Record<string, string> = {
+  provided: "已输入",
+  declined: "已跳过",
+  timeout: "已超时",
+  cancelled: "已取消",
+  failed: "写入失败",
+};
+
 /**
  * 一次执行的卡片：命令 + 结果。「在哪台机器上跑的」必须写清楚 —— Agent 是全局的，
  * 可以同时在好几个会话上下令，只显示命令的话分不清输出来自哪台机器。
@@ -1027,6 +1137,32 @@ function StepCard({ step }: { step: AgentStep }) {
       </div>
     );
   }
+  // 密码通道的过程卡：start（secretStatus 为空）→ 收尾（带结局）。
+  // 这张卡永远不含密码本身——只有理由、结局和写入后的输出尾部（后端已掩码）。
+  if (step.kind === "secret") {
+    const finished = step.secretStatus !== undefined;
+    const out = step.output ?? "";
+    const bad = step.secretStatus === "failed" || step.secretStatus === "timeout";
+    return (
+      <div className={`ap-step${finished ? "" : " pending"}${bad ? " danger" : ""}`}>
+        <div className="ap-step-head">
+          <span className="ap-step-tag">密码</span>
+          {step.targetLabel ? (
+            <span className="ap-step-where" title={step.target}>
+              {step.targetLabel}
+            </span>
+          ) : null}
+          <PromptBadge kind={step.promptKind} />
+        </div>
+        {step.command ? <div className="ap-step-why">原因：{step.command}</div> : null}
+        <div className="ap-step-why">
+          {finished ? (SECRET_STATUS_LABELS[step.secretStatus!] ?? step.secretStatus) : "等待用户输入……"}
+          {step.text && finished ? `（${step.text}）` : ""}
+        </div>
+        {finished && out.trim() ? <pre className="ap-code ap-out-plain">{out}</pre> : null}
+      </div>
+    );
+  }
   // 手和眼：发按键 / 等输出 / 读屏幕。output 为空 = 进行中，有值（含空串）= 已收尾。
   if (step.kind === "keys" || step.kind === "wait" || step.kind === "screen") {
     const tag = step.kind === "keys" ? "按键" : step.kind === "wait" ? "等待" : "读屏";
@@ -1042,6 +1178,7 @@ function StepCard({ step }: { step: AgentStep }) {
               {step.targetLabel}
             </span>
           ) : null}
+          {finished ? <PromptBadge kind={step.promptKind} /> : null}
         </div>
         {step.command ? <pre className="ap-code">{step.command}</pre> : null}
         {step.text ? <div className="ap-step-why">{step.text}</div> : null}
@@ -1101,6 +1238,7 @@ function StepCard({ step }: { step: AgentStep }) {
         <span className="ap-step-where" title={step.target}>
           {step.targetLabel ?? "未知会话"}
         </span>
+        {done ? <PromptBadge kind={step.promptKind} /> : null}
       </div>
       <pre className="ap-code">{step.command ?? ""}</pre>
       {done ? (
@@ -1177,6 +1315,113 @@ function ApproveCard({
             拒绝
           </button>
         </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 密码卡片（nx_secret）。模型只负责「请求」，值由人在这里输入、直送后端写进终端。
+ *
+ * - 输入值**只存在本组件的 useState 里**：提交 / 跳过后立刻清空，
+ *   不写入会话 state、不进 `AgentMessage`、不进任何日志或事件。
+ * - 用 `type="password"` + `autoComplete="off"`，避免浏览器 / WebView 记住或回填。
+ * - `busy` 为 false（这一轮已结束 / 被取消）后输入框禁用：后端早就不再等了。
+ */
+function SecretCard({
+  req,
+  result,
+  busy,
+  onAnswer,
+}: {
+  req: AgentSecretRequest;
+  result?: "submitted" | "skipped" | "expired";
+  busy: boolean;
+  /** `value` 为 undefined = 跳过。返回内联错误文案，或 null 表示已处理 */
+  onAnswer: (value?: string) => Promise<string | null>;
+}) {
+  const [value, setValue] = useState("");
+  const [inlineErr, setInlineErr] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
+  const [left, setLeft] = useState(req.timeoutSecs);
+  const settled = result !== undefined;
+
+  // 倒计时只是提示：真正的超时在后端，到点后端会放弃等待并告诉模型「超时」
+  useEffect(() => {
+    if (settled) return;
+    const t = window.setInterval(() => setLeft((n) => (n > 0 ? n - 1 : 0)), 1000);
+    return () => window.clearInterval(t);
+  }, [settled]);
+
+  const submit = async (v?: string) => {
+    if (sending) return;
+    setSending(true);
+    setInlineErr(null);
+    const err = await onAnswer(v);
+    setSending(false);
+    if (err === null) {
+      // 无论提交还是跳过，本地输入立刻清掉
+      setValue("");
+    } else {
+      setInlineErr(err);
+    }
+  };
+
+  const unexpected = req.promptKind !== undefined && req.promptKind !== "password";
+  const dead = !busy || left === 0;
+  return (
+    <div className={`ap-approve ap-secret${settled ? (result === "submitted" ? " ok" : " no") : ""}`}>
+      <div className="ap-step-head">
+        <span className="ap-step-tag">请求输入密码</span>
+        <span className="ap-step-where" title={req.target}>
+          {req.targetLabel || "未知会话"}
+        </span>
+      </div>
+      <div className="ap-step-why">原因：{req.reason}</div>
+      {settled ? (
+        <div className="ap-approve-done">
+          {result === "submitted"
+            ? "已提交（密码只写入了终端，助手看不到它）"
+            : result === "skipped"
+              ? "已跳过"
+              : "已失效（超时或这一轮已结束）"}
+        </div>
+      ) : (
+        <form
+          className="ap-secret-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (value && !dead) void submit(value);
+          }}
+        >
+          {unexpected && (
+            <div className="ap-secret-warn">
+              终端看起来并没有停在密码提示上，输入可能会被回显到屏幕。
+            </div>
+          )}
+          <input
+            className="ap-secret-input"
+            type="password"
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            placeholder="在此输入，回车提交"
+            value={value}
+            disabled={dead || sending}
+            onChange={(e) => setValue(e.target.value)}
+          />
+          {inlineErr && <div className="ap-secret-err">{inlineErr}</div>}
+          <div className="ap-approve-row">
+            <button className="btn primary" type="submit" disabled={dead || sending || !value}>
+              提交
+            </button>
+            <button className="btn" type="button" disabled={dead || sending} onClick={() => void submit(undefined)}>
+              跳过
+            </button>
+            <span className="ap-secret-left">{dead ? "已失效" : `${left} 秒后超时`}</span>
+          </div>
+        </form>
       )}
     </div>
   );
