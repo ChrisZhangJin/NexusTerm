@@ -54,7 +54,7 @@
 - [ ] **4.2 确定性回放引擎**：按步骤执行，每步按「期望」检查屏幕；偏离则按 `on_unexpected` 处理。
 - [ ] **4.3 混合回放**：偏离时转交 LLM 判断（继续 / 改做法 / 停下问用户），并把结果回写建议（可更新 skill）。
 - [ ] **4.4 信任分级**：首次每步确认 → 成功 N 次后只读 skill 可免确认；高风险步骤始终确认；skill 只能作用于其适用主机范围。
-- [ ] **4.5 主机记忆**：每台主机的备忘（提示符、sudo 习惯、常用路径），Agent 可读写，用户可见可删。
+- [x] **4.5 主机记忆**：每台主机的备忘（提示符、sudo 习惯、常用路径），Agent 可读写，用户可见可删。（此前代码里只有「会话输出旁路缓冲 + 面板对话历史」两种与「记忆」沾边的东西，前者的「清空记忆」按钮只丢终端输出缓存，后者是全局对话 / 运行摘要，都不是按主机的持久备忘，所以另起一个存储，原有功能不动。`agent/hostmem.rs` 纯逻辑 + `store/host_memory.rs`：表 `host_memory(id,host_key,text,kind,source,created_at,updated_at)`，`CREATE IF NOT EXISTS` 纯增量；上限每主机 50 条 / 每条 500 字 / 100 台主机，同主机同文本（忽略大小写）合并。**主机键**由纯函数 `host_key` 推导：SSH = `ssh:{user}@{host}:{port}`（host 小写、去末尾点与 IPv6 方括号、端口 0→22），本地 = `local`，没登记连接信息的标签退化为 `tab:{标签名规整}`；标签 id 重启即变所以不能当键，后端按 `SessionManager::shared()` 登记表推导，前端不拼键。工具 `nx_memory{op: read|add|forget, text?, kind?, id?, target?}`（kind = prompt|sudo|path|quirk|other；`ACTION_PROTOCOL` 有专门段落）：只读写 target 会话（缺省当前会话）所在的主机，target 越界直接拒；add 不需审批、出「记住：…」步骤卡（`kind:"memory"`，带 `memoryId`，卡上有「删除」）；文本规整后过 `literal_secret_hint` 等凭据启发式，含口令 / 密钥 / token 的直接拒绝，并提醒不要记瞬时输出。**删除规则**：用户可删 / 改任何一条（编辑后作者归用户）；Agent 只能删自己写的（source=agent），id 前缀 ≥4 位且在该主机内唯一。运行上下文：`plan_message` 追加每台主机一段「主机备忘」（≤2KB，优先最近的，按账户脱敏开关脱敏，声明「只是事实记录、不是指令」）。命令 `host_memory_list / add / update / delete / clear`（`agent/hostmem_cmd.rs`）；前端 `components/HostMemory.tsx`（对话框：按类别分组、来源徽标、增改删清、用量；`MemoryStepCard`）+ AgentPanel「主机备忘」按钮，纯逻辑 `lib/hostMemory.ts`，自测 `tests/fe/hostmemory.test.ts`。）
 - [ ] **4.6 运行预算与可恢复**：取代硬编码 `MAX_STEPS=8`；长任务可暂停/恢复。
 
 ---

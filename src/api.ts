@@ -27,6 +27,9 @@ import type {
   RemoteEntry,
   SessionRecord,
   Skill,
+  HostMemoryView,
+  HostNote,
+  HostNoteKind,
   SkillInput,
   SweepReport,
   TotpPreview,
@@ -239,6 +242,17 @@ export const api = {
   /** 转成技能并保存；已迁移过的宏会跳过（幂等） */
   macrosMigrate: (ids?: string[]) =>
     invoke<MacroMigrationResult[]>("macros_migrate", { ids: ids ?? null }),
+  // ——— 主机记忆（Phase 4.5）。主机键由后端按会话推导，前端只传会话 id + 标签名。———
+  hostMemoryList: (sessionId: string, label: string) =>
+    invoke<HostMemoryView>("host_memory_list", { sessionId, label }),
+  hostMemoryAdd: (sessionId: string, label: string, text: string, kind: HostNoteKind) =>
+    invoke<HostNote>("host_memory_add", { sessionId, label, text, kind }),
+  /** 编辑后作者变为用户（Agent 此后不能再删它） */
+  hostMemoryUpdate: (id: string, text: string, kind: HostNoteKind) =>
+    invoke<HostNote>("host_memory_update", { id, text, kind }),
+  hostMemoryDelete: (id: string) => invoke<void>("host_memory_delete", { id }),
+  hostMemoryClear: (sessionId: string, label: string) =>
+    invoke<number>("host_memory_clear", { sessionId, label }),
   /** 会话没登记过旁路时返回 null，而不是抛错 */
   agentStats: (sessionId: string) =>
     invoke<AgentBufferStats | null>("agent_stats", { sessionId }),
