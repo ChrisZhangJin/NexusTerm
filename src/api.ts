@@ -28,6 +28,7 @@ import type {
   TotpPreview,
   VaultStatus,
 } from "./types";
+import type { ControlPayload, ControlState } from "./lib/control";
 
 export const api = {
   health: () => invoke<string>("health"),
@@ -222,9 +223,24 @@ export const api = {
    * 与 `agentAsk` 的分工：这条会真在终端里跑命令。
    */
   agentRun: (request: AgentRunRequest) => invoke<void>("agent_run", { request }),
-  /** 中止该会话正在进行的一轮。幂等。 */
-  agentRunCancel: (sessionId: string) =>
-    invoke<void>("agent_run_cancel", { sessionId }),
+  /**
+   * 中止该会话正在进行的一轮。幂等。
+   * `sendCtrlC` 为真时同时给被驾驶的会话发 Ctrl-C（打断前台进程）；停止后控制权回到用户。
+   */
+  agentRunCancel: (sessionId: string, sendCtrlC?: boolean) =>
+    invoke<void>("agent_run_cancel", { sessionId, sendCtrlC: sendCtrlC ?? false }),
+  /** 查询会话的控制权状态（事件只在变化时推，挂载时用它对账）。 */
+  agentControlGet: (sessionId: string) =>
+    invoke<ControlState>("agent_control_get", { sessionId }),
+  /** 用户在 Agent 驾驶的终端里敲了键（前端只在状态切换时调一次）。 */
+  agentControlUserInput: (sessionId: string) =>
+    invoke<void>("agent_control_user_input", { sessionId }),
+  /** 「接管」：Agent 让路直到交还。 */
+  agentControlTakeover: (sessionId: string) =>
+    invoke<void>("agent_control_takeover", { sessionId }),
+  /** 「交还」：Paused → AgentDriving，Agent 继续。 */
+  agentControlHandback: (sessionId: string) =>
+    invoke<void>("agent_control_handback", { sessionId }),
   /**
    * 答复一条审批请求。
    * 返回 false 表示这条请求已经没人接了（超时 / 答复晚到）—— 不是错误。
@@ -499,6 +515,17 @@ export async function onAgentApprove(
   return listen<AgentApproveRequest>(`nx://agent/approve/${id}`, (ev) =>
     handler(ev.payload)
   );
+}
+
+/**
+ * 终端控制权变化（人 / Agent / 暂停）。同一个事件既发给被驾驶的会话自己（终端据此开关键盘闸），
+ * 也发给驾驶它的那一轮运行的发起会话（面板据此出「接管 / 交还」）。载荷带 `session` 区分是谁的状态。
+ */
+export async function onAgentControl(
+  id: string,
+  handler: (p: ControlPayload) => void
+): Promise<UnlistenFn> {
+  return listen<ControlPayload>(`nx://agent/control/${id}`, (ev) => handler(ev.payload));
 }
 
 /** Agent 请用户输入一个密码（`nx_secret`）。处理完用 `api.agentSecretAck(...)` 答复。 */

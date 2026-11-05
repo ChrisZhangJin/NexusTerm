@@ -58,6 +58,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 use super::capture;
+use super::control::{self, ControlState};
 use super::danger::assess;
 use super::executor::{
     wait_for_end, ExecEnd, ExecOutcome, WaitConfig, CLASSIFY_TAIL_BYTES,
@@ -2060,6 +2061,8 @@ pub struct ActRuntime {
     screen_acks: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ScreenReply>>>,
     /// request_id → 谁来收用户对密码请求的答复（值经它直达 `run`，再写进 pty）
     secret_acks: Mutex<HashMap<String, tokio::sync::oneshot::Sender<SecretAnswer>>>,
+    /// 各终端会话的控制权（人 / Agent / 暂停），见 `control.rs`
+    pub control: control::ControlTable,
 }
 
 impl ActRuntime {
@@ -2070,6 +2073,29 @@ impl ActRuntime {
             tab_acks: Mutex::new(HashMap::new()),
             screen_acks: Mutex::new(HashMap::new()),
             secret_acks: Mutex::new(HashMap::new()),
+            control: control::ControlTable::new(),
+        }
+    }
+
+    /// 用户侧的控制权操作（敲键盘 / 接管 / 交还）：改状态，**真的变了才**推事件。
+    /// 没有 Agent 在驾驶时这些都是空操作，所以前端误报也无害。
+    pub fn user_control(&self, app: &AppHandle, session: &str, ev: control::ControlEvent) {
+        use control::ControlEvent::*;
+        let changed = match ev {
+            UserInput => self.control.user_input(session),
+            Takeover => self.control.takeover(session),
+            Handback => self.control.handback(session),
+            RunStarted | RunEnded => None,
+        };
+        if let Some(st) = changed {
+            emit_control(app, session, &self.control.holders_of(session), st);
+        }
+    }
+
+    /// 一轮运行结束 / 被停止：把它驾驶的会话全部还给用户并推事件。幂等。
+    pub fn release_control(&self, app: &AppHandle, run: &str) {
+        for (session, st) in self.control.release_run(run) {
+            emit_control(app, &session, &[run.to_string()], st);
         }
     }
 
@@ -2199,6 +2225,95 @@ impl Default for ActRuntime {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `nx://agent/control/{session}` 的载荷。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlPayload {
+    session: String,
+    state: ControlState,
+}
+
+/// 推控制权变化。同时发给会话自己的频道（终端据此开关键盘闸）和每个驾驶它的运行的频道
+/// （面板据此出「接管 / 交还」横幅 —— 面板订阅的是发起会话，不一定是被驾驶的那个）。
+fn emit_control(app: &AppHandle, session: &str, runs: &[String], state: ControlState) {
+    let payload = ControlPayload { session: session.to_string(), state };
+    let _ = app.emit(&format!("nx://agent/control/{session}"), payload.clone());
+    for run in runs.iter().filter(|r| r.as_str() != session) {
+        let _ = app.emit(&format!("nx://agent/control/{run}"), payload.clone());
+    }
+}
+
+/// 一轮运行持有的控制权：Drop 时（正常结束 / 出错 / 提前 return）一律还给用户，
+/// 免得哪条出口漏了就让会话永远卡在「Agent 驾驶中」。
+struct ControlLease<'a> {
+    app: &'a AppHandle,
+    rt: &'a ActRuntime,
+    run: String,
+}
+
+impl Drop for ControlLease<'_> {
+    fn drop(&mut self) {
+        self.rt.release_control(self.app, &self.run);
+    }
+}
+
+/// 暂停时最多等多久用户交还。到点仍没交还就按「用户接管了终端」告知模型。
+const PAUSE_MAX_WAIT: Duration = Duration::from_secs(300);
+/// 暂停等待的轮询间隔。
+const PAUSE_POLL: Duration = Duration::from_millis(150);
+
+/// Agent 写 pty 之前的闸：先登记驾驶（首次对某个目标动手时），再在 `Paused` 时等用户交还。
+///
+/// 只在 Agent 这一侧等待，**从不**拦用户的键盘。取消优先。
+async fn gate_drive(
+    app: &AppHandle,
+    runtime: &ActRuntime,
+    run: &str,
+    target: &str,
+    cancel: &AtomicBool,
+) -> control::PauseWait {
+    if cancel.load(Ordering::Relaxed) {
+        return control::PauseWait::Cancelled;
+    }
+    if let Some(st) = runtime.control.acquire(target, run) {
+        emit_control(app, target, &[run.to_string()], st);
+    }
+    control::wait_unpaused(
+        || runtime.control.state(target) == ControlState::Paused,
+        || cancel.load(Ordering::Relaxed),
+        PAUSE_MAX_WAIT,
+        PAUSE_POLL,
+        tokio::time::sleep,
+    )
+    .await
+}
+
+/// 等满上限用户仍没交还时喂给模型的话：别再下发终端动作，直接收尾。
+const TOOK_OVER_FEEDBACK: &str = "用户已经接管了终端（在终端里自己输入，并且长时间没有把控制权交还），\
+    这一步没有往终端写入任何内容。不要再下发新的终端动作，请直接用中文给出结论：\
+    说明已经做到哪一步、现在停在哪里，以及等用户交还后还需要做什么。\n";
+
+/// 同一轮里「用户接管且超时」达到这个次数就直接收束本轮，别让模型反复撞墙。
+const MAX_TOOK_OVER: usize = 2;
+
+/// 停止一轮运行：置取消标记；`send_ctrl_c` 时再给它驾驶的会话各发一个 Ctrl-C（`\x03`）打断前台进程；
+/// 最后立刻把控制权还给用户（不等运行循环自己收尾 —— 它可能正卡在一个等待里）。
+///
+/// Ctrl-C 绕过暂停闸：这是用户明确点了「停止并中断」，不是 Agent 在写。
+/// 返回「确有一轮在跑」。
+pub async fn stop_run(app: &AppHandle, state: &AppState, run: &str, send_ctrl_c: bool) -> bool {
+    let was_running = state.act.cancel(run);
+    if send_ctrl_c {
+        for session in state.act.control.sessions_of(run) {
+            if let Err(e) = write_to(state, &session, &[0x03]).await {
+                tracing::warn!("停止时向 {session} 发送 Ctrl-C 失败：{e}");
+            }
+        }
+    }
+    state.act.release_control(app, run);
+    was_running
 }
 
 /// 请人点头。超时（或 UI 崩了导致发送端被 drop）一律按**拒绝**处理。
@@ -2498,6 +2613,11 @@ pub async fn run(
     let Some(cancel) = runtime.begin(&req.session_id) else {
         return Err(AgentError::Busy);
     };
+    // 这一轮开始驾驶发起会话；任何出口（含出错 return）drop 时都会还给用户
+    let _lease = ControlLease { app, rt: runtime, run: req.session_id.clone() };
+    if let Some(st) = runtime.control.acquire(&req.session_id, &req.session_id) {
+        emit_control(app, &req.session_id, &[req.session_id.clone()], st);
+    }
     let acct = cfg.active_account();
     let max_bytes = if acct.max_context_bytes == 0 {
         super::DEFAULT_MAX_CONTEXT_BYTES
@@ -2539,13 +2659,42 @@ pub async fn run(
     let mut marks: HashMap<String, u64> = HashMap::new();
     // 动作块写歪的次数。允许模型改一次，但不许它拿这个把步数刷完。
     let mut misfires = 0usize;
+    // 用户接管且等到超时的次数（见 `MAX_TOOK_OVER`）
+    let mut took_over_times = 0usize;
     // 服务方不认 tools 时置 false：此后一律走围栏协议，不再每轮都白试一次。
     let mut use_tools = true;
     let specs = tool_specs();
+    // 本轮动作里是否撞上了「用户接管且超时」：置位后跳出当前动作列表，别再逐个空等
+    let mut took_over: bool;
+    // 写 pty 之前的控制权闸（`gate_drive`）：Paused 就等用户交还；取消直接跳出动作列表
+    // （外层循环顶会收尾），等满上限则标记 `took_over`。
+    macro_rules! drive_gate {
+        ($target:expr) => {
+            match gate_drive(app, runtime, &session, $target, &cancel).await {
+                control::PauseWait::Ready => {}
+                control::PauseWait::Cancelled => break,
+                control::PauseWait::TookOver => {
+                    took_over = true;
+                    break;
+                }
+            }
+        };
+    }
 
     loop {
         if cancel.load(Ordering::Relaxed) {
             emit_step(app, &session, StepPayload { text: Some("已取消。".into()), ..StepPayload::new("note", step) });
+            break;
+        }
+        if took_over_times >= MAX_TOOK_OVER {
+            emit_step(
+                app,
+                &session,
+                StepPayload {
+                    text: Some("用户一直在接管终端，本轮先停下；交还后可以再让我继续。".into()),
+                    ..StepPayload::new("note", step)
+                },
+            );
             break;
         }
         if step >= MAX_STEPS {
@@ -2677,11 +2826,15 @@ pub async fn run(
             );
         }
 
+        took_over = false;
         for action in actions {
             if cancel.load(Ordering::Relaxed) {
                 feedback.push_str("（用户取消了后续动作，请直接给出结论。）\n");
                 break;
             }
+            // 开始下一个动作之前先看控制权：用户正在终端里操作时不抢（读屏 / 等待也算，
+            // 此刻的屏幕是用户在打字的屏幕）。发起会话始终是被驾驶的。
+            drive_gate!(&session);
             // 一轮内的多个动作共用同一个 step 号：UI 按 step 折叠，同一步归在一张卡里
             match action {
                 AgentAction::Reject { command, hint } => {
@@ -2818,6 +2971,8 @@ pub async fn run(
                         }
                     }
 
+                    // 审批都过了、真要写之前最后看一眼：别往用户正在打的字里插命令
+                    drive_gate!(&target_id);
                     match run_one(
                         state,
                         app,
@@ -3083,6 +3238,7 @@ pub async fn run(
                         }
                     }
 
+                    drive_gate!(&target_id);
                     emit_interact(app, &session, "keys", step, &target_id, &label, Some(&shown), None, None, None);
                     match send_keys(state, &target_id, &bytes).await {
                         Ok(tail) => {
@@ -3308,6 +3464,10 @@ pub async fn run(
                             .await;
                     runtime.unregister_secret(&request_id);
 
+                    // 用户可能在填密码卡片的这段时间里自己动了终端：写之前再看一眼。
+                    // 放弃时 `answered` 随 break 被 drop，`Zeroizing` 擦掉密码。
+                    drive_gate!(&target_id);
+
                     // 写入前记起点：之后的才是这个密码引出的输出
                     let mark = state.agent.pushed(&target_id).unwrap_or_default();
                     let (status, tail) = secret::deliver(
@@ -3511,6 +3671,19 @@ pub async fn run(
                     }
                 }
             }
+        }
+
+        if took_over {
+            took_over_times += 1;
+            emit_step(
+                app,
+                &session,
+                StepPayload {
+                    text: Some("你接管了终端，等待交还超时，这一步没有执行。".into()),
+                    ..StepPayload::new("note", step)
+                },
+            );
+            feedback.push_str(TOOK_OVER_FEEDBACK);
         }
     }
 

@@ -30,9 +30,11 @@ import {
 import { GhostText, cursorAtLineEnd, cursorFollowsTyped } from "../lib/ghost";
 import { ImeGuard, type KeyLike } from "../lib/ime";
 import { buildUserCommandReport } from "../lib/userCommand";
+import { createControlGate } from "../lib/control";
 
 import {
   api,
+  onAgentControl,
   onLocalClosed,
   onLocalData,
   onTermClosed,
@@ -734,6 +736,28 @@ export default function TerminalView({
         : api.sshWrite(tabId, stringToBytes(d));
     sendRef.current = send;
 
+    // ——— Agent 控制权闸 ———
+    // 平时（没有 Agent 在驾驶这个终端）闸是关的：每个键只多一次布尔判断，不发 IPC。
+    // Agent 驾驶时闸开着，用户第一次真的打字就通知后端一次（→ Paused），随即闸关。
+    // 字节本身永远先发给 pty，闸只旁观，不拦、不延迟。
+    const controlGate = createControlGate(() => {
+      api.agentControlUserInput(tabId).catch(() => {});
+    });
+    let sawControlEvent = false;
+    onAgentControl(tabId, (p) => {
+      // 同一频道也会收到「以本会话为发起方的运行」驾驶别的会话的状态，只认自己的
+      if (disposed || p.session !== tabId) return;
+      sawControlEvent = true;
+      controlGate.set(p.state);
+    }).then((u) => cleanups.push(u));
+    // 挂载时对一次账（比如终端是在 Agent 已经在跑时才重建的）；期间若已有事件到达，以事件为准
+    api
+      .agentControlGet(tabId)
+      .then((st) => {
+        if (!disposed && !sawControlEvent) controlGate.set(st);
+      })
+      .catch(() => {});
+
     /**
      * 所有「用户敲进来的字节」的唯一出口。
      *
@@ -746,6 +770,8 @@ export default function TerminalView({
       // 旁路监听（宏录制、宏回放时「用户插了一脚就中止」）。发不发送由这里决定，监听方只读
       emitInput(tabId, d);
       send(d).catch(() => {});
+      // 用户键入 → 若 Agent 正在驾驶则让它暂停（字节已发出，这里只通知，不拦）
+      controlGate.onInput(d);
       // 新行开始要清掉上一行的回显标记，否则密码行的「已回显过」旧状态会把
       // 紧接着敲的命令蹭进历史
       if (!lineRef.current.text) lineEchoedRef.current = false;

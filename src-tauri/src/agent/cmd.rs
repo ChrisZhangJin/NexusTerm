@@ -8,6 +8,7 @@ use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use super::act::{self, AgentRunRequest, ExecResult, OpenKind, OpenSpec};
 use super::{capture, load_config, save_config, AgentConfig, AgentError};
 use crate::agent::buffer::BufferStats;
+use crate::agent::control::{ControlEvent, ControlState};
 use crate::agent::llm;
 use crate::cmd::AppState;
 
@@ -196,18 +197,56 @@ pub async fn agent_run(
 
 /// 取消该会话正在进行的这一轮 Agentic 运行（中止整条连锁操作）。
 ///
+/// `send_ctrl_c = true` 时还会给它驾驶的会话发一个 Ctrl-C（`\x03`），打断正在跑的前台进程；
+/// 省略 / false 只停 Agent、不碰终端。无论哪种，停止后控制权都回到用户
+/// （`nx://agent/control` 推 `userDriving`）。
+///
 /// 幂等：没有在跑时什么都不做 —— 用户连点两次不该弹错误。
 #[tauri::command]
-pub fn agent_run_cancel(session_id: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn agent_run_cancel(
+    session_id: String,
+    send_ctrl_c: Option<bool>,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
     if session_id.trim().is_empty() {
         return Err(AgentError::NoSession(session_id).to_string());
     }
-    if state.act.cancel(&session_id) {
-        tracing::info!("Agentic 运行已请求取消：{}", session_id);
+    let ctrl_c = send_ctrl_c.unwrap_or(false);
+    if act::stop_run(&app, &state, &session_id, ctrl_c).await {
+        tracing::info!("Agentic 运行已请求取消：{}（Ctrl-C：{}）", session_id, ctrl_c);
     } else {
         tracing::debug!("取消请求被忽略，该会话没有进行中的 Agentic 运行：{}", session_id);
     }
     Ok(())
+}
+
+// ——— 终端控制权（人 / Agent / 暂停） ———
+
+/// 查询某会话此刻的控制权状态。终端挂载 / 面板打开时对一次账（事件只在变化时推）。
+#[tauri::command]
+pub fn agent_control_get(session_id: String, state: State<'_, AppState>) -> ControlState {
+    state.act.control.state(&session_id)
+}
+
+/// 用户在一个 Agent 正在驾驶的终端里敲了键。**前端只在状态切换时调一次**
+/// （键盘热路径上没有 Agent 驾驶时一个 IPC 都不发）。后端：AgentDriving → Paused 并推事件；
+/// 其余状态空操作。
+#[tauri::command]
+pub fn agent_control_user_input(session_id: String, state: State<'_, AppState>, app: AppHandle) {
+    state.act.user_control(&app, &session_id, ControlEvent::UserInput);
+}
+
+/// 用户点「接管」：Agent 立刻让路（等同于自己敲了键），直到「交还」。
+#[tauri::command]
+pub fn agent_control_takeover(session_id: String, state: State<'_, AppState>, app: AppHandle) {
+    state.act.user_control(&app, &session_id, ControlEvent::Takeover);
+}
+
+/// 用户点「交还」：Paused → AgentDriving，等着的 Agent 继续。
+#[tauri::command]
+pub fn agent_control_handback(session_id: String, state: State<'_, AppState>, app: AppHandle) {
+    state.act.user_control(&app, &session_id, ControlEvent::Handback);
 }
 
 /// 答复一次审批请求。`approved = false` 或请求已超时，都按「不执行」处理。
