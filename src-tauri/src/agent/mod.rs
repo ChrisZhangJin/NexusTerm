@@ -24,6 +24,8 @@ pub mod history;
 pub mod interact;
 pub mod llm;
 pub mod prompt;
+pub mod recorder;
+pub mod recorder_cmd;
 pub mod redact;
 pub mod secret;
 pub mod skill;
@@ -402,6 +404,8 @@ pub struct AgentManager {
     sessions: Mutex<HashMap<String, SessionBuffer>>,
     /// 每会话的统一时间线（2.5，见 `timeline.rs`）。与 `sessions` **不嵌套持锁**。
     timelines: Mutex<timeline::Timelines>,
+    /// 每会话的录制状态（3.2，见 `recorder.rs`）。与 `sessions` / `timelines` **不嵌套持锁**。
+    recordings: Mutex<recorder::Recordings>,
 }
 
 impl AgentManager {
@@ -411,6 +415,7 @@ impl AgentManager {
             auto_attach: AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
             timelines: Mutex::new(HashMap::new()),
+            recordings: Mutex::new(HashMap::new()),
         }
     }
 
@@ -580,6 +585,7 @@ impl AgentManager {
     pub fn remove(&self, session_id: &str) {
         self.sessions.lock().remove(session_id);
         self.timelines.lock().remove(session_id);
+        self.recordings.lock().remove(session_id);
     }
 
     pub fn stats(&self, session_id: &str) -> Option<BufferStats> {

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import ConfirmDialog, { type ConfirmOptions } from "./ConfirmDialog";
 import Timeline from "./Timeline";
+import { RecordingBadge } from "./RecorderBar";
 import {
   api,
   onAgentApprove,
@@ -773,6 +774,7 @@ export function AgentPanel({
     <div className={`ap-root${view === "timeline" ? " show-tl" : ""}`}>
       <div className="ap-head">
         <span className="ap-title">Nexus AI Agent</span>
+        <RecordingBadge sessionId={sessionId} />
         <div className="ap-tabs" role="tablist">
           <button
             role="tab"
@@ -802,7 +804,9 @@ export function AgentPanel({
         </button>
       </div>
 
-      {view === "timeline" && <Timeline sessionId={sessionId} />}
+      {view === "timeline" && (
+        <Timeline sessionId={sessionId} hostLabel={sessions.find((s) => s.id === sessionId)?.label} />
+      )}
 
       <div className="ap-status">
         <span className="ap-stat">

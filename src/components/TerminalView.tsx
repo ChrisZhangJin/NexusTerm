@@ -30,6 +30,8 @@ import {
 import { GhostText, cursorAtLineEnd, cursorFollowsTyped } from "../lib/ghost";
 import { ImeGuard, type KeyLike } from "../lib/ime";
 import { buildUserCommandReport } from "../lib/userCommand";
+import { captureLineStart, readLogicalLine, recorderTapAction, type LineStart } from "../lib/termLine";
+import { isRecording, watchRecording } from "../lib/useRecorder";
 import { createControlGate } from "../lib/control";
 
 import {
@@ -213,6 +215,31 @@ function pushUserCommand(sessionId: string, committed: string, echoed: boolean, 
   void api.agentUserCommand(sessionId, r.line, r.noEcho).catch(() => {});
 }
 
+/**
+ * 录制中（3.2）补报行状态机没能交出的操作：Ctrl-C 等按键、空回车、↑ 历史 / Tab 补全出来的整行。
+ * 调用方先问 `isRecording`，没在录制时这里一次都不会走到。
+ */
+function tapRecorder(
+  sessionId: string,
+  term: Terminal,
+  data: string,
+  committed: string | null,
+  wasKnown: boolean,
+  start: LineStart | null,
+): void {
+  const buf = term.buffer.active;
+  const act = recorderTapAction({
+    data,
+    committed,
+    wasKnown,
+    altScreen: buf.type !== "normal",
+    recover: () => readLogicalLine(buf, start),
+  });
+  if (!act) return;
+  if (act.kind === "keys") void api.agentUserKeys(sessionId, act.keys).catch(() => {});
+  else pushUserCommand(sessionId, act.line, true, false);
+}
+
 export default function TerminalView({
   tabId,
   active,
@@ -324,6 +351,10 @@ export default function TerminalView({
    * `cursorFollowsTyped` 永远匹配不上；回了车却从没见过回显就不记进历史。
    */
   const lineEchoedRef = useRef(false);
+  /** 录制用：当前这行输入的起点（提示符之后）。↑ 历史 / Tab 补全后靠它把整行从屏幕读回来 */
+  const lineStartRef = useRef<LineStart | null>(null);
+  // 录制状态由后端事件驱动（面板可能浮出在另一个窗口里按的「开始录制」），终端只需同步问 `isRecording`
+  useEffect(() => watchRecording(tabId), [tabId]);
   const ghostRef = useRef(new GhostText());
   const hintsRef = useRef<CompletionItem[]>([]);
   /**
@@ -479,6 +510,7 @@ export default function TerminalView({
   const runTypedLine = useCallback(() => {
     dismissHints();
     // 走的是与「自己敲回车」同一条记账路径：行状态提交 + 进历史，再发 \r。
+    const wasKnown = lineRef.current.known;
     const committed = feedKeys(lineRef.current, "\r");
     if (committed) {
       if (lineEchoedRef.current && termRef.current?.buffer.active.type === "normal") {
@@ -486,6 +518,9 @@ export default function TerminalView({
       }
       pushUserCommand(tabId, committed, lineEchoedRef.current, termRef.current?.buffer.active.type !== "normal");
       lineEchoedRef.current = false;
+    }
+    if (termRef.current && isRecording(tabId)) {
+      tapRecorder(tabId, termRef.current, "\r", committed, wasKnown, lineStartRef.current);
     }
     sendRef.current("\r");
   }, [dismissHints]);
@@ -775,6 +810,10 @@ export default function TerminalView({
       // 新行开始要清掉上一行的回显标记，否则密码行的「已回显过」旧状态会把
       // 紧接着敲的命令蹭进历史
       if (!lineRef.current.text) lineEchoedRef.current = false;
+      // 录制中：新一行的第一个键到来时屏幕光标还停在提示符末尾，记下它作为「这行输入的起点」
+      const recording = isRecording(tabId);
+      const wasKnown = lineRef.current.known;
+      if (recording && wasKnown && !lineRef.current.text) lineStartRef.current = captureLineStart(term.buffer.active);
       // 喂键攒行（同步、纯字符串运算），候选留到下一帧再算
       const committed = feedKeys(lineRef.current, d);
       if (committed) {
@@ -785,6 +824,7 @@ export default function TerminalView({
         pushUserCommand(tabId, committed, lineEchoedRef.current, term.buffer.active.type !== "normal");
         lineEchoedRef.current = false;
       }
+      if (recording) tapRecorder(tabId, term, d, committed, wasKnown, lineStartRef.current);
       refreshHintsSoon();
     };
 

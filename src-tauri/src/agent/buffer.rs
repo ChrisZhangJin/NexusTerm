@@ -425,11 +425,11 @@ impl SessionBuffer {
         self.user_cmds.since_seq(after)
     }
 
-    /// 终端此刻是否停在密码提示上。
+    /// 最近至少 `max_bytes` 字节的**程序输出（Out 段）**，剥 ANSI、时间正序。
     ///
-    /// **只看程序输出（Out 段）**：人敲进去的字符在 In 段里，混进来会把
-    /// `Password:` 之后的内容当成提示符的一部分。
-    fn awaiting_password(&self) -> bool {
+    /// 只看 Out：人敲进去的字符在 In 段里，混进来会把 `Password:` 之后的内容
+    /// 当成提示符的一部分。给「判密码提示」与录制器（3.2）判「用户是在回答什么提示」共用。
+    pub fn out_tail(&self, max_bytes: usize) -> String {
         let mut picked: Vec<String> = Vec::new();
         let mut total = 0usize;
         for chunk in self.chunks.iter().rev() {
@@ -439,12 +439,54 @@ impl SessionBuffer {
             let text = chunk.text();
             total += text.len();
             picked.push(text);
-            if total >= SECRET_PROBE_BYTES {
+            if total >= max_bytes {
                 break;
             }
         }
         picked.reverse();
-        let tail = picked.concat();
+        picked.concat()
+    }
+
+    /// 从位置 `mark` 往后，**输入段（In）**里提交了多少次回车（`\r`，或不跟在 `\r` 后的 `\n`；
+    /// `\r\n` 算一次）。录制器（3.2）据此对账「终端实际收到的提交」与「前端推来的命令」：
+    /// 前者多出来的就是没被捕获的操作（历史回溯 / 片段 / 快速发送 / 宏回放 / 全屏程序里的回车）。
+    /// 与 [`Self::out_since`] 同坐标；`mark` 之前已被环形缓冲丢掉的部分只会少算、不会多算。
+    pub fn in_enters_since(&self, mark: u64) -> u32 {
+        let start = self.pushed - self.bytes as u64;
+        let mut skip = mark.saturating_sub(start).min(self.bytes as u64) as usize;
+        let mut n = 0u32;
+        let mut prev_cr = false;
+        for chunk in &self.chunks {
+            let len = chunk.data.len();
+            if skip >= len {
+                skip -= len;
+                continue;
+            }
+            if chunk.kind == StreamKind::In {
+                for &b in chunk.data.iter().skip(skip) {
+                    match b {
+                        b'\r' => {
+                            n = n.saturating_add(1);
+                            prev_cr = true;
+                            continue;
+                        }
+                        b'\n' if !prev_cr => n = n.saturating_add(1),
+                        _ => {}
+                    }
+                    prev_cr = false;
+                }
+            }
+            skip = 0;
+        }
+        n
+    }
+
+    /// 终端此刻是否停在密码提示上。
+    ///
+    /// **只看程序输出（Out 段）**：人敲进去的字符在 In 段里，混进来会把
+    /// `Password:` 之后的内容当成提示符的一部分。
+    fn awaiting_password(&self) -> bool {
+        let tail = self.out_tail(SECRET_PROBE_BYTES);
         let g = classify(&tail, false);
         g.kind == PromptKind::Password && g.confidence >= SECRET_CONFIDENCE
     }

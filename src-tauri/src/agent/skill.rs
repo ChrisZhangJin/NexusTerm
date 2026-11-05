@@ -543,7 +543,7 @@ fn has_control(s: &str, allow_tab: bool) -> bool {
 }
 
 /// 疑似写死的口令。返回命中的说明。宁可少报：只抓形状很确定的。
-fn literal_secret_hint(text: &str) -> Option<&'static str> {
+pub(crate) fn literal_secret_hint(text: &str) -> Option<&'static str> {
     static RES: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     let res = RES.get_or_init(|| {
         [

@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api, onAgentTimeline } from "../api";
+import { RecorderControls, RecorderDraftCard } from "./RecorderBar";
 import {
   ACTOR_LABEL,
   KIND_META,
@@ -76,7 +77,7 @@ const Row = memo(
  * - 自动滚动只在贴底时生效，用户往上翻了就不再抢滚动条，并提示有几条新事件；
  * - 密码永远只有占位，这里拿不到也不会显示任何密文。
  */
-export default function Timeline({ sessionId }: { sessionId: string }) {
+export default function Timeline({ sessionId, hostLabel }: { sessionId: string; hostLabel?: string }) {
   const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [opened, setOpened] = useState<ReadonlySet<number>>(() => new Set());
   const [unseen, setUnseen] = useState(0);
@@ -170,6 +171,7 @@ export default function Timeline({ sessionId }: { sessionId: string }) {
     <div className="ap-tl">
       <div className="tl-bar">
         <span className="tl-count">{rows.length} 条</span>
+        <RecorderControls sessionId={sessionId} hostLabel={hostLabel} />
         <span className="tl-legend">
           <span className="tl-badge user">用户</span>
           <span className="tl-badge agent">Agent</span>
@@ -178,6 +180,7 @@ export default function Timeline({ sessionId }: { sessionId: string }) {
           刷新
         </button>
       </div>
+      <RecorderDraftCard sessionId={sessionId} />
       <div className="tl-list" ref={listRef} onScroll={onScroll}>
         {rows.length === 0 ? (
           <div className="ap-empty">

@@ -2138,3 +2138,31 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 }
 .note-input:focus { outline: none; border-color: var(--accent); }
 .note-input::placeholder { color: var(--text-dim); }
+
+/* 录制器（3.2）：🔴 指示、开始 / 结束按钮、草稿预览 */
+.rec-badge {
+  flex: none; display: inline-flex; align-items: center; gap: 5px;
+  padding: 1px 8px; border-radius: 10px; font-size: 11px; color: #ff6b6b;
+  border: 1px solid color-mix(in srgb, #ff6b6b 45%, transparent);
+  background: color-mix(in srgb, #ff6b6b 12%, transparent);
+}
+.rec-dot { width: 7px; height: 7px; border-radius: 50%; background: #ff4d4f; animation: rec-blink 1.2s ease-in-out infinite; }
+@keyframes rec-blink { 50% { opacity: .25; } }
+.rec-btn.on { color: #ff6b6b; border-color: #ff6b6b; }
+.rec-btn:hover { color: var(--text); border-color: var(--accent); }
+.rec-btn.on:hover { color: #ff6b6b; border-color: #ff6b6b; }
+.rec-card {
+  flex: none; max-height: 45%; overflow-y: auto; margin: 0 8px 6px; padding: 7px 9px;
+  border-radius: 8px; border: 1px solid var(--border); background: var(--bg-elev); font-size: 12px;
+}
+.rec-err { color: var(--danger); border-color: var(--danger); }
+.rec-card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+.rec-card-head .tl-dim { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rec-card-title { flex: none; font-weight: 600; color: var(--text); }
+.rec-warn { margin: 0 0 6px; padding: 4px 8px 4px 22px; border-radius: 6px; color: #e5c07b; background: color-mix(in srgb, #e5c07b 10%, transparent); }
+.rec-steps { margin: 0; padding-left: 20px; }
+.rec-steps li { margin: 2px 0; }
+.rec-kind { display: inline-block; margin-right: 6px; padding: 0 5px; border-radius: 6px; font-size: 10.5px; color: var(--text-dim); border: 1px solid var(--border); }
+.rec-kind.k-secret { color: var(--accent); border-color: var(--accent); }
+.rec-step-text { word-break: break-all; font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; color: var(--text); }
+.rec-notes { margin-top: 5px; font-size: 11px; }

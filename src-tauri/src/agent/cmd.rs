@@ -147,6 +147,8 @@ pub fn agent_user_command(
     let Some(entry) = state.agent.record_user_command(&session_id, &line, no_echo) else {
         return;
     };
+    // 录制中（3.2）：先记下这一行是在回答什么提示，再并入命令本身
+    super::recorder_cmd::capture_context(&app, &state, &session_id);
     // 并入统一时间线（2.5）并推给面板；命令的输出摘要等输出安静下来再补一条
     let evs = state.agent.timeline_user(&session_id, &entry);
     timeline::publish(&app, &session_id, &evs);
