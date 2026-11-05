@@ -1219,6 +1219,7 @@ export function AgentPanel({
           initialDraft={skillUi.draft}
           onClose={() => setSkillUi(null)}
           onRunSkill={sessionId && !busy ? (sk, p) => void runSkill(sk, p) : undefined}
+          scopeTarget={sessionId ? { sessionId, label: sessions.find((s) => s.id === sessionId)?.label ?? "当前会话" } : undefined}
         />}
       {memOpen && (
         <HostMemoryDialog

@@ -3,7 +3,7 @@
  * （校验、风险评估、渲染都以后端为准；这里只做编辑器要用的轻量辅助，不重复校验）。
  */
 
-import type { SkillInput, SkillRisk, SkillStep } from "../types";
+import type { SkillInput, SkillRisk, SkillStep, SkillTrustView } from "../types";
 
 /**
  * 模板里引用的参数名，规则与后端一致：`{{name}}`（两侧可有空白），name 为
@@ -98,4 +98,43 @@ export function emptySkillInput(): SkillInput {
     hostScope: { kind: "any" },
     source: "manual",
   };
+}
+
+// ——————————————————————————————— 信任分级（4.4） ———————————————————————————————
+
+/** 列表里信任徽标的外观：`tone` 对应 CSS 类（`sk-trust.<tone>`）。 */
+export interface TrustBadge {
+  label: string;
+  tone: "confirm" | "trusted" | "guarded";
+  /** 鼠标悬停的完整说明（后端给的原因） */
+  title: string;
+}
+
+/**
+ * 把后端的信任结论变成徽标。后端是权威：这里只翻译，不重算。
+ * 没拿到结论（还在加载 / 失败）时按最严的「需逐步确认」展示，不会误导成已信任。
+ */
+export function trustBadge(v: SkillTrustView | undefined): TrustBadge {
+  if (!v) return { label: "需逐步确认", tone: "confirm", title: "每个写步骤都会先询问你" };
+  switch (v.level) {
+    case "trusted":
+      return { label: "已信任（只读）", tone: "trusted", title: v.reason };
+    case "guarded":
+      return { label: "始终逐步确认", tone: "guarded", title: v.reason };
+    default:
+      return {
+        label: v.streak > 0 ? `需逐步确认 ${v.streak}/${v.needed}` : "需逐步确认",
+        tone: "confirm",
+        title: v.reason,
+      };
+  }
+}
+
+/**
+ * 当前会话下这份技能能不能跑：超出适用主机范围时返回拒绝原因（用来置灰「运行」并解释），否则 null。
+ * 只是体验层的预判，真正的拒绝在后端 `run_skill`，不依赖这里。
+ */
+export function scopeBlock(v: SkillTrustView | undefined): string | null {
+  if (!v || v.scopeOk !== false) return null;
+  return v.scopeReason?.trim() || "超出技能的适用主机范围";
 }

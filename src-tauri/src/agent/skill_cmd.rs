@@ -2,8 +2,9 @@
 //!
 //! 命名必须是 snake_case（Tauri 2 直接拿函数名当 IPC 名字）。
 //!
-//! **刻意不暴露**：`skill_record_run_result`（成功 / 失败计数）。计数是 4.4 信任分级的依据，
-//! 只能由后端回放引擎在真跑完后记，不能让前端自己改。创建 / 更新也无法带计数
+//! **刻意不暴露**：`skill_record_run` / `skill_record_run_result`（成功 / 失败计数与信任阶梯）。
+//! 计数是 4.4 信任分级的依据，只能由后端回放引擎在真跑完后记，不能让前端自己改。
+//! 前端只读得到 [`skill_trust`] 算出的结论。创建 / 更新也无法带计数
 //! （`SkillInput` 里没有这些字段）。
 
 use tauri::State;
@@ -13,7 +14,7 @@ use super::load_config;
 use super::recorder::RecordingDraft;
 use super::skill::{self, Skill, SkillInput};
 use super::skill_refine::{self, RefineLlm, RefinedSkillDraft};
-use super::skill_run;
+use super::skill_run::{self, check_scope, HostIdentity};
 use super::AgentAccount;
 use crate::cmd::AppState;
 
@@ -137,4 +138,119 @@ pub async fn skill_run(
     let ctx = skill_run::SkillRunCtx { app: &app, state: &state, runtime: &state.act, cfg: &cfg };
     let label = target_label.unwrap_or_default();
     skill_run::run_skill(&ctx, &skill, &params, &session_id, &label, opts).await
+}
+
+/// 一份 skill 给界面看的信任结论（4.4）：档位 + 原因 + 当前会话是否在适用主机范围内。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillTrustView {
+    pub id: String,
+    #[serde(flatten)]
+    pub trust: skill::TrustInfo,
+    /// 传了会话才有：`true` 在范围内、`false` 超出（运行会被拒绝）。
+    pub scope_ok: Option<bool>,
+    /// 超出范围时的原因（中文）。
+    pub scope_reason: Option<String>,
+}
+
+/// 纯逻辑：把 skill 列表映射成信任视图。`who` 为空则不做范围判断。
+pub fn build_trust_views(skills: &[Skill], who: Option<&HostIdentity>) -> Vec<SkillTrustView> {
+    skills
+        .iter()
+        .map(|s| {
+            let scope = who.map(|w| check_scope(&s.host_scope, w));
+            SkillTrustView {
+                id: s.id.clone(),
+                trust: skill::trust_info(s),
+                scope_ok: scope.as_ref().map(|r| r.is_ok()),
+                scope_reason: scope.and_then(|r| r.err()),
+            }
+        })
+        .collect()
+}
+
+/// 4.4：所有 skill 的信任档位（只读）。传 `session_id` 时同时给出「这个会话在不在各 skill 的适用主机范围内」。
+/// 档位由后端按成功次数 / 风险 / 内容指纹算出，前端无法改写。
+#[tauri::command]
+pub fn skill_trust(
+    session_id: Option<String>,
+    target_label: Option<String>,
+    state: State<'_, AppState>,
+) -> Vec<SkillTrustView> {
+    let skills = state.store.skill_list(None);
+    let who = session_id
+        .filter(|s| !s.trim().is_empty())
+        .map(|sid| HostIdentity::resolve(&state, &sid, target_label.as_deref().unwrap_or("")));
+    build_trust_views(&skills, who.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::skill::{
+        HostScope, OnUnexpected, Risk, SkillStep, TrustLevel, TRUST_MIN_SUCCESSES,
+    };
+
+    fn ro_skill(id: &str, scope: HostScope) -> Skill {
+        SkillInput {
+            name: id.into(),
+            description: String::new(),
+            params: vec![],
+            steps: vec![SkillStep::Exec {
+                command: "ls -la".into(),
+                timeout_ms: None,
+                expect_after: None,
+                on_unexpected: OnUnexpected::Ask,
+            }],
+            verify: None,
+            risk: Risk::Low,
+            host_scope: scope,
+            source: None,
+        }
+        .into_skill(id.into(), 1)
+    }
+
+    fn who(key: Option<&str>) -> HostIdentity {
+        HostIdentity { session_id: "s1".into(), label: "web-1 (root)".into(), host_key: key.map(Into::into) }
+    }
+
+    #[test]
+    fn trust_views_without_a_session_make_no_scope_claim() {
+        let skills = vec![ro_skill("a", HostScope::List { hosts: vec!["x".into()] })];
+        let v = build_trust_views(&skills, None);
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].id.as_str(), v[0].trust.level), ("a", TrustLevel::Confirm));
+        assert_eq!((v[0].scope_ok, v[0].scope_reason.clone()), (None, None));
+    }
+
+    #[test]
+    fn trust_views_flag_out_of_scope_skills_with_a_reason() {
+        let skills = vec![
+            ro_skill("any", HostScope::Any),
+            ro_skill("prod", HostScope::List { hosts: vec!["*.prod.example.com".into()] }),
+            ro_skill("web", HostScope::List { hosts: vec!["root@web.example.com".into()] }),
+        ];
+        let w = who(Some("ssh:root@web.example.com:22"));
+        let v = build_trust_views(&skills, Some(&w));
+        assert_eq!(v[0].scope_ok, Some(true));
+        assert_eq!(v[1].scope_ok, Some(false));
+        let why = v[1].scope_reason.clone().unwrap();
+        assert!(why.contains("*.prod.example.com") && why.contains("没有执行任何操作"), "{why}");
+        assert_eq!(v[2].scope_ok, Some(true));
+        assert!(v[2].scope_reason.is_none());
+    }
+
+    #[test]
+    fn trust_view_serializes_flat_camel_case_for_the_ui() {
+        let skills = vec![ro_skill("a", HostScope::Any)];
+        let v = build_trust_views(&skills, Some(&who(None)));
+        let j = serde_json::to_value(&v[0]).unwrap();
+        assert_eq!(j["id"], "a");
+        assert_eq!(j["level"], "confirm");
+        assert_eq!(j["streak"], 0);
+        assert_eq!(j["needed"], TRUST_MIN_SUCCESSES);
+        assert!(j["reason"].is_string());
+        assert_eq!(j["scopeOk"], true);
+        assert!(j["scopeReason"].is_null());
+    }
 }

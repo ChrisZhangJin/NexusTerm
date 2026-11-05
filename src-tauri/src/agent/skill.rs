@@ -58,6 +58,9 @@
 //!   录制器必须把口令步骤录成 `secret`（见 3.2）。
 //! - 导入的 skill 是**不受信输入**：限大小、严格解析、重新校验、重新评估风险，
 //!   `success_count` 清零（4.4 的信任分级据此把它当成从没跑过的新 skill），来源强制为 `imported`。
+//! - 信任分级（4.4，见 [`trust_info`]）：新 skill / 被编辑 / 导入的 skill 从「每个写步骤都确认」起步；
+//!   只读（风险 Low）的 skill 连续 [`TRUST_MIN_SUCCESSES`] 次干净成功后才免逐步确认；失败 / 偏离清零；
+//!   危险步骤任何时候都问（那在回放引擎里，不在这里）。
 //! - 风险等级 [`Risk`] 只会被抬高：[`Skill::normalize`] 把它抬到不低于 [`assess_risk`] 的结果，
 //!   且 [`validate`] 拒绝低于评估值的 skill。
 //! - 参数值（运行时给的）经 [`resolve_params`] 检查：不得含控制字符（含换行）、≤1000 字符；
@@ -358,6 +361,15 @@ pub struct Skill {
     pub fail_count: u32,
     #[serde(default)]
     pub last_run_ts: Option<i64>,
+    /// 信任阶梯（4.4）：连续「干净成功」（完整成功、验证通过、没有偏离）的次数。失败 / 偏离 /
+    /// 内容被改 / 导入都会让它回到 0。只有 `store::skills::skill_record_run` 能增加；
+    /// **不序列化**（不进导出文件、不给前端），前端看到的是 [`trust_info`] 算出来的结论。
+    #[serde(default, skip_serializing)]
+    pub trust_streak: u32,
+    /// 上一次让 `trust_streak` 增长时的 [`trust_fingerprint`]。信任只在它与当前指纹一致时有效：
+    /// 即使有某条路径改了步骤却忘了清零，指纹对不上，信任也自动失效。
+    #[serde(default, skip_serializing)]
+    pub trust_hash: String,
     #[serde(default)]
     pub created_at: i64,
     #[serde(default)]
@@ -408,6 +420,8 @@ impl SkillInput {
             success_count: 0,
             fail_count: 0,
             last_run_ts: None,
+            trust_streak: 0,
+            trust_hash: String::new(),
             created_at: now,
             updated_at: now,
             schema_version: SCHEMA_VERSION,
@@ -1169,6 +1183,8 @@ pub fn export_text(skill: &Skill) -> String {
     s.success_count = 0;
     s.fail_count = 0;
     s.last_run_ts = None;
+    s.trust_streak = 0;
+    s.trust_hash.clear();
     let v = serde_json::json!({
         "format": EXPORT_FORMAT,
         "version": SCHEMA_VERSION,
@@ -1207,12 +1223,109 @@ pub fn import_text(text: &str, new_id: String, now: i64) -> Result<Skill, Vec<St
     skill.success_count = 0;
     skill.fail_count = 0;
     skill.last_run_ts = None;
+    // 导入是不受信来源：信任回到「首次运行」的起点（文件里即使带了这两个字段也不采信）
+    skill.trust_streak = 0;
+    skill.trust_hash.clear();
     skill.created_at = now;
     skill.updated_at = now;
     skill.schema_version = SCHEMA_VERSION;
     skill.normalize();
     validate(&skill)?;
     Ok(skill)
+}
+
+// ——————————————————————————————— 信任分级（4.4） ———————————————————————————————
+
+/// 免逐步确认所需的连续「干净成功」次数。
+pub const TRUST_MIN_SUCCESSES: u32 = 3;
+
+/// 技能当前所处的信任档位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustLevel {
+    /// 每个写步骤都要确认（新建 / 被改过 / 导入 / 失败过 / 成功次数还不够）。
+    Confirm,
+    /// 只读且连续干净成功 N 次：自动模式下免逐步确认（危险步骤与审批模式照旧问）。
+    Trusted,
+    /// 风险等级不是只读（Medium / High）：不参与阶梯，永远逐步确认。
+    Guarded,
+}
+
+/// 给界面 / 回放引擎看的信任结论。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustInfo {
+    pub level: TrustLevel,
+    /// 当前连续干净成功次数（内容变更后的旧值按 0 计）。
+    pub streak: u32,
+    pub needed: u32,
+    /// 一句话原因（中文，直接给人看，也用在审批卡上）。
+    pub reason: String,
+}
+
+/// 实际风险：存的风险与重新评估取大（防止库里被改低；风险只升不降）。
+pub fn effective_risk(skill: &Skill) -> Risk {
+    skill.risk.max(assess_risk(&skill.steps).risk)
+}
+
+/// 「会改变这份技能做什么」的内容指纹（SHA-256 十六进制）：步骤、参数、验证、适用主机、实际风险。
+/// 名称 / 描述 / 计数 / 时间不在其中。信任（`trust_streak`）只在指纹与记录时一致才有效：
+/// 即便某条路径改了内容却没清零，指纹对不上，信任照样失效。
+pub fn trust_fingerprint(skill: &Skill) -> String {
+    use sha2::{Digest, Sha256};
+    let v = serde_json::json!({
+        "steps": skill.steps,
+        "params": skill.params,
+        "verify": skill.verify,
+        "hostScope": skill.host_scope,
+        "risk": effective_risk(skill),
+    });
+    let bytes = serde_json::to_vec(&v).unwrap_or_default();
+    Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn risk_zh(r: Risk) -> &'static str {
+    match r {
+        Risk::Low => "低（只读）",
+        Risk::Medium => "中",
+        Risk::High => "高",
+    }
+}
+
+/// 算出技能当前的信任档位与原因。纯函数。
+///
+/// 阶梯：`Confirm`（起点）→ 连续 [`TRUST_MIN_SUCCESSES`] 次干净成功 → `Trusted`（仅风险 Low 的技能）。
+/// 往回掉：失败 / 偏离 → streak 清零；编辑（内容指纹变）/ 导入 → 清零；风险只升不降。
+pub fn trust_info(skill: &Skill) -> TrustInfo {
+    let needed = TRUST_MIN_SUCCESSES;
+    let risk = effective_risk(skill);
+    let valid = !skill.trust_hash.is_empty() && skill.trust_hash == trust_fingerprint(skill);
+    let streak = if valid { skill.trust_streak } else { 0 };
+    let (level, reason) = if risk > Risk::Low {
+        (
+            TrustLevel::Guarded,
+            format!("风险等级为{}：每个写步骤都需要确认（危险步骤任何时候都会询问）", risk_zh(risk)),
+        )
+    } else if streak >= needed {
+        (
+            TrustLevel::Trusted,
+            format!("只读技能，已连续成功运行 {streak} 次：自动模式下免逐步确认（危险步骤与审批模式仍会询问）"),
+        )
+    } else if skill.trust_streak >= needed {
+        (TrustLevel::Confirm, format!("技能内容在获得信任后被修改，需重新连续成功运行 {needed} 次"))
+    } else if skill.fail_count > 0 && streak == 0 {
+        (TrustLevel::Confirm, format!("最近一次运行失败或出现偏离，信任已清零：需重新连续成功运行 {needed} 次"))
+    } else if skill.success_count == 0 && skill.fail_count == 0 {
+        let why = if skill.source == SkillSource::Imported {
+            "导入的技能（来源不受信）"
+        } else {
+            "还没有运行过"
+        };
+        (TrustLevel::Confirm, format!("{why}：每个写步骤都需要确认（连续成功运行 {needed} 次后只读技能可免确认）"))
+    } else {
+        (TrustLevel::Confirm, format!("已连续成功 {streak}/{needed} 次：达到后只读技能可免逐步确认"))
+    };
+    TrustInfo { level, streak, needed, reason }
 }
 
 // ——————————————————————————————— 测试 ———————————————————————————————
@@ -1993,5 +2106,159 @@ mod tests {
         assert_eq!(s.schema_version, SCHEMA_VERSION);
         let back: Skill = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
+    }
+
+    // ——— 4.4 信任分级 ———
+
+    /// 只读（Low）技能，已经按指纹「挣到」了 `streak` 次干净成功。
+    fn earned(streak: u32) -> Skill {
+        let mut s = skill(vec![], vec![exec("ls -la")]);
+        assert_eq!(s.risk, Risk::Low);
+        s.success_count = streak;
+        s.trust_streak = streak;
+        s.trust_hash = trust_fingerprint(&s);
+        s
+    }
+
+    #[test]
+    fn trust_ladder_levels() {
+        let fresh = skill(vec![], vec![exec("ls -la")]);
+        let t = trust_info(&fresh);
+        assert_eq!((t.level, t.streak, t.needed), (TrustLevel::Confirm, 0, TRUST_MIN_SUCCESSES));
+        assert!(t.reason.contains("还没有运行过"), "{}", t.reason);
+
+        for n in 1..TRUST_MIN_SUCCESSES {
+            let t = trust_info(&earned(n));
+            assert_eq!(t.level, TrustLevel::Confirm, "{n} 次还不够");
+            assert!(t.reason.contains(&format!("{n}/{TRUST_MIN_SUCCESSES}")), "{}", t.reason);
+        }
+        let t = trust_info(&earned(TRUST_MIN_SUCCESSES));
+        assert_eq!(t.level, TrustLevel::Trusted);
+        assert!(t.reason.contains("审批模式"), "原因里要交代审批模式仍会问：{}", t.reason);
+        assert_eq!(trust_info(&earned(TRUST_MIN_SUCCESSES + 5)).level, TrustLevel::Trusted);
+    }
+
+    #[test]
+    fn trust_requires_read_only_risk() {
+        // 非只读（Medium）：再多次成功也永远逐步确认
+        let mut s = skill(vec![], vec![exec("touch /tmp/x")]);
+        assert_eq!(s.risk, Risk::Medium);
+        s.trust_streak = 99;
+        s.trust_hash = trust_fingerprint(&s);
+        let t = trust_info(&s);
+        assert_eq!(t.level, TrustLevel::Guarded);
+        assert!(t.reason.contains("中"));
+        // 高风险同理
+        let mut h = skill(vec![], vec![exec("rm -rf /var/data")]);
+        assert_eq!(h.risk, Risk::High);
+        h.trust_streak = 99;
+        h.trust_hash = trust_fingerprint(&h);
+        assert_eq!(trust_info(&h).level, TrustLevel::Guarded);
+    }
+
+    #[test]
+    fn trust_uses_reassessed_risk_not_the_stored_one() {
+        // 库里被改低的风险字段不能抬高信任：实际风险 = max(存的, 重新评估)
+        let mut s = skill(vec![], vec![exec("touch /tmp/x")]);
+        s.risk = Risk::Low;
+        assert_eq!(effective_risk(&s), Risk::Medium);
+        s.trust_streak = 99;
+        s.trust_hash = trust_fingerprint(&s);
+        assert_eq!(trust_info(&s).level, TrustLevel::Guarded);
+    }
+
+    #[test]
+    fn trust_is_void_when_content_changes_even_if_counters_survive() {
+        let mut s = earned(TRUST_MIN_SUCCESSES);
+        assert_eq!(trust_info(&s).level, TrustLevel::Trusted);
+        // 步骤被换成别的只读命令，但计数 / 指纹没被清掉：指纹对不上，信任失效
+        s.steps = vec![exec("cat /etc/hostname")];
+        let t = trust_info(&s);
+        assert_eq!(t.level, TrustLevel::Confirm);
+        assert_eq!(t.streak, 0);
+        assert!(t.reason.contains("被修改"), "{}", t.reason);
+        // 适用主机放宽也算内容变更
+        let mut s = earned(TRUST_MIN_SUCCESSES);
+        s.host_scope = HostScope::List { hosts: vec!["x".into()] };
+        assert_eq!(trust_info(&s).level, TrustLevel::Confirm);
+        // 验证条件、参数同理
+        let mut s = earned(TRUST_MIN_SUCCESSES);
+        s.verify = Some(SkillCheck { expect: "ok".into(), timeout_ms: None });
+        assert_eq!(trust_info(&s).level, TrustLevel::Confirm);
+    }
+
+    #[test]
+    fn trust_ignores_name_and_description_edits() {
+        let mut s = earned(TRUST_MIN_SUCCESSES);
+        s.name = "改个名字".into();
+        s.description = "改个描述".into();
+        assert_eq!(trust_info(&s).level, TrustLevel::Trusted);
+    }
+
+    #[test]
+    fn trust_needs_a_recorded_fingerprint() {
+        // 有计数但从没记过指纹（比如旧库升级上来）：不信任
+        let mut s = skill(vec![], vec![exec("ls -la")]);
+        s.success_count = 10;
+        s.trust_streak = 10;
+        assert_eq!(trust_info(&s).level, TrustLevel::Confirm);
+    }
+
+    #[test]
+    fn trust_reason_after_failure_and_for_imported() {
+        let mut s = skill(vec![], vec![exec("ls -la")]);
+        s.success_count = 2;
+        s.fail_count = 1;
+        let t = trust_info(&s);
+        assert_eq!(t.level, TrustLevel::Confirm);
+        assert!(t.reason.contains("失败") && t.reason.contains("清零"), "{}", t.reason);
+        let mut i = skill(vec![], vec![exec("ls -la")]);
+        i.source = SkillSource::Imported;
+        assert!(trust_info(&i).reason.contains("导入"), "{}", trust_info(&i).reason);
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_sensitive() {
+        let a = skill(vec![], vec![exec("ls -la")]);
+        let b = skill(vec![], vec![exec("ls -la")]);
+        assert_eq!(trust_fingerprint(&a), trust_fingerprint(&b));
+        assert_eq!(trust_fingerprint(&a).len(), 64);
+        let mut c = a.clone();
+        c.name = "别的名字".into();
+        c.success_count = 7;
+        c.updated_at = 999;
+        assert_eq!(trust_fingerprint(&a), trust_fingerprint(&c), "名称 / 计数 / 时间不进指纹");
+        let mut d = a.clone();
+        d.steps = vec![exec("ls -l")];
+        assert_ne!(trust_fingerprint(&a), trust_fingerprint(&d));
+        let mut e = a.clone();
+        e.host_scope = HostScope::List { hosts: vec!["h".into()] };
+        assert_ne!(trust_fingerprint(&a), trust_fingerprint(&e));
+        let mut f = a.clone();
+        f.risk = Risk::High;
+        assert_ne!(trust_fingerprint(&a), trust_fingerprint(&f), "风险变化（只会升）也让信任失效");
+    }
+
+    #[test]
+    fn trust_fields_never_serialize_and_export_import_reset_them() {
+        let s = earned(TRUST_MIN_SUCCESSES);
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("trustStreak").is_none() && v.get("trustHash").is_none() && v.get("trust_streak").is_none());
+        // 导出不带信任；即使有人手写进文件，导入也不采信
+        let text = export_text(&s);
+        assert!(!text.contains("trust"));
+        let mut root: Value = serde_json::from_str(&text).unwrap();
+        root["skill"]["trustStreak"] = json!(99);
+        root["skill"]["trustHash"] = json!("deadbeef");
+        let imported = import_text(&root.to_string(), "new-id".into(), 5).unwrap();
+        assert_eq!((imported.trust_streak, imported.trust_hash.as_str()), (0, ""));
+        assert_eq!(trust_info(&imported).level, TrustLevel::Confirm);
+        assert!(trust_info(&imported).reason.contains("导入"));
+    }
+
+    #[test]
+    fn into_skill_starts_untrusted() {
+        let s = SkillInput::from(&earned(5)).into_skill("n".into(), 1);
+        assert_eq!((s.trust_streak, s.trust_hash.as_str()), (0, ""));
     }
 }

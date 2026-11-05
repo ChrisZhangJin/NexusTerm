@@ -43,11 +43,25 @@ pub(super) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_skills_updated ON skills(updated_at);
         "#,
-    )
+    )?;
+    // 4.4 信任分级的两列：旧库补列（`ALTER … ADD COLUMN` 带默认值，纯增量；旧版本会忽略它们）
+    let has = |name: &str| -> rusqlite::Result<bool> {
+        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('skills')")?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(names.iter().any(|n| n == name))
+    };
+    if !has("trust_streak")? {
+        conn.execute("ALTER TABLE skills ADD COLUMN trust_streak INTEGER NOT NULL DEFAULT 0", [])?;
+    }
+    if !has("trust_hash")? {
+        conn.execute("ALTER TABLE skills ADD COLUMN trust_hash TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    Ok(())
 }
 
 const COLS: &str = "id, name, description, params, steps, verify, risk, host_scope, source, \
-                    success_count, fail_count, last_run_ts, created_at, updated_at, schema_version";
+                    success_count, fail_count, last_run_ts, created_at, updated_at, schema_version, \
+                    trust_streak, trust_hash";
 
 fn json<T: serde::Serialize>(v: &T) -> Result<String, String> {
     serde_json::to_string(v).map_err(|e| e.to_string())
@@ -82,6 +96,8 @@ fn row_to_skill(r: &Row) -> rusqlite::Result<Skill> {
         created_at: r.get(12)?,
         updated_at: r.get(13)?,
         schema_version: r.get::<_, i64>(14)?.max(0) as u32,
+        trust_streak: r.get::<_, i64>(15)?.max(0) as u32,
+        trust_hash: r.get(16)?,
     })
 }
 
@@ -117,7 +133,7 @@ fn fetch(conn: &Connection, id: &str) -> Result<Option<Skill>, String> {
 fn insert_row(conn: &Connection, s: &Skill) -> Result<(), String> {
     let verify = s.verify.as_ref().map(json).transpose()?;
     conn.execute(
-        &format!("INSERT INTO skills ({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)"),
+        &format!("INSERT INTO skills ({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)"),
         params![
             s.id,
             s.name,
@@ -134,6 +150,8 @@ fn insert_row(conn: &Connection, s: &Skill) -> Result<(), String> {
             s.created_at,
             s.updated_at,
             s.schema_version as i64,
+            s.trust_streak as i64,
+            s.trust_hash,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -153,6 +171,9 @@ impl Store {
         s.success_count = 0;
         s.fail_count = 0;
         s.last_run_ts = None;
+        // 信任同样只能靠真跑出来：入库的一律从「首次运行」起步（导入 / 录制 / 迁移都走这里）
+        s.trust_streak = 0;
+        s.trust_hash.clear();
         let s = validated(s)?;
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         if count(&conn)? >= MAX_SKILLS {
@@ -179,12 +200,19 @@ impl Store {
             s.fail_count = old.fail_count;
             s.last_run_ts = old.last_run_ts;
         }
+        // 信任（4.4）：用户编辑过「会改变技能做什么」的内容（步骤 / 参数 / 验证 / 范围 / 实际风险）就清零。
+        // 比 `keep_stats` 更严：用户把手填的风险调低也算（指纹含实际风险）。名称 / 描述不影响信任。
+        s.normalize();
+        if skill::trust_fingerprint(&old) == skill::trust_fingerprint(&s) {
+            s.trust_streak = old.trust_streak;
+            s.trust_hash = old.trust_hash.clone();
+        }
         let s = validated(s)?;
         let verify = s.verify.as_ref().map(json).transpose()?;
         conn.execute(
             "UPDATE skills SET name=?2, description=?3, params=?4, steps=?5, verify=?6, risk=?7,
                 host_scope=?8, success_count=?9, fail_count=?10, last_run_ts=?11, updated_at=?12,
-                schema_version=?13 WHERE id=?1",
+                schema_version=?13, trust_streak=?14, trust_hash=?15 WHERE id=?1",
             params![
                 s.id,
                 s.name,
@@ -199,6 +227,8 @@ impl Store {
                 s.last_run_ts,
                 s.updated_at,
                 s.schema_version as i64,
+                s.trust_streak as i64,
+                s.trust_hash,
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -265,21 +295,47 @@ impl Store {
         .collect()
     }
 
-    /// 记一次回放结果：成功 / 失败计数 +1，`last_run_ts` 取当前。不改 `updated_at`（运行不是编辑）。
+    /// 记一次回放结果（只动计数与信任，不改 `updated_at`——运行不是编辑）。
     /// 仅供回放引擎（后端）调用，**不**暴露为 Tauri 命令——否则前端可以自抬信任。
-    pub fn skill_record_run_result(&self, id: &str, ok: bool) -> Result<(), String> {
+    ///
+    /// - 成功 / 失败计数 +1，`last_run_ts` 取当前；
+    /// - **信任阶梯**（4.4）：只有 `ok && clean`（完整成功、验证通过、没有任何偏离）**且**
+    ///   `ran_fingerprint` 与库里**当前**内容的指纹一致（跑的就是现在存着的这份；运行途中被编辑过则不算）
+    ///   才让 `trust_streak` +1 并记下指纹；其余一律清零——失败 / 偏离 / 内容变了都会掉信任。
+    pub fn skill_record_run(&self, id: &str, ok: bool, clean: bool, ran_fingerprint: &str) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let cur = fetch(&conn, id)?.ok_or_else(|| "skill 不存在".to_string())?;
+        let fp = skill::trust_fingerprint(&cur);
+        let earn = ok && clean && !ran_fingerprint.is_empty() && ran_fingerprint == fp;
+        let (streak, hash) = if earn {
+            // 指纹变过（理论上编辑时已清零）就从 1 重新数
+            let base = if cur.trust_hash == fp { cur.trust_streak } else { 0 };
+            (base.saturating_add(1), fp)
+        } else {
+            (0, String::new())
+        };
         let col = if ok { "success_count" } else { "fail_count" };
-        let n = conn
-            .execute(
-                &format!("UPDATE skills SET {col} = {col} + 1, last_run_ts = ?2 WHERE id = ?1"),
-                params![id, now_secs()],
-            )
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Err("skill 不存在".into());
-        }
+        conn.execute(
+            &format!(
+                "UPDATE skills SET {col} = {col} + 1, last_run_ts = ?2, trust_streak = ?3, trust_hash = ?4 WHERE id = ?1"
+            ),
+            params![id, now_secs(), streak as i64, hash],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// 清零信任（不动计数）：运行里出现过偏离、但没有「完整成功 / 明确失败」的结局时用。
+    pub fn skill_drop_trust(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute("UPDATE skills SET trust_streak = 0, trust_hash = '' WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// 只记计数、不给信任加分的简化入口（成功也不算「干净」，失败照样清零信任）。
+    pub fn skill_record_run_result(&self, id: &str, ok: bool) -> Result<(), String> {
+        self.skill_record_run(id, ok, false, "")
     }
 }
 
@@ -568,5 +624,238 @@ mod tests {
         assert_eq!(saved.source, SkillSource::Imported);
         assert_eq!(saved.success_count, 0);
         assert_eq!(store.skill_list(None).len(), 2);
+    }
+
+    // ——— 4.4 信任阶梯 ———
+
+    /// 只读（Low）技能输入：`ls -la`，无参数。
+    fn ro_input(name: &str) -> SkillInput {
+        SkillInput {
+            name: name.into(),
+            description: String::new(),
+            params: vec![],
+            steps: vec![exec("ls -la")],
+            verify: None,
+            risk: Risk::Low,
+            host_scope: HostScope::Any,
+            source: None,
+        }
+    }
+
+    fn fp(store: &Store, id: &str) -> String {
+        skill::trust_fingerprint(&store.skill_get(id).unwrap())
+    }
+
+    fn level(store: &Store, id: &str) -> skill::TrustLevel {
+        skill::trust_info(&store.skill_get(id).unwrap()).level
+    }
+
+    /// 干净成功一次（带当前指纹）。
+    fn clean_run(store: &Store, id: &str) {
+        let f = fp(store, id);
+        store.skill_record_run(id, true, true, &f).unwrap();
+    }
+
+    fn clean_runs(store: &Store, id: &str, n: u32) {
+        for _ in 0..n {
+            clean_run(store, id);
+        }
+    }
+
+    #[test]
+    fn ladder_three_clean_runs_earn_trust() {
+        let (store, _) = temp_store_at("trust-ladder");
+        let s = store.skill_create(ro_input("只读")).unwrap();
+        assert_eq!(s.risk, Risk::Low);
+        assert_eq!(level(&store, &s.id), skill::TrustLevel::Confirm);
+        for n in 1..skill::TRUST_MIN_SUCCESSES {
+            clean_run(&store, &s.id);
+            assert_eq!(store.skill_get(&s.id).unwrap().trust_streak, n);
+            assert_eq!(level(&store, &s.id), skill::TrustLevel::Confirm);
+        }
+        clean_run(&store, &s.id);
+        let got = store.skill_get(&s.id).unwrap();
+        assert_eq!(got.success_count, skill::TRUST_MIN_SUCCESSES);
+        assert_eq!(skill::trust_info(&got).level, skill::TrustLevel::Trusted);
+    }
+
+    #[test]
+    fn ladder_non_read_only_never_trusted() {
+        let (store, _) = temp_store_at("trust-guarded");
+        let s = store.skill_create(input("带参数")).unwrap();
+        assert_eq!(s.risk, Risk::Medium);
+        clean_runs(&store, &s.id, 10);
+        assert_eq!(level(&store, &s.id), skill::TrustLevel::Guarded);
+    }
+
+    #[test]
+    fn ladder_failure_drops_trust_and_counts() {
+        let (store, _) = temp_store_at("trust-fail");
+        let s = store.skill_create(ro_input("a")).unwrap();
+        clean_runs(&store, &s.id, 3);
+        assert_eq!(level(&store, &s.id), skill::TrustLevel::Trusted);
+        store.skill_record_run(&s.id, false, false, &fp(&store, &s.id)).unwrap();
+        let got = store.skill_get(&s.id).unwrap();
+        assert_eq!((got.success_count, got.fail_count, got.trust_streak), (3, 1, 0));
+        assert!(got.trust_hash.is_empty());
+        assert_eq!(skill::trust_info(&got).level, skill::TrustLevel::Confirm);
+        // 重新从头数
+        clean_runs(&store, &s.id, 3);
+        assert_eq!(level(&store, &s.id), skill::TrustLevel::Trusted);
+    }
+
+    #[test]
+    fn ladder_success_with_deviation_does_not_count_and_resets() {
+        let (store, _) = temp_store_at("trust-deviation");
+        let s = store.skill_create(ro_input("a")).unwrap();
+        clean_runs(&store, &s.id, 2);
+        // 成功了，但有偏离（clean=false）：成功计数 +1，信任清零
+        store.skill_record_run(&s.id, true, false, &fp(&store, &s.id)).unwrap();
+        let got = store.skill_get(&s.id).unwrap();
+        assert_eq!((got.success_count, got.trust_streak), (3, 0));
+        assert_eq!(skill::trust_info(&got).level, skill::TrustLevel::Confirm);
+    }
+
+    #[test]
+    fn ladder_record_run_result_wrapper_never_earns() {
+        let (store, _) = temp_store_at("trust-wrapper");
+        let s = store.skill_create(ro_input("a")).unwrap();
+        for _ in 0..5 {
+            store.skill_record_run_result(&s.id, true).unwrap();
+        }
+        let got = store.skill_get(&s.id).unwrap();
+        assert_eq!((got.success_count, got.trust_streak), (5, 0));
+        assert_eq!(skill::trust_info(&got).level, skill::TrustLevel::Confirm);
+    }
+
+    #[test]
+    fn ladder_run_of_a_stale_fingerprint_does_not_earn() {
+        let (store, _) = temp_store_at("trust-stale");
+        let s = store.skill_create(ro_input("a")).unwrap();
+        let before = fp(&store, &s.id);
+        // 运行途中技能被编辑了
+        let mut edited = ro_input("a");
+        edited.steps = vec![exec("ls -l")];
+        store.skill_update(&s.id, edited).unwrap();
+        store.skill_record_run(&s.id, true, true, &before).unwrap();
+        let got = store.skill_get(&s.id).unwrap();
+        assert_eq!((got.success_count, got.trust_streak), (1, 0));
+        // 空指纹同样不算
+        store.skill_record_run(&s.id, true, true, "").unwrap();
+        assert_eq!(store.skill_get(&s.id).unwrap().trust_streak, 0);
+    }
+
+    #[test]
+    fn ladder_edit_of_behaviour_resets_trust() {
+        let (store, _) = temp_store_at("trust-edit");
+        let s = store.skill_create(ro_input("a")).unwrap();
+        clean_runs(&store, &s.id, 3);
+        assert_eq!(level(&store, &s.id), skill::TrustLevel::Trusted);
+
+        // 改步骤
+        let mut e = ro_input("a");
+        e.steps = vec![exec("cat /etc/hostname")];
+        let got = store.skill_update(&s.id, e).unwrap();
+        assert_eq!((got.trust_streak, got.trust_hash.as_str()), (0, ""));
+        assert_eq!(skill::trust_info(&got).level, skill::TrustLevel::Confirm);
+        clean_runs(&store, &s.id, 3);
+        assert_eq!(level(&store, &s.id), skill::TrustLevel::Trusted);
+
+        // 放宽适用主机
+        let mut e = ro_input("a");
+        e.steps = vec![exec("cat /etc/hostname")];
+        e.host_scope = HostScope::List { hosts: vec!["*.prod.example.com".into()] };
+        let got = store.skill_update(&s.id, e.clone()).unwrap();
+        assert_eq!(got.trust_streak, 0);
+        clean_runs(&store, &s.id, 3);
+        assert_eq!(level(&store, &s.id), skill::TrustLevel::Trusted);
+
+        // 加验证条件
+        e.verify = Some(SkillCheck { expect: "x".into(), timeout_ms: None });
+        assert_eq!(store.skill_update(&s.id, e).unwrap().trust_streak, 0);
+    }
+
+    #[test]
+    fn ladder_edit_of_name_or_description_keeps_trust() {
+        let (store, _) = temp_store_at("trust-rename");
+        let s = store.skill_create(ro_input("a")).unwrap();
+        clean_runs(&store, &s.id, 3);
+        let mut e = ro_input("改名了");
+        e.description = "新的描述".into();
+        let got = store.skill_update(&s.id, e).unwrap();
+        assert_eq!(got.trust_streak, 3);
+        assert_eq!(skill::trust_info(&got).level, skill::TrustLevel::Trusted);
+    }
+
+    #[test]
+    fn ladder_risk_edit_resets_trust() {
+        let (store, _) = temp_store_at("trust-risk");
+        let s = store.skill_create(ro_input("a")).unwrap();
+        clean_runs(&store, &s.id, 3);
+        let mut e = ro_input("a");
+        e.risk = Risk::High;
+        let got = store.skill_update(&s.id, e).unwrap();
+        assert_eq!(got.trust_streak, 0);
+        assert_eq!(skill::trust_info(&got).level, skill::TrustLevel::Guarded);
+    }
+
+    #[test]
+    fn ladder_import_and_insert_start_untrusted_even_with_forged_fields() {
+        let (store, _) = temp_store_at("trust-insert");
+        let mut forged = ro_input("forged").into_skill("forged-id".into(), 1);
+        forged.trust_streak = 99;
+        forged.trust_hash = skill::trust_fingerprint(&forged);
+        let got = store.skill_insert(forged).unwrap();
+        assert_eq!((got.trust_streak, got.trust_hash.as_str()), (0, ""));
+        assert_eq!(skill::trust_info(&got).level, skill::TrustLevel::Confirm);
+
+        // 已受信的技能导出 -> 导入：不带信任
+        clean_runs(&store, &got.id, 3);
+        assert_eq!(level(&store, &got.id), skill::TrustLevel::Trusted);
+        let text = skill::export_text(&store.skill_get(&got.id).unwrap());
+        let imported = skill::import_text(&text, "imp".into(), 5).unwrap();
+        let saved = store.skill_insert(imported).unwrap();
+        assert_eq!(skill::trust_info(&saved).level, skill::TrustLevel::Confirm);
+    }
+
+    #[test]
+    fn ladder_drop_trust_keeps_counts() {
+        let (store, _) = temp_store_at("trust-drop");
+        let s = store.skill_create(ro_input("a")).unwrap();
+        clean_runs(&store, &s.id, 3);
+        store.skill_drop_trust(&s.id).unwrap();
+        let got = store.skill_get(&s.id).unwrap();
+        assert_eq!((got.success_count, got.fail_count, got.trust_streak), (3, 0, 0));
+        assert_eq!(skill::trust_info(&got).level, skill::TrustLevel::Confirm);
+    }
+
+    #[test]
+    fn ladder_trust_survives_reopen() {
+        let (store, path) = temp_store_at("trust-reopen");
+        let s = store.skill_create(ro_input("a")).unwrap();
+        clean_runs(&store, &s.id, 3);
+        drop(store);
+        let store = Store::open(path.parent().unwrap().to_path_buf()).unwrap();
+        assert_eq!(level(&store, &s.id), skill::TrustLevel::Trusted);
+    }
+
+    #[test]
+    fn old_skills_table_gets_trust_columns_and_starts_untrusted() {
+        let (store, path) = temp_store_at("trust-migrate");
+        let s = store.skill_create(ro_input("旧")).unwrap();
+        drop(store);
+        // 模拟 4.4 之前的库：去掉两列
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("ALTER TABLE skills DROP COLUMN trust_streak", []).unwrap();
+            conn.execute("ALTER TABLE skills DROP COLUMN trust_hash", []).unwrap();
+        }
+        let store = Store::open(path.parent().unwrap().to_path_buf()).unwrap();
+        let got = store.skill_get(&s.id).unwrap();
+        assert_eq!((got.trust_streak, got.trust_hash.as_str()), (0, ""));
+        assert_eq!(skill::trust_info(&got).level, skill::TrustLevel::Confirm);
+        // 之后可以正常挣信任
+        clean_runs(&store, &s.id, 3);
+        assert_eq!(level(&store, &s.id), skill::TrustLevel::Trusted);
     }
 }

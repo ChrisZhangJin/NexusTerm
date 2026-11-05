@@ -105,6 +105,15 @@
 }
 .sk-c-name { flex: 1 1 0; min-width: 0; }
 .sk-c-risk { flex: none; width: 62px; }
+.sk-c-trust { flex: none; width: 104px; display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+.sk-trust {
+  display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; cursor: help; white-space: nowrap;
+  border: 1px solid transparent;
+}
+.sk-trust.confirm { color: var(--text-dim); background: var(--bg-panel); border-color: var(--border); }
+.sk-trust.trusted { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
+.sk-trust.guarded { color: #e5c07b; background: color-mix(in srgb, #e5c07b 12%, transparent); border-color: color-mix(in srgb, #e5c07b 30%, transparent); }
+.sk-trust.scope { color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); border-color: color-mix(in srgb, var(--danger) 30%, transparent); }
 .sk-c-host { flex: none; width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
 .sk-c-src { flex: none; width: 56px; color: var(--text-dim); }
 .sk-c-cnt { flex: none; width: 78px; color: var(--text-dim); }
