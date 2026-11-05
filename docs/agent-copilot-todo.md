@@ -38,7 +38,7 @@
 - [x] **2.3 停止语义**：「停止」可选同时发 Ctrl-C；停止后状态回到 UserDriving。（面板「同时发 Ctrl-C」复选框，localStorage 持久、默认关；`agent_run_cancel(sessionId, sendCtrlC)` → `act::stop_run`：置取消、可选向被驾驶会话写 `\x03`（绕过暂停闸）、立即释放控制权。）
 - [x] **2.4 提交命令事件**：前端 `onCommandCommitted`（已有于 `TerminalView`）推给后端；后端 side buffer 增加分段后的 user command 记录，且不记录无回显（密码）输入。（回车时 `agent_user_command{sessionId,line,noEcho}` fire-and-forget；`agent/usercmd.rs` 的 `UserCommandEntry{seq,tsMs,actor,kind,line,truncated,at}` 环形 256 条；无回显（前端 `lineEchoedRef`）或后端 `prompt::classify` 判 Password >= 0.8 → 只存 `secret_input` 占位；读取走 `AgentManager::user_commands / _redacted / _since`，给模型必须用脱敏版。）
 - [ ] **2.5 统一时间线**：终端会话的事件流 `{actor: user|agent, kind: command|keys|prompt|output, ts}`；面板展示，并标明谁做的。
-- [ ] **2.6 对话与运行持久化**：跨重载保留对话；`act::run` 能带上上一轮摘要。
+- [x] **2.6 对话与运行持久化**：跨重载保留对话；`act::run` 能带上上一轮摘要。（范围=全局一份：面板对话本就全局唯一，标签 id 重启即变，按标签分桶无意义。新表 `agent_conversations(scope,messages JSON,updated_at)` + `agent_run_summaries(id,scope,ts,summary JSON)`，`CREATE IF NOT EXISTS` 纯增量；对话上限 200 条 / 1MB / 单字段 8000 字，摘要留 20 条。落盘前后端 `agent/history.rs::sanitize_messages` 统一脱敏（不看账号开关，落盘即脱敏）、丢 value/password 键。`StepPayload` 经 `emit_step` 进 `RunLogs`，`RunLogGuard` Drop 时收成 `RunSummary{goal,actions,outcome,finalState}`；`act::run` 把最近 3 条（<=3000 字、再过 `scrub`）拼在第一条 user 消息前。前端 `lib/agentHistory.ts`（纯逻辑）+ `lib/useAgentHistory.ts`，挂载读回、1.5s 防抖写盘；读回时把未收尾的审批 / 密码卡 / 进行中步骤收尾；面板新增「清空对话」真删库。）
 
 ## 阶段 3 · 学习（操作 → skill）
 

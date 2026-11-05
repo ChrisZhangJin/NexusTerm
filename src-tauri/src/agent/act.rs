@@ -55,7 +55,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use super::capture;
 use super::control::{self, ControlState};
@@ -633,7 +633,7 @@ pub struct StepPayload {
 }
 
 impl StepPayload {
-    fn new(kind: &'static str, step: usize) -> Self {
+    pub(super) fn new(kind: &'static str, step: usize) -> Self {
         Self {
             kind,
             step,
@@ -785,6 +785,10 @@ pub struct SecretRequest {
 }
 
 fn emit_step(app: &AppHandle, session: &str, payload: StepPayload) {
+    // 顺手记进这一轮的流水账，结束时收成运行摘要（2.6）。不在 `run` 里的步骤会被忽略。
+    if let Some(st) = app.try_state::<AppState>() {
+        st.act.runlog.record(session, &payload);
+    }
     let _ = app.emit(&format!("nx://agent/step/{session}"), payload);
 }
 
@@ -2063,6 +2067,8 @@ pub struct ActRuntime {
     secret_acks: Mutex<HashMap<String, tokio::sync::oneshot::Sender<SecretAnswer>>>,
     /// 各终端会话的控制权（人 / Agent / 暂停），见 `control.rs`
     pub control: control::ControlTable,
+    /// 进行中各轮运行的流水账，结束时收成摘要落库，见 `history.rs`
+    pub runlog: super::history::RunLogs,
 }
 
 impl ActRuntime {
@@ -2074,6 +2080,7 @@ impl ActRuntime {
             screen_acks: Mutex::new(HashMap::new()),
             secret_acks: Mutex::new(HashMap::new()),
             control: control::ControlTable::new(),
+            runlog: super::history::RunLogs::default(),
         }
     }
 
@@ -2256,6 +2263,28 @@ struct ControlLease<'a> {
 impl Drop for ControlLease<'_> {
     fn drop(&mut self) {
         self.rt.release_control(self.app, &self.run);
+    }
+}
+
+/// 一轮运行的收尾：任何出口（含出错 return）drop 时，把流水账收成摘要落库（2.6）。
+/// 落库失败只记日志，绝不影响这一轮的结果。
+struct RunLogGuard<'a> {
+    state: &'a AppState,
+    run: String,
+}
+
+impl Drop for RunLogGuard<'_> {
+    fn drop(&mut self) {
+        let Some(log) = self.state.act.runlog.take(&self.run) else { return };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if let Some(summary) = log.finish(now) {
+            if let Err(e) = self.state.store.agent_summary_push(&summary) {
+                tracing::warn!("保存运行摘要失败: {e}");
+            }
+        }
     }
 }
 
@@ -2618,6 +2647,16 @@ pub async fn run(
     if let Some(st) = runtime.control.acquire(&req.session_id, &req.session_id) {
         emit_control(app, &req.session_id, &[req.session_id.clone()], st);
     }
+    // 此前几轮的摘要要在 `runlog.start` 之前取（本轮自己还没落库，但保持顺序更直观）
+    let prior_runs = super::history::render_prior_runs(
+        &state.store.agent_summaries_recent(super::history::PRIOR_RUNS_IN_CONTEXT),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    );
+    runtime.runlog.start(&req.session_id, &req.question);
+    let _runlog = RunLogGuard { state, run: req.session_id.clone() };
     let acct = cfg.active_account();
     let max_bytes = if acct.max_context_bytes == 0 {
         super::DEFAULT_MAX_CONTEXT_BYTES
@@ -2638,13 +2677,12 @@ pub async fn run(
     };
 
     let system = IfAgentic::pick(&acct.system_prompt);
-    let mut messages = vec![ChatMessage::user(plan_message(
-        state,
-        req,
-        &targets,
-        max_bytes,
-        capture.as_deref(),
-        acct.redact,
+    // 上一轮摘要拼在第一条 user 消息前面（同一条消息，避免连续两条 user）；
+    // 落盘时已脱敏，开关为真时出网前再过一遍闸门。
+    let mut messages = vec![ChatMessage::user(format!(
+        "{}{}",
+        scrub(acct.redact, &prior_runs),
+        plan_message(state, req, &targets, max_bytes, capture.as_deref(), acct.redact)
     ))];
 
     let session = req.session_id.clone();
@@ -2729,6 +2767,7 @@ pub async fn run(
                 if trace_on {
                     trace::record(&session, step, "error", &e.to_string());
                 }
+                runtime.runlog.mark_error(&session);
                 // 先把自己这一轮从登记表里摘掉，再报错 —— 否则会话会被永久卡住「运行中」
                 runtime.finish(&session);
                 let _ = app.emit(&format!("nx://agent/error/{session}"), e.to_string());

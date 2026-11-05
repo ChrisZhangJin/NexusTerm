@@ -21,6 +21,7 @@ import {
 } from "../lib/control";
 import { enterVerdict, ImeGuard, isImeKey, keyInfoFrom } from "../lib/ime";
 import { matchSessions, scanMention } from "../lib/mention";
+import { useAgentHistory } from "../lib/useAgentHistory";
 import type {
   AgentApproveRequest,
   AgentDoneReason,
@@ -309,6 +310,14 @@ function finishWithoutAnswer(c: Conversation): Conversation {
   return withConclusion(c, NO_CONCLUSION);
 }
 
+/** 清空对话的确认框文案（真删已保存的对话与运行摘要） */
+const CLEAR_CONV_OPTS: ConfirmOptions = {
+  title: "清空对话",
+  message: "将删除本面板的全部对话记录与已保存的运行摘要（含重启后恢复用的那份），助手不再记得之前做过什么。此操作不可恢复。",
+  okText: "清空",
+  danger: true,
+};
+
 /** 清空记忆的确认框文案是固定的，提到组件外避免每次渲染新建对象 */
 const CLEAR_OPTS: ConfirmOptions = {
   title: "清空 AI 记忆",
@@ -365,7 +374,7 @@ export function AgentPanel({
    */
   const [runSession, setRunSession] = useState<string | null>(null);
   const [pending, setPending] = useState<
-    { kind: "clear" } | { kind: "cmd"; cmd: string } | null
+    { kind: "clear" } | { kind: "clearConv" } | { kind: "cmd"; cmd: string } | null
   >(null);
 
   /**
@@ -396,6 +405,16 @@ export function AgentPanel({
   const patch = useCallback((fn: (c: Conversation) => Conversation) => {
     setConv((prev) => fn(prev));
   }, []);
+
+  // ——— 对话持久化：重载 / 重启后恢复，变化时防抖写盘 ———
+  const history = useAgentHistory(
+    messages,
+    useCallback(
+      (fn: (prev: AgentMessage[]) => AgentMessage[]) =>
+        setConv((c) => ({ ...c, messages: fn(c.messages) })),
+      []
+    )
+  );
 
   // ——— 终端控制权（人 / Agent / 暂停） ———
 
@@ -518,6 +537,17 @@ export function AgentPanel({
       setErr(null);
     } catch (e) {
       setErr(`清空失败：${toFriendlyError(e).message}`);
+    }
+  };
+
+  /** 「清空对话」：先真删盘上的数据，成功后再清界面（失败就保持原样并报错）。 */
+  const clearConversation = async () => {
+    try {
+      await history.clear();
+      setConv((c) => ({ ...c, messages: [], interrupted: false }));
+      setErr(null);
+    } catch (e) {
+      setErr(`清空对话失败：${toFriendlyError(e).message}`);
     }
   };
 
@@ -730,6 +760,7 @@ export function AgentPanel({
     setPending(null);
     if (!ok || !p) return;
     if (p.kind === "clear") void clearMemory();
+    else if (p.kind === "clearConv") void clearConversation();
     else void insertCommand(p.cmd);
   };
 
@@ -759,6 +790,14 @@ export function AgentPanel({
           title="丢弃该会话已缓存的终端输出，助手会忘掉之前看到的内容"
         >
           清空记忆
+        </button>
+        <button
+          className="ap-mini"
+          disabled={busy}
+          onClick={() => setPending({ kind: "clearConv" })}
+          title="删除本面板的对话记录与已保存的运行摘要（重启后也不会再恢复）"
+        >
+          清空对话
         </button>
       </div>
 
@@ -1081,6 +1120,8 @@ export function AgentPanel({
           opts={
             pending.kind === "clear"
               ? CLEAR_OPTS
+              : pending.kind === "clearConv"
+              ? CLEAR_CONV_OPTS
               : {
                   title: "确认插入到终端",
                   message: "以下内容将写入当前会话的终端（只插入，不会自动回车执行）：",

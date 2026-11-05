@@ -196,6 +196,12 @@ export const api = {
     invoke<string>("agent_context", { sessionId, maxBytes: maxBytes ?? null }),
   /** 清空缓冲（让 agent 忘掉刚才的事） */
   agentClear: (sessionId: string) => invoke<void>("agent_clear", { sessionId }),
+  /** 读回已保存的面板对话（全局一份）。结构见 `lib/agentHistory`。 */
+  agentHistoryLoad: () => invoke<unknown[]>("agent_history_load"),
+  /** 覆盖保存面板对话。后端落盘前会再脱敏、截断、限量。 */
+  agentHistorySave: (messages: unknown[]) => invoke<void>("agent_history_save", { messages }),
+  /** 「清空对话」：真删已保存的对话与运行摘要。 */
+  agentHistoryClear: () => invoke<void>("agent_history_clear"),
   /** 会话没登记过旁路时返回 null，而不是抛错 */
   agentStats: (sessionId: string) =>
     invoke<AgentBufferStats | null>("agent_stats", { sessionId }),

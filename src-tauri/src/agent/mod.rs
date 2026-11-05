@@ -20,6 +20,7 @@ pub mod cmd;
 pub mod control;
 pub mod danger;
 pub mod executor;
+pub mod history;
 pub mod interact;
 pub mod llm;
 pub mod prompt;
