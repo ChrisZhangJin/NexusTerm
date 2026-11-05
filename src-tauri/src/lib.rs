@@ -312,6 +312,11 @@ pub fn run() {
             agent::skill_cmd::skill_refine_draft,
             agent::macro_migrate::macros_migrate_preview,
             agent::macro_migrate::macros_migrate,
+            agent::hostmem_cmd::host_memory_list,
+            agent::hostmem_cmd::host_memory_add,
+            agent::hostmem_cmd::host_memory_update,
+            agent::hostmem_cmd::host_memory_delete,
+            agent::hostmem_cmd::host_memory_clear,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import ConfirmDialog, { type ConfirmOptions } from "./ConfirmDialog";
 import SkillManager from "./SkillManager";
+import { HostMemoryDialog, MemoryStepCard } from "./HostMemory";
 import Timeline from "./Timeline";
 import { RecordingBadge } from "./RecorderBar";
 import {
@@ -346,6 +347,7 @@ export function AgentPanel({
   const [view, setView] = useState<"chat" | "timeline">("chat");
   // 技能管理器（3.4）。`draft` 给了就直接弹出预填的「新建技能」编辑器（录制器 / LLM 草稿 / 宏迁移用）
   const [skillUi, setSkillUi] = useState<{ draft?: SkillInput } | null>(null);
+  const [memOpen, setMemOpen] = useState(false);
 
   /**
    * Agent 面向全局：整个应用只有**一份**对话。
@@ -832,6 +834,13 @@ export function AgentPanel({
         </button>
         <button
           className="ap-mini"
+          onClick={() => setMemOpen(true)}
+          title="查看 / 编辑助手对这台主机记下的备忘（提示符、sudo 习惯、常用路径……）"
+        >
+          主机备忘
+        </button>
+        <button
+          className="ap-mini"
           disabled={busy}
           onClick={() => setPending({ kind: "clearConv" })}
           title="删除本面板的对话记录与已保存的运行摘要（重启后也不会再恢复）"
@@ -1174,6 +1183,13 @@ export function AgentPanel({
       )}
 
       {skillUi && <SkillManager initialDraft={skillUi.draft} onClose={() => setSkillUi(null)} />}
+      {memOpen && (
+        <HostMemoryDialog
+          sessionId={sessionId}
+          label={sessions.find((s) => s.id === sessionId)?.label ?? ""}
+          onClose={() => setMemOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -1259,6 +1275,7 @@ function StepCard({ step }: { step: AgentStep }) {
   if (step.kind === "note") {
     return <div className="ap-note">{step.text ?? ""}</div>;
   }
+  if (step.kind === "memory") return <MemoryStepCard step={step} />;
   // 工具调用卡片：把「调了哪个工具、传了什么参数」原样摆出来，让调用过程看得见。
   // 没有它时，模型想开新标签页会写出 `new-tab` 这种不存在的命令，敲进去只换来
   // command not found —— 看起来就像它答应了却没动手。

@@ -21,6 +21,8 @@ pub mod control;
 pub mod danger;
 pub mod executor;
 pub mod history;
+pub mod hostmem;
+pub mod hostmem_cmd;
 pub mod interact;
 pub mod llm;
 pub mod macro_migrate;

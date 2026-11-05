@@ -424,6 +424,8 @@ export interface AgentStep {
    * 只有状态——密码本身不会出现在任何事件里。
    */
   secretStatus?: AgentSecretStatus;
+  /** kind:"memory" 专用：被新增 / 删除的主机备忘 id（`command` 是操作 add | forget | read） */
+  memoryId?: string;
 }
 
 /** 终端尾部的交互提示分类（与后端 `prompt::PromptKind` 的 snake_case 名字一致） */
@@ -656,3 +658,34 @@ export interface MacroMigrationResult {
   warnings: string[];
 }
 
+
+// ——————————————————————————————— 主机记忆（Phase 4.5） ———————————————————————————————
+// 与 Rust `agent::hostmem` 对应。备忘按稳定主机键归档（ssh:user@host:port / local / tab:标签名），
+// 主机键由后端推导，前端只传会话 id + 标签名。
+
+export type HostNoteKind = "prompt" | "sudo" | "path" | "quirk" | "other";
+export type HostNoteSource = "agent" | "user";
+
+export interface HostNote {
+  id: string;
+  hostKey: string;
+  text: string;
+  kind: HostNoteKind;
+  source: HostNoteSource;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 会话所属的主机。origin = label 说明没认出主机，只是按标签名归档 */
+export interface HostRef {
+  key: string;
+  display: string;
+  origin: "ssh" | "local" | "label";
+}
+
+export interface HostMemoryView {
+  host: HostRef | null;
+  notes: HostNote[];
+  maxNotes: number;
+  maxChars: number;
+}
