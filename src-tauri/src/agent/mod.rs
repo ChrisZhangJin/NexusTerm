@@ -25,6 +25,7 @@ pub mod llm;
 pub mod prompt;
 pub mod redact;
 pub mod secret;
+pub mod timeline;
 pub mod trace;
 pub mod usercmd;
 
@@ -396,6 +397,8 @@ pub struct AgentManager {
     /// 未显式登记过的会话，默认是否旁路。
     auto_attach: AtomicBool,
     sessions: Mutex<HashMap<String, SessionBuffer>>,
+    /// 每会话的统一时间线（2.5，见 `timeline.rs`）。与 `sessions` **不嵌套持锁**。
+    timelines: Mutex<timeline::Timelines>,
 }
 
 impl AgentManager {
@@ -404,6 +407,7 @@ impl AgentManager {
             enabled: AtomicBool::new(false),
             auto_attach: AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
+            timelines: Mutex::new(HashMap::new()),
         }
     }
 
@@ -564,6 +568,7 @@ impl AgentManager {
         if let Some(buf) = self.sessions.lock().get_mut(session_id) {
             buf.clear();
         }
+        self.timeline_clear(session_id);
     }
 
     /// 会话关闭时调用。**必须调用**，否则长生命周期的 AppState 会
@@ -571,6 +576,7 @@ impl AgentManager {
     /// 调用点：`cmd::ssh_close` 与 `cmd::local_close`。
     pub fn remove(&self, session_id: &str) {
         self.sessions.lock().remove(session_id);
+        self.timelines.lock().remove(session_id);
     }
 
     pub fn stats(&self, session_id: &str) -> Option<BufferStats> {

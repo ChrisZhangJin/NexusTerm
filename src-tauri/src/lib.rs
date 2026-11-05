@@ -272,6 +272,7 @@ pub fn run() {
             agent::cmd::agent_clear,
             agent::cmd::agent_stats,
             agent::cmd::agent_user_command,
+            agent::cmd::agent_timeline,
             agent::cmd::agent_ask,
             agent::cmd::agent_cancel,
             agent::cmd::agent_test,

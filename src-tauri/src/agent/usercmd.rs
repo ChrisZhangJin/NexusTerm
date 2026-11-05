@@ -35,8 +35,7 @@ pub const MAX_LINE_BYTES: usize = 2048;
 #[serde(rename_all = "snake_case")]
 pub enum Actor {
     User,
-    /// 预留：2.5 统一时间线里 Agent 自己发的命令。本模块不会产生它。
-    #[allow(dead_code)]
+    /// 2.5 统一时间线里 Agent 自己发的动作。本模块不会产生它。
     Agent,
 }
 

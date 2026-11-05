@@ -10,6 +10,8 @@ use super::{capture, load_config, save_config, AgentConfig, AgentError};
 use crate::agent::buffer::BufferStats;
 use crate::agent::control::{ControlEvent, ControlState};
 use crate::agent::llm;
+use crate::agent::timeline;
+use crate::agent::usercmd::UserEntryKind;
 use crate::cmd::AppState;
 
 /// 浮动 Agent 窗口的固定 label。只开一个：再次调用就聚焦并切会话，不叠窗。
@@ -110,11 +112,35 @@ pub fn agent_user_command(
     line: String,
     no_echo: Option<bool>,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) {
     let no_echo = no_echo.unwrap_or(false);
     // 无回显时内容不该走到任何存储，这里先清掉，后面谁改了实现也碰不到
     let line = if no_echo { String::new() } else { line };
-    state.agent.record_user_command(&session_id, &line, no_echo);
+    let Some(entry) = state.agent.record_user_command(&session_id, &line, no_echo) else {
+        return;
+    };
+    // 并入统一时间线（2.5）并推给面板；命令的输出摘要等输出安静下来再补一条
+    let evs = state.agent.timeline_user(&session_id, &entry);
+    timeline::publish(&app, &session_id, &evs);
+    if entry.kind == UserEntryKind::Command {
+        timeline::schedule_user_flush(app, session_id, evs.last().map(|e| e.seq).unwrap_or(0));
+    }
+}
+
+/// 统一时间线（2.5）：`seq` 大于 `since_seq` 的事件，最多 `limit` 条（默认 200，超出保留最新的）。
+/// 返回**原文**（界面展示用）；给模型的版本走 `AgentManager::timeline_digest`，已脱敏。
+/// 增量更新走事件 `nx://agent/timeline/{session}`（载荷为同样结构的数组）。
+#[tauri::command]
+pub fn agent_timeline(
+    session_id: String,
+    since_seq: Option<u64>,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Vec<timeline::TimelineEvent> {
+    state
+        .agent
+        .timeline_since(&session_id, since_seq.unwrap_or(0), limit.unwrap_or(200).min(timeline::MAX_EVENTS))
 }
 
 // ——— 提问 / 取消 / 测试连接 ———

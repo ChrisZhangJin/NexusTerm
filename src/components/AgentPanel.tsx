@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import ConfirmDialog, { type ConfirmOptions } from "./ConfirmDialog";
+import Timeline from "./Timeline";
 import {
   api,
   onAgentApprove,
@@ -329,6 +330,8 @@ export function AgentPanel({
 }: AgentPanelProps) {
   const cfg = useAgentConfig();
   const ready = isAgentReady(cfg);
+  // 对话 / 时间线（2.5）视图切换。时间线只在选中时挂载（才订阅事件）；对话区只是被 CSS 藏起来，状态不丢
+  const [view, setView] = useState<"chat" | "timeline">("chat");
 
   /**
    * Agent 面向全局：整个应用只有**一份**对话。
@@ -736,9 +739,28 @@ export function AgentPanel({
   if (!visible || !sessionId) return null;
 
   return (
-    <div className="ap-root">
+    <div className={`ap-root${view === "timeline" ? " show-tl" : ""}`}>
       <div className="ap-head">
         <span className="ap-title">Nexus AI Agent</span>
+        <div className="ap-tabs" role="tablist">
+          <button
+            role="tab"
+            aria-selected={view === "chat"}
+            className={`ap-tab${view === "chat" ? " on" : ""}`}
+            onClick={() => setView("chat")}
+          >
+            对话
+          </button>
+          <button
+            role="tab"
+            aria-selected={view === "timeline"}
+            className={`ap-tab${view === "timeline" ? " on" : ""}`}
+            onClick={() => setView("timeline")}
+            title="这个终端里用户与 Agent 各做了什么"
+          >
+            时间线
+          </button>
+        </div>
         {onFloatOut && (
           <button className="ap-x ap-float" onClick={onFloatOut} title="浮出为独立窗口">
             ⧉
@@ -748,6 +770,8 @@ export function AgentPanel({
           ✕
         </button>
       </div>
+
+      {view === "timeline" && <Timeline sessionId={sessionId} />}
 
       <div className="ap-status">
         <span className="ap-stat">
