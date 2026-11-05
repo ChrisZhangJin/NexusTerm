@@ -304,6 +304,8 @@ pub fn run() {
             agent::skill_cmd::skill_export,
             agent::skill_cmd::skill_import_preview,
             agent::skill_cmd::skill_import,
+            agent::macro_migrate::macros_migrate_preview,
+            agent::macro_migrate::macros_migrate,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

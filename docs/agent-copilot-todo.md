@@ -46,7 +46,7 @@
 - [ ] **3.2 录制器**：基于 2.5 时间线录制一段操作（开始/结束），密码步骤只记 `secret` 占位。替代旧宏录制中「录下密码」的问题。
 - [ ] **3.3 Agent 整理 skill**：录制 → LLM 提取参数、前置条件、每步期望、验证 → 草稿 skill，用户可编辑后保存。
 - [x] **3.4 Skill 管理界面**：列表 / 查看 / 编辑 / 删除 / 导入导出（文本文件）。（`components/SkillManager.tsx` 列表 + 搜索 + 删除确认 + 导入（文件 → `skill_import_preview` → 确认 → `skill_import`）/ 导出（`skill_export` → 保存对话框 → `write_file`）；`SkillEditor.tsx` 查看 / 编辑（参数编辑器、按种类的步骤编辑器含增删 / 上下移 / 复制、verify、主机范围、占位符高亮、后端校验问题按步骤 / 参数逐条显示）；入口为 AgentPanel 头部「技能」按钮；风险只读（后端评估只会抬高）；secret 参数在 UI 里不能填默认值；`SkillManager` 接受 `initialDraft?: SkillInput` 供 3.2 / 3.3 / 3.5 预填新建编辑器；纯逻辑在 `lib/skillForm.ts`，自测 `tests/fe/skillform.test.ts`。）
-- [ ] **3.5 旧宏迁移**：`macros` 表数据可一键转成 skill。
+- [x] **3.5 旧宏迁移**：`macros` 表数据可一键转成 skill。（`agent/macro_migrate.rs`：纯函数转换器 `convert_macro`（打字片段合并成行；整行命令 → `exec`，Ctrl-C/D/Z 单独 `keys`，Tab/方向键等混进行里则整行记 `keys`；ssh / su / 数据库客户端等交互会话内的行一律 `keys`；`sleep` / 静默 `wait` 丢弃，仅 ≥2s 的作为上一步 `timeoutMs` 提示，带 pattern 的 `wait` 变成上一步 `expectAfter`）；来源 `migrated_macro`、主机范围不限、风险经 `assess_risk`、计数为 0、重名加 ` (2)` 后缀。**录下的密码一律不复制**：口令提示之后的行、ssh/sudo/su/mysql -p 等登录命令之后的第一行非空内容、命令行里写死的凭据（`password=` / `sshpass -p` / `echo x | sudo -S` / URL 内嵌凭据 / `curl -u` 等）、形似口令的单词、口令后的 4-8 位数字验证码，全部换成 `secret` 占位（或 `expect_respond{secret:true}`），警告只写步骤序号与类别、不引用原文；转换后过 `validate`，因凭据类问题失败的步骤同样被换成占位并报告。幂等：`store/macro_migration.rs` 的 `macro_migrations` 表（`CREATE IF NOT EXISTS` 纯增量）；不删除、不修改原宏（报告里提醒其中仍有明文）。命令 `macros_migrate_preview(ids?)`（不写库）/ `macros_migrate(ids?)`；前端 `api.macrosMigratePreview / macrosMigrate`、`lib/macroMigrate.ts`，宏管理器里「转为技能」「全部迁移」按钮 + `MacroMigrateDialog` 预览 / 结果窗口。）
 
 ## 阶段 4 · 独立执行（混合回放 + 记忆）
 
