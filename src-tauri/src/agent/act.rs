@@ -60,6 +60,7 @@ use tauri::{AppHandle, Emitter};
 use super::capture;
 use super::danger::assess;
 use super::executor::{wait_for_end, ExecEnd, ExecOutcome, WaitConfig};
+use super::interact::{self, Pattern, WaitEnd, WaitSpec};
 use super::llm::{self, ChatMessage, CONTEXT_BEGIN, CONTEXT_END};
 use super::trace;
 use super::{AgentConfig, AgentError};
@@ -130,12 +131,13 @@ pub struct AgentRunRequest {
     pub console_alt: bool,
 }
 
-/// 模型下发的一个动作。五选一：
+/// 模型下发的一个动作。八选一：
 ///
 /// - `Exec`：在某个会话上跑一条命令。
 /// - `Export`：把某个会话迄今为止的全部输出要回来（`agent::capture`）。
 /// - `Open`：开一个新会话（本地或某个已保存的 SSH 主机），可选顺手发一条命令。
 /// - `Tab`：操作窗口上的标签页（列出 / 切换 / 关闭 / 改名 / 重连）。
+/// - `Keys` / `Wait` / `Screen`：对终端的「手和眼」——发原始按键、等文字出现、读当前屏幕。
 /// - `Reject`：模型把界面动作写成了 shell 命令，被拦下来了（见 `pseudo_command_hint`）。
 ///
 /// `Tab` 与 `Exec` 有个本质区别：**它不由后端执行**。tab 是前端 React state，
@@ -146,6 +148,19 @@ pub enum AgentAction {
     Export { target: Option<String>, deep: bool },
     Open { kind: OpenKind, label: Option<String>, command: Option<String> },
     Tab { op: TabOp, target: Option<String>, name: Option<String> },
+    /// 原始按键：写进 pty 就算完，**不追加换行、不等命令结束**。
+    /// `keys` 保留模型写的转义串原文（语法见 `interact::parse_keys`），执行时才解码，
+    /// 这样审批卡 / trace 里能原样展示它「想发什么」。
+    Keys { target: Option<String>, keys: String },
+    /// 等某段文字出现（子串或 `/regex/`）或输出静止。只读旁路缓冲，不往终端写任何东西。
+    Wait {
+        target: Option<String>,
+        pattern: Option<String>,
+        timeout_ms: Option<u64>,
+        quiet_ms: Option<u64>,
+    },
+    /// 读目标会话此刻的 xterm 屏幕（含 alt screen）。
+    Screen { target: Option<String> },
     /// 不是「命令有风险」，而是「这条命令根本不该出现」。
     ///
     /// 它照样占一个动作位、照样例行走反馈链路 —— 让模型看到自己错在哪，
@@ -234,6 +249,18 @@ struct ExecBlock {
     /// `tab` + `op:"rename"` 专用：新名字。
     #[serde(default)]
     name: Option<String>,
+    /// `keys` 专用：按键串（转义语法见 `interact::parse_keys`）。
+    #[serde(default)]
+    keys: Option<String>,
+    /// `wait` 专用：子串，或 `/regex/`。
+    #[serde(default)]
+    pattern: Option<String>,
+    /// `wait` 专用：最长等多久（毫秒），后端会封顶。
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    /// `wait` 专用：连续多久没有新输出就返回（毫秒）。
+    #[serde(default)]
+    quiet_ms: Option<u64>,
 }
 
 // ——————————————————————————————— 工具声明 ———————————————————————————————
@@ -247,6 +274,9 @@ pub const TOOL_EXEC: &str = "nx_exec";
 pub const TOOL_EXPORT: &str = "nx_export";
 pub const TOOL_OPEN: &str = "nx_open_tab";
 pub const TOOL_TAB: &str = "nx_tab";
+pub const TOOL_KEYS: &str = "nx_send_keys";
+pub const TOOL_WAIT: &str = "nx_wait";
+pub const TOOL_SCREEN: &str = "nx_screen";
 
 /// 声明给模型的全部工具。
 ///
@@ -335,6 +365,76 @@ pub fn tool_specs() -> Vec<llm::ToolSpec> {
                 "required": ["op"]
             }),
         },
+        llm::ToolSpec {
+            name: TOOL_KEYS,
+            description: "向终端发送原始按键：**不追加换行、不等命令结束**，写进去就返回。\
+                          用于 nx_exec 做不到的事：vim 里按 Esc 与 :wq、回应 [Y/n] 之类的交互提示、\
+                          Ctrl-C 打断卡住的进程、Ctrl-D 退出 REPL、方向键 / Tab 补全、\
+                          在 python / mysql 等 REPL 里输入。普通的「跑一条命令看输出」仍用 nx_exec。\
+                          **绝不要用它输入密码**：遇到密码提示请停下，让用户自己在终端里输入。".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "目标会话 id。省略表示用户当前所在的会话。"
+                    },
+                    "keys": {
+                        "type": "string",
+                        "description": "按键串，解码后最长 256 字节。普通字符原样发送；\
+                                        转义：\\r 回车、\\n 换行、\\t 制表、\\e ESC、\\\\ 反斜杠、\\xNN 任意字节（\\x03 = Ctrl-C）；\
+                                        具名键：<Enter> <Tab> <Esc> <Space> <BS> <Del> <Up> <Down> <Left> <Right> \
+                                        <Home> <End> <PgUp> <PgDn> <F1>…<F12>、<C-a>…<C-z>（Ctrl 组合，如 <C-c> <C-d>）、\
+                                        <M-x>（Alt + 字符）、<lt>（字面的 <）。\
+                                        例：\"<C-c>\" 打断；\"y<Enter>\" 回答 y 并回车；\"<Esc>:wq<Enter>\" 保存退出 vim。"
+                    }
+                },
+                "required": ["keys"]
+            }),
+        },
+        llm::ToolSpec {
+            name: TOOL_WAIT,
+            description: "等终端里出现某段文字（或输出静止），不往终端写任何东西。\
+                          适合发完按键 / 启动了长任务之后，等一个提示或结束标志出现。\
+                          返回是否命中，以及等待期间输出的尾部。".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "目标会话 id。省略表示当前会话。"
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "description": "要等的文字：直接写就是子串匹配；写成 /正则/（可加 i 标志，如 /error|fail/i）则按正则匹配。\
+                                        只在**新输出**里找。省略则只等输出静止。"
+                    },
+                    "timeoutMs": {
+                        "type": "integer",
+                        "description": "最长等多久（毫秒），默认 15000，上限 60000。"
+                    },
+                    "quietMs": {
+                        "type": "integer",
+                        "description": "连续这么久（毫秒）没有新输出就算静止并返回。\
+                                        没给 pattern 时默认 1500；给了 pattern 时不设，只等命中或超时。"
+                    }
+                }
+            }),
+        },
+        llm::ToolSpec {
+            name: TOOL_SCREEN,
+            description: "读取目标会话此刻的终端屏幕文字（含 vim / less / tmux 等全屏程序的当前画面）。\
+                          想确认「现在屏幕上到底是什么」「它在等我输入什么」时用。".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "目标会话 id。省略表示当前会话。"
+                    }
+                }
+            }),
+        },
     ]
 }
 
@@ -359,6 +459,9 @@ fn tool_action_name(name: &str) -> Option<&'static str> {
         TOOL_EXPORT => Some("export"),
         TOOL_OPEN => Some("open"),
         TOOL_TAB => Some("tab"),
+        TOOL_KEYS => Some("keys"),
+        TOOL_WAIT => Some("wait"),
+        TOOL_SCREEN => Some("screen"),
         _ => None,
     }
 }
@@ -395,6 +498,9 @@ pub fn actions_from_tool_call(call: &llm::ToolCall) -> Vec<AgentAction> {
         "export" => parse_export(block),
         "open" => parse_open(block).into_iter().collect(),
         "tab" => parse_tab(block).into_iter().collect(),
+        "keys" => parse_keys_action(block),
+        "wait" => parse_wait(block),
+        "screen" => parse_screen(block),
         _ => parse_exec(block),
     }
 }
@@ -421,6 +527,9 @@ pub fn tool_label(name: &str, args: &str) -> &'static str {
         TOOL_EXEC => "执行命令",
         TOOL_EXPORT => "导出记录",
         TOOL_OPEN => "新建标签页",
+        TOOL_KEYS => "发送按键",
+        TOOL_WAIT => "等待输出",
+        TOOL_SCREEN => "读取屏幕",
         TOOL_TAB => match serde_json::from_str::<serde_json::Value>(args)
             .ok()
             .and_then(|v| v.get("op").and_then(|o| o.as_str()).map(|s| s.to_string()))
@@ -569,6 +678,39 @@ pub struct TabInfo {
     pub active: bool,
 }
 
+/// `nx://agent/screen` 的载荷：请前端把某个会话此刻的 xterm 屏幕读出来。
+///
+/// 与 `TabRequest` 同一套往返：xterm 实例只在前端，后端没有「屏幕」这个东西
+/// （旁路缓冲是字节流转录，不是渲染后的画面，vim 之类的全屏程序在里面是一团转义序列）。
+/// 全局事件、不带 session 后缀，理由同 `TabRequest`。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenRequest {
+    pub request_id: String,
+    /// 发起这次读取的会话（只为定位来源）
+    pub session_id: String,
+    /// 要读哪个会话的屏幕
+    pub target: String,
+    /// 前端最多回多少字符（取末尾）
+    pub max_chars: usize,
+}
+
+/// 前端对 `ScreenRequest` 的回执。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenReply {
+    pub ok: bool,
+    /// 屏幕文字（已摊平成纯文本）
+    #[serde(default)]
+    pub text: String,
+    /// 是否停在 alternate screen（vim / less / tmux …）
+    #[serde(default)]
+    pub alt: bool,
+    /// `ok=false` 时的原因
+    #[serde(default)]
+    pub detail: String,
+}
+
 fn emit_step(app: &AppHandle, session: &str, payload: StepPayload) {
     let _ = app.emit(&format!("nx://agent/step/{session}"), payload);
 }
@@ -626,6 +768,9 @@ fn parse_block(raw: &str) -> Vec<AgentAction> {
             "export" => parse_export(block),
             "open" => parse_open(block).into_iter().collect(),
             "tab" => parse_tab(block).into_iter().collect(),
+            "keys" => parse_keys_action(block),
+            "wait" => parse_wait(block),
+            "screen" => parse_screen(block),
             _ => parse_exec(block),
         },
         Err(_) => parse_raw_shell(raw),
@@ -706,6 +851,53 @@ fn parse_export(block: ExecBlock) -> Vec<AgentAction> {
             .map(|t| AgentAction::Export { target: Some(t), deep: block.deep })
             .collect()
     }
+}
+
+/// 把 `target` / `targets` 摊成一串目标；都没写就是 `[None]`（落到当前会话）。
+fn fan_targets(single: Option<String>, many: Vec<String>) -> Vec<Option<String>> {
+    let ts: Vec<String> = if many.is_empty() { single.into_iter().collect() } else { many };
+    let ts: Vec<String> =
+        ts.into_iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    if ts.is_empty() {
+        vec![None]
+    } else {
+        ts.into_iter().map(Some).collect()
+    }
+}
+
+/// `action:"keys"`：原始按键。`keys` 为空就不产生动作（由主循环给「缺参数」提示）。
+///
+/// 只存原文、不在这里解码：解码失败要给人看的卡片与喂回模型的原因，那是执行层的事。
+fn parse_keys_action(block: ExecBlock) -> Vec<AgentAction> {
+    let Some(keys) = block.keys.filter(|k| !k.is_empty()) else {
+        return Vec::new();
+    };
+    fan_targets(block.target, block.targets)
+        .into_iter()
+        .map(|target| AgentAction::Keys { target, keys: keys.clone() })
+        .collect()
+}
+
+/// `action:"wait"`：参数全可选（pattern / quietMs 都省略 = 等输出静止）。
+fn parse_wait(block: ExecBlock) -> Vec<AgentAction> {
+    let pattern = block.pattern.filter(|p| !p.is_empty());
+    fan_targets(block.target, block.targets)
+        .into_iter()
+        .map(|target| AgentAction::Wait {
+            target,
+            pattern: pattern.clone(),
+            timeout_ms: block.timeout_ms,
+            quiet_ms: block.quiet_ms,
+        })
+        .collect()
+}
+
+/// `action:"screen"`：读屏幕。
+fn parse_screen(block: ExecBlock) -> Vec<AgentAction> {
+    fan_targets(block.target, block.targets)
+        .into_iter()
+        .map(|target| AgentAction::Screen { target })
+        .collect()
 }
 
 /// `action:"open"`：开一个新会话。`kind:"ssh"` 必须带 `sessionRecordId`，
@@ -835,7 +1027,7 @@ pub const AGENTIC_SYSTEM_PROMPT_INTRO: &str = concat!(
 /// 之前自定义路径用的是压缩版说明，结果用户的提示词里写着「只给结论与必要命令」，
 /// 模型就真把 shell 直接抄进围栏 —— 协议写歪了，界面上什么都不发生。
 pub const ACTION_PROTOCOL: &str = concat!(
-    "【优先用工具】你有 nx_exec / nx_export / nx_open_tab / nx_tab 四个工具。",
+    "【优先用工具】你有 nx_exec / nx_send_keys / nx_wait / nx_screen / nx_export / nx_open_tab / nx_tab 七个工具。",
     "能用工具调用时**直接用工具**，不要写成下面的围栏文本；",
     "只有当你确认自己无法发起工具调用时，才退化成围栏代码块。\n",
     "**绝不要把界面动作当成 shell 命令**：`new-tab`、`reconnect`、`close-tab`、",
@@ -872,14 +1064,34 @@ pub const ACTION_PROTOCOL: &str = concat!(
     "标签页 id 与 exec 的 target 是同一套会话 id。关掉自己当前所在的那个标签页也是允许的，\n",
     "但注意：关掉之后它就不在了，这一轮里后面再有 exec 动作省略 target、想隐式落到",
     "这个会话上会失败，需要的话换一个明确的 target。\n\n",
+    "【手和眼：按键 / 等待 / 读屏】nx_exec 是「敲一行命令、等它跑完」；",
+    "终端里**正停在一个交互程序上**时它不适用，改用下面三个（围栏写法分别是 ",
+    "`{\"action\":\"keys\",\"keys\":\"…\"}` / `{\"action\":\"wait\",\"pattern\":\"…\"}` / `{\"action\":\"screen\"}`，同样可带 target）：\n",
+    "· **nx_send_keys{keys}**：写入原始按键，**不追加回车、不等命令结束**，约 0.3 秒后回一段新输出。",
+    "用于 vim（`<Esc>:wq<Enter>`）、`[Y/n]` 之类的确认（`y<Enter>`）、`python` / `mysql` 等 REPL 里输入、",
+    "方向键与 Tab 补全，以及 **Ctrl-C 打断卡住的进程（`<C-c>`）**、Ctrl-D 退出 REPL（`<C-d>`）。",
+    "按键串语法：普通字符原样发；转义 `\\r` 回车 `\\n` 换行 `\\t` 制表 `\\e` ESC `\\\\` 反斜杠 `\\xNN` 任意字节；",
+    "具名键 `<Enter> <Tab> <Esc> <Space> <BS> <Del> <Up> <Down> <Left> <Right> <Home> <End> <PgUp> <PgDn> <F1>…<F12>`、",
+    "`<C-a>`…`<C-z>`、`<M-x>`、`<lt>`（字面 `<`）。解码后最长 256 字节，超了请拆开。",
+    "要跑一条普通命令并拿它的输出，仍用 nx_exec —— 它会替你等命令结束；send_keys 不会。\n",
+    "· **nx_wait{pattern?, timeoutMs?, quietMs?}**：等新输出里出现某段文字（直接写是子串，`/正则/` 加 i 可忽略大小写），",
+    "或等输出静止；不往终端写任何东西。发完按键、启动了长任务后用它等一个提示 / 结束标志，",
+    "返回命中与否 + 期间输出的尾部。超时默认 15 秒、最多 60 秒，没命中就如实说没等到，不要假装成功。\n",
+    "· **nx_screen{}**：读目标会话**此刻的屏幕**（含 vim / less / tmux 等全屏程序的当前画面）。",
+    "拿不准「现在屏幕上是什么 / 它在等我输入什么」时先读屏，不要凭记忆盲敲按键。\n",
+    "**绝不要用 send_keys / exec 输入密码、口令、验证码、私钥口令**：看到 `Password:` / `passphrase` / `[sudo] password` 这类提示，",
+    "立刻停手，在结论里请**用户自己在终端里输入**（之后会有专门的密码通道，目前没有），输完再继续；",
+    "也不要尝试猜密码、读取用户的密码文件来代填。\n",
+    "send_keys 与 exec 一样受作用范围与审批约束；审批模式下含回车的按键会弹窗让人确认。\n\n",
     "【作用范围】你只能操作上面列出的「作用范围内」会话（含省略 target 时落到的当前会话）。",
-    "对范围外会话的 exec / export / tab 动作，以及任何 open 新会话的动作，都会被拦截或弹窗交给用户确认，",
+    "对范围外会话的 exec / send_keys / wait / screen / export / tab 动作，以及任何 open 新会话的动作，都会被拦截或弹窗交给用户确认，",
     "用户拒绝就是拒绝：不要重试、不要换个说法或换条路径绕过去，改为在结论里告诉用户",
     "需要把哪个会话加入作用范围，或请他自己操作。tab 的 list 也只会列出范围内的标签页。\n\n",
     "【规则】\n",
     "1) exec 的 command 必须是**单条单行**命令，不许用换行或 && 串联互不相关的操作；",
     "需要分几步就分几轮，每轮都会收到上一条的真实输出；\n",
-    "2) 一次最多给 12 条动作，够用为止，不要贪多；\n",
+    "2) 一次最多给 12 条动作，够用为止，不要贪多；按键类动作尤其如此 ——",
+    "每敲一下屏幕都会变，要看了效果再决定下一步的，就分轮，别在同一轮里盲发一长串；\n",
     "3) 优先用只读命令把情况看清楚：POSIX 用 ls / cat / grep / ss / df / ps / journalctl；",
     "**Windows 本地会话（提示符形如 `C:\\Users\\…>`）是 cmd.exe，必须换成 dir / type /",
     " findstr / ipconfig / tasklist / systeminfo 等 cmd 语法** —— ls、cat、grep 在 cmd 里",
@@ -896,7 +1108,8 @@ pub const ACTION_PROTOCOL: &str = concat!(
 /// 全屏程序（tmux / docker / 分页器）里抓真实输出时的退路。
 const OUTPUT_SKILL_TIPS: &str = concat!(
     "【输出抓取 skill（export 工具的退路）】当记录看起来被全屏程序接管、看不到真实输出时",
-    "（tmux / screen / docker attach / less / vim 等），优先用上面的 export + deep:true；",
+    "（tmux / screen / docker attach / less / vim 等），想知道**此刻屏幕上是什么**先用 nx_screen；",
+    "想要更早的历史再用上面的 export + deep:true；",
     "如果它抓到的 pane 不是你想要的那个，再退回手动只读命令自己定位：\n",
     "· tmux：先 `tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}'` 找到 pane，",
     "再 `tmux capture-pane -p -t <pane> -S -200` 抓最近 200 行；\n",
@@ -926,24 +1139,57 @@ fn plan_message(
     targets: &[AgentTarget],
     max_bytes: usize,
     capture: Option<&str>,
+    redact: bool,
+) -> String {
+    let blocks: Vec<(&AgentTarget, String)> = targets
+        .iter()
+        .map(|t| {
+            // 当前会话优先用前端抓的屏幕快照：它含 scrollback，且不依赖旁路是否开启。
+            // 别的会话前端拿不到屏幕，只能退回旁路缓冲。
+            let screen = req
+                .console_text
+                .as_deref()
+                .filter(|s| !s.trim().is_empty() && t.id == req.session_id);
+            let raw = match screen {
+                // 屏幕快照同样受上下文预算约束：前端按 24KB 抓的，配置里可能更小。
+                // 砍头不砍尾 —— 要问的是「刚才发生了什么」。
+                Some(s) => tail_chars(s, max_bytes),
+                None => state.agent.context(&t.id, max_bytes).unwrap_or_default(),
+            };
+            (t, raw)
+        })
+        .collect();
+    build_plan_message(req, &blocks, capture, &saved_hosts_hint(state), redact)
+}
+
+/// 出网前的脱敏闸门：`redact` 为真时过 `redact::redact`。
+///
+/// 对话循环里**所有**发往模型的终端内容（初始上下文、命令输出、屏幕、错误）
+/// 都必须经过它 —— `llm::complete_reply` 本身不做脱敏，漏一处就是一次凭据外泄。
+fn scrub(redact: bool, text: &str) -> String {
+    if redact {
+        super::redact::redact(text)
+    } else {
+        text.to_string()
+    }
+}
+
+/// `plan_message` 的纯拼装部分（不碰 `AppState`，便于测试）。
+///
+/// 终端内容（每个会话的记录、全屏抓取）在这里脱敏；用户自己写的问题与已保存主机清单不脱敏：
+/// 前者是用户明确交给模型的话，后者是模型挑 `sessionRecordId` 必需的信息（含 host）。
+fn build_plan_message(
+    req: &AgentRunRequest,
+    blocks: &[(&AgentTarget, String)],
+    capture: Option<&str>,
+    hosts_hint: &str,
+    redact: bool,
 ) -> String {
     let mut msg = String::from(
         "以下是你可以操作的终端会话及其最近输出记录（`$ ` 开头是命令，其余是输出）：\n",
     );
-    for t in targets {
-        // 当前会话优先用前端抓的屏幕快照：它含 scrollback，且不依赖旁路是否开启。
-        // 别的会话前端拿不到屏幕，只能退回旁路缓冲。
-        let screen = req
-            .console_text
-            .as_deref()
-            .filter(|s| !s.trim().is_empty() && t.id == req.session_id);
-        let raw = match screen {
-            // 屏幕快照同样受上下文预算约束：前端按 24KB 抓的，配置里可能更小。
-            // 砍头不砍尾 —— 要问的是「刚才发生了什么」。
-            Some(s) => tail_chars(s, max_bytes),
-            None => state.agent.context(&t.id, max_bytes).unwrap_or_default(),
-        };
-        let ctx = raw;
+    for (t, raw) in blocks {
+        let ctx = scrub(redact, raw);
         msg.push_str(&format!(
             "\n===== 会话 {} ({}) =====\n{}{}\n{}\n",
             t.label,
@@ -969,7 +1215,7 @@ fn plan_message(
                 msg.push_str("我已通过旁路通道自动抓取了该程序的真实内容（只读，未碰你的屏幕）：\n");
                 msg.push_str(CONTEXT_BEGIN);
                 msg.push('\n');
-                msg.push_str(text);
+                msg.push_str(&scrub(redact, text));
                 msg.push('\n');
                 msg.push_str(CONTEXT_END);
                 msg.push('\n');
@@ -978,7 +1224,7 @@ fn plan_message(
             _ => msg.push_str("必要时先用「输出抓取 skill」拿到内容再判断。\n"),
         }
     }
-    msg.push_str(&saved_hosts_hint(state));
+    msg.push_str(hosts_hint);
     msg.push_str(&format!(
         "\n目标：{}\n\n需要执行操作就调用工具，已经查清就直接给结论。",
         req.question.trim()
@@ -1300,6 +1546,203 @@ pub async fn run_one(
     Ok(outcome)
 }
 
+// ——————————————————————————————— 手和眼：按键 / 等待 / 读屏 ———————————————————————————————
+
+/// 按键写入之后，等多久再取一次输出尾部给模型看。
+///
+/// 太短看不到回显（`:wq` 之后 vim 还没退出），太长拖慢一轮；300ms 是人眼「敲完看一眼」的量级，
+/// 要看更晚的结果由模型接一个 `nx_wait`。
+const KEYS_SETTLE: Duration = Duration::from_millis(300);
+
+/// 反馈里「按键之后的输出尾部」最多保留多少字节。
+const KEYS_TAIL_BYTES: usize = 2000;
+
+/// 读屏结果 / 等待输出尾部的字节上限（喂回模型与向前端索取的都是它）。
+const SCREEN_MAX_BYTES: usize = 6 * 1024;
+
+/// 往目标会话写原始按键。**不追加换行、不等命令结束**，只在 ~300ms 后回一段输出尾部。
+///
+/// 与 `run_one` 一样把发出去的字节喂进旁路缓冲（`In`），审计与 `since(mark)` 才对得上；
+/// 区别是这里没有命令边界，缓冲里这一段只是一串按键。
+pub async fn send_keys(state: &AppState, session_id: &str, data: &[u8]) -> Result<String, String> {
+    state.agent.set_enabled(session_id, true);
+    write_to(state, session_id, data).await?;
+    state.agent.feed(session_id, data, StreamKind::In);
+    // mark 取在 feed 之后：之后的才是这些按键引出的输出
+    let mark = state.agent.pushed(session_id).unwrap_or_default();
+    tokio::time::sleep(KEYS_SETTLE).await;
+    let out = state.agent.since(session_id, mark).unwrap_or_default();
+    Ok(out.trim().to_string())
+}
+
+/// 按键串会不会「提交一行」，以及这样做的风险原因。`None` = 没有回车，只是往行里加字，无需把关。
+///
+/// 为什么不直接对键入文本做 `assess`：被提交的那一行**不止是这次键入的** ——
+/// 它可能是之前几次按键拼起来的、用户自己敲了一半的，或是 `<Up>` 从历史里翻出来、
+/// Tab 补全展开的，这些我们都看不见。只评估本次文本会给人「已经把过关」的错觉。
+/// 所以凡含回车一律给出原因（审批模式下由此触发人工批准）；
+/// 本次键入的各行若本身命中危险规则，再把具体原因一并列出，方便人判断。
+pub fn keys_risk(bytes: &[u8]) -> Option<Vec<String>> {
+    if !interact::contains_enter(bytes) {
+        return None;
+    }
+    let mut reasons = vec![
+        "按键序列含回车，会提交终端当前行（那一行也可能是之前输入或历史里翻出来的）".to_string(),
+    ];
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.split(['\r', '\n']).map(str::trim).filter(|l| !l.is_empty()) {
+        // 控制字符（ESC 序列等）不是命令的一部分，只评估可见文本
+        let visible: String = line.chars().filter(|c| !c.is_control()).collect();
+        let risk = assess(&visible);
+        if risk.dangerous {
+            for r in risk.reasons {
+                reasons.push(format!("`{visible}`：{r}"));
+            }
+        }
+    }
+    Some(reasons)
+}
+
+/// 发按键的反馈。
+fn keys_feedback(label: &str, shown: &str, tail: &str) -> String {
+    let tail = tail.trim();
+    format!(
+        "已向会话「{label}」发送按键：`{shown}`（只写入，不等命令结束，也不保证对方已处理）。\n\
+         约 300ms 后的新输出：\n{}\n",
+        if tail.is_empty() { "（暂无新输出）".to_string() } else { tail_chars(tail, KEYS_TAIL_BYTES) }
+    )
+}
+
+/// 等待的结论（给人看，也给模型看）。
+fn wait_feedback(label: &str, pattern: Option<&str>, end: WaitEnd, output: &str) -> String {
+    let what = pattern.map(|p| format!("「{p}」")).unwrap_or_else(|| "输出静止".to_string());
+    let verdict = match end {
+        WaitEnd::Matched => format!("命中：新输出里出现了 {what}"),
+        WaitEnd::Quiet => match pattern {
+            Some(_) => format!("未命中 {what}：输出已静止"),
+            None => "输出已静止".to_string(),
+        },
+        WaitEnd::Timeout => format!("未命中：等 {what} 超时，条件仍未满足"),
+        WaitEnd::Cancelled => return format!("等待会话「{label}」的输出时被用户取消。\n"),
+    };
+    let out = output.trim();
+    format!(
+        "等待会话「{label}」：{verdict}。\n等待期间的新输出（尾部）：\n{}\n",
+        if out.is_empty() { "（无）".to_string() } else { tail_chars(out, SCREEN_MAX_BYTES) }
+    )
+}
+
+/// 读屏的反馈。`rendered=true` 是前端 xterm 渲染后的画面，否则是旁路缓冲的转录（全屏程序里不可信）。
+fn screen_feedback(label: &str, text: &str, alt: bool, rendered: bool) -> String {
+    let body = text.trim_matches('\n');
+    let mut s = if rendered {
+        format!(
+            "会话「{label}」当前屏幕{}：\n",
+            if alt { "（正停在全屏程序 / alternate screen 里）" } else { "" }
+        )
+    } else {
+        format!(
+            "界面没有回应读屏请求，以下是会话「{label}」旁路缓冲里的最近记录\
+             （是字节流转录而不是渲染后的画面，若在全屏程序里请谨慎参考）：\n"
+        )
+    };
+    s.push_str(&if body.trim().is_empty() {
+        "（屏幕上没有文字）".to_string()
+    } else {
+        tail_chars(body, SCREEN_MAX_BYTES)
+    });
+    s.push('\n');
+    s
+}
+
+/// 一张「手和眼」类步骤卡：`output` 为 `None` 是开始（执行中），`Some` 是收尾。
+/// 前端按 (kind, target, command) 把收尾合并回开始那张卡上。
+#[allow(clippy::too_many_arguments)]
+fn emit_interact(
+    app: &AppHandle,
+    session: &str,
+    kind: &'static str,
+    step: usize,
+    target_id: &str,
+    label: &str,
+    command: Option<&str>,
+    text: Option<String>,
+    output: Option<String>,
+) {
+    emit_step(
+        app,
+        session,
+        StepPayload {
+            target: Some(target_id.into()),
+            target_label: Some(label.into()),
+            command: command.map(str::to_string),
+            text,
+            output,
+            ..StepPayload::new(kind, step)
+        },
+    );
+}
+
+/// 范围闸门（Keys / Wait / Screen 共用）：把 `target` 落到真实会话，越界则先要人批准。
+///
+/// 返回 `Some((id, 展示名, 是否越过了界))`；`None` = 已落好「未执行」卡并写好反馈，调用方 `continue`。
+/// `what` 是越界弹窗里「要做什么」（拿展示名拼）；`skip_cmd` 是未执行卡上的命令位文本；
+/// `reasons` 并进越界弹窗（越界又危险只弹一次，同 Exec）。
+#[allow(clippy::too_many_arguments)]
+async fn gate_target(
+    app: &AppHandle,
+    state: &AppState,
+    runtime: &ActRuntime,
+    session: &str,
+    step: usize,
+    targets: &mut Vec<AgentTarget>,
+    target: Option<&str>,
+    what: impl Fn(&str) -> String,
+    skip_cmd: &str,
+    reasons: Vec<String>,
+    feedback: &mut String,
+) -> Option<(String, String, bool)> {
+    match locate(target, targets, session) {
+        Ok((id, label)) => Some((id, label, false)),
+        Err(id) => {
+            let label = out_of_scope_label(&id);
+            if !session_alive(state, &id) {
+                emit_step(
+                    app,
+                    session,
+                    StepPayload {
+                        target: Some(id.clone()),
+                        command: Some(skip_cmd.to_string()),
+                        reasons: Some(vec!["会话不存在，且不在作用范围内".into()]),
+                        ..StepPayload::new("skip", step)
+                    },
+                );
+                feedback.push_str(&format!(
+                    "会话 {id} 不在作用范围内，也不存在，「{skip_cmd}」没有执行。\
+                     只能操作作用范围内的会话。\n"
+                ));
+                return None;
+            }
+            if !ask_beyond_scope(
+                app,
+                runtime,
+                session,
+                step,
+                Some((&id, &label)),
+                &what(&label),
+                reasons,
+                feedback,
+            )
+            .await
+            {
+                return None;
+            }
+            admit(targets, &id, &label);
+            Some((id, label, true))
+        }
+    }
+}
+
 // ——————————————————————————————— 开新会话 ———————————————————————————————
 
 /// 一次「开新会话」请求。
@@ -1480,6 +1923,8 @@ pub struct ActRuntime {
     approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
     /// request_id → 谁来收前端对 tab 动作的回执
     tab_acks: Mutex<HashMap<String, tokio::sync::oneshot::Sender<TabReply>>>,
+    /// request_id → 谁来收前端对读屏请求的回执
+    screen_acks: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ScreenReply>>>,
 }
 
 impl ActRuntime {
@@ -1488,6 +1933,7 @@ impl ActRuntime {
             inflight: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             tab_acks: Mutex::new(HashMap::new()),
+            screen_acks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1549,6 +1995,24 @@ impl ActRuntime {
     /// 超时或提前放弃时把登记清掉，别让 map 随着轮次慢慢涨。
     fn unregister_tab(&self, request_id: &str) {
         self.tab_acks.lock().remove(request_id);
+    }
+
+    /// 收前端对读屏请求的回执。返回 false 表示请求已经超时、没人接了。
+    pub fn answer_screen(&self, request_id: &str, reply: ScreenReply) -> bool {
+        let Some(tx) = self.screen_acks.lock().remove(request_id) else {
+            return false;
+        };
+        tx.send(reply).is_ok()
+    }
+
+    fn register_screen(&self, request_id: &str) -> tokio::sync::oneshot::Receiver<ScreenReply> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.screen_acks.lock().insert(request_id.to_string(), tx);
+        rx
+    }
+
+    fn unregister_screen(&self, request_id: &str) {
+        self.screen_acks.lock().remove(request_id);
     }
 
     /// 挂一个待批请求，返回用来等答复的接收端。
@@ -1624,6 +2088,33 @@ async fn request_tab(
                 "标签页动作无人回执（来源会话 {session_id}）：{} {}",
                 payload.request_id,
                 payload.op
+            );
+            None
+        }
+    }
+}
+
+/// 读屏等前端回执的上限。同 `TAB_ACK_TIMEOUT`：前端只是读一下 xterm 缓冲，几毫秒的事。
+const SCREEN_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 请前端读一个会话的屏幕。`None` = 超时或前端没接，调用方退回旁路缓冲。
+async fn request_screen(
+    app: &AppHandle,
+    runtime: &ActRuntime,
+    session_id: &str,
+    payload: &ScreenRequest,
+) -> Option<ScreenReply> {
+    let rx = runtime.register_screen(&payload.request_id);
+    let _ = app.emit("nx://agent/screen", payload.clone());
+    let got = tokio::time::timeout(SCREEN_ACK_TIMEOUT, rx).await;
+    runtime.unregister_screen(&payload.request_id);
+    match got {
+        Ok(Ok(reply)) => Some(reply),
+        _ => {
+            tracing::warn!(
+                "读屏请求无人回执（来源会话 {session_id}）：{} → {}",
+                payload.request_id,
+                payload.target
             );
             None
         }
@@ -1866,6 +2357,7 @@ pub async fn run(
         &targets,
         max_bytes,
         capture.as_deref(),
+        acct.redact,
     ))];
 
     let session = req.session_id.clone();
@@ -1875,6 +2367,9 @@ pub async fn run(
     }
     let mut step = 0usize;
     let mut feedback = String::new();
+    // 会话 id → 本轮里上一次动过它（exec / 按键 / 等待）之后缓冲的位置，供 `nx_wait` 当起点：
+    // 模型思考的那几秒里到达的输出也该算「新输出」，否则等的提示早出现了反而永远等不到。
+    let mut marks: HashMap<String, u64> = HashMap::new();
     // 动作块写歪的次数。允许模型改一次，但不许它拿这个把步数刷完。
     let mut misfires = 0usize;
     // 服务方不认 tools 时置 false：此后一律走围栏协议，不再每轮都白试一次。
@@ -1903,7 +2398,9 @@ pub async fn run(
             if trace_on {
                 trace::record(&session, step, "feedback", &feedback);
             }
-            messages.push(ChatMessage::user(feedback.clone()));
+            // 所有喂回模型的终端内容（命令输出、屏幕、错误、命令原文）都在这唯一的入口脱敏：
+            // 各个动作分支往 feedback 里拼的是原文，漏一处分支就是一次外泄，所以不在分支里逐个处理。
+            messages.push(ChatMessage::user(scrub(acct.redact, &feedback)));
             feedback.clear();
         }
 
@@ -1961,7 +2458,7 @@ pub async fn run(
                 );
                 feedback.push_str(
                     "你的工具调用没有产生任何动作，多半是缺了必填参数。\
-                     nx_exec 必须有 command；nx_tab 必须有 op，\
+                     nx_exec 必须有 command；nx_send_keys 必须有 keys；nx_tab 必须有 op，\
                      且除 list 外都要带 target；nx_open_tab 必须有 kind，\
                      kind=ssh 时还要带 sessionRecordId。请补齐后重新调用。\n",
                 );
@@ -2168,6 +2665,7 @@ pub async fn run(
                     .await
                     {
                         Ok(outcome) => {
+                            marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
                             let text = feedback_for(&command, target_label, &outcome);
                             feedback.push_str(&text);
                             feedback.push('\n');
@@ -2335,6 +2833,255 @@ pub async fn run(
                             ));
                         }
                     }
+                }
+
+                AgentAction::Keys { target, keys } => {
+                    let bytes = match interact::parse_keys(&keys) {
+                        Ok(b) => b,
+                        Err(why) => {
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    command: Some(keys.clone()),
+                                    reasons: Some(vec![format!("按键串无效：{why}")]),
+                                    ..StepPayload::new("skip", step)
+                                },
+                            );
+                            feedback.push_str(&format!(
+                                "按键串 `{keys}` 无效，没有发送：{why}。请修正后重发。\n"
+                            ));
+                            continue;
+                        }
+                    };
+                    let shown = interact::display_keys(&bytes);
+                    // 审批模式下含回车的按键要人点头（原因见 `keys_risk`）；自动模式不把关，与 exec 一致。
+                    let risk = if cfg.exec_mode.is_approval() { keys_risk(&bytes) } else { None };
+                    let Some((target_id, label, crossed)) = gate_target(
+                        app,
+                        state,
+                        runtime,
+                        &session,
+                        step,
+                        &mut targets,
+                        target.as_deref(),
+                        |l| format!("向「{l}」发送按键：{shown}"),
+                        &shown,
+                        risk.clone().unwrap_or_default(),
+                        &mut feedback,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    // 越界弹窗已经把风险原因并在同一张卡里了，批准即覆盖两件事，不再弹第二次
+                    if let (Some(reasons), false) = (&risk, crossed) {
+                        let req_payload = ApprovePayload {
+                            request_id: uuid::Uuid::new_v4().simple().to_string(),
+                            kind: "danger",
+                            command: format!("发送按键：{shown}"),
+                            target: target_id.clone(),
+                            target_label: label.clone(),
+                            reasons: reasons.clone(),
+                        };
+                        let approved = request_approval(app, runtime, &session, &req_payload).await;
+                        if trace_on {
+                            trace::record(
+                                &session,
+                                step,
+                                "approval",
+                                &format!(
+                                    "{} · 按键 `{shown}` · 原因 {reasons:?}",
+                                    if approved { "已批准" } else { "未批准（拒绝或超时）" },
+                                ),
+                            );
+                        }
+                        if !approved {
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    target: Some(target_id.clone()),
+                                    target_label: Some(label.clone()),
+                                    command: Some(shown.clone()),
+                                    reasons: Some(reasons.clone()),
+                                    ..StepPayload::new("skip", step)
+                                },
+                            );
+                            feedback.push_str(&format!(
+                                "按键 `{shown}` 未发送（人没批准 / 等待超时）。\
+                                 请改成不含回车的输入，或在结论里告诉用户需要他本人按下回车。\n"
+                            ));
+                            continue;
+                        }
+                    }
+
+                    emit_interact(app, &session, "keys", step, &target_id, &label, Some(&shown), None, None);
+                    match send_keys(state, &target_id, &bytes).await {
+                        Ok(tail) => {
+                            if trace_on {
+                                trace::record(&session, step, "keys", &format!("{label}（{target_id}）← {shown}\n{tail}"));
+                            }
+                            marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
+                            emit_interact(
+                                app, &session, "keys", step, &target_id, &label, Some(&shown),
+                                Some("已发送".into()), Some(tail.clone()),
+                            );
+                            feedback.push_str(&keys_feedback(&label, &shown, &tail));
+                            feedback.push('\n');
+                        }
+                        Err(e) => {
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    target: Some(target_id.clone()),
+                                    target_label: Some(label.clone()),
+                                    command: Some(shown.clone()),
+                                    text: Some(e.clone()),
+                                    ..StepPayload::new("note", step)
+                                },
+                            );
+                            feedback.push_str(&failure_feedback(&shown, &label, &e));
+                        }
+                    }
+                }
+
+                AgentAction::Wait { target, pattern, timeout_ms, quiet_ms } => {
+                    let pat = match pattern.as_deref().map(Pattern::parse).transpose() {
+                        Ok(p) => p,
+                        Err(why) => {
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    command: pattern.clone(),
+                                    reasons: Some(vec![format!("pattern 无效：{why}")]),
+                                    ..StepPayload::new("skip", step)
+                                },
+                            );
+                            feedback.push_str(&format!(
+                                "nx_wait 的 pattern 无效：{why}。子串直接写；正则写成 /正则/（可加 i）。请修正后重发。\n"
+                            ));
+                            continue;
+                        }
+                    };
+                    let shown = pattern.clone().unwrap_or_else(|| "（等输出静止）".into());
+                    let Some((target_id, label, _)) = gate_target(
+                        app,
+                        state,
+                        runtime,
+                        &session,
+                        step,
+                        &mut targets,
+                        target.as_deref(),
+                        |l| format!("读取「{l}」的新输出（等待：{shown}）"),
+                        &shown,
+                        Vec::new(),
+                        &mut feedback,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    if !session_alive(state, &target_id) {
+                        feedback.push_str(&format!("会话「{label}」不存在或已关闭，无法等待它的输出。\n"));
+                        continue;
+                    }
+                    let spec = WaitSpec::from_args(pat, timeout_ms, quiet_ms);
+                    state.agent.set_enabled(&target_id, true);
+                    // 起点用「本轮上次动过这个会话之后」：模型思考的那几秒里到的输出也算新输出
+                    let mark = marks
+                        .get(&target_id)
+                        .copied()
+                        .or_else(|| state.agent.pushed(&target_id))
+                        .unwrap_or_default();
+                    emit_interact(
+                        app, &session, "wait", step, &target_id, &label, Some(&shown),
+                        Some(format!("等待中（最长 {} 秒）……", spec.timeout_ms / 1000)), None,
+                    );
+                    let res = interact::wait_for_pattern(
+                        &spec,
+                        || state.agent.pushed(&target_id).unwrap_or_default(),
+                        || state.agent.since(&target_id, mark).unwrap_or_default(),
+                        || cancel.load(Ordering::Relaxed),
+                    )
+                    .await;
+                    marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
+                    let fb = wait_feedback(&label, pattern.as_deref(), res.end, &res.output);
+                    if trace_on {
+                        trace::record(&session, step, "wait", &format!("{label}（{target_id}）{:?} {shown}\n{}", res.end, res.output));
+                    }
+                    let verdict = match res.end {
+                        WaitEnd::Matched => "已命中",
+                        WaitEnd::Quiet => "输出已静止",
+                        WaitEnd::Timeout => "超时未命中",
+                        WaitEnd::Cancelled => "已取消",
+                    };
+                    emit_interact(
+                        app, &session, "wait", step, &target_id, &label, Some(&shown),
+                        Some(verdict.into()), Some(tail_chars(res.output.trim(), SCREEN_MAX_BYTES)),
+                    );
+                    feedback.push_str(&fb);
+                    feedback.push('\n');
+                }
+
+                AgentAction::Screen { target } => {
+                    let Some((target_id, label, _)) = gate_target(
+                        app,
+                        state,
+                        runtime,
+                        &session,
+                        step,
+                        &mut targets,
+                        target.as_deref(),
+                        |l| format!("读取「{l}」的当前屏幕"),
+                        "screen",
+                        Vec::new(),
+                        &mut feedback,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    emit_interact(app, &session, "screen", step, &target_id, &label, None, Some("正在读取屏幕……".into()), None);
+                    let payload = ScreenRequest {
+                        request_id: uuid::Uuid::new_v4().simple().to_string(),
+                        session_id: session.clone(),
+                        target: target_id.clone(),
+                        max_chars: SCREEN_MAX_BYTES,
+                    };
+                    let reply = request_screen(app, runtime, &session, &payload).await;
+                    if let Some(r) = reply.as_ref().filter(|r| !r.ok) {
+                        tracing::debug!("读屏被前端拒绝，退回旁路缓冲：{}", r.detail);
+                    }
+                    let (text, alt, rendered) = match reply {
+                        Some(r) if r.ok => (r.text, r.alt, true),
+                        // 前端没回 / 没有这个终端：退回旁路缓冲，总比什么都不给强
+                        _ => (
+                            state
+                                .agent
+                                .context(&target_id, SCREEN_MAX_BYTES)
+                                .or_else(|| state.agent.snapshot(&target_id))
+                                .unwrap_or_default(),
+                            false,
+                            false,
+                        ),
+                    };
+                    if trace_on {
+                        trace::record(&session, step, "screen", &format!("{label}（{target_id}）{}\n{text}", if rendered { "xterm" } else { "旁路缓冲" }));
+                    }
+                    emit_interact(
+                        app, &session, "screen", step, &target_id, &label, None,
+                        Some(match (rendered, alt) {
+                            (true, true) => "已读取屏幕（全屏程序）".into(),
+                            (true, false) => "已读取屏幕".into(),
+                            (false, _) => "界面未回应，改读旁路缓冲".into(),
+                        }),
+                        Some(tail_chars(text.trim_matches('\n'), SCREEN_MAX_BYTES)),
+                    );
+                    feedback.push_str(&screen_feedback(&label, &text, alt, rendered));
+                    feedback.push('\n');
                 }
 
                 AgentAction::Export { target, deep } => {
@@ -3214,6 +3961,277 @@ mod tests {
         assert!(actions_from_tool_call(&call).is_empty());
         let call = llm::ToolCall { name: TOOL_TAB.into(), arguments: "not json".into() };
         assert!(actions_from_tool_call(&call).is_empty());
+    }
+
+    // —————————————— 手和眼：工具声明 / 解析 ——————————————
+
+    fn call(name: &str, args: &str) -> llm::ToolCall {
+        llm::ToolCall { name: name.into(), arguments: args.into() }
+    }
+
+    #[test]
+    fn new_tools_are_declared_with_unique_names() {
+        let specs = tool_specs();
+        for n in [TOOL_KEYS, TOOL_WAIT, TOOL_SCREEN] {
+            assert!(specs.iter().any(|s| s.name == n), "缺少工具 {n}");
+        }
+        let mut names: Vec<_> = specs.iter().map(|s| s.name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "工具名重复");
+        let keys = specs.iter().find(|s| s.name == TOOL_KEYS).unwrap();
+        assert_eq!(keys.schema["required"][0], "keys");
+    }
+
+    #[test]
+    fn keys_tool_call_keeps_raw_text() {
+        let acts = actions_from_tool_call(&call(TOOL_KEYS, r#"{"keys":"<C-c>","target":"s1"}"#));
+        assert_eq!(acts, vec![AgentAction::Keys { target: Some("s1".into()), keys: "<C-c>".into() }]);
+    }
+
+    #[test]
+    fn keys_without_keys_field_yields_nothing() {
+        assert!(actions_from_tool_call(&call(TOOL_KEYS, r#"{"target":"s1"}"#)).is_empty());
+        assert!(actions_from_tool_call(&call(TOOL_KEYS, r#"{"keys":""}"#)).is_empty());
+        assert!(actions_from_tool_call(&call(TOOL_KEYS, "")).is_empty());
+    }
+
+    #[test]
+    fn keys_array_target_fans_out() {
+        let acts = actions_from_tool_call(&call(TOOL_KEYS, r#"{"keys":"q","target":["a","b"]}"#));
+        assert_eq!(acts.len(), 2);
+        assert_eq!(acts[1], AgentAction::Keys { target: Some("b".into()), keys: "q".into() });
+    }
+
+    #[test]
+    fn wait_tool_call_parses_optional_fields() {
+        let acts = actions_from_tool_call(&call(
+            TOOL_WAIT,
+            r#"{"pattern":"/done|fail/i","timeoutMs":5000,"quietMs":800}"#,
+        ));
+        assert_eq!(
+            acts,
+            vec![AgentAction::Wait {
+                target: None,
+                pattern: Some("/done|fail/i".into()),
+                timeout_ms: Some(5000),
+                quiet_ms: Some(800),
+            }]
+        );
+        // 全省略也合法：等输出静止
+        assert_eq!(
+            actions_from_tool_call(&call(TOOL_WAIT, "{}")),
+            vec![AgentAction::Wait { target: None, pattern: None, timeout_ms: None, quiet_ms: None }]
+        );
+    }
+
+    #[test]
+    fn screen_tool_call_parses() {
+        assert_eq!(
+            actions_from_tool_call(&call(TOOL_SCREEN, r#"{"target":"s2"}"#)),
+            vec![AgentAction::Screen { target: Some("s2".into()) }]
+        );
+        assert_eq!(
+            actions_from_tool_call(&call(TOOL_SCREEN, "")),
+            vec![AgentAction::Screen { target: None }]
+        );
+    }
+
+    #[test]
+    fn fence_protocol_supports_new_actions() {
+        assert_eq!(
+            extract_actions(&block(r#"{"action":"keys","keys":"y<Enter>"}"#)),
+            vec![AgentAction::Keys { target: None, keys: "y<Enter>".into() }]
+        );
+        assert_eq!(
+            extract_actions(&block(r#"{"action":"wait","pattern":"login:"}"#)),
+            vec![AgentAction::Wait {
+                target: None,
+                pattern: Some("login:".into()),
+                timeout_ms: None,
+                quiet_ms: None
+            }]
+        );
+        assert_eq!(
+            extract_actions(&block(r#"{"action":"screen","target":"s1"}"#)),
+            vec![AgentAction::Screen { target: Some("s1".into()) }]
+        );
+    }
+
+    #[test]
+    fn tool_labels_cover_new_tools() {
+        assert_eq!(tool_label(TOOL_KEYS, "{}"), "发送按键");
+        assert_eq!(tool_label(TOOL_WAIT, "{}"), "等待输出");
+        assert_eq!(tool_label(TOOL_SCREEN, "{}"), "读取屏幕");
+    }
+
+    /// exec 的单行铁律不能因为有了 keys 而松动：回车 / 控制字符只在 keys 里合法。
+    #[test]
+    fn exec_still_rejects_control_chars_while_keys_allow_them() {
+        assert!(reject_command("ls\r").is_some());
+        assert!(reject_command("ls\n").is_some());
+        assert_eq!(interact::parse_keys("ls\\r").unwrap(), b"ls\r");
+        assert_eq!(interact::parse_keys("<C-c>").unwrap(), vec![3]);
+    }
+
+    // —————————————— 手和眼：审批 / 反馈 / 回执 ——————————————
+
+    #[test]
+    fn keys_without_enter_need_no_approval() {
+        assert!(keys_risk(b"\x03").is_none());
+        assert!(keys_risk(b"ls -la").is_none());
+        assert!(keys_risk(b"\x1b[A").is_none());
+    }
+
+    #[test]
+    fn keys_with_enter_always_flag_risk() {
+        let r = keys_risk(b"y\r").expect("含回车必须给出原因");
+        assert_eq!(r.len(), 1, "安全文本只有『含回车』这一条原因：{r:?}");
+        assert!(keys_risk(b"\r").is_some(), "单独的回车也会提交当前行");
+        assert!(keys_risk(b"a\nb").is_some());
+    }
+
+    #[test]
+    fn keys_with_dangerous_text_list_concrete_reasons() {
+        let r = keys_risk(b"rm -rf /tmp/x\r").unwrap();
+        assert!(r.len() > 1, "危险命令要列出具体原因：{r:?}");
+        assert!(r.iter().any(|x| x.contains("rm -rf /tmp/x")));
+    }
+
+    #[test]
+    fn keys_feedback_says_sent_and_shows_tail() {
+        let f = keys_feedback("web-1", "<C-c>", "^C\n$ ");
+        assert!(f.contains("已向会话「web-1」发送按键"));
+        assert!(f.contains("^C"));
+        assert!(keys_feedback("w", "x", "  ").contains("暂无新输出"));
+    }
+
+    #[test]
+    fn wait_feedback_distinguishes_outcomes() {
+        assert!(wait_feedback("w", Some("ok"), WaitEnd::Matched, "all ok").contains("命中"));
+        let miss = wait_feedback("w", Some("ok"), WaitEnd::Timeout, "x");
+        assert!(miss.contains("未命中") && miss.contains("超时"));
+        assert!(wait_feedback("w", Some("ok"), WaitEnd::Quiet, "").contains("未命中"));
+        assert!(wait_feedback("w", None, WaitEnd::Quiet, "x").contains("输出已静止"));
+        assert!(wait_feedback("w", Some("ok"), WaitEnd::Cancelled, "").contains("取消"));
+    }
+
+    #[test]
+    fn screen_feedback_marks_alt_and_fallback() {
+        assert!(screen_feedback("w", "hello", true, true).contains("alternate screen"));
+        let fb = screen_feedback("w", "hello", false, false);
+        assert!(fb.contains("旁路缓冲") && fb.contains("hello"));
+        assert!(screen_feedback("w", "\n\n", false, true).contains("没有文字"));
+    }
+
+    #[test]
+    fn screen_ack_round_trip_and_cleanup() {
+        let rt = ActRuntime::new();
+        let mut rx = rt.register_screen("r1");
+        assert!(rt.answer_screen(
+            "r1",
+            ScreenReply { ok: true, text: "hi".into(), alt: true, detail: String::new() }
+        ));
+        let got = rx.try_recv().unwrap();
+        assert!(got.ok && got.alt && got.text == "hi");
+        // 已取走：再答复一次是「没人接了」
+        assert!(!rt.answer_screen("r1", ScreenReply::default()));
+        // 超时路径：注销后迟到的回执同样无人接
+        let _rx = rt.register_screen("r2");
+        rt.unregister_screen("r2");
+        assert!(!rt.answer_screen("r2", ScreenReply::default()));
+    }
+
+    #[test]
+    fn protocol_teaches_new_tools_and_forbids_typing_passwords() {
+        for key in ["nx_send_keys", "nx_wait", "nx_screen", "<C-c>", "256 字节"] {
+            assert!(ACTION_PROTOCOL.contains(key), "协议缺少：{key}");
+        }
+        assert!(ACTION_PROTOCOL.contains("绝不要用 send_keys / exec 输入密码"));
+        assert!(ACTION_PROTOCOL.contains("用户自己在终端里输入"));
+        assert!(ACTION_PROTOCOL.contains(&format!("一次最多给 {MAX_ACTIONS} 条动作")));
+        assert!(IfAgentic::pick("只给结论").contains("nx_send_keys"));
+    }
+
+    // —————————————— 出网脱敏（1.1） ——————————————
+
+    const SECRET_CTX: &str =
+        "$ env\nopenai sk-ABCDEFGH12345678\nmail bob@example.com host 10.1.2.3\n";
+
+    fn plain_req(question: &str, alt: bool) -> AgentRunRequest {
+        AgentRunRequest {
+            session_id: "s1".into(),
+            question: question.into(),
+            targets: Vec::new(),
+            console_text: None,
+            console_alt: alt,
+        }
+    }
+
+    #[test]
+    fn scrub_masks_only_when_enabled() {
+        let on = scrub(true, SECRET_CTX);
+        assert!(!on.contains("sk-ABCDEFGH12345678"));
+        assert!(!on.contains("bob@example.com"));
+        assert!(!on.contains("10.1.2.3"));
+        assert!(on.contains(super::super::redact::PLACEHOLDER));
+        assert_eq!(scrub(false, SECRET_CTX), SECRET_CTX);
+    }
+
+    #[test]
+    fn plan_message_redacts_terminal_content_only_when_on() {
+        let t = AgentTarget { id: "s1".into(), label: "本机".into() };
+        let r = plain_req("帮我看看", false);
+        let blocks = [(&t, SECRET_CTX.to_string())];
+        let on = build_plan_message(&r, &blocks, None, "", true);
+        assert!(!on.contains("sk-ABCDEFGH12345678"));
+        assert!(!on.contains("bob@example.com"));
+        assert!(on.contains("帮我看看"), "用户的问题不该被脱敏吃掉");
+        let off = build_plan_message(&r, &blocks, None, "", false);
+        assert!(off.contains("sk-ABCDEFGH12345678") && off.contains("bob@example.com"));
+    }
+
+    #[test]
+    fn plan_message_redacts_fullscreen_capture() {
+        let t = AgentTarget { id: "s1".into(), label: "本机".into() };
+        let r = plain_req("q", true);
+        let msg = build_plan_message(
+            &r,
+            &[(&t, "x".to_string())],
+            Some("tmux pane password=hunter2hunter2"),
+            "",
+            true,
+        );
+        assert!(msg.contains("自动抓取"));
+        assert!(!msg.contains("hunter2hunter2"));
+    }
+
+    /// 反馈由 `run` 在入口统一过 `scrub`；这里确认各类反馈经 scrub 后不含明文。
+    #[test]
+    fn every_feedback_kind_is_clean_after_scrub() {
+        let all = [
+            feedback_for(
+                "echo hi",
+                "web",
+                &ExecOutcome { output: "key sk-ABCDEFGH12345678".into(), reason: ExecEnd::Confirmed },
+            ),
+            failure_feedback("echo bob@example.com", "web", "连接 10.1.2.3 失败"),
+            keys_feedback("web", "x", "password=hunter2hunter2"),
+            wait_feedback("web", Some("p"), WaitEnd::Matched, "from 10.9.8.7"),
+        ];
+        for f in all {
+            let clean = scrub(true, &f);
+            for needle in [
+                "sk-ABCDEFGH12345678",
+                "bob@example.com",
+                "10.1.2.3",
+                "hunter2hunter2",
+                "10.9.8.7",
+            ] {
+                assert!(!clean.contains(needle), "脱敏后仍含 {needle}：{clean}");
+            }
+        }
     }
 
     #[test]
