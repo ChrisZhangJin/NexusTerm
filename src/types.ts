@@ -391,7 +391,11 @@ export interface AgentRunRequest {
  * 刻意是「扁平结构 + kind」而不是判别联合：多数字段本就可选，渲染时不用做类型收窄。
  */
 export interface AgentStep {
-  /** plan | tool | exec | result | skip | note | answer | open | export | tab | waiting */
+  /**
+   * plan | tool | exec | result | skip | note | answer | open | export | tab | waiting
+   * | keys | wait | screen（后三者是「手和眼」：发按键 / 等输出 / 读屏幕。
+   * `output` 为空 = 进行中，有值（哪怕是空串）= 已收尾，`text` 是一句话结论）
+   */
   kind: string;
   step: number;
   /** kind:"tool" 专用：模型调用的工具名（原始，如 nx_tab） */
@@ -441,6 +445,20 @@ export interface AgentTabRequest {
   opLabel: string;
   target?: string;
   name?: string;
+}
+
+/**
+ * `nx://agent/screen` 的载荷：请前端把某个会话此刻的 xterm 屏幕读出来（`nx_screen`）。
+ * 办完（或办不成）必须回一句 `agentScreenAck`。
+ */
+export interface AgentScreenRequest {
+  requestId: string;
+  /** 发起这次读取的会话，只为定位来源 */
+  sessionId: string;
+  /** 要读哪个会话的屏幕 */
+  target: string;
+  /** 最多回多少字符（取末尾） */
+  maxChars: number;
 }
 
 /** 一个标签页的对外视图（回执里的清单） */
