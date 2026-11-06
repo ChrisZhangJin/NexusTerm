@@ -306,17 +306,40 @@ pub async fn import(
     let contents = tokio::fs::read_to_string(&src_path)
         .await
         .map_err(|e| format!("无法读取私钥：{}", e))?;
-    let (_, encrypted) = read_public(&contents)
+    let fallback = src_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("imported-key")
+        .to_string();
+    let final_name = name
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or(fallback);
+    import_contents(store, base, &contents, final_name, passphrase).await
+}
+
+/// 把内存里的私钥文本写进密钥库并登记 —— [`import`] 与「连接迁移」共用。
+///
+/// 落盘路径永远是 `<base>/keys/<新生成的 uuid>`，**调用方给不出任何路径成分**，
+/// 所以来自不可信文件的内容也没有办法写到密钥库之外。
+pub async fn import_contents(
+    store: &Store,
+    base: &Path,
+    contents: &str,
+    name: String,
+    passphrase: Option<String>,
+) -> Result<KeyInfo, String> {
+    let (_, encrypted) = read_public(contents)
         .ok_or("无法解析私钥：无法识别的格式（支持 OpenSSH 与 PuTTY 的 .ppk）")?;
 
     // 给了口令就顺带校验一次；没给也允许导入 —— 加密私钥可以等到连接时再问
     if encrypted {
         if let Some(p) = passphrase.as_deref().filter(|p| !p.is_empty()) {
-            parse_private_key(&contents, Some(p))?;
+            parse_private_key(contents, Some(p))?;
         }
     } else {
         // 明文也要完整解析一遍：PPK 要验 MAC，损坏文件不该进库
-        parse_private_key(&contents, None)?;
+        parse_private_key(contents, None)?;
     }
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -327,21 +350,26 @@ pub async fn import(
 
     // 原样复制字节，不重新编码：重新编码会丢掉原文件的换行风格与注释，
     // 也会把「带口令」这个状态意外改掉。
-    tokio::fs::write(&dest, contents.as_bytes())
-        .await
-        .map_err(|e| format!("写入密钥库失败：{}", e))?;
+    //
+    // 创建时就是 0600（`create_new` 还顺带保证不会覆盖已有文件），不留「先 0644
+    // 落盘、稍后才收紧」的窗口。
+    {
+        use tokio::io::AsyncWriteExt as _;
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut f = opts
+            .open(&dest)
+            .await
+            .map_err(|e| format!("写入密钥库失败：{}", e))?;
+        f.write_all(contents.as_bytes())
+            .await
+            .map_err(|e| format!("写入密钥库失败：{}", e))?;
+        f.flush().await.map_err(|e| format!("写入密钥库失败：{}", e))?;
+    }
 
-    let fallback = src_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("imported-key")
-        .to_string();
-    let final_name = name
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty())
-        .unwrap_or(fallback);
-
-    finish_key(store, &dest, id, final_name, None).await
+    finish_key(store, &dest, id, name, None).await
 }
 
 /// 生成新密钥（ed25519 或 RSA）。RSA 默认 4096 —— 现代机器几秒钟能出，

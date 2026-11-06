@@ -224,7 +224,7 @@ impl KdfSpec {
     }
 
     /// 由主密码派生 KEK。
-    fn derive(&self, password: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
+    pub(crate) fn derive(&self, password: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
         if self.alg == DAMAGED {
             return Err("保险库元数据已损坏（settings 里的 vault.kdf 读不出来），\
                         无法解锁。如果有 nexus.db.pre-vault.bak，可以用它恢复。"

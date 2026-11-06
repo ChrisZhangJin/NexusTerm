@@ -769,3 +769,26 @@ export interface SkillRunReport {
   /** true 已记成功 / false 已记失败 / 未记 */
   recorded?: boolean | null;
 }
+
+// ——————————————————————————————— 连接迁移 ———————————————————————————————
+// 与 Rust `migrate::{ExportSummary, ImportSummary}` 一一对应。只有计数与警告，没有任何凭据。
+
+export interface ConnExportSummary {
+  sessions: number;
+  passwords: number;
+  passphrases: number;
+  totpSeeds: number;
+  keys: number;
+  warnings: string[];
+}
+
+export interface ConnImportSummary {
+  imported: number;
+  /** 与已有连接 (host, port, username, name) 相同而跳过的条数 */
+  skipped: number;
+  passwords: number;
+  passphrases: number;
+  totpSeeds: number;
+  keys: number;
+  warnings: string[];
+}

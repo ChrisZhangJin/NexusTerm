@@ -1758,7 +1758,16 @@ export default function App() {
       {settingsWin === "shortcuts" && <ShortcutsDialog onClose={() => setSettingsWin(null)} />}
       {settingsWin === "agent" && <AgentDialog onClose={() => setSettingsWin(null)} />}
       {settingsWin === "keys" && <KeyManagerDialog onClose={() => setSettingsWin(null)} />}
-      {settingsWin === "security" && <SecurityDialog onClose={() => setSettingsWin(null)} />}
+      {settingsWin === "security" && (
+        <SecurityDialog
+          onClose={() => setSettingsWin(null)}
+          // 导入连接后：列表和会话附加设置（登录脚本 / 兼容模式）都要重新拉
+          onImported={() => {
+            void refresh();
+            void loadExtras();
+          }}
+        />
+      )}
 
       {macroOpen && (
         <MacroDialog

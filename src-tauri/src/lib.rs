@@ -14,6 +14,7 @@ mod cmd;
 mod histfile;
 mod keys;
 mod local;
+mod migrate;
 mod viewer;
 mod secret;
 mod sftp;
@@ -260,6 +261,8 @@ pub fn run() {
             cmd::vault_forget,
             cmd::vault_change_password,
             cmd::vault_disable,
+            cmd::connections_export,
+            cmd::connections_import,
             viewer::viewer_open_sftp,
             viewer::viewer_open_ssh,
             viewer::viewer_open_local,
