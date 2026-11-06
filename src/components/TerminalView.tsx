@@ -1458,6 +1458,7 @@ export default function TerminalView({
       {active && findOpen && searchRef.current && (
         <FindBar
           search={searchRef.current}
+          term={termRef.current}
           initial={termRef.current?.getSelection() ?? ""}
           onClose={() => {
             searchRef.current?.clearDecorations();
@@ -1502,10 +1503,12 @@ const FIND_DECO = {
 
 function FindBar({
   search,
+  term,
   initial,
   onClose,
 }: {
   search: SearchAddon;
+  term: Terminal | null;
   initial: string;
   onClose: () => void;
 }) {
@@ -1516,11 +1519,20 @@ function FindBar({
   const [result, setResult] = useState<{ index: number; count: number } | null>(null);
   const [bad, setBad] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  // tmux / screen / less / vim 等全屏程序跑在备用屏：xterm 没有它的滚动历史，只能搜到当前这一屏
+  const [altScreen, setAltScreen] = useState(term?.buffer.active.type === "alternate");
 
   useEffect(() => {
     inputRef.current?.focus();
     inputRef.current?.select();
   }, []);
+
+  useEffect(() => {
+    if (!term) return;
+    setAltScreen(term.buffer.active.type === "alternate");
+    const sub = term.buffer.onBufferChange((b) => setAltScreen(b.type === "alternate"));
+    return () => sub.dispose();
+  }, [term]);
 
   useEffect(() => {
     const sub = search.onDidChangeResults((r) =>
@@ -1599,6 +1611,11 @@ function FindBar({
         <button className="find-btn" onClick={next} title="下一个 (Enter)">↓</button>
         <button className="find-btn" onClick={onClose} title="关闭 (Esc)">×</button>
       </div>
+      {altScreen && (
+        <div className="find-hint">
+          当前在全屏程序（tmux / screen / less 等）里，只能搜索当前这一屏；它自己的滚动历史请用它自带的搜索（tmux：Ctrl+B 后按 [，再按 Ctrl+S）。
+        </div>
+      )}
       <div className="find-opts">
         <label>
           <input
