@@ -1083,3 +1083,42 @@ pub fn vault_disable(password: String, state: State<'_, AppState>) -> Result<Swe
     state.store.vault_disable(&password)
 }
 
+// ——— 连接迁移 ———
+
+/// 导出全部连接（含凭据与私钥文件）到 `dest`，用 `password` 加密。
+///
+/// 读 → 加密 → 写文件全在后端完成：明文凭据不过 IPC，前端只给导出密码和目标路径。
+/// 同步命令（Tauri 放线程池跑），里面有一次 Argon2。
+#[tauri::command]
+pub fn connections_export(
+    dest: String,
+    password: String,
+    include_keys: bool,
+    state: State<'_, AppState>,
+) -> Result<crate::migrate::ExportSummary, String> {
+    let password = Zeroizing::new(password);
+    crate::migrate::export_to_file(
+        &state.store,
+        std::path::Path::new(&dest),
+        &password,
+        include_keys,
+    )
+}
+
+/// 导入 `.nexusconn`。解密 + 校验全部通过后才开始写库；重复连接跳过，不覆盖。
+#[tauri::command]
+pub async fn connections_import(
+    path: String,
+    password: String,
+    state: State<'_, AppState>,
+) -> Result<crate::migrate::ImportSummary, String> {
+    let password = Zeroizing::new(password);
+    // Argon2 要几百毫秒，放到阻塞线程，别占着异步运行时
+    let payload = tauri::async_runtime::spawn_blocking(move || {
+        crate::migrate::read_and_open(std::path::Path::new(&path), &password)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    crate::migrate::apply_import(&state.store, &state.keys_dir, payload).await
+}
+

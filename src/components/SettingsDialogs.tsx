@@ -18,6 +18,8 @@ import type {
 } from "../types";
 import { normalizeBudget, parseBudgetInput, type RunBudget } from "../lib/agentBudget";
 import MasterPasswordDialog, { type MasterPasswordMode } from "./MasterPasswordDialog";
+import ConnMigrateDialog, { type ConnMigrateMode } from "./ConnMigrateDialog";
+import { CONN_FILE_EXT, type MigrateReport } from "../lib/connMigrate";
 import {
   DEFAULT_SHORTCUTS,
   SHORTCUT_LABELS,
@@ -866,7 +868,14 @@ function describeDone(mode: MasterPasswordMode, r: SweepReport | null): VaultRep
     : { text: "已解锁，本次运行期间凭据可正常读写。", warn: false };
 }
 
-export function SecurityDialog({ onClose }: { onClose: () => void }) {
+export function SecurityDialog({
+  onClose,
+  onImported,
+}: {
+  onClose: () => void;
+  /** 连接迁移导入成功后调用：调用方要重新拉连接列表与会话附加设置 */
+  onImported?: () => void;
+}) {
   const [status, setStatus] = useState<VaultStatus | null>(null);
   /** null = 还在问系统凭据服务。不是 false —— 「没记住」和「还不知道」要分开显示 */
   const [remembered, setRemembered] = useState<boolean | null>(null);
@@ -874,11 +883,14 @@ export function SecurityDialog({ onClose }: { onClose: () => void }) {
   /** 开出去的那个弹窗里「在本机记住」要不要预先勾上 */
   const [rememberDefault, setRememberDefault] = useState(false);
   const [report, setReport] = useState<VaultReport | null>(null);
+  /** 连接迁移：开着的密码弹窗（导出 / 导入）与上一次的结果 */
+  const [mig, setMig] = useState<ConnMigrateMode | null>(null);
+  const [migReport, setMigReport] = useState<MigrateReport | null>(null);
   /** 每次操作完 +1，驱动下面两条 effect 重新拉状态 */
   const [tick, setTick] = useState(0);
 
   // 弹窗开着的时候 Escape 归它管，否则一下 Esc 会把两层一起关掉
-  useEsc(onClose, prompt === null);
+  useEsc(onClose, prompt === null && mig === null);
 
   // 状态是廉价的内存读，挂载即拉
   useEffect(() => {
@@ -944,11 +956,37 @@ export function SecurityDialog({ onClose }: { onClose: () => void }) {
     void api.vaultForget();
   };
 
+  /** 先选文件、再问密码：选文件的系统对话框关掉后才弹自己的弹窗，两层不叠在一起 */
+  const pickImport = async () => {
+    setMigReport(null);
+    try {
+      const { open: openDialog } = await import("@tauri-apps/plugin-dialog");
+      const picked = await openDialog({
+        multiple: false,
+        directory: false,
+        title: "导入连接",
+        filters: [{ name: "NexusTerm 连接迁移文件", extensions: [CONN_FILE_EXT] }],
+      });
+      if (typeof picked === "string") setMig({ kind: "import", path: picked });
+    } catch (e) {
+      setMigReport({ text: `无法打开文件选择框：${String(e)}`, warn: true, details: [] });
+    }
+  };
+
+  const migDone = (kind: ConnMigrateMode["kind"]) => (r: MigrateReport) => {
+    setMig(null);
+    setMigReport(r);
+    if (kind === "import") onImported?.();
+  };
+
   const enabled = status?.enabled === true;
   const unlocked = status?.unlocked === true;
 
   return (
-    <div className="modal-backdrop" onMouseDown={() => prompt === null && onClose()}>
+    <div
+      className="modal-backdrop"
+      onMouseDown={() => prompt === null && mig === null && onClose()}
+    >
       <div className="modal settings-modal" onMouseDown={(e) => e.stopPropagation()}>
         <div className="settings-head">
           <h2>安全</h2>
@@ -1085,12 +1123,52 @@ export function SecurityDialog({ onClose }: { onClose: () => void }) {
           </div>
         </div>
 
+        <div className="settings-section">连接迁移</div>
+        <p className="ag-hint">
+          把全部已保存的连接（含密码、私钥口令、TOTP 种子，可选私钥文件）打成一个文件，
+          换电脑时导入。文件用你设的导出密码加密，和主密码无关。
+          <strong>拿到文件并且知道导出密码的人就能读到这些凭据</strong>
+          —— 导出密码请和文件分开保管，迁移完成后记得删除文件。
+          导入时与已有连接（主机、端口、用户名、名称都相同）重复的会跳过，不会覆盖。
+        </p>
+        <div className="row">
+          <label>连接</label>
+          <button
+            className="btn"
+            onClick={() => {
+              setMigReport(null);
+              setMig({ kind: "export" });
+            }}
+          >
+            导出全部连接…
+          </button>
+          <button className="btn" onClick={() => void pickImport()}>
+            导入连接…
+          </button>
+        </div>
+        {migReport && (
+          <div className={`vault-report${migReport.warn ? " warn" : ""}`}>
+            <strong>{migReport.text}</strong>
+            {migReport.details.length > 0 && (
+              <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+                {migReport.details.map((w, i) => (
+                  <li key={i}>{w}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
         <div className="modal-actions">
           <button className="btn primary" onClick={onClose}>
             完成
           </button>
         </div>
       </div>
+
+      {mig && (
+        <ConnMigrateDialog mode={mig} onClose={() => setMig(null)} onDone={migDone(mig.kind)} />
+      )}
 
       {prompt && (
         <MasterPasswordDialog

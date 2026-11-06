@@ -34,6 +34,8 @@ import type {
   SkillTrustView,
   SkillInput,
   SweepReport,
+  ConnExportSummary,
+  ConnImportSummary,
   TotpPreview,
   VaultStatus,
 } from "./types";
@@ -449,6 +451,17 @@ export const api = {
       kind: "markdown" | "html" | "image" | "audio" | "video" | "code";
       data: string;
     }>("viewer_doc", { id }),
+
+  // ——— 连接迁移 ———
+  //
+  // 读 → 加密 → 写文件全在 Rust 侧完成：凭据明文不过 IPC，前端只给导出密码与路径。
+
+  /** 导出全部连接到 dest（`.nexusconn`）。保险库锁着时后端会拒绝 */
+  connectionsExport: (dest: string, password: string, includeKeys: boolean) =>
+    invoke<ConnExportSummary>("connections_export", { dest, password, includeKeys }),
+  /** 导入 `.nexusconn`：重复连接跳过、不覆盖；密码错 / 文件被改则什么都不导入 */
+  connectionsImport: (path: string, password: string) =>
+    invoke<ConnImportSummary>("connections_import", { path, password }),
 
   // ——— 主密码保险库 ———
   //
