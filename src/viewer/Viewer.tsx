@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, base64ToBytes } from "../api";
 import { BUILTIN_THEMES, DEFAULT_THEME } from "../lib/theme";
 import { applyChromeVars } from "../lib/chrome";
@@ -66,6 +67,8 @@ export default function Viewer({ id }: { id: string }) {
   const [allowJs, setAllowJs] = useState(false);
   const [zoom, setZoom] = useState(() => Number(localStorage.getItem("nx.viewer.zoom")) || 100);
   const mdRef = useRef<HTMLDivElement>(null);
+  // 全屏：窗口铺满屏幕，Markdown 纸面同时取消 920px 宽度上限，宽表格才能完整显示
+  const [fullscreen, setFullscreen] = useState(false);
   const [imgInfo, setImgInfo] = useState("");
   const [toast, setToast] = useState<string | null>(null);
   const toastTimer = useRef<number | undefined>(undefined);
@@ -132,6 +135,41 @@ export default function Viewer({ id }: { id: string }) {
     el.addEventListener("click", onClick);
     return () => el.removeEventListener("click", onClick);
   }, [mdHtml, mode]);
+
+  const toggleFullscreen = useCallback((to?: boolean) => {
+    const win = getCurrentWindow();
+    void win
+      .isFullscreen()
+      .then((cur) => win.setFullscreen(to ?? !cur))
+      .then(() => win.isFullscreen())
+      .then(setFullscreen)
+      .catch(() => {});
+  }, []);
+
+  // F11 切换，Esc 退出；窗口被系统手势（如 macOS 绿色按钮）改了全屏状态时同步回来
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "F11") {
+        e.preventDefault();
+        toggleFullscreen();
+      } else if (e.key === "Escape" && fullscreen) {
+        toggleFullscreen(false);
+      }
+    };
+    window.addEventListener("keydown", key);
+    const win = getCurrentWindow();
+    let unlisten: (() => void) | undefined;
+    void win
+      .onResized(() => void win.isFullscreen().then(setFullscreen).catch(() => {}))
+      .then((f) => {
+        unlisten = f;
+      })
+      .catch(() => {});
+    return () => {
+      window.removeEventListener("keydown", key);
+      unlisten?.();
+    };
+  }, [fullscreen, toggleFullscreen]);
 
   // Ctrl + 滚轮 / Ctrl +/- / Ctrl 0 缩放
   const isImage = doc?.kind === "image";
@@ -232,6 +270,13 @@ export default function Viewer({ id }: { id: string }) {
           </button>
         </div>
         )}
+        <button
+          className={`rd-full${fullscreen ? " on" : ""}`}
+          onClick={() => toggleFullscreen()}
+          title={fullscreen ? "退出全屏 (Esc / F11)" : "全屏 (F11)：宽表格可完整显示"}
+        >
+          {fullscreen ? "退出全屏" : "全屏"}
+        </button>
       </div>
 
       <div className="rd-body">
@@ -273,7 +318,7 @@ export default function Viewer({ id }: { id: string }) {
           <div className="rd-scroll">
             <article
               ref={mdRef}
-              className="rd-md"
+              className={`rd-md${fullscreen ? " rd-wide" : ""}`}
               style={{ fontSize: `${(15 * zoom) / 100}px` }}
               dangerouslySetInnerHTML={{ __html: mdHtml }}
             />
