@@ -31,6 +31,7 @@ export function registerTerm(id: string, term: Terminal): () => void {
       lastOutput.delete(id);
       outputCount.delete(id);
       inputTaps.delete(id);
+      userKeyLast.delete(id);
       dropCaptureState(id);
     }
   };
@@ -104,6 +105,68 @@ export function setUserKeySink(fn: UserKeySink | null): void {
   userKeySink = fn;
 }
 
+/**
+ * xterm **自己**生成、却同样经 `onData` 冒出来的字节：焦点进出、鼠标上报、
+ * 对远端查询的自动应答（光标位置 / 设备属性 / 状态 / 模式 / 窗口尺寸 / OSC / DCS）。
+ * 这些不是用户动手，当成敲键会让 Steward 无缘无故被夺权（开了鼠标追踪的 TUI 里
+ * 鼠标一晃就是一串）。一次 onData 可能连着好几段，整串都由这些组成才算。
+ *
+ * 与 `macro.isTerminalReply` 同一思路、覆盖面更大；放这里是因为 macro 依赖本模块，
+ * 反过来引用会成环。只排除结构明确的形状，方向键 `ESC[A`、`ESC O P` 等仍算用户。
+ */
+const XTERM_GENERATED = new RegExp(
+  "^(?:" +
+    [
+      "\\x1b\\[[IO]", // 焦点进出（DECSET 1004）
+      "\\x1b\\[M[\\s\\S]{3}", // X10 / normal 鼠标：ESC [ M Cb Cx Cy
+      "\\x1b\\[<[0-9]+;[0-9]+;[0-9]+[Mm]", // SGR 鼠标（1006）
+      "\\x1b\\[[0-9]+;[0-9]+;[0-9]+M", // urxvt 鼠标（1015）
+      "\\x1b\\[\\??[0-9]+;[0-9]+R", // CPR：光标位置报告
+      "\\x1b\\[[?>][0-9;]*c", // DA1 / DA2：设备属性
+      "\\x1b\\[\\??[0-9;]*n", // DSR：状态报告
+      "\\x1b\\[\\??[0-9;]*\\$y", // DECRPM：模式应答
+      "\\x1b\\[[0-9;]*t", // 窗口尺寸报告
+      "\\x1b\\][\\s\\S]*?(?:\\x07|\\x1b\\\\)", // OSC 应答（标题 / 颜色查询）
+      "\\x1bP[\\s\\S]*?\\x1b\\\\", // DCS 应答
+    ].join("|") +
+    ")+$"
+);
+
+export function isXtermGenerated(data: string): boolean {
+  return data.length > 0 && XTERM_GENERATED.test(data);
+}
+
+/**
+ * 当前有托管契约的 console。只有它们才采屏幕帧、发心跳、上报敲键夺权 ——
+ * 没签契约的终端没人读这些帧，每 2s 一次的全屏重建 + 哈希 + IPC 纯属浪费。
+ * App / 托管面板轮询契约列表后调 `setStewardConsoles` 喂进来。
+ */
+const stewardConsoles = new Set<string>();
+
+export function setStewardConsoles(ids: Iterable<string>): void {
+  const next = new Set(ids);
+  const added = [...next].filter((id) => !stewardConsoles.has(id));
+  const removed = [...stewardConsoles].filter((id) => !next.has(id));
+  if (added.length === 0 && removed.length === 0) return;
+  for (const id of removed) {
+    stewardConsoles.delete(id);
+    userKeyLast.delete(id);
+    dropCaptureState(id);
+  }
+  for (const id of added) stewardConsoles.add(id);
+  // 新签的契约立刻补一帧全量：后端马上就有屏幕可读，不必等下一次输出或心跳
+  for (const id of added) {
+    if (!registry.has(id)) continue;
+    pendingFull.add(id);
+    scheduleCapture(id, 0);
+  }
+  syncCaptureHeartbeat();
+}
+
+export function isStewardConsole(id: string): boolean {
+  return stewardConsoles.has(id);
+}
+
 export function onInput(id: string, fn: InputTap): () => void {
   let set = inputTaps.get(id);
   if (!set) {
@@ -118,7 +181,8 @@ export function onInput(id: string, fn: InputTap): () => void {
 }
 
 export function emitInput(id: string, data: string): void {
-  if (userKeySink && data.length > 0) {
+  // 只有真·用户输入、且这个 console 正在被托管时才上报；其余情况后端也只会回 -1
+  if (userKeySink && stewardConsoles.has(id) && data.length > 0 && !isXtermGenerated(data)) {
     const now = Date.now();
     if (now - (userKeyLast.get(id) ?? 0) >= USER_KEY_MIN_GAP_MS) {
       userKeyLast.set(id, now);
@@ -315,18 +379,26 @@ export function setScreenDeltaSink(fn: DeltaSink | null): void {
   deltaSink = fn;
 }
 
-/** 本地开关。采集是纯本地行为，不出网、不调模型，可以默认常开。 */
+/**
+ * 本地总开关。采集是纯本地行为，不出网、不调模型；实际只对有托管契约的 console
+ * 生效（见 `setStewardConsoles`），没有契约时连心跳定时器都不起。
+ */
 export function setScreenCaptureEnabled(on: boolean): void {
   captureEnabled = on;
-  if (!on) {
-    stopCaptureHeartbeat();
-    return;
+  if (on) {
+    for (const id of registry.keys()) {
+      if (!stewardConsoles.has(id)) continue;
+      pendingFull.add(id);
+      scheduleCapture(id);
+    }
   }
-  for (const id of registry.keys()) {
-    pendingFull.add(id);
-    scheduleCapture(id);
-  }
-  startCaptureHeartbeat();
+  syncCaptureHeartbeat();
+}
+
+/** 有开关、且至少一个托管中的 console 时才跑心跳 */
+function syncCaptureHeartbeat(): void {
+  if (captureEnabled && stewardConsoles.size > 0) startCaptureHeartbeat();
+  else stopCaptureHeartbeat();
 }
 
 function startCaptureHeartbeat(): void {
@@ -334,7 +406,9 @@ function startCaptureHeartbeat(): void {
   captureHeartbeat = window.setInterval(() => {
     if (!captureEnabled || !deltaSink) return;
     // hash 不变的帧只带 frameId + 空 lines，后端仍会累 idleFrames 并刷新 updatedAt
-    for (const id of registry.keys()) scheduleCapture(id, 0);
+    for (const id of stewardConsoles) {
+      if (registry.has(id)) scheduleCapture(id, 0);
+    }
   }, CAPTURE_HEARTBEAT_MS);
 }
 
@@ -351,10 +425,10 @@ export function requestFullFrame(id: string): void {
   scheduleCapture(id, 0);
 }
 
-/** 供面板手动刷新 / 验证用 */
+/** 供面板手动刷新 / 验证用：显式操作，不受托管门控限制 */
 export function captureNow(id: string): void {
   pendingFull.add(id);
-  captureFrame(id);
+  captureFrame(id, true);
 }
 
 function dropCaptureState(id: string): void {
@@ -368,7 +442,8 @@ function dropCaptureState(id: string): void {
 }
 
 function scheduleCapture(id: string, delay = CAPTURE_DEBOUNCE_MS): void {
-  if (!captureEnabled || !deltaSink) return;
+  // 没签契约的终端连定时器都不排：onWriteParsed 是热路径，这里只读两个布尔 + 一次 Set 查找
+  if (!captureEnabled || !deltaSink || !stewardConsoles.has(id)) return;
   const existing = captureTimers.get(id);
   if (existing !== undefined) window.clearTimeout(existing);
   const timer = window.setTimeout(() => {
@@ -378,9 +453,10 @@ function scheduleCapture(id: string, delay = CAPTURE_DEBOUNCE_MS): void {
   captureTimers.set(id, timer);
 }
 
-function captureFrame(id: string): void {
+function captureFrame(id: string, force = false): void {
   const term = registry.get(id);
   if (!term || !captureEnabled || !deltaSink) return;
+  if (!force && !stewardConsoles.has(id)) return;
   try {
     const buf = term.buffer.active;
     const alt = buf.type !== "normal";

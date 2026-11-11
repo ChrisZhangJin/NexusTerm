@@ -9,7 +9,14 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { splitList, stewardApi, type CtxInput, type CtxItem, type CtxKind } from "../lib/steward";
+import {
+  TIER_LABELS,
+  splitList,
+  stewardApi,
+  type CtxInput,
+  type CtxItem,
+  type CtxKind,
+} from "../lib/steward";
 
 export interface StewardContextProps {
   /** 当前选中的托管契约；意向栈按它过滤 */
@@ -118,7 +125,7 @@ export default function StewardContext({ contractId, onChanged }: StewardContext
   const submit = async () => {
     if (!text.trim() || busy) return;
     if (kind === "intent" && !contractId) {
-      setErr("先签一份托管契约，意向栈要挂在契约上");
+      setErr("先开始托管，意向栈要挂在托管契约上");
       return;
     }
     let extra: Record<string, unknown> = {};
@@ -226,7 +233,7 @@ export default function StewardContext({ contractId, onChanged }: StewardContext
         {shown.length === 0 && (
           <div className="st-empty">
             {kind === "intent" && !contractId
-              ? "先在上面签一份托管契约，这里会出现编译出的意向栈 I0"
+              ? "先在上面开始托管，这里会出现由目标编译出的意向栈 I0"
               : "这一类还没有条目"}
           </div>
         )}
@@ -305,9 +312,9 @@ export default function StewardContext({ contractId, onChanged }: StewardContext
               <input className="st-input" value={answer} onChange={(e) => setAnswer(e.target.value)} placeholder="要发出的回复（单行）" />
               <input className="st-input short" value={optionIndex} onChange={(e) => setOptionIndex(e.target.value)} placeholder="选项号" />
               <select className="st-select" value={tier} onChange={(e) => setTier(e.target.value)}>
-                <option value="auto">Auto</option>
-                <option value="notify">Notify</option>
-                <option value="approve">Approve</option>
+                <option value="auto">{TIER_LABELS.auto}</option>
+                <option value="notify">{TIER_LABELS.notify}</option>
+                <option value="approve">{TIER_LABELS.approve}</option>
               </select>
             </div>
           </>

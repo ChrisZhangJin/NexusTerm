@@ -40,11 +40,12 @@ import {
   requestFullFrame,
   setScreenCaptureEnabled,
   setScreenDeltaSink,
+  setStewardConsoles,
   setUserKeySink,
   snapshotConsole,
   waitForPrompt,
 } from "./lib/termRegistry";
-import { stewardApi } from "./lib/steward";
+import { stewardApi, stewardConsoleIds } from "./lib/steward";
 import {
   isTerminalReply,
   runMacro,
@@ -1237,6 +1238,34 @@ export default function App() {
       setScreenDeltaSink(null);
       setUserKeySink(null);
       setScreenCaptureEnabled(false);
+    };
+  }, []);
+
+  /**
+   * 采集 / 心跳 / 敲键上报只对有托管契约的 console 生效。托管面板只在打开时轮询，
+   * 这里在 App 层兜底：契约开始 / 停止 / 恢复的事件到来时立刻对一次账，另每 5s 慢轮询
+   * 一次（整个 app 一次 IPC，与终端数无关）—— 冷启动后从 Checkpoint 重建的契约也能接上。
+   */
+  useEffect(() => {
+    let disposed = false;
+    const sync = () => {
+      void stewardApi
+        .status()
+        .then((list) => {
+          if (!disposed) setStewardConsoles(stewardConsoleIds(list));
+        })
+        .catch(() => undefined);
+    };
+    sync();
+    const timer = window.setInterval(sync, 5000);
+    const un = stewardApi.onEvent((e) => {
+      if (e.kind === "contract_started" || e.kind === "contract_stopped" || e.kind === "resumed") sync();
+    });
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      void un.then((f) => f()).catch(() => undefined);
+      setStewardConsoles([]);
     };
   }, []);
 

@@ -14,15 +14,25 @@ import {
   registerTerm,
   setScreenCaptureEnabled,
   setScreenDeltaSink,
+  setStewardConsoles,
   type ScreenDelta,
 } from "../../src/lib/termRegistry";
 import {
   ACTION_LABELS,
   OUTCOME_LABELS,
   REF_LABELS,
+  TIER_LABELS,
+  authorityToSave,
+  decisionAwaiting,
   decisionSettled,
   splitList,
+  stewardConsoleIds,
+  stewardStatusLine,
+  syncAuthDraft,
+  type Authority,
   type DecisionRecord,
+  type EscalationCard,
+  type StewardContract,
 } from "../../src/lib/steward";
 
 test("帧指纹与后端共用同一组校验向量", () => {
@@ -93,6 +103,8 @@ test("静默期心跳帧持续上报：哈希不变、只带 frameId、时间戳
   try {
     setScreenDeltaSink((d) => frames.push(d));
     unregister = registerTerm("tab-1", fake);
+    // 只有托管中的 console 才采帧 / 发心跳
+    setStewardConsoles(["tab-1"]);
     setScreenCaptureEnabled(true);
     assert.equal(intervals.length, 1, "开启采集后应起一个心跳定时器");
 
@@ -118,6 +130,7 @@ test("静默期心跳帧持续上报：哈希不变、只带 frameId、时间戳
     assert.ok(frames[2].tsMs >= frames[1].tsMs, "时间戳要持续刷新，后端才不会误判断流");
   } finally {
     setScreenCaptureEnabled(false);
+    setStewardConsoles([]);
     unregister();
     setScreenDeltaSink(null);
     g.window = prevWindow;
@@ -127,7 +140,7 @@ test("静默期心跳帧持续上报：哈希不变、只带 frameId、时间戳
 
 // ───────────────── P2：决策卡的人话标签与升级卡收敛 ─────────────────
 
-const fakeDecision = (outcome: string): DecisionRecord => ({
+const fakeDecision = (outcome: string, escalation: EscalationCard | null = null): DecisionRecord => ({
   seq: 1,
   tsMs: 1_000,
   contractId: "c-1",
@@ -142,14 +155,39 @@ const fakeDecision = (outcome: string): DecisionRecord => ({
   tier: "auto",
   llmUsed: false,
   outcome,
-  escalation: null,
+  escalation,
   receipt: null,
 });
 
-test("升级卡只在未收敛的决策上出现", () => {
+const fakeCard = (createdAt: number, timeoutMs = 30_000): EscalationCard => ({
+  recommendation: { kind: "answer", text: "yes", optionIndex: null, injectable: true },
+  why: [],
+  alternatives: [],
+  defaultAction: { kind: "wait", text: "继续等待", optionIndex: null, injectable: false },
+  timeoutMs,
+  oneClick: true,
+  createdAt,
+});
+
+test("已收敛的决策不再显示倒计时；escalated 是「待确认」不算收敛", () => {
   assert.equal(decisionSettled(fakeDecision("proposed")), false);
-  for (const o of ["applied", "escalated", "rejected", "no_receipt", "rolled_back"]) {
+  // 后端把每条等你拍板的决策都记成 escalated，算成已收敛就永远看不到确认按钮
+  assert.equal(decisionSettled(fakeDecision("escalated")), false);
+  for (const o of ["applied", "rejected", "no_receipt", "rolled_back"]) {
     assert.equal(decisionSettled(fakeDecision(o)), true, `${o} 不该继续显示倒计时`);
+  }
+});
+
+test("升级卡：escalated + 有卡 + 倒计时未到才显示「按建议执行 / 我自己来」", () => {
+  const card = fakeCard(10_000, 30_000);
+  assert.equal(decisionAwaiting(fakeDecision("escalated", card), 10_000), true);
+  assert.equal(decisionAwaiting(fakeDecision("escalated", card), 39_999), true);
+  // 超时：循环会按默认动作收敛，前端也先收起
+  assert.equal(decisionAwaiting(fakeDecision("escalated", card), 40_000), false);
+  // 没有卡 / 已收敛的不显示
+  assert.equal(decisionAwaiting(fakeDecision("escalated"), 10_000), false);
+  for (const o of ["applied", "rejected", "no_receipt", "rolled_back", "proposed", "observed"]) {
+    assert.equal(decisionAwaiting(fakeDecision(o, card), 10_000), false, o);
   }
 });
 
@@ -202,6 +240,7 @@ test("P3 事件枚举扩容后每个 kind 都有中文标签", () => {
 
 test("用户敲键触发夺权上报，且同 console 250ms 内节流", () => {
   const calls: Array<[string, number]> = [];
+  setStewardConsoles(["tab-1", "tab-2"]);
   setUserKeySink((id, at) => calls.push([id, at]));
   emitInputP3("tab-1", "a");
   emitInputP3("tab-1", "b");
@@ -214,12 +253,132 @@ test("用户敲键触发夺权上报，且同 console 250ms 内节流", () => {
   assert.equal(calls.length, 2);
   assert.equal(calls[1][0], "tab-2");
   setUserKeySink(null);
+  setStewardConsoles([]);
 });
 
 test("空字节不触发夺权上报（防 paste 空事件噪音）", () => {
   const calls: Array<[string, number]> = [];
+  setStewardConsoles(["tab-3"]);
   setUserKeySink((id, at) => calls.push([id, at]));
   emitInputP3("tab-3", "");
   assert.equal(calls.length, 0);
   setUserKeySink(null);
+  setStewardConsoles([]);
+});
+
+// ————————————————————————— 授权草稿按契约 id 绑定 —————————————————————————
+
+const auth = (patch: Partial<Authority> = {}): Authority => ({
+  tier: "notify",
+  deny: ["rm -rf"],
+  allow: [],
+  allowPermanentGrant: false,
+  undoWindowMs: 30_000,
+  hostScope: [],
+  maxSteps: 50,
+  maxMinutes: 30,
+  maxOutputChars: 100_000,
+  timeboxMs: 0,
+  ...patch,
+});
+
+test("授权草稿：轮询给新对象不会冲掉正在编辑的值", () => {
+  const first = syncAuthDraft(null, "c-A", auth());
+  assert.ok(first);
+  const edited = { ...first, authority: { ...first.authority, maxSteps: 7 }, dirty: true };
+  // 每 1.5s 一个内容相同的新对象 / 甚至后端换了档，改过的草稿都原样保留
+  assert.equal(syncAuthDraft(edited, "c-A", auth()), edited);
+  assert.equal(syncAuthDraft(edited, "c-A", auth({ tier: "approve" })), edited);
+  // 没改过的草稿：内容不变返回原对象（省一次渲染），后端变了就跟上
+  assert.equal(syncAuthDraft(first, "c-A", auth()), first);
+  assert.equal(syncAuthDraft(first, "c-A", auth({ tier: "approve" }))?.authority.tier, "approve");
+});
+
+test("授权草稿：换到另一份契约（哪怕同档位）就丢掉旧草稿，保存绝不写到别的契约上", () => {
+  const a = syncAuthDraft(null, "c-A", auth({ hostScope: ["host-a"] }));
+  assert.ok(a);
+  const edited = { ...a, authority: { ...a.authority, maxSteps: 3 }, dirty: true };
+  const b = syncAuthDraft(edited, "c-B", auth({ hostScope: ["host-b"] }));
+  assert.equal(b?.contractId, "c-B");
+  assert.equal(b?.authority.maxSteps, 50);
+  assert.deepEqual(b?.authority.hostScope, ["host-b"]);
+  assert.equal(b?.dirty, false);
+  // A 的草稿拿去存 B：拒绝
+  assert.equal(authorityToSave(edited, "c-B", auth({ hostScope: ["host-b"] })), null);
+  assert.equal(syncAuthDraft(edited, null, null), null);
+});
+
+test("授权保存只带表单可改字段，host 作用域 / deny / 档位取目标契约当前值", () => {
+  const draft = {
+    contractId: "c-A",
+    authority: auth({ maxSteps: 9, maxMinutes: 5, timeboxMs: 60_000, allowPermanentGrant: true, hostScope: ["stale"], tier: "auto" as const }),
+    dirty: true,
+  };
+  const server = auth({ hostScope: ["host-a"], tier: "approve", deny: ["shutdown"] });
+  const out = authorityToSave(draft, "c-A", server);
+  assert.ok(out);
+  assert.equal(out.maxSteps, 9);
+  assert.equal(out.maxMinutes, 5);
+  assert.equal(out.timeboxMs, 60_000);
+  assert.equal(out.allowPermanentGrant, true);
+  assert.deepEqual(out.hostScope, ["host-a"]);
+  assert.deepEqual(out.deny, ["shutdown"]);
+  assert.equal(out.tier, "approve");
+});
+
+// ————————————————————————— 采集门控 / 顶部状态行 / 档位标签 —————————————————————————
+
+test("采集门控只认有契约的 console，去重", () => {
+  const c = (id: string, consoleId: string): StewardContract => ({
+    id,
+    consoleId,
+    hostKey: "local",
+    goal: "g",
+    authorityTier: "notify",
+    status: "observing",
+    intentIds: [],
+    timeboxMs: 0,
+    createdAt: 0,
+  });
+  assert.deepEqual(stewardConsoleIds([]), []);
+  assert.deepEqual(stewardConsoleIds([c("a", "tab-1"), c("b", "tab-2"), c("c", "tab-1")]), ["tab-1", "tab-2"]);
+});
+
+test("档位只换显示文字，值不变", () => {
+  assert.equal(TIER_LABELS.auto, "自动执行");
+  assert.equal(TIER_LABELS.notify, "通知后执行");
+  assert.equal(TIER_LABELS.approve, "需确认后执行");
+});
+
+test("顶部状态行按优先级解释「为什么没动 / 在干什么」", () => {
+  const base = {
+    hasContract: true,
+    ownership: "agent_driving" as const,
+    executionEnabled: true,
+    awaiting: 0,
+    situation: "idle" as const,
+  };
+  assert.match(stewardStatusLine({ ...base, hasContract: false }).text, /^未开始：.*「开始托管」/);
+  assert.match(stewardStatusLine({ ...base, ownership: "observing_only" }).text, /你接管中.*交还托管/);
+  assert.match(stewardStatusLine({ ...base, ownership: "suspended" }).text, /已暂停（预算用完/);
+  assert.match(
+    stewardStatusLine({ ...base, ownership: "suspended", suspensionReason: "时间盒到期" }).text,
+    /已暂停（时间盒到期）/
+  );
+  const pend = stewardStatusLine({ ...base, awaiting: 2, executionEnabled: false });
+  assert.match(pend.text, /待你确认的建议 ↓/);
+  assert.equal(pend.tone, "warn");
+  assert.match(stewardStatusLine({ ...base, stale: true }).text, /断流/);
+  assert.match(stewardStatusLine({ ...base, situation: "password" }).text, /密码/);
+  assert.equal(
+    stewardStatusLine({ ...base, executionEnabled: false }).text,
+    "自动应答已关 — 只会给建议，不会替你输入"
+  );
+  const idle = stewardStatusLine(base);
+  assert.match(idle.text, /^等待屏幕出现提问 \/ 权限确认（当前：shell 空闲 → 不会主动执行命令）$/);
+  assert.equal(idle.tone, "idle");
+  assert.match(stewardStatusLine({ ...base, situation: null }).text, /当前：未识别/);
+  const busy = stewardStatusLine({ ...base, situation: "permission" });
+  assert.match(busy.text, /授权确认/);
+  assert.equal(busy.tone, "active");
 });

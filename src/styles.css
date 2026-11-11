@@ -1602,8 +1602,9 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 }
 .st-note strong { color: var(--accent); font-weight: 500; }
 .st-err { flex: none; padding: 6px 10px; color: var(--danger); }
-.st-head { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.st-head > div { display: flex; gap: 6px; }
+.st-head { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+/* 按钮组窄面板下换行，别把「刷新」挤出右边 */
+.st-head > div { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; min-width: 0; }
 .st-btn {
   padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px;
   background: var(--bg-elev); color: var(--text); cursor: pointer; font-size: 11.5px;
@@ -1612,6 +1613,11 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .st-btn:disabled { opacity: 0.45; cursor: default; }
 .st-btn.primary { background: var(--accent); color: #0d1512; border-color: var(--accent); }
 .st-btn.danger { color: var(--danger); }
+/* 「开着、要留意」的开关态（自动应答 / Planner）：琥珀色，与关闭态的中性灰一眼可分 */
+.st-btn.warn {
+  color: #e5c07b; border-color: #e5c07b;
+  background: color-mix(in srgb, #e5c07b 14%, var(--bg-elev));
+}
 .st-list { flex: none; display: flex; flex-direction: column; gap: 4px; max-height: 190px; overflow-y: auto; }
 .st-empty { color: var(--text-dim); padding: 8px; }
 .st-row {
@@ -1629,10 +1635,15 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 }
 .st-badge.on { color: var(--accent); border-color: var(--accent); }
 .st-badge.alt { color: #e0b86c; }
-.st-meta { flex: none; color: var(--text-dim); font-size: 10.5px; }
+/* 可收缩：窄面板下长元信息换行，而不是把同一行的按钮挤出可视区 */
+.st-meta { flex: 0 1 auto; min-width: 0; color: var(--text-dim); font-size: 10.5px; }
 .st-form { flex: none; display: flex; flex-direction: column; gap: 6px; }
 .st-form-title { display: flex; align-items: center; gap: 8px; }
 .st-form-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.st-form-row.st-center { align-items: center; }
+.st-form-row.st-nowrap { flex-wrap: nowrap; }
+/* 行内长文本（现场目标 / 撤销动作 / 剧本候选）：单行省略，完整内容放 title */
+.st-ellipsis { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .st-goal, .st-select {
   border: 1px solid var(--border); border-radius: 6px; background: var(--bg-panel);
   color: var(--text); font-size: 11.5px; padding: 6px 8px; font-family: inherit;
@@ -2353,3 +2364,26 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .st-ctx-text { flex: 1 1 100%; display: flex; align-items: baseline; gap: 5px; flex-wrap: wrap; font-size: 11.5px; color: var(--text); }
 .st-ctx-acts { display: flex; gap: 4px; }
 .st-ctx-form { display: flex; flex-direction: column; gap: 5px; padding: 7px; border: 1px solid var(--border); border-radius: 7px; }
+
+/* ── 托管页主卡：目标终端 / 目标 / 开始停止 / 档位 / 接管交还 / 自动应答 / 状态行 ── */
+.st-main {
+  flex: none; display: flex; flex-direction: column; gap: 7px;
+  padding: 9px 10px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-elev);
+}
+.st-main-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 12.5px; }
+.st-main-head .st-name { flex: 1 1 auto; font-weight: 600; }
+.st-status {
+  padding: 5px 8px; border-radius: 6px; border-left: 3px solid var(--border);
+  background: var(--bg-panel); color: var(--text-dim); font-size: 11.5px; line-height: 1.5;
+}
+.st-status.active { border-left-color: var(--accent); color: var(--text); }
+.st-status.warn { border-left-color: #e5c07b; color: #e5c07b; }
+
+/* 诊断：计数器 / 阈值 / 帧指纹等内部细节，默认收起 */
+.st-diag { flex: none; color: var(--text-dim); }
+.st-diag > summary { cursor: pointer; font-size: 11.5px; padding: 2px 0; }
+.st-diag-body {
+  display: flex; flex-direction: column; gap: 6px; margin-top: 6px;
+  padding: 7px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-panel);
+}
