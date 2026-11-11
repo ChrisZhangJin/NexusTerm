@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::decision::{CtxRef, DecisionAction, DecisionRecord, EscalationCard};
-use super::situation::{Situation, SituationKind};
+use super::situation::{Choice, Situation, SituationKind};
 
 pub const TIER_AUTO: &str = "auto";
 pub const TIER_NOTIFY: &str = "notify";
@@ -135,7 +135,28 @@ const DESTRUCTIVE_TERMS: &[&str] = &[
     "生产环境", "prod ", "shutdown", "reboot", "kill -9",
 ];
 
-/// 从动作文本与局面推断风险。纯函数：同一条决策多次调用结果必须一致。
+/// 永久扩权的文字特征；只在拿不到结构化选项时兜底使用。
+const PERMANENT_TERMS: &[&str] = &["don't ask again", "always allow", "永久", "不再询问"];
+
+/// 动作选中的那个屏幕选项（按编号精确匹配）。拿不到就说明是自由文本或伪造编号。
+fn chosen_option<'a>(action: &DecisionAction, sit: &'a Situation) -> Option<&'a Choice> {
+    let idx = action.option_index.as_deref().filter(|s| !s.is_empty())?;
+    sit.options.iter().find(|o| o.index.as_deref() == Some(idx))
+}
+
+/// 真正会生效的语义文本：选了编号就是那个选项的原文，否则是动作文本本身。
+/// 风险与 deny 关键字都只看它——「本次允许：Yes（不选择永久授权）」这种说明文字里
+/// 出现「永久」二字，不能让本次允许被当成永久扩权一起拒掉。
+fn effective_payload(action: &DecisionAction, sit: &Situation) -> String {
+    match chosen_option(action, sit) {
+        Some(o) => o.text.to_lowercase(),
+        None => action.text.to_lowercase(),
+    }
+}
+
+/// 从动作与局面推断风险。纯函数：同一条决策多次调用结果必须一致。
+/// 有结构化选项时以选项元数据（`grants_permanent`）为准，选项原文的永久特征也算（fail-closed）；
+/// 没有选项可依时才扫动作文本。
 pub fn risk_of(action: &DecisionAction, sit: &Situation) -> Risk {
     if action.kind == "secret" || sit.kind == SituationKind::Password {
         return Risk::Secret;
@@ -143,18 +164,15 @@ pub fn risk_of(action: &DecisionAction, sit: &Situation) -> Risk {
     if !action.injectable || matches!(action.kind.as_str(), "observe" | "wait") {
         return Risk::Read;
     }
-    let text = format!("{} {}", action.text, action.option_index.as_deref().unwrap_or("")).to_lowercase();
-    if sit.options
-        .iter()
-        .any(|o| o.grants_permanent && action.option_index.as_deref() == o.index.as_deref())
-        || text.contains("don't ask again")
-        || text.contains("always allow")
-        || text.contains("永久")
-        || text.contains("不再询问")
-    {
+    let payload = effective_payload(action, sit);
+    let permanent = match chosen_option(action, sit) {
+        Some(o) => o.grants_permanent || PERMANENT_TERMS.iter().any(|t| payload.contains(t)),
+        None => PERMANENT_TERMS.iter().any(|t| payload.contains(t)),
+    };
+    if permanent {
         return Risk::Permanent;
     }
-    if DESTRUCTIVE_TERMS.iter().any(|t| text.contains(t)) {
+    if DESTRUCTIVE_TERMS.iter().any(|t| payload.contains(t)) {
         return Risk::Destructive;
     }
     // 权限提示的「本次允许」会改变会话状态，但作用域限于单会话，按可逆处理
@@ -201,15 +219,22 @@ pub fn evaluate(
     host_in_scope: bool,
 ) -> PolicyVerdict {
     let risk = risk_of(&rec.chosen, sit);
-    let haystack = format!(
-        "{} {} {}",
-        rec.chosen.kind,
-        rec.chosen.text.to_lowercase(),
-        risk.as_str()
-    );
+    let payload = effective_payload(&rec.chosen, sit);
+    // 结构化标签：动作类别、风险档，以及 deny 列表里约定的 secret / permanent_grant
+    let mut tags: Vec<&str> = vec![rec.chosen.kind.as_str(), risk.as_str()];
+    match risk {
+        Risk::Secret => tags.push("secret"),
+        Risk::Permanent => tags.push("permanent_grant"),
+        _ => {}
+    }
 
-    // 1. deny 是硬禁，allow 不能覆盖
-    if auth.deny.iter().any(|d| haystack.contains(d.as_str())) {
+    // 1. deny 是硬禁，allow 不能覆盖：标签精确命中，或自定义关键字出现在真正生效的文本里
+    if tags.iter().any(|t| auth.denies(t))
+        || auth
+            .deny
+            .iter()
+            .any(|d| !d.is_empty() && payload.contains(&d.to_lowercase()))
+    {
         return PolicyVerdict::Deny {
             reason: format!("命中 Authority.deny（{}）", risk.as_str()),
         };
@@ -510,6 +535,28 @@ mod tests {
         a.allow.push("answer".into());
         let r = rec("answer", "cargo test", None, true);
         assert_eq!(evaluate(&a, &r, &sit(SituationKind::Question, false), true), PolicyVerdict::Auto);
+    }
+
+    #[test]
+    fn allow_once_passes_while_permanent_option_is_denied() {
+        let a = Authority::default().with_tier("auto");
+        // compile() 产出的「本次允许」说明文字里带「永久」二字，但选中的是非永久的 1 号
+        let once = rec("answer", "本次允许：Yes（不选择永久授权）", Some("1"), true);
+        let s = sit(SituationKind::Permission, true);
+        assert_eq!(risk_of(&once.chosen, &s), Risk::Reversible);
+        assert!(!matches!(evaluate(&a, &once, &s, true), PolicyVerdict::Deny { .. }));
+        // 2 号带 grants_permanent：无论动作文本怎么写都拒
+        let perm = rec("answer", "just yes", Some("2"), true);
+        assert!(matches!(evaluate(&a, &perm, &s, true), PolicyVerdict::Deny { .. }));
+        // 分类器漏标 grants_permanent，但选项原文是永久特征：仍然 fail-closed
+        let s2 = sit(SituationKind::Permission, false);
+        assert_eq!(risk_of(&perm.chosen, &s2), Risk::Permanent);
+        // 编号对不上任何选项（伪造）时退回扫动作文本
+        let forged = rec("answer", "2. Yes, and don't ask again", Some("9"), true);
+        assert_eq!(risk_of(&forged.chosen, &s), Risk::Permanent);
+        // 密码依旧硬禁
+        let pw = rec("secret", "本人输入", None, false);
+        assert!(matches!(evaluate(&a, &pw, &sit(SituationKind::Password, false), true), PolicyVerdict::Deny { .. }));
     }
 
     #[test]

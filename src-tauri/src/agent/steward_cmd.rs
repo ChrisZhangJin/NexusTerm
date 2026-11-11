@@ -25,8 +25,8 @@ use super::situation;
 use super::steward::{now_ms, ScreenStore, StewardContract, StewardRegistry};
 use super::steward_core::{CoreView, StewardCore};
 use super::steward_loop::{
-    build_context, persist_decision, EventLog, StewardBus, StewardEvent, StewardEventKind,
-    StewardResolutions,
+    approval_gate, build_context, persist_decision, EventLog, StewardBus, StewardEvent,
+    StewardEventKind, StewardResolutions, StewardRuntime,
 };
 
 /// 命令层直接往托管事件流补一条系统事件（循环下一 tick 也会看到同一份 log）。
@@ -88,6 +88,10 @@ pub fn steward_ctx_delete(
     let removed = brain.delete(&id);
     if removed {
         state.store.steward_ctx_delete(&id)?;
+        // 蒸馏剧本的 id 由 (host, 签名) 确定性生成，不留墓碑的话下一轮蒸馏又会建回来
+        if id.starts_with("distilled-") {
+            state.store.steward_tombstone_add(&id, now_ms()).ok();
+        }
         bus.wake();
     }
     Ok(removed)
@@ -166,6 +170,7 @@ pub fn steward_decide_now(
     brain: State<'_, StewardBrain>,
     core: State<'_, StewardCore>,
     state: State<'_, AppState>,
+    runtime: State<'_, StewardRuntime>,
 ) -> Result<DecisionRecord, String> {
     let Some(snap) = screen.get(&console_id) else {
         return Err("还没有这个 console 的屏幕帧".to_string());
@@ -182,6 +187,8 @@ pub fn steward_decide_now(
     policy::authorize(&auth, &mut rec, &sit, in_scope);
     rec.seq = persist_decision(&app, &rec);
     brain.remember_decision(rec.seq, &rec);
+    // 落了库的决策都算进决策计数，面板上的数字才和决策列表对得上
+    runtime.mark_decision();
     Ok(rec)
 }
 
@@ -203,24 +210,43 @@ pub fn steward_set_execution(
 }
 
 /// 升级卡「按建议执行」：只投递 seq，注入由常驻循环执行。
-/// 这里同时挡掉密码 / 不可注入动作，避免升级卡变成一个通用写终端后门。
+/// 投递前先跑与循环相同的 `approval_gate`（待确认、契约仍有效、屏幕未变、非 shell、
+/// 策略复核、总闸、所有权），不满足就直接把中文原因还给前端；循环注入前还会再跑一遍，
+/// 并在写入前消费掉这张卡，所以同一张卡连点两次也只会写一次。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn steward_approve(
     seq: i64,
     brain: State<'_, StewardBrain>,
     resolutions: State<'_, StewardResolutions>,
     bus: State<'_, StewardBus>,
     core: State<'_, StewardCore>,
+    registry: State<'_, StewardRegistry>,
+    screen: State<'_, ScreenStore>,
+    state: State<'_, AppState>,
 ) -> Result<bool, String> {
     let rec = brain
         .decision(seq)
         .ok_or_else(|| format!("找不到决策 #{seq}（可能已过期）"))?;
-    if rec.chosen.send_bytes().is_none() {
-        return Err("这条建议不能自动注入（密码 / 只读动作需本人处理）".to_string());
-    }
-    if !core.ownership().can_write(&rec.console_id) {
-        return Err("当前是观察 / 暂停态：请先点「交还」再确认执行".to_string());
-    }
+    let active = registry.for_console(&rec.console_id);
+    let auth = core.authority(&rec.contract_id);
+    let known =
+        state.local.contains(&rec.console_id) || state.sessions.contains(&rec.console_id);
+    let in_scope = active
+        .as_ref()
+        .map(|c| policy::host_in_scope(&auth, &c.host_key, known))
+        .unwrap_or(false);
+    approval_gate(
+        &rec,
+        core.is_consumed(seq),
+        active.as_ref(),
+        screen.get(&rec.console_id).as_ref(),
+        &auth,
+        in_scope,
+        brain.execution_enabled(),
+        core.ownership().can_write(&rec.console_id),
+        now_ms(),
+    )?;
     resolutions.approve(seq);
     bus.wake();
     Ok(true)
@@ -235,10 +261,14 @@ pub fn steward_reject(
     state: State<'_, AppState>,
     resolutions: State<'_, StewardResolutions>,
     bus: State<'_, StewardBus>,
+    core: State<'_, StewardCore>,
 ) -> Result<bool, String> {
     let rec = brain
         .decision(seq)
         .ok_or_else(|| format!("找不到决策 #{seq}（可能已过期）"))?;
+    // 立刻消费：拒绝之后哪怕循环还没处理，迟到的批准也写不进去
+    core.try_consume(seq);
+    brain.set_decision_outcome(seq, "rolled_back");
     resolutions.reject(seq);
     state
         .store
@@ -299,7 +329,9 @@ pub fn steward_user_key(
     if registry.for_console(&console_id).is_none() {
         return -1; // 没托管的 tab 不建槽，避免每个键都产生副作用
     }
-    let latency = core.ownership().user_key(&console_id, key_at_ms, now_ms());
+    let latency = core
+        .ownership()
+        .user_key(&console_id, key_at_ms, now_ms(), core.elapsed_ms());
     bus.wake();
     latency
 }
@@ -425,7 +457,8 @@ pub fn steward_set_authority(
 ) -> Authority {
     let a = core.set_authority(&contract_id, authority);
     registry.amend(&contract_id, None, Some(a.tier.clone()));
-    core.set_timebox_config(TimeboxConfig::from_authority(&a));
+    // 契约里的 timebox 只属于这份契约；以前写进全局配置，会把别的 tab 的 deadline 一起改掉
+    core.set_contract_timebox(&contract_id, TimeboxConfig::from_authority(&a));
     bus.wake();
     a
 }
@@ -460,23 +493,33 @@ pub fn steward_resume(
     registry: State<'_, StewardRegistry>,
     core: State<'_, StewardCore>,
     bus: State<'_, StewardBus>,
+    state: State<'_, AppState>,
 ) -> Result<String, String> {
     if registry.get(&contract_id).is_none() {
+        // 内存里没有（例如启动扫描时被去重掉）就回库里找那一行
         let cp = core
             .checkpoint(&contract_id)
+            .or_else(|| {
+                state
+                    .store
+                    .steward_checkpoint(&contract_id)
+                    .and_then(|raw| serde_json::from_str::<StewardCheckpoint>(&raw).ok())
+            })
             .ok_or_else(|| format!("找不到契约 {contract_id} 的 Checkpoint"))?;
         let c = StewardContract {
             id: cp.contract_id.clone(),
             console_id: cp.console_id.clone(),
-            host_key: format!("local:{}", cp.console_id),
+            host_key: cp.restored_host_key(),
             goal: cp.goal.clone(),
             authority_tier: cp.authority.tier.clone(),
             status: "observing".to_string(),
             intent_ids: cp.intent_ids.clone(),
             timebox_ms: cp.authority.timebox_ms,
-            created_at: cp.saved_wall_ms,
+            created_at: cp.created_or_saved_wall_ms(),
         };
         core.set_authority(&contract_id, cp.authority.clone());
+        core.resume_contract(&contract_id, cp.spent.elapsed_secs as i64 * 1000);
+        core.set_checkpoint(cp);
         registry.restore(c);
     }
     core.ensure_console(
@@ -609,6 +652,7 @@ pub async fn steward_plan_now(
     state: State<'_, AppState>,
     log: State<'_, EventLog>,
     bus: State<'_, StewardBus>,
+    runtime: State<'_, StewardRuntime>,
 ) -> Result<DecisionRecord, String> {
     if !core.planner().enabled() {
         return Err("LLM Planner 总闸未打开".to_string());
@@ -634,6 +678,7 @@ pub async fn steward_plan_now(
         return Err("AI 账号未配置完整（baseUrl / apiKey）".to_string());
     }
     let (system, messages) = planner::build_request(&ctx);
+    runtime.mark_llm_call();
     let reply = super::llm::complete_reply(&acct, &system, &messages, &[], None)
         .await
         .map_err(|e| format!("Planner 调用失败：{e:?}"))?;
@@ -641,9 +686,15 @@ pub async fn steward_plan_now(
     let auth = core.authority(&contract.id);
     let known = state.local.contains(&console_id) || state.sessions.contains(&console_id);
     let in_scope = policy::host_in_scope(&auth, &contract.host_key, known);
+    // apply_plan 把模型输出变成一张升级卡（或观察 / 硬禁），这里绝不直接注入：
+    // 卡交给常驻循环挂到状态槽上，之后与其它卡一样走超时收敛与 approval_gate。
     planner::apply_plan(&mut rec, action, &why, &auth, &sit, in_scope);
     rec.seq = persist_decision(&app, &rec);
     brain.remember_decision(rec.seq, &rec);
+    runtime.mark_decision();
+    if rec.escalation.is_some() && rec.seq > 0 {
+        core.push_escalation(&console_id, rec.seq);
+    }
     emit_event(
         &app,
         &log,

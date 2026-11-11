@@ -109,7 +109,9 @@ impl TimeboxHit {
     /// 触发后的默认动作描述。每一档都有，绝不出现「什么都不做」。
     pub fn default_action(self) -> &'static str {
         match self {
-            Self::ScreenAck => "降级到旁路缓冲，标低置信度，暂停一切写入",
+            // 循环里这一档只记旁路事件并通知，不改所有权、不拦写入（写入仍受回执与策略约束），
+            // 描述必须与实际行为一致，否则用户会以为此时已经停写。
+            Self::ScreenAck => "屏幕迟迟无新帧：记一条旁路事件并通知用户（不暂停写入）",
             Self::Receipt => "不重发；标记 no_receipt 并升级给人确认",
             Self::Step => "取消在途动作，回到观察，等待下一帧",
             Self::Idle => "收紧心跳到 1s，发一条状态摘要给用户",
@@ -266,6 +268,14 @@ pub struct StewardCheckpoint {
     pub state: String,
     pub last_signature: String,
     pub note: String,
+    /// 契约绑定的真实 host_key（例如 `ssh:root@10.0.0.1:22`），恢复时原样还原，
+    /// 不能再拼一个 `local:<console>`，否则主机作用域判定会错。旧库没有这个字段时为空。
+    #[serde(default)]
+    pub host_key: String,
+    /// 首次落盘的墙钟。TTL 从这里算：每 30s 的周期快照都会刷新 `saved_wall_ms`，
+    /// 若拿它算 TTL，一个永远开着的契约就永远不会过期。旧库没有该字段时为 0，回落到 `saved_wall_ms`。
+    #[serde(default)]
+    pub created_wall_ms: i64,
 }
 
 /// `TimeboxState` 带 BTreeSet，单独做个可序列化镜像（只需时间戳，raised 恢复后清空）。
@@ -298,6 +308,27 @@ impl StewardCheckpoint {
             state: "observing".to_string(),
             last_signature: String::new(),
             note: String::new(),
+            host_key: String::new(),
+            created_wall_ms: 0,
+        }
+    }
+
+    /// 重建契约用的 host_key。旧版本的 Checkpoint 没存这个字段，只能退回旧的
+    /// `local:<console>` 拼法（与旧行为一致），新落盘的都带真实值。
+    pub fn restored_host_key(&self) -> String {
+        if self.host_key.is_empty() {
+            format!("local:{}", self.console_id)
+        } else {
+            self.host_key.clone()
+        }
+    }
+
+    /// 契约的创建时刻（墙钟）；旧 Checkpoint 没有就用最后一次落盘时刻。
+    pub fn created_or_saved_wall_ms(&self) -> i64 {
+        if self.created_wall_ms > 0 {
+            self.created_wall_ms
+        } else {
+            self.saved_wall_ms
         }
     }
 
@@ -341,7 +372,12 @@ pub fn resume_verdict(
             reason: "该契约已完成，无需恢复".to_string(),
         };
     }
-    if now_wall_ms - cp.saved_wall_ms > CHECKPOINT_TTL_MS {
+    let born = if cp.created_wall_ms > 0 {
+        cp.created_wall_ms
+    } else {
+        cp.saved_wall_ms
+    };
+    if now_wall_ms - born > CHECKPOINT_TTL_MS {
         return ResumeVerdict::Expired {
             reason: format!(
                 "Checkpoint 已超过 {} 小时，现场可能早已变化",
@@ -354,12 +390,20 @@ pub fn resume_verdict(
             reason: cp.note.clone(),
         };
     }
-    match current_hash {
-        Some(h) if !cp.screen_hash.is_empty() && h != cp.screen_hash => ResumeVerdict::Drift {
+    // 没有屏幕帧 = 没法核对现场，绝不能当成 Clean 直接恢复写权限；
+    // 调用方应当等首帧到了再判一次。
+    let Some(h) = current_hash else {
+        return ResumeVerdict::Suspended {
+            reason: "还没有屏幕帧，无法核对现场：等首帧到达后再判定是否恢复".to_string(),
+        };
+    };
+    // checkpoint 里没存屏幕 hash（契约刚开就退出）同样无从比对，按漂移处理、降到 approve。
+    if cp.screen_hash.is_empty() || h != cp.screen_hash {
+        return ResumeVerdict::Drift {
             downgrade_to: TIER_APPROVE.to_string(),
-        },
-        _ => ResumeVerdict::Clean,
+        };
     }
+    ResumeVerdict::Clean
 }
 
 #[cfg(test)]
@@ -455,6 +499,47 @@ mod tests {
         assert!(matches!(resume_verdict(&cp, Some("aaaa1111"), 2_000), ResumeVerdict::Suspended { .. }));
         cp.state = "completed".into();
         assert!(matches!(resume_verdict(&cp, Some("aaaa1111"), 2_000), ResumeVerdict::Expired { .. }));
+    }
+
+    #[test]
+    fn resume_without_frame_is_never_clean() {
+        let mut cp = StewardCheckpoint::new("c1", "tab-1", "目标", &Authority::default());
+        cp.screen_hash = "aaaa1111".into();
+        cp.saved_wall_ms = 1_000;
+        assert!(matches!(resume_verdict(&cp, None, 2_000), ResumeVerdict::Suspended { .. }));
+        // 没存过 hash 的 checkpoint 也无从比对
+        cp.screen_hash.clear();
+        assert!(matches!(resume_verdict(&cp, Some("x"), 2_000), ResumeVerdict::Drift { .. }));
+    }
+
+    #[test]
+    fn ttl_counts_from_creation_not_last_periodic_save() {
+        let mut cp = StewardCheckpoint::new("c1", "tab-1", "目标", &Authority::default());
+        cp.screen_hash = "aaaa1111".into();
+        cp.created_wall_ms = 1_000;
+        // 周期快照刚刷新过 saved_wall_ms，但契约本身已经开了 24h 以上
+        cp.saved_wall_ms = CHECKPOINT_TTL_MS + 1_500;
+        assert!(matches!(
+            resume_verdict(&cp, Some("aaaa1111"), CHECKPOINT_TTL_MS + 2_000),
+            ResumeVerdict::Expired { .. }
+        ));
+    }
+
+    #[test]
+    fn old_checkpoint_json_without_new_fields_still_parses() {
+        let cp = StewardCheckpoint::new("c1", "tab-1", "目标", &Authority::default());
+        let mut v = serde_json::to_value(&cp).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("hostKey");
+        o.remove("createdWallMs");
+        let back: StewardCheckpoint = serde_json::from_value(v).unwrap();
+        assert!(back.host_key.is_empty());
+        assert_eq!(back.created_wall_ms, 0);
+    }
+
+    #[test]
+    fn screen_ack_description_does_not_claim_to_pause_writes() {
+        assert!(!TimeboxHit::ScreenAck.default_action().contains("暂停一切写入"));
     }
 
     #[test]

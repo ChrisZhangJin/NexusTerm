@@ -195,28 +195,8 @@ pub fn run() {
             app.manage(steward_resolutions.clone());
             app.manage(steward_core.clone());
             // P4：启动扫描未完成契约。契约本身只在内存里，靠 Checkpoint 重建；
-            // 循环启动后会 drain 恢复队列、先读屏对齐，hash 不符就降为「确认」档。
-            for (contract_id, console_id, _cp_state, raw) in store.steward_checkpoints() {
-                let Ok(cp) = serde_json::from_str::<agent::checkpoint::StewardCheckpoint>(&raw)
-                else {
-                    continue;
-                };
-                steward_registry.restore(agent::steward::StewardContract {
-                    id: contract_id.clone(),
-                    console_id: console_id.clone(),
-                    host_key: format!("local:{console_id}"),
-                    goal: cp.goal.clone(),
-                    authority_tier: cp.authority.tier.clone(),
-                    status: "observing".to_string(),
-                    intent_ids: cp.intent_ids.clone(),
-                    timebox_ms: cp.authority.timebox_ms,
-                    created_at: cp.saved_wall_ms,
-                });
-                steward_core.set_authority(&contract_id, cp.authority.clone());
-                steward_core.set_checkpoint(cp);
-                steward_core.ensure_console(&console_id);
-                steward_core.push_resume(&contract_id);
-            }
+            // 循环启动后会 drain 恢复队列、等首帧读屏对齐，hash 不符就降为「确认」档。
+            agent::steward::restore_checkpoints(&store, &steward_registry, &steward_core);
             app.manage(AppState {
                 sessions,
                 sftp,
