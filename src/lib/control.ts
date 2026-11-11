@@ -10,6 +10,7 @@
  */
 
 import { isTerminalReply } from "./macro";
+import { isXtermGenerated } from "./termRegistry";
 
 export type ControlState = "userDriving" | "agentDriving" | "paused";
 
@@ -24,18 +25,17 @@ export interface ControlPayload {
  *
  * xterm 的 `onData` 不只有键盘：终端程序发来查询（光标位置 `ESC[6n`、设备属性 `ESC[c`、
  * 颜色查询 OSC 等）时，xterm 会**自己**回一段应答也走 `onData`；开了焦点上报的程序
- * 还会收到 `ESC[I` / `ESC[O`。这些不是用户动手 —— 把它们当键盘会让 Agent 无缘无故被暂停。
+ * 还会收到 `ESC[I` / `ESC[O`，开了鼠标追踪的 TUI 还有鼠标上报。这些不是用户动手 ——
+ * 把它们当键盘会让 Agent 无缘无故被暂停。
  *
  * 判定刻意保守地只排除已知的自动应答形状，其余（含方向键 `ESC[A`、`ESC O P` 等）都算用户。
  */
 export function isUserTyping(d: string): boolean {
   if (d.length === 0) return false;
   if (isTerminalReply(d)) return false; // CPR / DA / 窗口尺寸 / OSC / DCS（与宏录制共用同一份判定）
-  // 补充 macro 那份没覆盖的：焦点进出、带 ? 的 CPR、DSR 状态报告、DECRPM 模式应答
-  if (d === "\x1b[I" || d === "\x1b[O") return false;
-  if (/^\x1b\[\?[0-9]+;[0-9]+R$/.test(d)) return false;
-  if (/^\x1b\[\??[0-9;]*n$/.test(d)) return false;
-  if (/^\x1b\[\??[0-9;]*\$y$/.test(d)) return false;
+  // 补充 macro 那份没覆盖的：焦点进出、鼠标上报、带 ? 的 CPR、DSR、DECRPM，以及几段连发
+  // （与托管夺权共用 termRegistry 的同一份判定）
+  if (isXtermGenerated(d)) return false;
   return true;
 }
 

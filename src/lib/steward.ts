@@ -579,9 +579,151 @@ export const OUTCOME_LABELS: Record<string, string> = {
   rolled_back: "已纠正",
 };
 
+/** 档位的人话标签（值不变，只换显示）。面板、依据编辑、决策卡共用。 */
+export const TIER_LABELS: Record<StewardTier, string> = {
+  auto: "自动执行",
+  notify: "通知后执行",
+  approve: "需确认后执行",
+};
+
+export const tierLabel = (t: string): string => TIER_LABELS[t as StewardTier] ?? t;
+
+/** 契约 / 现场状态的人话标签；未知值原样显示 */
+const CONTRACT_STATUS_LABELS: Record<string, string> = {
+  observing: "观察中",
+  none: "未托管",
+  suspended: "已暂停",
+};
+
+export const contractStatusLabel = (s: string): string => CONTRACT_STATUS_LABELS[s] ?? s;
+
 /** 已收敛的决策不再显示升级卡 / 倒计时。 */
 export const decisionSettled = (d: DecisionRecord): boolean =>
-  ["applied", "rejected", "rolled_back", "no_receipt", "escalated"].includes(d.outcome);
+  ["applied", "rejected", "rolled_back", "no_receipt"].includes(d.outcome);
+
+/**
+ * 这条决策还在等你拍板吗？后端把每条待确认的决策都记成 outcome=escalated 并挂一张
+ * 升级卡；超时后循环会按默认动作收敛并改写 outcome，前端倒计时到点也先收起。
+ */
+export const decisionAwaiting = (d: DecisionRecord, now: number): boolean =>
+  !!d.escalation &&
+  d.outcome === "escalated" &&
+  now < d.escalation.createdAt + d.escalation.timeoutMs;
+
+/** 当前有托管契约的 console —— 只有它们需要屏幕帧 / 心跳 / 敲键夺权上报 */
+export const stewardConsoleIds = (contracts: StewardContract[]): string[] => [
+  ...new Set(contracts.map((c) => c.consoleId)),
+];
+
+// ————————————————————————— 授权草稿（按契约 id 绑定） —————————————————————————
+
+/**
+ * 授权表单的编辑草稿。必须记住「从哪份契约加载的」：轮询每 1.5s 都会给一个新的
+ * Authority 对象，切到别的 console 时契约也会换，草稿只能写回它来源的那份契约。
+ */
+export interface AuthDraft {
+  contractId: string;
+  authority: Authority;
+  /** 用户改过还没保存；改过的草稿不被轮询覆盖 */
+  dirty: boolean;
+}
+
+const sameAuthority = (a: Authority, b: Authority): boolean =>
+  JSON.stringify(a) === JSON.stringify(b);
+
+/**
+ * 轮询结果到来时怎么处理草稿：
+ * - 契约 id 变了（换 console / 重签）→ 丢掉旧草稿，按新契约重新加载；
+ * - 同一份契约、用户改过 → 原样保留，绝不被轮询冲掉；
+ * - 同一份契约、没改过 → 跟随后端（比如交还时降档），值没变就返回原对象省一次渲染。
+ */
+export function syncAuthDraft(
+  prev: AuthDraft | null,
+  contractId: string | null,
+  server: Authority | null
+): AuthDraft | null {
+  if (!contractId) return null;
+  if (prev && prev.contractId === contractId) {
+    if (prev.dirty || !server) return prev;
+    return sameAuthority(prev.authority, server) ? prev : { contractId, authority: server, dirty: false };
+  }
+  return server ? { contractId, authority: server, dirty: false } : null;
+}
+
+/**
+ * 「保存授权」要发出去的内容。草稿不属于目标契约时返回 null（宁可不存，也不能把
+ * A 的预算 / host 作用域写到 B 上）。只取表单里能改的字段，其余（deny / allow /
+ * hostScope / 档位）一律以目标契约当前的为准 —— 档位只由顶部那一个选择框改。
+ */
+export function authorityToSave(
+  draft: AuthDraft | null,
+  contractId: string | null,
+  server: Authority | null
+): Authority | null {
+  if (!draft || !contractId || !server || draft.contractId !== contractId) return null;
+  const a = draft.authority;
+  return {
+    ...server,
+    allowPermanentGrant: a.allowPermanentGrant,
+    maxSteps: a.maxSteps,
+    maxMinutes: a.maxMinutes,
+    timeboxMs: a.timeboxMs,
+  };
+}
+
+// ————————————————————————— 顶部状态行 —————————————————————————
+
+export interface StatusLineInput {
+  hasContract: boolean;
+  ownership: OwnershipState | null;
+  suspensionReason?: string | null;
+  executionEnabled: boolean;
+  /** 这个 console 上还在倒计时的升级卡数 */
+  awaiting: number;
+  situation: SituationKind | null;
+  /** 帧断流（终端关了 / 前端不在） */
+  stale?: boolean;
+}
+
+export type StatusTone = "idle" | "warn" | "active";
+
+/** 屏幕上「有程序在问你」的局面：只有这些才可能被应答 */
+const ANSWERABLE: SituationKind[] = ["question", "permission", "menu", "pager", "error", "awaiting_input"];
+
+/**
+ * 托管页顶部那一行「它现在为什么没动 / 在干什么」。只从已有状态推导，按优先级取第一条。
+ */
+export function stewardStatusLine(s: StatusLineInput): { text: string; tone: StatusTone } {
+  if (!s.hasContract) {
+    return { text: "未开始：选择一个终端，写下目标，点「开始托管」", tone: "idle" };
+  }
+  if (s.ownership === "observing_only") {
+    return { text: "你接管中 — 点「交还托管」让它继续", tone: "warn" };
+  }
+  if (s.ownership === "suspended") {
+    return { text: `已暂停（${s.suspensionReason || "预算用完 / 恢复后需确认"}）`, tone: "warn" };
+  }
+  if (s.awaiting > 0) {
+    return { text: `有 ${s.awaiting} 条待你确认的建议 ↓`, tone: "warn" };
+  }
+  if (s.stale) {
+    return { text: "屏幕帧断流 — 终端可能已关闭，暂不应答", tone: "warn" };
+  }
+  if (s.situation === "password") {
+    return { text: "屏幕在要密码 — 只能由你本人输入", tone: "warn" };
+  }
+  if (!s.executionEnabled) {
+    return { text: "自动应答已关 — 只会给建议，不会替你输入", tone: "idle" };
+  }
+  if (s.situation && ANSWERABLE.includes(s.situation)) {
+    return { text: `正在应答：${SITUATION_LABELS[s.situation]}`, tone: "active" };
+  }
+  const now = s.situation ? SITUATION_LABELS[s.situation] : "未识别";
+  return {
+    text: `等待屏幕出现提问 / 权限确认（当前：${now} → 不会主动执行命令）`,
+    tone: "idle",
+  };
+}
 
 /** 表单里逗号 / 分号分隔的列表，供 intent.constraints 与 knowledge.tags 使用。 */
 export const splitList = (s: string): string[] =>
