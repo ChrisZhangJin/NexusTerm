@@ -115,8 +115,22 @@ pub struct PlaybookCandidate {
     pub input: CtxInput,
 }
 
+/// 决策当时所在的 host_key：编译时写进 authority 依据的「授权档位 X · host Y」。
+/// 拿不到就返回 None——宁可不蒸馏，也不能把一台主机上的答案升格成全局剧本。
+fn host_of(d: &DecisionRecord) -> Option<String> {
+    d.ctx_refs
+        .iter()
+        .filter(|r| r.source == "authority")
+        .find_map(|r| r.snippet.split_once("· host ").map(|(_, h)| h.trim().to_string()))
+        .filter(|h| !h.is_empty())
+}
+
 /// 从决策历史里蒸馏确定性剧本。只有 `applied`（有写后回执）且两次以上、
 /// 且回复文本完全一致才生成候选——避免把一次侥幸或互相矛盾的回答固化下来。
+///
+/// 候选按 (host, 签名) 分组，作用域收窄到那台主机，并且**默认停用**：
+/// 蒸馏是机器归纳，自动生效会让一次错误的成功在所有主机上被反复自动执行；
+/// 用户在剧本面板里看过、手动启用后才参与决策。
 pub fn distill(decisions: &[DecisionRecord]) -> Vec<PlaybookCandidate> {
     #[derive(Default)]
     struct Group {
@@ -125,8 +139,10 @@ pub fn distill(decisions: &[DecisionRecord]) -> Vec<PlaybookCandidate> {
         option_index: Option<String>,
         sig_parts: Vec<String>,
         evidence: String,
+        host: String,
+        sig: String,
     }
-    let mut groups: HashMap<String, Group> = HashMap::new();
+    let mut groups: HashMap<(String, String), Group> = HashMap::new();
     for d in decisions {
         if d.outcome != "applied" || d.llm_used || !d.chosen.injectable {
             continue;
@@ -134,8 +150,15 @@ pub fn distill(decisions: &[DecisionRecord]) -> Vec<PlaybookCandidate> {
         if matches!(d.chosen.kind.as_str(), "observe" | "wait" | "secret" | "handoff") {
             continue;
         }
-        let g = groups.entry(d.situation_signature.clone()).or_default();
+        let Some(host) = host_of(d) else {
+            continue;
+        };
+        let g = groups
+            .entry((host.clone(), d.situation_signature.clone()))
+            .or_default();
         if g.n == 0 {
+            g.host = host;
+            g.sig = d.situation_signature.clone();
             g.text = d.chosen.text.clone();
             g.option_index = d.chosen.option_index.clone();
             g.sig_parts = d
@@ -154,7 +177,8 @@ pub fn distill(decisions: &[DecisionRecord]) -> Vec<PlaybookCandidate> {
     let mut out: Vec<PlaybookCandidate> = groups
         .into_iter()
         .filter(|(_, g)| g.n >= DISTILL_MIN_OCCURRENCES && !g.text.is_empty())
-        .map(|(sig, g)| {
+        .map(|(_, g)| {
+            let sig = g.sig.clone();
             let spec = PlaybookSpec {
                 match_program: g.sig_parts.first().cloned(),
                 match_kind: g.sig_parts.get(1).cloned(),
@@ -163,9 +187,9 @@ pub fn distill(decisions: &[DecisionRecord]) -> Vec<PlaybookCandidate> {
                 answer: g.text.clone(),
                 option_index: g.option_index.clone(),
                 tier: Some("auto".to_string()),
-                enabled: true,
+                enabled: false,
             };
-            let id = format!("distilled-{}", short_hash(&sig));
+            let id = format!("distilled-{}", short_hash(&format!("{}|{}", g.host, sig)));
             PlaybookCandidate {
                 id: id.clone(),
                 signature: sig.clone(),
@@ -180,7 +204,7 @@ pub fn distill(decisions: &[DecisionRecord]) -> Vec<PlaybookCandidate> {
                     kind: KIND_PLAYBOOK.to_string(),
                     text: format!("自动沉淀：{} → {}", sig.split('|').take(2).collect::<Vec<_>>().join("/"), truncate(&g.text, 60)),
                     strength: None,
-                    scope: Some("global".to_string()),
+                    scope: Some(g.host.clone()),
                     source: Some("distilled".to_string()),
                     evidence: Some(g.evidence.clone()),
                     extra: Some(serde_json::to_value(spec).unwrap_or_default()),
@@ -470,6 +494,7 @@ mod tests {
                 CtxRef::of("intent", "i-1", "目标：修好构建"),
                 CtxRef::of("profile", "p-1", "硬约束：最小改动"),
                 CtxRef::of("policy", "policy:auto", "策略层已复核"),
+                CtxRef::of("authority", "c-1", "授权档位 auto · host local:tab-1"),
             ],
             candidates: vec![],
             chosen: DecisionAction::answer(text.into(), None),
@@ -536,6 +561,26 @@ mod tests {
     }
 
     #[test]
+    fn distilled_playbook_is_disabled_and_host_scoped() {
+        let mut b = rec(2, "claude_code|question|settings", "applied", "No — 不改设置");
+        let a = rec(1, "claude_code|question|settings", "applied", "No — 不改设置");
+        let c = distill(&[a.clone(), b.clone()]);
+        assert_eq!(c[0].input.scope.as_deref(), Some("local:tab-1"));
+        let spec: PlaybookSpec =
+            serde_json::from_value(c[0].input.extra.clone().unwrap()).unwrap();
+        assert!(!spec.enabled, "蒸馏出来的剧本必须等用户启用");
+        // 同签名但分属两台主机：各自只有一次成功，不能拼成一条
+        for r in b.ctx_refs.iter_mut().filter(|r| r.source == "authority") {
+            r.snippet = "授权档位 auto · host ssh:root@b:22".into();
+        }
+        assert!(distill(&[a.clone(), b]).is_empty());
+        // 没有 host 信息的记录不参与蒸馏
+        let mut x = a.clone();
+        x.ctx_refs.retain(|r| r.source != "authority");
+        assert!(distill(&[x.clone(), x]).is_empty());
+    }
+
+    #[test]
     fn distill_rejects_conflicting_or_unconfirmed() {
         let v = vec![
             rec(1, "sig", "applied", "A"),
@@ -566,7 +611,8 @@ mod tests {
         let e = explain(&rec(9, "sig", "applied", "No"), &[]);
         assert!(e.why_auto.contains("零 LLM"));
         assert!(e.why_auto.contains("意向"));
-        assert_eq!(e.refs.len(), 3);
+        // rec() 与真实 compile 一样带一条 authority 引用（蒸馏靠它取主机）
+        assert_eq!(e.refs.len(), 4);
         assert_eq!(e.refs[0].label, "意向");
         assert!(!e.llm_used);
         let denied = explain(&rec(10, "sig", "rejected", "x"), &[]);

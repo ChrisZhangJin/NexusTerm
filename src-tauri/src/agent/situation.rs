@@ -541,6 +541,19 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().skip(skip).collect()
 }
 
+/// 末行是 shell 提示符时追加的证据标记（局面不一定判成 Idle）。
+pub const SHELL_PROMPT_VISIBLE: &str = "shell:prompt-visible";
+
+/// 屏幕当前是否停在 shell 提示符上。此时写入的任何文本都会被当成命令执行，
+/// 决策层与空转推进都以此为硬闸。
+pub fn shell_visible(sit: &Situation) -> bool {
+    sit.program == Program::Shell
+        || sit
+            .evidence
+            .iter()
+            .any(|e| e == SHELL_PROMPT_VISIBLE || e == "prompt:shell_prompt")
+}
+
 /// 对一帧屏幕分类。`stale_limit_ms` 由 StewardConfig 给（默认 6s）；
 /// 前端帧断流时置信度减半，P3 会据此只允许只读动作。
 pub fn classify(snap: &ScreenSnapshot, now_ms: i64, stale_limit_ms: i64) -> Situation {
@@ -559,6 +572,13 @@ pub fn classify(snap: &ScreenSnapshot, now_ms: i64, stale_limit_ms: i64) -> Situ
     let guess = prompt::classify(&text, snap.alt);
     let program = detect_program(&lower, snap.alt, guess.kind);
     let mut d = rule(&non_empty, snap.alt, guess, program);
+    // 规则按优先级 return，「报错」排在「回到 shell」前面：屏幕上一行 error 加一个空闲
+    // 提示符会被判成 Error，提示符这一事实就丢了。单独补一条证据，决策层据此拒绝代答。
+    if guess.kind == PromptKind::ShellPrompt
+        && !d.evidence.iter().any(|e| e == "prompt:shell_prompt")
+    {
+        d.evidence.push(SHELL_PROMPT_VISIBLE.to_string());
+    }
 
     let stale_ms = if snap.updated_at > 0 {
         (now_ms - snap.updated_at).max(0)
@@ -655,6 +675,18 @@ mod tests {
 
     fn c(s: &ScreenSnapshot) -> Situation {
         classify(s, 1_100, 6_000)
+    }
+
+    #[test]
+    fn error_line_above_shell_prompt_keeps_shell_evidence() {
+        let s = snap(
+            &["$ cargo build", "error: could not compile `nexus`", "alice@host:~/proj$ "],
+            false,
+        );
+        let x = c(&s);
+        assert_eq!(x.kind, SituationKind::Error);
+        assert!(x.evidence.iter().any(|e| e == SHELL_PROMPT_VISIBLE));
+        assert!(shell_visible(&x));
     }
 
     #[test]

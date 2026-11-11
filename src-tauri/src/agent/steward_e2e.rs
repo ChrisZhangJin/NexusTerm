@@ -193,6 +193,7 @@ fn e2e_a_question_screen_full_loop_with_receipt() {
     let cands = learning::distill(&[rec.clone(), second]);
     assert_eq!(cands.len(), 1, "成功轨迹应沉淀出剧本候选");
     assert!(cands[0].occurrences >= 2);
+    assert_eq!(cands[0].input.scope.as_deref(), Some(contract.host_key.as_str()), "只作用于来源主机");
 }
 
 // ───────────────────── 场景 B：永久扩权选项 fail-closed ─────────────────────
@@ -224,7 +225,7 @@ fn e2e_b_permanent_grant_option_is_never_auto_selected() {
     push_intent(&brain, &contract.id, "跑测试");
 
     let ctx = build_context(&contract, &sit, &brain, NOW + 200);
-    let mut rec = decision::compile(&ctx);
+    let rec = decision::compile(&ctx);
     // 编译层：只挑「本次允许」，绝不选永久项
     assert!(
         rec.chosen.text.contains("本次允许"),
@@ -317,18 +318,19 @@ fn e2e_e_takeover_handback_and_undo_learns() {
     assert!(core.ownership().can_write("tab-5"), "初始 Steward 驾驶");
 
     // 用户敲键 → 100ms SLA 夺权
-    let latency = core.ownership().user_key("tab-5", NOW, NOW + 40);
+    // key_at / now_wall 是墙钟（算 SLA），最后一个参数是单调时钟（算离开时长）
+    let latency = core.ownership().user_key("tab-5", NOW, NOW + 40, 40);
     assert!(latency >= 0 && latency <= 100, "夺权延迟 {latency}ms");
     assert!(!core.ownership().can_write("tab-5"), "观察态绝不写终端");
 
     // 离开期间：观察与决策都进 AbsenceNote
-    core.ownership().note("tab-5", "decision", "#3 观察态决策：等待用户", NOW + 50);
-    core.ownership().note("tab-5", "escalation", "#4 待确认", NOW + 100);
+    core.ownership().note("tab-5", "decision", "#3 观察态决策：等待用户", 50);
+    core.ownership().note("tab-5", "escalation", "#4 待确认", 100);
 
     // 交还：摘要 + 恢复驾驶
-    let summary = core.ownership().handback("tab-5", NOW + 500, true);
+    let summary = core.ownership().handback("tab-5", 500, true);
     assert_eq!(summary.takeover_count, 1);
-    // duration 从接管时刻起算（NOW+40 → NOW+500），40ms 夺权处理也在「离开」里
+    // duration 从接管时刻（单调 40）起算到交还（单调 500）
     assert!(
         (400..=500).contains(&summary.duration_ms),
         "离开时长 {}",
@@ -512,4 +514,282 @@ fn e2e_planner_gate_only_for_observe_fallback() {
     obs.chosen = DecisionAction::observe("现场不足以托付写入");
     obs.outcome = "observed".to_string();
     assert!(super::planner::should_plan(&gate, &obs));
+}
+
+// ───────────────────── 缺陷回归：真实路径 (a)–(g) ─────────────────────
+
+fn wall_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn temp_store(tag: &str) -> crate::store::Store {
+    let dir = std::env::temp_dir().join(format!("nexus-e2e-{tag}-{}", uuid::Uuid::new_v4()));
+    crate::store::Store::open(dir).expect("打开临时库")
+}
+
+/// 一张「本次允许」的权限屏：approve 档下编译成待确认的升级卡。
+fn permission_card(
+    console: &str,
+) -> (
+    ScreenStore,
+    super::steward::StewardContract,
+    situation::Situation,
+    decision::DecisionRecord,
+    Authority,
+) {
+    let screen = ScreenStore::new();
+    screen.apply(&frame(
+        console,
+        1,
+        &[
+            "Do you want to proceed?",
+            "❯ 1. Yes",
+            "  2. Yes, and don't ask again",
+            "  3. No",
+            "  Esc to cancel",
+        ],
+        true,
+        NOW,
+    ));
+    let snap = screen.get(console).unwrap();
+    let sit = situation::classify(&snap, NOW + 100, 6_000);
+    let registry = StewardRegistry::new();
+    let contract = registry.start(console, "local", "跑测试", "approve");
+    let brain = StewardBrain::new();
+    push_intent(&brain, &contract.id, "跑测试");
+    let ctx = build_context(&contract, &sit, &brain, NOW + 200);
+    let mut rec = decision::compile(&ctx);
+    rec.seq = 41;
+    let auth = Authority::default().with_tier("approve");
+    policy::authorize(&auth, &mut rec, &sit, true);
+    assert_eq!(rec.outcome, "escalated", "approve 档必须出卡");
+    (screen, contract, sit, rec, auth)
+}
+
+// (a) 有意向 + shell 空闲提示符 + 一行 error：绝不注入
+#[test]
+fn e2e_regress_a_error_at_shell_prompt_never_injects() {
+    let screen = ScreenStore::new();
+    screen.apply(&frame(
+        "tab-a",
+        1,
+        &["$ cargo build", "error: could not compile `nexus`", "alice@host:~/proj$ "],
+        false,
+        NOW,
+    ));
+    let snap = screen.get("tab-a").unwrap();
+    let sit = situation::classify(&snap, NOW + 100, 6_000);
+    assert!(situation::shell_visible(&sit), "{sit:?}");
+
+    let registry = StewardRegistry::new();
+    let contract = registry.start("tab-a", "local", "修好编译", "auto");
+    let brain = StewardBrain::new();
+    push_intent(&brain, &contract.id, "修好编译");
+    let ctx = build_context(&contract, &sit, &brain, NOW + 200);
+    let mut rec = decision::compile(&ctx);
+    let auth = Authority::default().with_tier("auto");
+    policy::authorize(&auth, &mut rec, &sit, true);
+    assert!(
+        !decision::can_execute_with_llm(&rec, true, "auto", true),
+        "shell 提示符下 auto 档也不能自动写：{:?}",
+        rec.chosen
+    );
+
+    // 哪怕有人把它伪造成一张待确认的答复卡，批准闸门也拒绝
+    let mut forged = rec.clone();
+    forged.seq = 1;
+    forged.chosen = DecisionAction::answer("请继续".to_string(), None);
+    forged.outcome = "escalated".to_string();
+    forged.escalation = Some(decision::EscalationCard::new(
+        forged.chosen.clone(),
+        forged.ctx_refs.clone(),
+        NOW,
+    ));
+    let err = super::steward_loop::approval_gate(
+        &forged,
+        false,
+        Some(&contract),
+        Some(&snap),
+        &auth,
+        true,
+        true,
+        true,
+        NOW + 300,
+    )
+    .unwrap_err();
+    assert!(err.contains("shell"), "{err}");
+}
+
+// (b) 同一张卡连点两次只写一次；屏幕变了之后的批准被拒
+#[test]
+fn e2e_regress_b_double_approve_types_once_and_stale_screen_refused() {
+    let (screen, contract, _sit, rec, auth) = permission_card("tab-b");
+    let core = StewardCore::new();
+    let snap = screen.get("tab-b").unwrap();
+    let gate = |consumed: bool, snap: &super::steward::ScreenSnapshot| {
+        super::steward_loop::approval_gate(
+            &rec,
+            consumed,
+            Some(&contract),
+            Some(snap),
+            &auth,
+            true,
+            true,
+            true,
+            NOW + 300,
+        )
+    };
+
+    let mut typed = 0;
+    for _ in 0..2 {
+        if gate(core.is_consumed(rec.seq), &snap).is_ok() && core.try_consume(rec.seq) {
+            typed += 1;
+        }
+    }
+    assert_eq!(typed, 1, "两次批准只能写一次");
+
+    // 新的一张卡（未消费），但屏幕已经变了
+    screen.apply(&frame("tab-b", 2, &["$ ls", "Cargo.toml"], false, NOW + 400));
+    let snap2 = screen.get("tab-b").unwrap();
+    let err = gate(false, &snap2).unwrap_err();
+    assert!(err.contains("屏幕已经变化"), "{err}");
+}
+
+// (c) 应用已跑了 2h 以上才签的契约，不会一上来就被判预算耗尽
+#[test]
+fn e2e_regress_c_contract_started_late_is_not_exhausted() {
+    let core = StewardCore::new();
+    core.advance_clock(2 * 3_600_000 + 60_000);
+    core.start_contract("c-late");
+    let auth = Authority {
+        tier: "auto".to_string(),
+        max_minutes: 30,
+        ..Authority::default()
+    };
+    let spent = core.touch_elapsed("c-late");
+    assert!(spent.elapsed_secs < 5, "契约计时从签约起算：{}", spent.elapsed_secs);
+    assert!(!matches!(spent.check(&auth), BudgetCheck::Exhausted(_)));
+}
+
+// (d) 带 Checkpoint 重启、前端还没送首帧：不处于 AgentDriving，也判不出 Clean
+#[test]
+fn e2e_regress_d_restart_without_frame_is_not_agent_driving() {
+    let store = temp_store("d");
+    let now = wall_now();
+    let auth = Authority::default().with_tier("auto");
+    let mut cp = StewardCheckpoint::new("c-d", "tab-d", "目标", &auth);
+    cp.screen_hash = "h1".to_string();
+    cp.state = "observing".to_string();
+    cp.host_key = "ssh:tab-d".to_string();
+    cp.saved_wall_ms = now;
+    cp.created_wall_ms = now;
+    let json = serde_json::to_string(&cp).unwrap();
+    store
+        .steward_checkpoint_save("c-d", "tab-d", &json, "observing", now)
+        .unwrap();
+
+    let registry = StewardRegistry::new();
+    let core = StewardCore::new();
+    let restored = super::steward::restore_checkpoints(&store, &registry, &core);
+    assert_eq!(restored, vec!["c-d".to_string()]);
+    assert_ne!(
+        core.ownership().state("tab-d"),
+        super::ownership::OwnershipState::AgentDriving
+    );
+    assert!(!core.ownership().can_write("tab-d"), "首帧核对前不许写");
+    assert_eq!(registry.get("c-d").unwrap().host_key, "ssh:tab-d", "用真实 host_key 重建");
+    assert!(!matches!(resume_verdict(&cp, None, now), ResumeVerdict::Clean));
+}
+
+// (e) 关掉 console：契约停止，下次启动扫描不再恢复它
+#[test]
+fn e2e_regress_e_closing_console_stops_contract_and_checkpoint() {
+    let store = temp_store("e");
+    let registry = StewardRegistry::new();
+    let brain = StewardBrain::new();
+    let core = StewardCore::new();
+    let contract = registry.start("tab-e", "local", "目标", "notify");
+    core.ensure_console("tab-e");
+    let auth = Authority::default().with_tier("notify");
+    let mut cp = StewardCheckpoint::new(&contract.id, "tab-e", "目标", &auth);
+    cp.saved_wall_ms = wall_now();
+    let json = serde_json::to_string(&cp).unwrap();
+    store
+        .steward_checkpoint_save(&contract.id, "tab-e", &json, "observing", cp.saved_wall_ms)
+        .unwrap();
+
+    assert!(super::steward::release_console(&registry, &brain, &store, &core, "tab-e"));
+    assert!(registry.for_console("tab-e").is_none());
+    assert!(!super::steward::release_console(&registry, &brain, &store, &core, "tab-e"));
+
+    let registry2 = StewardRegistry::new();
+    let core2 = StewardCore::new();
+    assert!(super::steward::restore_checkpoints(&store, &registry2, &core2).is_empty());
+    assert!(registry2.for_console("tab-e").is_none());
+}
+
+// 启动扫描：同一 console 只恢复最新一份 Checkpoint，旧的标记完成
+#[test]
+fn e2e_restore_dedupes_by_console() {
+    let store = temp_store("dedupe");
+    let now = wall_now();
+    let auth = Authority::default().with_tier("notify");
+    for (id, ts) in [("c-old", now - 10_000), ("c-new", now)] {
+        let mut cp = StewardCheckpoint::new(id, "tab-x", "目标", &auth);
+        cp.saved_wall_ms = ts;
+        let json = serde_json::to_string(&cp).unwrap();
+        store
+            .steward_checkpoint_save(id, "tab-x", &json, "observing", ts)
+            .unwrap();
+    }
+    let registry = StewardRegistry::new();
+    let core = StewardCore::new();
+    let restored = super::steward::restore_checkpoints(&store, &registry, &core);
+    assert_eq!(restored, vec!["c-new".to_string()]);
+    assert_eq!(store.steward_checkpoints().len(), 1, "旧的一份已标记完成");
+}
+
+// (f) 「本次允许」可以批准执行；永久扩权选项即便在卡上也被拒
+#[test]
+fn e2e_regress_f_allow_once_passes_but_permanent_is_denied() {
+    let (screen, contract, _sit, rec, auth) = permission_card("tab-f");
+    let snap = screen.get("tab-f").unwrap();
+    assert!(rec.chosen.text.contains("本次允许"), "{}", rec.chosen.text);
+    let gate = |r: &decision::DecisionRecord| {
+        super::steward_loop::approval_gate(
+            r,
+            false,
+            Some(&contract),
+            Some(&snap),
+            &auth,
+            true,
+            true,
+            true,
+            NOW + 300,
+        )
+    };
+    assert!(gate(&rec).is_ok(), "{:?}", gate(&rec));
+
+    let mut forged = rec.clone();
+    forged.chosen =
+        DecisionAction::answer("2. Yes, and don't ask again".to_string(), Some("2".to_string()));
+    let err = gate(&forged).unwrap_err();
+    assert!(err.contains("PolicyEngine"), "{err}");
+}
+
+// (g) 写许可被占着时，第二次注入直接跳过
+#[test]
+fn e2e_regress_g_held_write_permit_skips_second_inject() {
+    let core = StewardCore::new();
+    core.ensure_console("tab-g");
+    let held = super::steward_loop::acquire_write(&core, "tab-g").expect("第一次拿得到");
+    assert!(super::steward_loop::acquire_write(&core, "tab-g").is_none());
+    drop(held);
+    assert!(super::steward_loop::acquire_write(&core, "tab-g").is_some());
+    // 观察态拿不到许可
+    core.ownership().takeover("tab-g", 1);
+    assert!(super::steward_loop::acquire_write(&core, "tab-g").is_none());
 }

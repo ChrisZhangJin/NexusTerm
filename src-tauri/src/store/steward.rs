@@ -81,6 +81,13 @@ pub(super) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             saved_wall_ms INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_steward_cp_state ON steward_checkpoints(state);
+
+        -- 用户删掉的蒸馏剧本留一条墓碑：蒸馏器每轮按确定性 id 重新生成候选，
+        -- 没有墓碑的话删一条、下一轮又冒出来一条
+        CREATE TABLE IF NOT EXISTS steward_tombstones (
+            id TEXT PRIMARY KEY,
+            ts INTEGER NOT NULL
+        );
         "#,
     )
 }
@@ -283,6 +290,42 @@ impl Store {
             .unwrap_or_default()
     }
 
+    /// 清理不再可能恢复的 Checkpoint：已完成的，以及超过 TTL 的（恢复判定反正会拒）。
+    /// 一契约一行，但每次启动 / 重开 tab 都会产生新契约 id，不裁剪的话表会无限增长。
+    pub fn steward_checkpoints_prune(&self, now_wall_ms: i64, ttl_ms: i64) -> usize {
+        let Ok(conn) = self.conn.lock() else {
+            return 0;
+        };
+        conn.execute(
+            "DELETE FROM steward_checkpoints WHERE state = 'completed' OR saved_wall_ms < ?1",
+            params![now_wall_ms.saturating_sub(ttl_ms)],
+        )
+        .unwrap_or(0)
+    }
+
+    pub fn steward_tombstone_add(&self, id: &str, ts: i64) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT OR REPLACE INTO steward_tombstones (id, ts) VALUES (?1, ?2)",
+            params![id, ts],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn steward_tombstoned(&self, id: &str) -> bool {
+        let Ok(conn) = self.conn.lock() else {
+            // 读不到就当作已删除：宁可少蒸馏一条，也不复活用户删掉的剧本
+            return true;
+        };
+        conn.query_row(
+            "SELECT 1 FROM steward_tombstones WHERE id = ?1",
+            params![id],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
     pub fn steward_checkpoint(&self, contract_id: &str) -> Option<String> {
         let conn = self.conn.lock().ok()?;
         conn.query_row(
@@ -303,14 +346,30 @@ impl Store {
         .map_err(|e| e.to_string())?;
         Ok(())
     }
+}
 
-    pub fn steward_checkpoint_delete(&self, contract_id: &str) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        conn.execute(
-            "DELETE FROM steward_checkpoints WHERE contract_id = ?1",
-            params![contract_id],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::super::tests::temp_store_at;
+
+    #[test]
+    fn prune_drops_completed_and_expired_checkpoints() {
+        let (store, _) = temp_store_at("steward-cp-prune");
+        store.steward_checkpoint_save("c-old", "t1", "{}", "observing", 1_000).unwrap();
+        store.steward_checkpoint_save("c-done", "t2", "{}", "observing", 9_000).unwrap();
+        store.steward_checkpoint_state("c-done", "completed").unwrap();
+        store.steward_checkpoint_save("c-live", "t3", "{}", "observing", 9_500).unwrap();
+        assert_eq!(store.steward_checkpoints_prune(10_000, 5_000), 2);
+        let left: Vec<String> = store.steward_checkpoints().into_iter().map(|r| r.0).collect();
+        assert_eq!(left, vec!["c-live".to_string()]);
+        assert!(store.steward_checkpoint("c-old").is_none());
+    }
+
+    #[test]
+    fn tombstones_persist() {
+        let (store, _) = temp_store_at("steward-tomb");
+        assert!(!store.steward_tombstoned("distilled-1"));
+        store.steward_tombstone_add("distilled-1", 5).unwrap();
+        assert!(store.steward_tombstoned("distilled-1"));
     }
 }

@@ -78,10 +78,18 @@ pub fn build_request(ctx: &DecisionContext) -> (String, Vec<ChatMessage>) {
         kb.join(" | "),
         sit.program.as_str(),
         sit.kind.as_str(),
-        sit.topic.as_deref().unwrap_or("(无)"),
+        // 主题与选项同样取自屏幕原文：tail 脱敏了，它们也必须脱敏，否则 token 会从这里漏给模型
+        sit.topic
+            .as_deref()
+            .map(redact::redact)
+            .unwrap_or_else(|| "(无)".to_string()),
         sit.options
             .iter()
-            .map(|o| format!("{}:{}", o.index.as_deref().unwrap_or("-"), o.text))
+            .map(|o| format!(
+                "{}:{}",
+                o.index.as_deref().unwrap_or("-"),
+                redact::redact(&o.text)
+            ))
             .collect::<Vec<_>>()
             .join(", "),
         truncate(&redact::redact(&sit.tail), 900),
@@ -186,7 +194,40 @@ pub fn apply_plan(
         "llm_planner",
         "规则兜底：LLM Planner 生成回复，已由 PolicyEngine 复核",
     ));
-    super::policy::authorize(auth, rec, sit, host_in_scope)
+    // shell 提示符下任何一行都会被当成命令执行：模型给什么都只记录，不出可注入动作
+    if super::situation::shell_visible(sit) {
+        rec.chosen = DecisionAction::observe("屏幕停在 shell 提示符：不采纳 Planner 输出，只观察");
+        rec.tier = super::policy::TIER_APPROVE.to_string();
+        rec.outcome = "observed".to_string();
+        rec.escalation = None;
+        return super::policy::PolicyVerdict::Deny {
+            reason: "shell 提示符下不代答".to_string(),
+        };
+    }
+    let verdict = super::policy::authorize(auth, rec, sit, host_in_scope);
+    if matches!(verdict, super::policy::PolicyVerdict::Deny { .. }) {
+        return verdict;
+    }
+    if !rec.chosen.injectable || rec.chosen.send_bytes().is_none() {
+        // 模型也说「只观察」：不留旧的升级卡（那张卡推荐的是规则层的观察动作）
+        rec.outcome = "observed".to_string();
+        rec.escalation = None;
+        return verdict;
+    }
+    // 模型产出的是自由文本，不是屏幕上的结构化选项：无论策略档位多宽，都只能先给卡等人确认，
+    // 绝不直接注入。卡上的推荐动作必须是模型这条，而不是 compile() 时留下的旧卡。
+    let reason = "LLM Planner 产出的自由文本：必须人一键确认后才注入".to_string();
+    rec.tier = super::policy::TIER_APPROVE.to_string();
+    rec.outcome = "escalated".to_string();
+    rec.escalation = Some(super::decision::EscalationCard::new(
+        rec.chosen.clone(),
+        rec.ctx_refs.clone(),
+        rec.ts_ms,
+    ));
+    match verdict {
+        super::policy::PolicyVerdict::Approve { .. } => verdict,
+        _ => super::policy::PolicyVerdict::Approve { reason },
+    }
 }
 
 /// 命令层用：判断这次要不要真的调模型。
@@ -253,6 +294,38 @@ mod tests {
         assert!(sys.contains("只输出 JSON"));
         assert!(!msgs[0].content.contains("SECRET"));
         assert!(msgs[0].content.contains("不可信"));
+    }
+
+    #[test]
+    fn request_redacts_topic_and_options() {
+        let mut c = ctx();
+        c.situation.topic = Some("deploy token=TOPICSECRET".into());
+        c.situation.options = vec![super::super::situation::Choice {
+            index: Some("1".into()),
+            text: "use password=OPTSECRET".into(),
+            grants_permanent: false,
+        }];
+        let (_, msgs) = build_request(&c);
+        assert!(!msgs[0].content.contains("TOPICSECRET"));
+        assert!(!msgs[0].content.contains("OPTSECRET"));
+    }
+
+    #[test]
+    fn planner_free_text_always_needs_a_card_even_in_auto() {
+        let mut r = rec();
+        let v = apply_plan(
+            &mut r,
+            DecisionAction::answer("yes, proceed".into(), None),
+            "",
+            &Authority::default().with_tier("auto"),
+            &ctx().situation,
+            true,
+        );
+        assert!(matches!(v, super::super::policy::PolicyVerdict::Approve { .. }));
+        assert_eq!(r.outcome, "escalated");
+        let card = r.escalation.as_ref().unwrap();
+        assert_eq!(card.recommendation.text, "yes, proceed", "卡上推荐的必须是模型这条");
+        assert!(!super::super::decision::can_execute_with_llm(&r, true, "auto", true));
     }
 
     #[test]

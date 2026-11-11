@@ -16,7 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::profile::{CtxItem, IntentSpec, KnowledgeHit, PlaybookSpec};
-use super::situation::{Choice, Program, Situation, SituationKind};
+use super::situation::{self, Choice, Program, Situation, SituationKind};
 use super::steward::ScreenSnapshot;
 
 /// 注入后等多久必须看到新帧。设计 §2 `Timebox.receipt_ms` 的 1500ms。
@@ -297,6 +297,29 @@ pub fn compile(ctx: &DecisionContext) -> DecisionRecord {
         );
     }
 
+    // ── 1b. 安全硬约束：屏幕上是 shell 提示符 ──────────────────────
+    // 回到 shell 时往 PTY 写的任何一行都会被当成命令执行，哪怕上面还挂着一行报错、
+    // 哪怕意向栈里有现成回复。这里不出可注入动作、也不出升级卡（卡上一键确认同样会执行）。
+    if situation::shell_visible(sit) {
+        let reason = "屏幕停在 shell 提示符：写入会被当成命令执行，Steward 只观察不作答";
+        refs.push(CtxRef::of(
+            "policy",
+            "deny:shell-prompt",
+            "shell 提示符下不代答（输入即命令）",
+        ));
+        return record(
+            ctx,
+            refs,
+            candidates,
+            DecisionAction::observe(reason),
+            reason.to_string(),
+            sit.confidence,
+            "approve",
+            "observed",
+            None,
+        );
+    }
+
     // ── 2. 安全硬约束：永久扩权选项 ──────────────────────────────
     let permanent: Vec<&Choice> = sit
         .options
@@ -403,7 +426,9 @@ pub fn compile(ctx: &DecisionContext) -> DecisionRecord {
             sit.kind.as_str(),
             spec.answer
         );
-        let needs_card = rule_tier == "approve" || tier == "approve";
+        // 报错局面只允许观察或升级：剧本命中也要先给人看一眼，不自动替报错作答
+        let needs_card =
+            rule_tier == "approve" || tier == "approve" || sit.kind == SituationKind::Error;
         let card = needs_card.then(|| EscalationCard::new(action.clone(), refs.clone(), ctx.now_ms));
         return record(
             ctx,
@@ -491,7 +516,13 @@ pub fn compile(ctx: &DecisionContext) -> DecisionRecord {
         truncate(&text, 160)
     );
     let confidence = (sit.confidence * 0.6 + 0.4).min(0.97);
-    let needs_card = tier == "approve" || confidence < 0.75;
+    // 两类情况一律先给卡，不自动写：
+    // - 报错局面：只能观察或升级，替报错「作答」等于盲目继续；
+    // - 自由文本：没落在屏幕上的结构化选项（编号）里，就是我们自己拼出来的一段话，
+    //   写进去的后果无法由选项语义约束，必须人点头。
+    let free_text = action.option_index.is_none();
+    let needs_card =
+        tier == "approve" || confidence < 0.75 || free_text || sit.kind == SituationKind::Error;
     let card = needs_card.then(|| EscalationCard::new(action.clone(), refs.clone(), ctx.now_ms));
     record(
         ctx,
@@ -1044,8 +1075,13 @@ mod tests {
 
     #[test]
     fn execution_switch_is_a_hard_gate() {
+        // 原先用无选项的 Question 断言可执行，那是把「自由文本自动注入」锁成了正确行为；
+        // 现在只有落在结构化选项上的回答才可能免确认执行。
         let c = ctx(
-            situation(SituationKind::Question, vec![]),
+            situation(
+                SituationKind::Question,
+                vec![choice("1", "Yes", false), choice("2", "No, keep as is", false)],
+            ),
             "auto",
             Some(intent("i0", "继续", IntentSpec::default())),
         );
@@ -1053,5 +1089,50 @@ mod tests {
         assert!(can_execute(&r, true, "auto"));
         assert!(!can_execute(&r, false, "auto"));
         assert!(!can_execute(&r, true, "approve"));
+    }
+
+    #[test]
+    fn free_text_answer_requires_approval() {
+        let c = ctx(
+            situation(SituationKind::Question, vec![]),
+            "auto",
+            Some(intent("i0", "继续", IntentSpec::default())),
+        );
+        let r = compile(&c);
+        assert_eq!(r.chosen.kind, "answer");
+        assert!(r.chosen.option_index.is_none());
+        assert_eq!(r.outcome, "escalated");
+        assert!(r.escalation.is_some());
+        assert!(!can_execute(&r, true, "auto"));
+    }
+
+    #[test]
+    fn error_situation_only_observes_or_escalates() {
+        let c = ctx(
+            situation(
+                SituationKind::Error,
+                vec![choice("1", "Yes", false), choice("2", "No, keep as is", false)],
+            ),
+            "auto",
+            Some(intent("i0", "继续", IntentSpec::default())),
+        );
+        let r = compile(&c);
+        assert!(r.escalation.is_some());
+        assert!(!can_execute(&r, true, "auto"));
+    }
+
+    #[test]
+    fn shell_prompt_is_never_answered() {
+        let mut sit = situation(SituationKind::Error, vec![]);
+        sit.program = Program::Shell;
+        let r = compile(&ctx(sit, "auto", Some(intent("i0", "继续", IntentSpec::default()))));
+        assert_eq!(r.chosen.kind, "observe");
+        assert!(r.chosen.send_bytes().is_none());
+        assert!(r.escalation.is_none(), "shell 下连一键确认卡都不给");
+        // 程序没认出 shell，但分类器看到了 shell 提示符
+        let mut sit = situation(SituationKind::Question, vec![choice("1", "Yes", false)]);
+        sit.evidence.push("shell:prompt-visible".into());
+        let r = compile(&ctx(sit, "auto", Some(intent("i0", "继续", IntentSpec::default()))));
+        assert_eq!(r.chosen.kind, "observe");
     }
 }

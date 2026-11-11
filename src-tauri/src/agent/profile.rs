@@ -362,7 +362,13 @@ impl StewardBrain {
     }
 
     /// 剧本匹配：program / kind / topic / tail 四项，给了就都要命中（AND）。
-    pub fn match_playbook(&self, situation: &Situation) -> Option<(CtxItem, PlaybookSpec)> {
+    /// 剧本与偏好用同一套作用域：global / "*" / 程序名 / host_key。
+    /// 在 A 主机上蒸馏出的剧本（scope = A 的 host_key）不会在 B 主机上自动作答。
+    pub fn match_playbook(
+        &self,
+        situation: &Situation,
+        host_key: &str,
+    ) -> Option<(CtxItem, PlaybookSpec)> {
         let inner = self.0.lock();
         let tail = situation.tail.to_lowercase();
         let topic = situation.topic.as_deref().unwrap_or("").to_lowercase();
@@ -370,6 +376,11 @@ impl StewardBrain {
             .items
             .iter()
             .filter(|x| x.kind == KIND_PLAYBOOK)
+            .filter(|x| {
+                matches!(x.scope.as_str(), "global" | "*")
+                    || x.scope == situation.program.as_str()
+                    || x.scope == host_key
+            })
             .filter_map(|x| {
                 let spec: PlaybookSpec = serde_json::from_value(x.extra.clone()).ok()?;
                 if !spec.enabled || spec.answer.trim().is_empty() {
@@ -421,6 +432,14 @@ impl StewardBrain {
 
     pub fn decision(&self, seq: i64) -> Option<DecisionRecord> {
         self.0.lock().decisions.get(&seq).cloned()
+    }
+
+    /// 内存里那份决策的 outcome 也要跟着 SQLite 改：升级卡批准时读的是这里，
+    /// 只改库不改内存，「已执行 / 已拒绝」的卡在内存里永远还是 escalated，可以被反复批准。
+    pub fn set_decision_outcome(&self, seq: i64, outcome: &str) {
+        if let Some(r) = self.0.lock().decisions.get_mut(&seq) {
+            r.outcome = outcome.to_string();
+        }
     }
 
     pub fn recent_decisions(&self) -> Vec<String> {
@@ -801,11 +820,62 @@ mod tests {
             stale_ms: 0,
             signature: "ssh|question".into(),
         };
-        let hit = b.match_playbook(&sit).unwrap();
+        let hit = b.match_playbook(&sit, "local:tab-1").unwrap();
         assert_eq!(hit.0.id, "seed-pb-ssh");
         assert_eq!(hit.1.answer, "yes");
         sit.tail = "别的提示".into();
-        assert!(b.match_playbook(&sit).is_none());
+        assert!(b.match_playbook(&sit, "local:tab-1").is_none());
+    }
+
+    #[test]
+    fn host_scoped_playbook_only_matches_its_host() {
+        let b = brain();
+        b.upsert(CtxInput {
+            id: Some("pb-host-a".into()),
+            kind: KIND_PLAYBOOK.to_string(),
+            text: "A 主机专用".into(),
+            strength: None,
+            scope: Some("ssh:root@a:22".into()),
+            source: Some("user".into()),
+            evidence: None,
+            extra: Some(serde_json::json!({
+                "matchProgram": "*", "matchText": "only-on-a", "answer": "ok", "enabled": true
+            })),
+            contract_id: None,
+            position: None,
+        })
+        .unwrap();
+        let sit = Situation {
+            frame_id: 1,
+            screen_hash: "a".into(),
+            program: Program::Shell,
+            kind: SituationKind::Question,
+            topic: None,
+            options: vec![],
+            confidence: 0.9,
+            tail: "only-on-a ?".into(),
+            evidence: vec![],
+            stale_ms: 0,
+            signature: "x".into(),
+        };
+        assert!(b.match_playbook(&sit, "ssh:root@a:22").is_some());
+        assert!(b.match_playbook(&sit, "ssh:root@b:22").is_none());
+    }
+
+    #[test]
+    fn decision_outcome_updates_in_memory_copy() {
+        let b = brain();
+        let r = DecisionRecord {
+            seq: 5, ts_ms: 0, contract_id: "c".into(), console_id: "t".into(),
+            situation_signature: "s".into(), situation_hash: "h".into(),
+            ctx_refs: vec![], candidates: vec![],
+            chosen: crate::agent::decision::DecisionAction::answer("x".into(), None),
+            rationale: String::new(), confidence: 0.9, tier: "approve".into(),
+            llm_used: false, outcome: "escalated".into(), escalation: None, receipt: None,
+        };
+        b.remember_decision(5, &r);
+        b.set_decision_outcome(5, "applied");
+        assert_eq!(b.decision(5).unwrap().outcome, "applied");
     }
 
     #[test]
