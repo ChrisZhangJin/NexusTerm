@@ -36,7 +36,25 @@ pub mod skill;
 pub mod skill_cmd;
 pub mod skill_refine;
 pub mod skill_run;
+pub mod situation;
 pub mod skilltool;
+pub mod steward;
+pub mod steward_loop;
+pub mod decision;
+pub mod profile;
+pub mod steward_cmd;
+// P3 授权与协作
+pub mod policy;
+pub mod ownership;
+// P4 长运行与恢复
+pub mod checkpoint;
+// P5 学习闭环 / LLM 兜底
+pub mod learning;
+pub mod planner;
+// P3–P5 共享运行时状态
+pub mod steward_core;
+#[cfg(test)]
+mod steward_e2e;
 pub mod timeline;
 pub mod trace;
 pub mod usercmd;

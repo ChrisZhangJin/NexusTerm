@@ -1,5 +1,6 @@
 use tauri::{AppHandle, State};
 
+use crate::agent::steward::ScreenStore;
 use crate::agent::StreamKind;
 use crate::keys;
 use crate::sftp::{RemoteEntry, SftpError, SftpManager};
@@ -137,10 +138,17 @@ pub fn local_resize(
 }
 
 #[tauri::command]
-pub fn local_close(id: String, state: State<'_, AppState>) -> Result<(), String> {
+pub fn local_close(
+    id: String,
+    state: State<'_, AppState>,
+    screen: State<'_, ScreenStore>,
+) -> Result<(), String> {
     let res = state.local.close(&id);
     // 无论关闭是否报错（会话可能根本不存在），agent 侧都要清干净
     state.agent.remove(&id);
+    // 屏幕帧同理：不清理的话每个关掉的标签都留 200 行常驻内存。
+    // 托管契约保留（P1 断连恢复要看「这里曾经被托管过」）。
+    screen.drop(&id);
     res
 }
 
@@ -211,11 +219,12 @@ pub fn ssh_resize(
 }
 
 #[tauri::command]
-pub fn ssh_close(id: String, state: State<'_, AppState>) {
+pub fn ssh_close(id: String, state: State<'_, AppState>, screen: State<'_, ScreenStore>) {
     state.sessions.close(&id);
     // 会话没了，旁路缓冲也要跟着放掉：AppState 活到应用退出，
     // 不清理的话每个关掉的标签都会留下最多 256KB 常驻内存
     state.agent.remove(&id);
+    screen.drop(&id);
 }
 
 /// 回填二次验证（keyboard-interactive）的答案。

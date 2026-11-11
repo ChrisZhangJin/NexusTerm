@@ -7,6 +7,8 @@
 | [build.md](./build.md) | 构建 / 打包 / 签名全流程，含 macOS 的已知坑（dmg、Keychain ACL、Gatekeeper） |
 | [portability.md](./portability.md) | 跨平台说明：三端差异、平台相关代码清单、Windows / Linux 构建前置条件 |
 | [roadmap.md](./roadmap.md) | 已讨论设计但还没动手的方向（如 nexus-cli 控制面），避免结论随对话丢失 |
+| [agent-copilot-todo.md](./agent-copilot-todo.md) | Nexus Agent 协同化改造四阶段 TODO（已全部完成，可作为现状能力清单） |
+| [nexus-agent-steward-design.md](./nexus-agent-steward-design.md) | NexusAgent v2：主动托管 Console 的架构与行为设计（常驻 Steward、意向决策、授权契约、长运行恢复） |
 
 顶层 [README.md](../README.md) 是唯一入口，包含快速开始、目录结构与安全边界。
 

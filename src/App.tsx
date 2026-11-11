@@ -33,7 +33,18 @@ import {
   stealthInput,
   type TermContext,
 } from "./lib/context";
-import { cellWidth, getTerm, onInput, snapshotConsole, waitForPrompt } from "./lib/termRegistry";
+import {
+  cellWidth,
+  getTerm,
+  onInput,
+  requestFullFrame,
+  setScreenCaptureEnabled,
+  setScreenDeltaSink,
+  setUserKeySink,
+  snapshotConsole,
+  waitForPrompt,
+} from "./lib/termRegistry";
+import { stewardApi } from "./lib/steward";
 import {
   isTerminalReply,
   runMacro,
@@ -1198,6 +1209,35 @@ export default function App() {
       void api.agentScreenAck(req.requestId, true, snap.text, snap.alt).catch(() => false);
     });
     return () => void un.then((f) => f());
+  }, []);
+
+  /**
+   * P0 会话织物：把屏幕帧采集接到后端 ScreenStore。
+   *
+   * 采集挂在 termRegistry（TerminalView 持有 xterm 实例），这里只注入 IPC 出口并开闸，
+   * 所以 AgentPanel 关掉 / 浮出 / 最小化都不影响上报。needFull 时立刻重采一帧全量。
+   * 纯本地行为：不出网、不调模型、不写终端。
+   */
+  useEffect(() => {
+    setScreenDeltaSink((delta) => {
+      void stewardApi
+        .screenDelta(delta)
+        .then((ack) => {
+          if (ack.needFull) requestFullFrame(delta.consoleId);
+        })
+        .catch(() => undefined);
+    });
+    // P3 接管夺权：用户敲键 → 后端 100ms 内转 ObservingOnly。
+    // 字节已由 TerminalView 正常发出，这里只通知、不拦截；termRegistry 已按 console 节流。
+    setUserKeySink((consoleId, keyAtMs) => {
+      void stewardApi.userKey(consoleId, keyAtMs).catch(() => undefined);
+    });
+    setScreenCaptureEnabled(true);
+    return () => {
+      setScreenDeltaSink(null);
+      setUserKeySink(null);
+      setScreenCaptureEnabled(false);
+    };
   }, []);
 
   const saveSession = useCallback(

@@ -34,6 +34,11 @@ const redirect = {
   setup(build) {
     build.onResolve({ filter: /(^|\/)\.\.\/api$/ }, () => ({ path: stub("api-stub.ts") }));
     build.onResolve({ filter: /^@xterm\// }, () => ({ path: xtermStub }));
+    // P2 的 steward.ts 会在模块顶层 import Tauri 的 invoke/listen；
+    // node 里没有运行时，重定向到空桩，测试只验纯函数与常量。
+    build.onResolve({ filter: /^@tauri-apps\/api\/(core|event)$/ }, () => ({
+      path: stub("tauri-stub.ts"),
+    }));
   },
 };
 

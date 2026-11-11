@@ -4,6 +4,7 @@ import ConfirmDialog, { type ConfirmOptions } from "./ConfirmDialog";
 import SkillManager from "./SkillManager";
 import { HostMemoryDialog, MemoryStepCard } from "./HostMemory";
 import Timeline from "./Timeline";
+import StewardPanel from "./StewardPanel";
 import { RecordingBadge } from "./RecorderBar";
 import {
   api,
@@ -368,7 +369,7 @@ export function AgentPanel({
   const cfg = useAgentConfig();
   const ready = isAgentReady(cfg);
   // 对话 / 时间线（2.5）视图切换。时间线只在选中时挂载（才订阅事件）；对话区只是被 CSS 藏起来，状态不丢
-  const [view, setView] = useState<"chat" | "timeline">("chat");
+  const [view, setView] = useState<"chat" | "timeline" | "steward">("chat");
   // 技能管理器（3.4）。`draft` 给了就直接弹出预填的「新建技能」编辑器（录制器 / LLM 草稿 / 宏迁移用）
   const [skillUi, setSkillUi] = useState<{ draft?: SkillInput } | null>(null);
   const [memOpen, setMemOpen] = useState(false);
@@ -844,7 +845,7 @@ export function AgentPanel({
   if (!visible || !sessionId) return null;
 
   return (
-    <div className={`ap-root${view === "timeline" ? " show-tl" : ""}`}>
+    <div className={`ap-root${view === "timeline" ? " show-tl" : view === "steward" ? " show-steward" : ""}`}>
       <div className="ap-head">
         <span className="ap-title">Nexus AI Agent</span>
         <RecordingBadge sessionId={sessionId} />
@@ -866,6 +867,15 @@ export function AgentPanel({
           >
             时间线
           </button>
+          <button
+            role="tab"
+            aria-selected={view === "steward"}
+            className={`ap-tab${view === "steward" ? " on" : ""}`}
+            onClick={() => setView("steward")}
+            title="会话织物：终端屏幕状态与托管契约（P0 只观察）"
+          >
+            托管
+          </button>
         </div>
         <button className="ap-skill-btn" onClick={() => setSkillUi({})} title="管理技能（可回放的操作流程）">
           技能
@@ -886,6 +896,10 @@ export function AgentPanel({
           hostLabel={sessions.find((s) => s.id === sessionId)?.label}
           onOpenSkillDraft={(draft) => setSkillUi({ draft })}
         />
+      )}
+
+      {view === "steward" && (
+        <StewardPanel sessionId={sessionId} sessions={sessions} />
       )}
 
       <div className="ap-status">

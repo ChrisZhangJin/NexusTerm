@@ -127,6 +127,12 @@ impl LocalManager {
         self.sessions.lock().unwrap().contains_key(id)
     }
 
+    /// 当前活着的本地 PTY id 列表。P0 会话枚举用（`agent::steward::steward_list_consoles`）。
+    /// 只取键、不碰任何 PTY 句柄，调用方拿它做只读展示是安全的。
+    pub fn ids(&self) -> Vec<String> {
+        self.sessions.lock().unwrap().keys().cloned().collect()
+    }
+
     pub fn write(&self, id: &str, data: &[u8]) -> Result<(), String> {
         let mut guard = self.sessions.lock().unwrap();
         let s = guard.get_mut(id).ok_or("本地会话不存在")?;

@@ -332,8 +332,8 @@ impl Builder {
             Kind::Keys => self.on_keys(ev),
             Kind::Secret => self.on_secret(),
             Kind::Output => self.on_output(ev),
-            // 用户不会产生 wait / screen 事件；见了也不当操作
-            Kind::Wait | Kind::Screen => {}
+            // 用户不会产生 wait / screen / 托管决策事件；见了也不当操作
+            Kind::Wait | Kind::Screen | Kind::Decision => {}
         }
     }
 

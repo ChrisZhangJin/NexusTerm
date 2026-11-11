@@ -10,12 +10,28 @@ const lastOutput = new Map<string, number>();
 
 export function registerTerm(id: string, term: Terminal): () => void {
   registry.set(id, term);
+  // P0 会话织物：屏幕帧采集挂在这里（TerminalView 之下、App 之上），
+  // 与 AgentPanel 是否打开完全无关 —— 面板关掉、窗口最小化都照常上报。
+  // 用 typeof 守卫：测试里塞进来的假 Terminal 没有这些事件。
+  const disposables: Array<{ dispose(): void }> = [];
+  const withCursor = term as Terminal & {
+    onCursorMove?: (fn: () => void) => { dispose(): void };
+    onWriteParsed?: (fn: () => void) => { dispose(): void };
+  };
+  if (typeof withCursor.onWriteParsed === "function") {
+    disposables.push(withCursor.onWriteParsed(() => scheduleCapture(id)));
+  }
+  if (typeof withCursor.onCursorMove === "function") {
+    disposables.push(withCursor.onCursorMove(() => scheduleCapture(id)));
+  }
   return () => {
+    for (const d of disposables) d.dispose();
     if (registry.get(id) === term) {
       registry.delete(id);
       lastOutput.delete(id);
       outputCount.delete(id);
       inputTaps.delete(id);
+      dropCaptureState(id);
     }
   };
 }
@@ -73,6 +89,21 @@ export function lastOutputAt(id: string): number {
 type InputTap = (data: string) => void;
 const inputTaps = new Map<string, Set<InputTap>>();
 
+/**
+ * P3 接管夺权：用户敲键 → Steward 100ms 内转 ObservingOnly。
+ * 与 screenDeltaSink 同模式：termRegistry 保持纯函数、不依赖 Tauri，
+ * IPC 出口由 App 注入。节流到每 console 250ms 一次——夺权是一次性状态切换，
+ * 连发字节里只有第一下有意义，后端 SLA 看的是首个键的处理延迟。
+ */
+type UserKeySink = (consoleId: string, keyAtMs: number) => void;
+let userKeySink: UserKeySink | null = null;
+const userKeyLast = new Map<string, number>();
+const USER_KEY_MIN_GAP_MS = 250;
+
+export function setUserKeySink(fn: UserKeySink | null): void {
+  userKeySink = fn;
+}
+
 export function onInput(id: string, fn: InputTap): () => void {
   let set = inputTaps.get(id);
   if (!set) {
@@ -87,6 +118,13 @@ export function onInput(id: string, fn: InputTap): () => void {
 }
 
 export function emitInput(id: string, data: string): void {
+  if (userKeySink && data.length > 0) {
+    const now = Date.now();
+    if (now - (userKeyLast.get(id) ?? 0) >= USER_KEY_MIN_GAP_MS) {
+      userKeyLast.set(id, now);
+      userKeySink(id, now);
+    }
+  }
   const set = inputTaps.get(id);
   if (!set) return;
   for (const fn of set) fn(data);
@@ -174,4 +212,242 @@ export function snapshotConsole(
   let text = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
   if (text.length > maxChars) text = text.slice(text.length - maxChars);
   return { text, alt };
+}
+
+// ————————————————————————————————————————————————————————————————————————
+// P0 会话织物：结构化屏幕帧采集
+//
+// 现状的 `snapshotConsole` 是「一轮工具调用里抓一次」的请求-回执模型；
+// 主动托管需要的是后端常驻的屏幕状态。这里把 xterm 的活动缓冲摊成
+// 「尾部 200 行 + 帧指纹」，只推变化行；后端 `ScreenStore` 合并并校验。
+//
+// 三条约束：
+// 1. 采集失败绝不能影响终端（sink 抛错、buffer 读失败都吞掉）；
+// 2. 不去重掉光标帧 —— 后端要靠它数 idle_frames 做空转判定；
+// 3. 纯模块：不 import Tauri，IPC 由 App 注入 sink。
+// ————————————————————————————————————————————————————————————————————————
+
+/** 抓屏窗口内的行下标（0 = 窗口最旧一行），不是终端绝对行号 */
+export interface ScreenLine {
+  y: number;
+  text: string;
+}
+
+export interface ScreenDelta {
+  consoleId: string;
+  frameId: number;
+  /** 抓屏窗口首行的绝对行号；窗口滑动后必须发全量帧 */
+  windowStart: number;
+  total: number;
+  cols: number;
+  rows: number;
+  alt: boolean;
+  cursorX: number;
+  cursorY: number;
+  hash: string;
+  full: boolean;
+  lines: ScreenLine[];
+  tsMs: number;
+}
+
+export interface ScreenDeltaAck {
+  applied: boolean;
+  /** 后端与前端不同步，下一帧必须发全量 */
+  needFull: boolean;
+  changed: boolean;
+  frameId: number;
+}
+
+interface CaptureFrame {
+  windowStart: number;
+  lines: string[];
+  hash: string;
+  alt: boolean;
+  cols: number;
+  rows: number;
+  cursorX: number;
+  cursorY: number;
+  frameId: number;
+}
+
+/** 与后端 `agent::steward::frame_hash` 完全一致（校验向量见 steward.test.ts） */
+export function frameHash(
+  lines: string[],
+  alt: boolean,
+  cols: number,
+  rows: number,
+  cursorX: number,
+  cursorY: number
+): string {
+  const payload =
+    lines.join("\n") +
+    `\n#${alt ? 1 : 0}:${cols}:${rows}:${cursorX}:${cursorY}`;
+  const bytes = new TextEncoder().encode(payload);
+  let h = 0x811c9dc5 >>> 0;
+  for (let i = 0; i < bytes.length; i++) {
+    h ^= bytes[i];
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+const CAPTURE_LINES = 200;
+const CAPTURE_DEBOUNCE_MS = 180;
+/**
+ * P1：静默期也要发心跳帧。P0 只在 onWriteParsed / onCursorMove 时上报，
+ * 后端分不清「屏幕没动」和「前端不在（浮窗 / 最小化 / 锁屏）」，
+ * 空转计数也只会在有输出时增长。这里每 2s 补一帧同哈希帧（只带 frameId，
+ * 不带行内容），后端 ScreenStore 据此累 idleFrames、Steward 据此判断流。
+ * 与后端 stale_ms 默认 6s 配套：连续 3 次心跳没到才算断流。
+ */
+const CAPTURE_HEARTBEAT_MS = 2000;
+type DeltaSink = (d: ScreenDelta) => void;
+
+let captureEnabled = false;
+let deltaSink: DeltaSink | null = null;
+const captureFrames = new Map<string, CaptureFrame>();
+const captureTimers = new Map<string, number>();
+const pendingFull = new Set<string>();
+let captureHeartbeat: number | null = null;
+
+/** 注入 IPC 出口。App 启动时调一次；不注入时采集为空操作（前端单测不受影响）。 */
+export function setScreenDeltaSink(fn: DeltaSink | null): void {
+  deltaSink = fn;
+}
+
+/** 本地开关。采集是纯本地行为，不出网、不调模型，可以默认常开。 */
+export function setScreenCaptureEnabled(on: boolean): void {
+  captureEnabled = on;
+  if (!on) {
+    stopCaptureHeartbeat();
+    return;
+  }
+  for (const id of registry.keys()) {
+    pendingFull.add(id);
+    scheduleCapture(id);
+  }
+  startCaptureHeartbeat();
+}
+
+function startCaptureHeartbeat(): void {
+  if (captureHeartbeat !== null) return;
+  captureHeartbeat = window.setInterval(() => {
+    if (!captureEnabled || !deltaSink) return;
+    // hash 不变的帧只带 frameId + 空 lines，后端仍会累 idleFrames 并刷新 updatedAt
+    for (const id of registry.keys()) scheduleCapture(id, 0);
+  }, CAPTURE_HEARTBEAT_MS);
+}
+
+function stopCaptureHeartbeat(): void {
+  if (captureHeartbeat !== null) {
+    window.clearInterval(captureHeartbeat);
+    captureHeartbeat = null;
+  }
+}
+
+/** 后端回报 needFull 时调用：下一帧改发全量，立刻重采一次。 */
+export function requestFullFrame(id: string): void {
+  pendingFull.add(id);
+  scheduleCapture(id, 0);
+}
+
+/** 供面板手动刷新 / 验证用 */
+export function captureNow(id: string): void {
+  pendingFull.add(id);
+  captureFrame(id);
+}
+
+function dropCaptureState(id: string): void {
+  captureFrames.delete(id);
+  pendingFull.delete(id);
+  const timer = captureTimers.get(id);
+  if (timer !== undefined) {
+    window.clearTimeout(timer);
+    captureTimers.delete(id);
+  }
+}
+
+function scheduleCapture(id: string, delay = CAPTURE_DEBOUNCE_MS): void {
+  if (!captureEnabled || !deltaSink) return;
+  const existing = captureTimers.get(id);
+  if (existing !== undefined) window.clearTimeout(existing);
+  const timer = window.setTimeout(() => {
+    captureTimers.delete(id);
+    captureFrame(id);
+  }, delay);
+  captureTimers.set(id, timer);
+}
+
+function captureFrame(id: string): void {
+  const term = registry.get(id);
+  if (!term || !captureEnabled || !deltaSink) return;
+  try {
+    const buf = term.buffer.active;
+    const alt = buf.type !== "normal";
+    const start = Math.max(0, buf.length - CAPTURE_LINES);
+    const total = buf.length - start;
+    const lines: string[] = [];
+    for (let y = start; y < buf.length; y++) {
+      const line = buf.getLine(y);
+      lines.push(line ? line.translateToString(true) : "");
+    }
+    const cols = term.cols;
+    const rows = term.rows;
+    const cursorX = buf.cursorX;
+    const cursorY = buf.cursorY;
+    const hash = frameHash(lines, alt, cols, rows, cursorX, cursorY);
+    const prev = captureFrames.get(id);
+    const structural =
+      !prev ||
+      prev.windowStart !== start ||
+      prev.lines.length !== total ||
+      prev.alt !== alt ||
+      prev.cols !== cols ||
+      prev.rows !== rows;
+    const full = structural || pendingFull.has(id);
+    const changes: ScreenLine[] = [];
+    if (full) {
+      for (let i = 0; i < total; i++) changes.push({ y: i, text: lines[i] });
+    } else if (prev) {
+      for (let i = 0; i < total; i++) {
+        if (lines[i] !== prev.lines[i]) changes.push({ y: i, text: lines[i] });
+      }
+    }
+    const frameId = (prev?.frameId ?? 0) + 1;
+    const delta: ScreenDelta = {
+      consoleId: id,
+      frameId,
+      windowStart: start,
+      total,
+      cols,
+      rows,
+      alt,
+      cursorX,
+      cursorY,
+      hash,
+      full,
+      lines: changes,
+      tsMs: Date.now(),
+    };
+    captureFrames.set(id, {
+      windowStart: start,
+      lines,
+      hash,
+      alt,
+      cols,
+      rows,
+      cursorX,
+      cursorY,
+      frameId,
+    });
+    pendingFull.delete(id);
+    // sink 是 IPC 边界，抛错只记、绝不让终端渲染链路受影响
+    try {
+      deltaSink(delta);
+    } catch {
+      /* 旁路失败不影响主链路 */
+    }
+  } catch {
+    /* buffer 正在被重建等瞬时状态，等下一次 tick */
+  }
 }

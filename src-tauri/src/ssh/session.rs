@@ -300,6 +300,12 @@ impl SessionManager {
         self.inner.lock().contains_key(id)
     }
 
+    /// 当前活着的 SSH 会话 id 列表。P0 会话枚举用（`agent::steward::steward_list_consoles`）。
+    /// 与 `contains` 一样轻量：不握手、不开通道，只在锁内拷一份键。
+    pub fn ids(&self) -> Vec<String> {
+        self.inner.lock().keys().cloned().collect()
+    }
+
     pub fn close(&self, id: &str) {
         // 认证可能正卡在「等用户填验证码」上，先把它叫醒，
         // 否则后台 connect 任务会挂到超时为止。

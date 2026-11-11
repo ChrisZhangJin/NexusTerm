@@ -169,6 +169,54 @@ pub fn run() {
             let agent = agent::AgentManager::new();
             agent.apply_config(&agent::load_config(&store));
             app.manage(viewer::DocStore::default());
+            // P0 会话织物 + P1 常驻循环：屏幕帧状态、契约表、事件流、时钟统计、配置
+            // 都独立于 AppState，避免给热路径上的 AppState 再添锁；命令层通过 State<T> 直接取。
+            // 每份状态 clone 一份给常驻循环（都是 Arc），循环本身只读屏幕、不写终端。
+            let steward_screen = agent::steward::ScreenStore::new();
+            let steward_registry = agent::steward::StewardRegistry::new();
+            let steward_events = agent::steward_loop::EventLog::new();
+            let steward_bus = agent::steward_loop::StewardBus::default();
+            let steward_runtime = agent::steward_loop::StewardRuntime::new();
+            let steward_config = agent::steward_loop::StewardConfigStore::new();
+            // P2：决策依据是 db 的内存镜像，启动时载入并写默认种子；
+            // 升级卡裁决队列由命令层投递、循环统一执行，保证注入只有一个所有者。
+            let steward_brain = agent::profile::StewardBrain::load(&store);
+            let steward_resolutions = agent::steward_loop::StewardResolutions::new();
+            // P3–P5：一个共享状态承载所有权 / 授权 / Checkpoint / Timebox / 预算 /
+            // 撤销窗口 / Planner 开关 / 写锁 / LLM 并发闸 / 恢复队列。
+            let steward_core = agent::steward_core::StewardCore::new();
+            app.manage(steward_screen.clone());
+            app.manage(steward_registry.clone());
+            app.manage(steward_events.clone());
+            app.manage(steward_bus.clone());
+            app.manage(steward_runtime.clone());
+            app.manage(steward_config.clone());
+            app.manage(steward_brain.clone());
+            app.manage(steward_resolutions.clone());
+            app.manage(steward_core.clone());
+            // P4：启动扫描未完成契约。契约本身只在内存里，靠 Checkpoint 重建；
+            // 循环启动后会 drain 恢复队列、先读屏对齐，hash 不符就降为「确认」档。
+            for (contract_id, console_id, _cp_state, raw) in store.steward_checkpoints() {
+                let Ok(cp) = serde_json::from_str::<agent::checkpoint::StewardCheckpoint>(&raw)
+                else {
+                    continue;
+                };
+                steward_registry.restore(agent::steward::StewardContract {
+                    id: contract_id.clone(),
+                    console_id: console_id.clone(),
+                    host_key: format!("local:{console_id}"),
+                    goal: cp.goal.clone(),
+                    authority_tier: cp.authority.tier.clone(),
+                    status: "observing".to_string(),
+                    intent_ids: cp.intent_ids.clone(),
+                    timebox_ms: cp.authority.timebox_ms,
+                    created_at: cp.saved_wall_ms,
+                });
+                steward_core.set_authority(&contract_id, cp.authority.clone());
+                steward_core.set_checkpoint(cp);
+                steward_core.ensure_console(&console_id);
+                steward_core.push_resume(&contract_id);
+            }
             app.manage(AppState {
                 sessions,
                 sftp,
@@ -180,6 +228,20 @@ pub fn run() {
                 auth_prompts,
                 keys_dir,
             });
+            // P1：一个常驻 Supervisor 管所有被托管 console 的状态槽，
+            // 面板关闭 / 窗口最小化都不影响它按心跳观察。全程只读、零 LLM。
+            agent::steward_loop::spawn_daemon(
+                app.handle().clone(),
+                steward_screen,
+                steward_registry,
+                steward_events,
+                steward_bus,
+                steward_runtime,
+                steward_config,
+                steward_brain,
+                steward_resolutions,
+                steward_core,
+            );
             tracing::info!("nexus-term 后端就绪");
             Ok(())
         })
@@ -324,6 +386,53 @@ pub fn run() {
             agent::hostmem_cmd::host_memory_update,
             agent::hostmem_cmd::host_memory_delete,
             agent::hostmem_cmd::host_memory_clear,
+            agent::steward::steward_list_consoles,
+            agent::steward::steward_screen_delta,
+            agent::steward::steward_screen_get,
+            agent::steward::steward_start,
+            agent::steward::steward_stop,
+            agent::steward::steward_status,
+            agent::steward::steward_amend,
+            agent::steward_loop::steward_events,
+            agent::steward_loop::steward_runtime_info,
+            agent::steward_loop::steward_classify_now,
+            agent::steward_loop::steward_clear_events,
+            agent::steward_loop::steward_config,
+            agent::steward_loop::steward_set_config,
+            agent::steward_loop::steward_wake,
+            agent::steward_cmd::steward_brain,
+            agent::steward_cmd::steward_ctx_upsert,
+            agent::steward_cmd::steward_ctx_delete,
+            agent::steward_cmd::steward_intent_push,
+            agent::steward_cmd::steward_decisions,
+            agent::steward_cmd::steward_decide_now,
+            agent::steward_cmd::steward_execution,
+            agent::steward_cmd::steward_set_execution,
+            agent::steward_cmd::steward_approve,
+            agent::steward_cmd::steward_reject,
+            agent::steward_cmd::steward_clear_decisions,
+            agent::steward_cmd::steward_policy,
+            // P3 授权与协作
+            agent::steward_cmd::steward_core_view,
+            agent::steward_cmd::steward_user_key,
+            agent::steward_cmd::steward_takeover,
+            agent::steward_cmd::steward_handback,
+            agent::steward_cmd::steward_undo,
+            agent::steward_cmd::steward_policy_v2,
+            agent::steward_cmd::steward_set_authority,
+            // P4 长运行与恢复
+            agent::steward_cmd::steward_timebox,
+            agent::steward_cmd::steward_set_timebox,
+            agent::steward_cmd::steward_checkpoints,
+            agent::steward_cmd::steward_resume,
+            // P5 学习闭环 / 统一审计 / LLM 兜底
+            agent::steward_cmd::steward_explain,
+            agent::steward_cmd::steward_review,
+            agent::steward_cmd::steward_audit,
+            agent::steward_cmd::steward_distill,
+            agent::steward_cmd::steward_planner,
+            agent::steward_cmd::steward_set_planner,
+            agent::steward_cmd::steward_plan_now,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");
