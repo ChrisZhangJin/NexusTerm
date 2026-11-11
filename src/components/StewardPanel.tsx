@@ -74,6 +74,13 @@ const OWNERSHIP_LABELS: Record<OwnershipState, string> = {
   suspended: "已暂停（保留现场）",
 };
 
+/** console 列表上的短徽标：后端 status 是该 console 的真实所有权态 */
+const CONSOLE_OWNER_BADGE: Record<string, string> = {
+  agent_driving: "托管中",
+  observing_only: "你接管中",
+  suspended: "已暂停",
+};
+
 /** 事件流后端最多留 200 条：全拉下来，局面按 console 过滤，列表只显示最近 60 条 */
 const EVENTS_FETCH = 200;
 const EVENTS_SHOWN = 60;
@@ -637,7 +644,11 @@ export default function StewardPanel({ sessionId, sessions }: StewardPanelProps)
               <span className="st-name">{label(c.id)}</span>
               <span className="st-badge">{c.kind}</span>
               {c.alt && <span className="st-badge alt">全屏</span>}
-              {c.status !== "none" && <span className="st-badge on">托管中</span>}
+              {c.status !== "none" && (
+                <span className={`st-badge${c.status === "agent_driving" ? " on" : ""}`}>
+                  {CONSOLE_OWNER_BADGE[c.status] ?? "托管中"}
+                </span>
+              )}
               {cs?.kind && <span className="st-badge situation">{situationLabel(cs.kind)}</span>}
               {cs?.injectedCount ? <span className="st-badge hot">注入 {cs.injectedCount}</span> : null}
             </button>

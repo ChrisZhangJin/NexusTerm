@@ -592,6 +592,8 @@ export const tierLabel = (t: string): string => TIER_LABELS[t as StewardTier] ??
 const CONTRACT_STATUS_LABELS: Record<string, string> = {
   observing: "观察中",
   none: "未托管",
+  agent_driving: "托管中",
+  observing_only: "你接管中",
   suspended: "已暂停",
 };
 
