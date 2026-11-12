@@ -8,6 +8,7 @@
 import { useEffect, useState } from "react";
 import { api, onHostNotify } from "../api";
 import { DiffView } from "./DiffView";
+import { TodoList } from "./TodoList";
 import { toFriendlyError } from "../lib/errors";
 import { checkLines, checksToText, hostButtons, hostDetail, hostPill, isTerminal, pendingCard, textToChecks } from "../lib/host";
 import type {
@@ -138,6 +139,7 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [] }:
         </ul>
       )}
       {status.notice && <div className="st-status warn">{status.notice}</div>}
+      {status.todo && status.todo.length > 0 && <TodoList items={status.todo} />}
 
       {btn.reattach && (
         <div className="st-esc host-ask">

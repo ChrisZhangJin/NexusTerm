@@ -216,6 +216,23 @@ export function AgentPanel({
     }
   };
 
+  /**
+   * 「新对话」：之后的提问不再接着之前的模型消息历史（对话模式默认会接着上一轮的上下文追问）。
+   * 面板上的记录不删，只插一条分隔，免得人以为 AI 还记得上面的内容。
+   */
+  const newConversation = async () => {
+    try {
+      await api.agentConversationReset();
+      patch((c) => ({
+        ...c,
+        messages: [...c.messages, { id: uid(), role: "assistant" as const, text: "——— 新对话：之后的提问不再接着上面的上下文 ———", ts: Date.now() }],
+      }));
+      setErr(null);
+    } catch (e) {
+      setErr(`开始新对话失败：${toFriendlyError(e).message}`);
+    }
+  };
+
   /** 「清空对话」：先真删盘上的数据，成功后再清界面（失败就保持原样并报错）。 */
   const clearConversation = async () => {
     try {
@@ -589,6 +606,14 @@ export function AgentPanel({
           title="查看 / 编辑助手对这台主机记下的备忘（提示符、sudo 习惯、常用路径……）"
         >
           主机备忘
+        </button>
+        <button
+          className="ap-mini"
+          disabled={busy}
+          onClick={() => void newConversation()}
+          title="之后的提问从头开始（默认会接着之前的上下文追问）；面板上的记录保留"
+        >
+          新对话
         </button>
         <button
           className="ap-mini"

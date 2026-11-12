@@ -453,6 +453,14 @@ export interface AgentStep {
   skillStatus?: string;
   /** kind:"paused" 专用：为什么暂停（steps | time | output | user）。`text` 是「做了什么 / 还差什么」 */
   pauseKind?: string;
+  /** kind=todo：整张计划清单 */
+  todo?: TodoItem[];
+}
+
+/** 计划清单的一项（nx_todo） */
+export interface TodoItem {
+  text: string;
+  status: "pending" | "in_progress" | "done";
 }
 
 /** 终端尾部的交互提示分类（与后端 `prompt::PromptKind` 的 snake_case 名字一致） */
@@ -893,6 +901,8 @@ export interface HostStatus {
   label: string;
   /** 给人看的提示（例如接驳后降为确认档的原因） */
   notice?: string | null;
+  /** 计划清单（nx_todo） */
+  todo?: TodoItem[];
 }
 
 /** 前端给的 console 线索：后端据此存 ConsoleRef，重启后按它给候选 tab 排序 */
