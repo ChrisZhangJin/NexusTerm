@@ -561,6 +561,139 @@ impl SftpManager {
     }
 }
 
+impl SftpManager {
+    // ——— 给 Agent 文件工具（agent/files.rs）用的几个最小原语 ———
+
+    /// Agent 文件工具为某个终端标签开的 SFTP 会话 id。
+    /// 加前缀与文件面板的 id 隔开 —— 面板关掉时不该把 Agent 正在用的会话一起关了。
+    pub fn agent_sftp_id(tab_id: &str) -> String {
+        format!("agent-fs:{tab_id}")
+    }
+
+    /// 让 Agent 在「某个 SSH 终端标签」上拿到一个可用的 SFTP 会话，返回其 id。
+    ///
+    /// 只走复用路径：在该标签**自己那条**已认证连接上开 sftp 子系统，绝不独立拨号 ——
+    /// Agent 不该替用户再走一次认证（OTP 服务器上那等于要用户再输一次码）。
+    /// 标签没登记连接（会话没保存配置）或连接已断，直接报错，由调用方退回 shell 方案。
+    ///
+    /// 已开过且仍是同一条连接则直接复用；标签重连过（句柄换了）就关掉旧的重开，
+    /// 免得拿着旧连接操作一台可能已经换了的机器。
+    pub async fn attach_terminal(&self, tab_id: &str) -> Result<String, SftpError> {
+        let id = Self::agent_sftp_id(tab_id);
+        let handle = self
+            .shared
+            .lock()
+            .get(tab_id)
+            .filter(|c| !c.handle.is_closed())
+            .map(|c| c.handle.clone());
+        let Some(handle) = handle else {
+            // 标签没了：顺手把以前开的会话收掉，别让 `held` 替一条该关的连接续命
+            self.close(&id).await;
+            return Err(SftpError::NotFound(format!(
+                "终端 {tab_id} 没有可复用的已认证 SSH 连接（未保存会话配置或已断开）"
+            )));
+        };
+
+        let same = self
+            .held
+            .lock()
+            .get(&id)
+            .is_some_and(|h| Arc::ptr_eq(h, &handle));
+        if same && self.inner.lock().await.contains_key(&id) {
+            return Ok(id);
+        }
+        self.close(&id).await;
+        match self.open_shared(&id, handle).await {
+            Ok(()) => Ok(id),
+            Err(ReuseError::Connection(e)) => Err(SftpError::Connect(e)),
+            Err(ReuseError::Subsystem(e)) => Err(e),
+        }
+    }
+
+    /// 把一段内存字节写成远端文件（不存在则创建，存在则截断）。
+    /// 不做原子性保证 —— 「写临时文件再改名」由 agent/files.rs 在上层拼出来。
+    pub async fn write(&self, id: &str, path: &str, bytes: &[u8]) -> Result<(), SftpError> {
+        let mut file = {
+            let map = self.inner.lock().await;
+            let s = map
+                .get(id)
+                .ok_or_else(|| SftpError::NotFound(id.to_string()))?;
+            s.create(path.to_string())
+                .await
+                .map_err(|e| SftpError::Remote(e.to_string()))?
+        };
+        // 与 download/upload 一样：File 不借用 map，锁已释放，大文件写入不挡别的操作
+        file.write_all(bytes)
+            .await
+            .map_err(|e| SftpError::Remote(e.to_string()))?;
+        file.shutdown()
+            .await
+            .map_err(|e| SftpError::Remote(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 查询单个路径（跟随符号链接）。不存在返回 `Ok(None)`，其余错误照常上抛 ——
+    /// 「没有这个文件」与「没权限看」对调用方是两回事。
+    pub async fn stat(&self, id: &str, path: &str) -> Result<Option<RemoteEntry>, SftpError> {
+        use russh_sftp::client::error::Error as E;
+        use russh_sftp::protocol::StatusCode;
+        let map = self.inner.lock().await;
+        let s = map
+            .get(id)
+            .ok_or_else(|| SftpError::NotFound(id.to_string()))?;
+        match s.metadata(path.to_string()).await {
+            Ok(meta) => Ok(Some(RemoteEntry {
+                name: path.rsplit('/').next().unwrap_or(path).to_string(),
+                path: path.to_string(),
+                is_dir: meta.is_dir(),
+                size: meta.size.unwrap_or(0),
+                mtime: meta.mtime.map(|t| t as u64),
+                permissions: meta.permissions,
+            })),
+            Err(E::Status(st)) if st.status_code == StatusCode::NoSuchFile => Ok(None),
+            Err(e) => Err(SftpError::Remote(e.to_string())),
+        }
+    }
+
+    /// 原子改名覆盖（`posix-rename@openssh.com`）。服务器不支持该扩展时返回 `Ok(false)`
+    /// 且什么都不做 —— 普通 `rename` 在 OpenSSH 上遇到已存在的目标会失败，调用方需自备退路。
+    pub async fn posix_rename(&self, id: &str, from: &str, to: &str) -> Result<bool, SftpError> {
+        let map = self.inner.lock().await;
+        let s = map
+            .get(id)
+            .ok_or_else(|| SftpError::NotFound(id.to_string()))?;
+        s.posix_rename(from.to_string(), to.to_string())
+            .await
+            .map_err(|e| SftpError::Remote(e.to_string()))
+    }
+
+    /// 服务端解析出的规范路径（消掉 `..` 与符号链接）。路径不存在时服务器会报错。
+    pub async fn canonicalize(&self, id: &str, path: &str) -> Result<String, SftpError> {
+        let map = self.inner.lock().await;
+        let s = map
+            .get(id)
+            .ok_or_else(|| SftpError::NotFound(id.to_string()))?;
+        s.canonicalize(path.to_string())
+            .await
+            .map_err(|e| SftpError::Remote(e.to_string()))
+    }
+
+    /// 只改权限位。原子写换掉文件后用它把原文件的权限还回去（否则脚本会丢掉 +x）。
+    pub async fn set_permissions(&self, id: &str, path: &str, mode: u32) -> Result<(), SftpError> {
+        let map = self.inner.lock().await;
+        let s = map
+            .get(id)
+            .ok_or_else(|| SftpError::NotFound(id.to_string()))?;
+        let attrs = russh_sftp::protocol::FileAttributes {
+            permissions: Some(mode),
+            ..Default::default()
+        };
+        s.set_metadata(path.to_string(), attrs)
+            .await
+            .map_err(|e| SftpError::Remote(e.to_string()))
+    }
+}
+
 impl From<crate::ssh::session::SessionError> for SftpError {
     fn from(e: crate::ssh::session::SessionError) -> Self {
         SftpError::Auth(e.to_string())
@@ -596,6 +729,29 @@ mod tests {
             mgr.transfers.lock().get("t1").is_none(),
             "传输结束要把登记表里的条目清掉，否则取消标志会无限堆积"
         );
+    }
+
+    #[tokio::test]
+    async fn attach_terminal_without_shared_conn_is_not_found() {
+        let mgr = make_manager();
+        // 没有登记过的标签：只能报「不存在」，绝不能退回独立拨号
+        let err = mgr.attach_terminal("tab-x").await.unwrap_err();
+        assert!(matches!(err, SftpError::NotFound(_)), "{err}");
+        assert!(mgr.inner.lock().await.is_empty());
+        assert_eq!(SftpManager::agent_sftp_id("tab-x"), "agent-fs:tab-x");
+    }
+
+    #[tokio::test]
+    async fn new_primitives_on_unknown_session_report_not_found() {
+        let mgr = make_manager();
+        assert!(matches!(mgr.write("nope", "/tmp/x", b"hi").await, Err(SftpError::NotFound(_))));
+        assert!(matches!(mgr.stat("nope", "/tmp/x").await, Err(SftpError::NotFound(_))));
+        assert!(matches!(mgr.canonicalize("nope", "/").await, Err(SftpError::NotFound(_))));
+        assert!(matches!(mgr.posix_rename("nope", "/a", "/b").await, Err(SftpError::NotFound(_))));
+        assert!(matches!(
+            mgr.set_permissions("nope", "/tmp/x", 0o644).await,
+            Err(SftpError::NotFound(_))
+        ));
     }
 
     #[test]
