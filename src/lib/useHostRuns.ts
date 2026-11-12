@@ -6,7 +6,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, onHostAll } from "../api";
 import type { HostStatus } from "../types";
-import { hostForConsole, isTerminal, upsertHost } from "./host";
+import { hostForConsole, isTerminal, needsReattach, upsertHost } from "./host";
 
 export function useHostRuns(onEnded?: (st: HostStatus) => void) {
   const [map, setMap] = useState<Record<string, HostStatus>>({});
@@ -39,5 +39,7 @@ export function useHostRuns(onEnded?: (st: HostStatus) => void) {
   }, []);
 
   const forConsole = useCallback((consoleId: string | null | undefined) => (consoleId ? hostForConsole(map, consoleId) : null), [map]);
-  return { hosts: map, forConsole };
+  /** 等重新接驳的托管（重启后的 console id 已经变了，不按 console 归，单独列出） */
+  const awaitingReattach = Object.values(map).filter((s) => needsReattach(s.phase));
+  return { hosts: map, forConsole, awaitingReattach };
 }

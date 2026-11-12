@@ -68,7 +68,7 @@ test("预算暂停时按键再交还：仍可加预算继续", () => {
 
 test("终态没有可点的按钮", () => {
   const b = hostButtons({ kind: "stopped" });
-  assert.deepEqual(b, { takeover: false, handback: false, resume: false, pause: false, stop: false });
+  assert.deepEqual(b, { takeover: false, handback: false, resume: false, pause: false, stop: false, reattach: false });
 });
 
 test("按 console 取托管：未结束优先，否则最新结局", () => {
@@ -119,4 +119,31 @@ test("等密码 / 等确认判据有各自的胶囊", () => {
   });
   assert.equal(hostPill(mk("secret")).label, "等你输入密码");
   assert.equal(hostPill(mk("criteriaDraft")).label, "等你确认判据");
+});
+
+import { consoleHintOf, needsReattach } from "../../src/lib/host";
+
+test("ConsoleRef 线索：SSH 带记录 id、本地不带；cwd / tmux 取探测到的上下文", () => {
+  const ssh = consoleHintOf({
+    id: "tab-1",
+    title: "root@web1",
+    customTitle: "  ",
+    sessionId: "rec-web1",
+    status: "connected",
+    ctx: { cwd: "/srv/app", tmux: "main", at: 1 },
+  });
+  assert.deepEqual(ssh, { consoleId: "tab-1", label: "root@web1", sessionRecordId: "rec-web1", cwd: "/srv/app", tmux: "main" });
+  const local = consoleHintOf({ id: "tab-2", title: "", customTitle: "构建机", sessionId: "x", status: "connected", local: true });
+  assert.deepEqual(local, { consoleId: "tab-2", label: "构建机", sessionRecordId: null, cwd: null, tmux: null });
+});
+
+test("挂起（重启 / 终端关了）只给接驳与放弃", () => {
+  const p: HostPhase = { kind: "suspended", reason: "consoleGone", resume_to: { kind: "running" } };
+  assert.equal(hostPill(p).label, "终端已关闭·待接驳");
+  assert.equal(needsReattach(p), true);
+  const b = hostButtons(p);
+  assert.equal(b.reattach, true);
+  assert.equal(b.takeover, false);
+  assert.equal(b.stop, true);
+  assert.equal(needsReattach({ kind: "running" }), false);
 });

@@ -6,6 +6,7 @@ import TerminalView, { clock } from "./components/TerminalView";
 import FileManager from "./components/FileManager";
 import TabBar from "./components/TabBar";
 import StatusBar from "./components/StatusBar";
+import { consoleHintOf } from "./lib/host";
 import { AgentPanel } from "./components/AgentPanel";
 import {
   AppearanceDialog,
@@ -1037,7 +1038,7 @@ export default function App() {
     () =>
       tabs
         .filter((t) => t.status === "connected" || t.status === "reconnecting")
-        .map((t) => ({ id: t.id, label: t.customTitle || t.title || t.id })),
+        .map((t) => ({ id: t.id, label: t.customTitle || t.title || t.id, hint: consoleHintOf(t) })),
     [tabs],
   );
 

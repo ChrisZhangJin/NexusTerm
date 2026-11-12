@@ -4,7 +4,7 @@
  */
 
 import type { PauseKind } from "./agentBudget";
-import type { HostCheck, HostHumanCard, HostPhase, HostStatus } from "../types";
+import type { HostCheck, HostConsoleHint, HostHumanCard, HostPhase, HostStatus, TerminalTab } from "../types";
 
 export type HostPillTone = "active" | "warn" | "idle" | "done" | "bad";
 
@@ -51,7 +51,7 @@ export function hostPill(p: HostPhase): HostPill {
           return { label: "已暂停", tone: "warn" };
       }
     case "suspended":
-      return { label: "待重新接驳", tone: "warn" };
+      return { label: p.reason === "consoleGone" ? "终端已关闭·待接驳" : "待重新接驳", tone: "warn" };
     case "completed":
       return { label: "完成", tone: "done" };
     case "failed":
@@ -97,6 +97,8 @@ export function pendingCard(p: HostPhase): HostHumanCard | null {
 }
 
 export interface HostButtons {
+  /** 待重新接驳：显示候选 / 打开新连接 */
+  reattach: boolean;
   takeover: boolean;
   handback: boolean;
   resume: boolean;
@@ -108,12 +110,29 @@ export interface HostButtons {
 export function hostButtons(p: HostPhase): HostButtons {
   const b = basePhase(p);
   const live = !isTerminal(p);
+  const suspended = b.kind === "suspended";
   return {
-    takeover: live && p.kind !== "userDriving",
+    takeover: live && !suspended && p.kind !== "userDriving",
     handback: p.kind === "userDriving",
     resume: b.kind === "paused",
     pause: p.kind === "running",
     stop: live,
+    reattach: suspended,
+  };
+}
+
+/** 等重新接驳（重启后 / 终端关了） */
+export const needsReattach = (p: HostPhase): boolean => basePhase(p).kind === "suspended";
+
+/** 一个 tab 的 console 线索：重启后后端按它（SSH 记录 → 标签 → cwd）给候选排序 */
+export function consoleHintOf(tab: TerminalTab): HostConsoleHint {
+  const nz = (s: string | null | undefined) => (s && s.trim() ? s.trim() : null);
+  return {
+    consoleId: tab.id,
+    label: nz(tab.customTitle) ?? nz(tab.title) ?? tab.id,
+    sessionRecordId: tab.local ? null : nz(tab.sessionId),
+    cwd: nz(tab.ctx?.cwd),
+    tmux: nz(tab.ctx?.tmux),
   };
 }
 
