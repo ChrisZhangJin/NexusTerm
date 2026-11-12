@@ -7,7 +7,7 @@
 //!
 //! 本模块不碰 Tauri / pty / 时钟，只做判定与反馈文本，便于脱离运行时单测。
 
-use super::situation::{Program, Situation, SituationKind};
+use super::situation::{self, Program, Situation, SituationKind, SubmitStyle};
 
 /// 默认最长盯多久（毫秒）。
 pub const DEFAULT_TIMEOUT_MS: u64 = 600_000;
@@ -108,7 +108,9 @@ pub fn watch_verdict(
         return Some(Reason::ShellPrompt);
     }
     // 「等输入」（Claude Code 空输入框、`目录 [/opt/app]: ` 这类自由文本提示）形状上也像任务
-    // 刚发出时的瞬间画面或输出里的一行冒号结尾的话：屏幕要静止一阵才算真的在等人
+    // 刚发出时的瞬间画面或输出里的一行冒号结尾的话：屏幕要静止一阵才算真的在等人。
+    // 弱线索（构建输出里一句问号结尾的话、没有 `(y/n)` 的 `Continue?`）在 situation 里也归到
+    // AwaitingInput 而不是 Permission，所以同样要静止才叫醒
     let static_ok = kind != SituationKind::AwaitingInput || changed_ago_ms >= SETTLE_MS;
     if needs_attention(kind) && static_ok && (settled || kind == SituationKind::Password) {
         return Some(Reason::NeedsAttention(kind));
@@ -180,6 +182,12 @@ pub fn render_feedback(
                     head(&o.text, 120),
                     if o.grants_permanent { "（会永久扩大授权，不要选）" } else { "" }
                 ));
+            }
+            // 选中之后怎么提交：多发一个回车会落到下一屏（可能是下一张权限卡）
+            match situation::submit_style(x) {
+                SubmitStyle::DigitSubmits => s.push_str("提交方式：按编号即选中并提交，只发数字，不要再加 <Enter>。\n"),
+                SubmitStyle::ArrowSelect => s.push_str("提交方式：方向键菜单，输入编号无效；用 <Up>/<Down> 移到目标项再 <Enter>。\n"),
+                SubmitStyle::NeedsEnter => {}
             }
         }
         tail = x.tail.trim().to_string();
@@ -345,5 +353,35 @@ mod tests {
         let fb = render_feedback("s", Reason::Matched, 1000, Some(&sit), "", &"e".repeat(9000), 3000);
         assert!(fb.chars().count() <= 3000 + 600, "len={}", fb.chars().count());
         assert!(fb.contains("命中期间"));
+    }
+
+    #[test]
+    fn weak_question_mid_build_needs_a_static_screen() {
+        // 构建输出里一行问号结尾的话：situation 归为 AwaitingInput（不是 Permission）……
+        let sit = situation::frames::classify_lines(&["Compiling foo v0.1.0", "warning: unused variable", "note: should the linker proceed?"]);
+        assert_eq!(sit.kind, SituationKind::AwaitingInput, "{:?}", sit.evidence);
+        // ……屏幕还在刷新时不叫醒
+        assert_eq!(watch_verdict(sit.kind, sit.program, false, 500, 10_000, &cfg()), None);
+        // 静止下来才算在等人
+        assert_eq!(
+            watch_verdict(sit.kind, sit.program, false, SETTLE_MS, 10_000, &cfg()),
+            Some(Reason::NeedsAttention(SituationKind::AwaitingInput))
+        );
+        // ufw 的 allow / deny 输出上面是 shell 提示符：回到 shell，不是授权
+        let ufw = situation::frames::classify_lines(&["22/tcp ALLOW Anywhere", "80/tcp DENY Anywhere", "alice@host:~$ "]);
+        assert_eq!(
+            watch_verdict(ufw.kind, ufw.program, situation::shell_visible(&ufw), 0, 10_000, &cfg()),
+            Some(Reason::ShellPrompt)
+        );
+    }
+
+    #[test]
+    fn feedback_tells_how_to_submit_the_choice() {
+        let cc = situation::frames::classify_lines(&situation::frames::CC_BASH_PERM);
+        let fb = render_feedback("s", Reason::NeedsAttention(cc.kind), 1000, Some(&cc), "", "", 3000);
+        assert!(fb.contains("只发数字"), "{fb}");
+        let sh = situation::frames::classify_lines(&situation::frames::SCRIPT_MENU);
+        let fb = render_feedback("s", Reason::NeedsAttention(sh.kind), 1000, Some(&sh), "", "", 3000);
+        assert!(!fb.contains("提交方式"), "{fb}");
     }
 }

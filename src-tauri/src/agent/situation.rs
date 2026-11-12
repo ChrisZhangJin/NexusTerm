@@ -28,6 +28,8 @@ const TAIL_LINES: usize = 24;
 const RECENT_LINES: usize = 8;
 /// 事件流里保留的脱敏屏幕文本上限（字符）。
 const TAIL_CHARS: usize = 1200;
+/// 连续这么多帧（含前端心跳帧）内容没变，才算「屏幕静止」。
+const STATIC_FRAMES: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -157,6 +159,75 @@ impl Situation {
     }
 }
 
+/// 选中一个选项之后要不要再按回车。
+///
+/// - `NeedsEnter`：行式提示（`Select [1-3]: ` / bash `select`）——编号 + 回车；
+/// - `DigitSubmits`：带 `❯` 选中标记的编号菜单（Claude Code 权限卡、Ink select）——按数字即选中并提交，
+///   多发的回车会落到下一屏（可能就是下一张权限卡）；
+/// - `ArrowSelect`：inquirer 一类无编号的方向键菜单——只能方向键 + 回车，输入编号无效。
+///   这里只负责识别并记录，驱动方向键是后续任务；在那之前注入层对它一律不写。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmitStyle {
+    #[default]
+    NeedsEnter,
+    DigitSubmits,
+    ArrowSelect,
+}
+
+/// `SubmitStyle` 记在 `evidence` 里（不进 signature，也不改 `Situation` 的结构）。
+pub const SUBMIT_DIGIT: &str = "submit:digit-only";
+pub const SUBMIT_ARROW: &str = "submit:arrow-select";
+
+/// 这个局面里选中选项的提交方式。没有标记 = 行式提示，编号后要回车。
+pub fn submit_style(sit: &Situation) -> SubmitStyle {
+    if sit.evidence.iter().any(|e| e == SUBMIT_ARROW) {
+        SubmitStyle::ArrowSelect
+    } else if sit.evidence.iter().any(|e| e == SUBMIT_DIGIT) {
+        SubmitStyle::DigitSubmits
+    } else {
+        SubmitStyle::NeedsEnter
+    }
+}
+
+/// 两次取到的局面是否「实质不同」：等审批 / 等控制权的这段时间里屏幕换了一个局面，
+/// 之前对着旧局面批准的按键就不能再发。返回给模型看的一句原因。
+///
+/// 比的是语义（kind / program / 主题 / 选项）和光标所在的末行，不比帧哈希：
+/// 进度条、时钟每帧都变，但局面没变。仍在跑的任务（Progress）末行本来就一直在变，不比末行。
+pub fn materially_changed(before: &Situation, after: &Situation) -> Option<String> {
+    if before.kind != after.kind {
+        return Some(format!(
+            "局面从 {} 变成了 {}",
+            before.kind.as_str(),
+            after.kind.as_str()
+        ));
+    }
+    if before.program != after.program {
+        return Some(format!(
+            "前台程序从 {} 变成了 {}",
+            before.program.as_str(),
+            after.program.as_str()
+        ));
+    }
+    if !before.signature.is_empty() && !after.signature.is_empty() && before.signature != after.signature {
+        return Some("提问 / 选项已经不是批准时的那一屏".to_string());
+    }
+    if before.kind != SituationKind::Progress {
+        let last = |t: &str| {
+            t.lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| l.trim().to_string())
+                .unwrap_or_default()
+        };
+        if last(&before.tail) != last(&after.tail) {
+            return Some("光标所在的那一行已经变了".to_string());
+        }
+    }
+    None
+}
+
 struct Draft {
     kind: SituationKind,
     confidence: f32,
@@ -182,13 +253,47 @@ fn draft(
 }
 
 /// 去掉全屏程序的框线，让 `1. Yes` 这类选项能被解析，主题也不带一堆 `│`。
+///
+/// 只剥框线字符；选中标记（`❯` / `›` / `>`）只在**行首**、且后面跟着空格和一个像选项的东西时才剥。
+/// `>` 不能当框线两头乱剥：`>>> ` / `mysql> ` / PS2 的 `> ` 是 REPL 提示符，`<Ok>` 是 whiptail 按钮。
 fn clean_line(s: &str) -> String {
-    const FRAME: &str = "│┃╭╰╮╯─═╔╗╚╝┌┐└┘❯›>";
-    s.trim()
-        .trim_start_matches(|c: char| FRAME.contains(c) || c.is_whitespace())
-        .trim_end_matches(|c: char| FRAME.contains(c) || c.is_whitespace())
+    const FRAME: &str = "│┃║╭╰╮╯─━═╔╗╚╝┌┐└┘┏┓┗┛";
+    let t = s
         .trim()
-        .to_string()
+        .trim_matches(|c: char| FRAME.contains(c) || c.is_whitespace());
+    strip_cursor(t).trim().to_string()
+}
+
+/// 行首选中标记后面是不是一个选项：`1. Yes` / `2) No` / `[3] x`。
+fn option_like(rest: &str) -> bool {
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 {
+        return rest[digits..].starts_with(['.', ')', ':']);
+    }
+    rest.starts_with('[') && rest[1..].starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// 剥掉行首的选择器光标：`❯ 1. Yes` → `1. Yes`、`› Refactor now` → `Refactor now`。
+/// `❯` / `›` 后跟任意文字都算（它们不会是 REPL 提示符）；`>` 只认后面是编号选项的，
+/// 否则 `> ` 续行 / node 提示符 / 引用块原样保留。
+fn strip_cursor(t: &str) -> &str {
+    for (cursor, any_text) in [('❯', true), ('›', true), ('>', false)] {
+        let Some(rest) = t.strip_prefix(cursor) else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            return t;
+        }
+        let body = rest.trim_start();
+        if body.is_empty() {
+            return t;
+        }
+        if any_text || option_like(body) {
+            return body;
+        }
+        return t;
+    }
+    t
 }
 
 fn detect_program(lower: &str, alt: bool, guess: PromptKind) -> Program {
@@ -263,22 +368,7 @@ fn parse_options(lines: &[&str]) -> Vec<Choice> {
         if text.is_empty() {
             continue;
         }
-        let l = text.to_lowercase();
-        let grants_permanent = l.contains("don't ask")
-            || l.contains("don’t ask")
-            || l.contains("allow all")
-            || l.contains("this session")
-            || l.contains("shift+tab")
-            || l.contains("auto-accept")
-            || l.contains("auto accept")
-            || l.contains("bypass permissions")
-            || l.contains("yolo")
-            || l.contains("skip permissions")
-            || l.contains("always")
-            || l.contains("permanent")
-            || l.contains("永久")
-            || l.contains("不再询问")
-            || l.contains("不再提示");
+        let grants_permanent = grants_permanent_text(&text.to_lowercase());
         let choice = Choice {
             index: Some(index),
             text,
@@ -295,6 +385,25 @@ fn parse_options(lines: &[&str]) -> Vec<Choice> {
         }
     }
     out
+}
+
+/// 选项原文里的永久扩权特征（「don't ask again」「allow all … this session」…）。
+fn grants_permanent_text(l: &str) -> bool {
+    l.contains("don't ask")
+        || l.contains("don’t ask")
+        || l.contains("allow all")
+        || l.contains("this session")
+        || l.contains("shift+tab")
+        || l.contains("auto-accept")
+        || l.contains("auto accept")
+        || l.contains("bypass permissions")
+        || l.contains("yolo")
+        || l.contains("skip permissions")
+        || l.contains("always")
+        || l.contains("permanent")
+        || l.contains("永久")
+        || l.contains("不再询问")
+        || l.contains("不再提示")
 }
 
 /// 终端程序的操作提示页脚（`? for shortcuts` / `esc to cancel` / `⏵⏵ accept edits on …`）：
@@ -402,6 +511,90 @@ fn selector_line(raw: &str) -> bool {
     digits > 0 && rest[digits..].starts_with(|c| c == '.' || c == ')')
 }
 
+/// 方向键菜单的操作提示（inquirer / prompts / enquirer）。
+fn arrow_cue(lower: &str) -> bool {
+    lower.contains("use arrow keys")
+        || lower.contains("arrow keys to")
+        || lower.contains("↑/↓")
+        || lower.contains("↑↓")
+}
+
+/// inquirer 一类方向键菜单：`? Pick one: (Use arrow keys)` 下面一列**不带编号**的选项，
+/// 当前项前面是 `❯` / `›` / `>`。返回各选项（`index` 为空：输入编号无效，只能方向键 + 回车）。
+///
+/// 要求同时有选中光标行和方向键提示；带编号的选择器归 `parse_options` / `DigitSubmits`。
+fn parse_arrow_menu(raw: &[String]) -> Option<Vec<Choice>> {
+    let from = raw.len().saturating_sub(16);
+    let window = &raw[from..];
+    let lower = window.join("\n").to_lowercase();
+    if !arrow_cue(&lower) {
+        return None;
+    }
+    let cursor_at = window.iter().rposition(|l| {
+        let t = l.trim_start_matches(|c: char| c == '│' || c == '┃' || c.is_whitespace());
+        ['❯', '›', '>'].iter().any(|c| {
+            t.strip_prefix(*c).map_or(false, |r| {
+                r.starts_with(char::is_whitespace) && {
+                    let b = r.trim();
+                    !b.is_empty() && !option_like(b)
+                }
+            })
+        })
+    })?;
+    // 光标行上下相邻、缩进的非空行是同一列选项；碰到提问行（`? …`）、空行或提示页脚就停
+    let is_item = |l: &str| {
+        let t = clean_line(l);
+        let lt = t.to_lowercase();
+        !t.is_empty()
+            && !t.starts_with('?')
+            && !arrow_cue(&lt)
+            && !is_footer_line(&lt)
+            && t.chars().count() <= 120
+    };
+    let mut lo = cursor_at;
+    while lo > 0 && is_item(&window[lo - 1]) && window[lo - 1].starts_with(char::is_whitespace) {
+        lo -= 1;
+    }
+    let mut hi = cursor_at;
+    while hi + 1 < window.len() && is_item(&window[hi + 1]) && window[hi + 1].starts_with(char::is_whitespace) {
+        hi += 1;
+    }
+    let opts: Vec<Choice> = window[lo..=hi]
+        .iter()
+        .take(12)
+        .map(|l| {
+            let text = clean_line(l);
+            let grants_permanent = grants_permanent_text(&text.to_lowercase());
+            Choice {
+                index: None,
+                text,
+                grants_permanent,
+            }
+        })
+        .collect();
+    (!opts.is_empty()).then_some(opts)
+}
+
+/// npm init 一类「冒号 / 问号后面括号里给默认值」的提示：`package name: (myapp) ` /
+/// `Is this OK? (yes) `。返回括号里的默认值；直接回车即采用它。
+pub fn offered_default(line: &str) -> Option<String> {
+    let t = line.trim();
+    if t.chars().count() > 120 || !t.ends_with(')') || arrow_cue(&t.to_lowercase()) {
+        return None;
+    }
+    let open = t.rfind('(')?;
+    let head = t[..open].trim_end();
+    let default = t[open + 1..t.len() - 1].trim();
+    if !head.ends_with([':', '?', '：', '？']) || default.contains(['(', ')']) || default.chars().count() > 60 {
+        return None;
+    }
+    let words = head.split_whitespace().count();
+    if !(1..=8).contains(&words) || head.chars().count() < 3 {
+        return None;
+    }
+    Some(default.to_string())
+}
+
 /// 末行是「shell 提示符 + 已敲的文字」（`user@h:~/p$ rm -rf x` / `PS C:\> dir`）。
 /// 光标就在这一行：不管上面残留着什么程序的画面，现在都是 shell 在收这行字。
 pub fn shell_prompt_with_text(line: &str) -> bool {
@@ -491,6 +684,10 @@ pub fn free_text_strong(line: &str) -> bool {
     if l.contains("press enter") || l.contains("press return") || l.contains("hit enter") {
         return true;
     }
+    // `package name: (myapp) ` / `Is this OK? (yes) `：括号里是回车即采用的默认值
+    if offered_default(&l).is_some() {
+        return true;
+    }
     let t = l.trim_end();
     let colon = t.ends_with([':', '：']);
     let question = t.ends_with(['?', '？']);
@@ -544,7 +741,14 @@ fn free_text_weak(line: &str) -> bool {
 /// `free_text_prompt` 命中时写进证据里的标记。
 pub const FREE_TEXT_PROMPT: &str = "prompt:free-text";
 
-fn rule(lines: &[&str], alt: bool, guess: PromptGuess, program: Program, hints: Hints) -> Draft {
+fn rule(
+    lines: &[&str],
+    alt: bool,
+    guess: PromptGuess,
+    program: Program,
+    hints: Hints,
+    arrow_opts: Option<Vec<Choice>>,
+) -> Draft {
     let recent = lines
         .iter()
         .rev()
@@ -555,7 +759,20 @@ fn rule(lines: &[&str], alt: bool, guess: PromptGuess, program: Program, hints: 
         .join("\n")
         .to_lowercase();
     let last = lines.last().copied().unwrap_or("").to_lowercase();
+    // 光标附近（最后 3 个非空行）：「allow / deny」这类线索得出现在这里才算对话框，
+    // 8 行之前的 `ufw status` 输出不算
+    let near = lines
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
     let q = question_line(lines);
+    // 光标停在 shell 提示符上：上面不管残留着什么对话框文字，都已经是历史
+    let at_shell = guess.kind == PromptKind::ShellPrompt;
 
     // 1) 密码：沿用 prompt.rs 的判据，绝不代填，也不把内容写进 tail
     if guess.kind == PromptKind::Password {
@@ -603,18 +820,27 @@ fn rule(lines: &[&str], alt: bool, guess: PromptGuess, program: Program, hints: 
         && opts_now.iter().any(|c| c.text.to_lowercase().starts_with("yes"))
         && opts_now.iter().any(|c| c.text.to_lowercase().starts_with("no"))
         && !topic_of(q.clone(), &recent).map_or(false, |t| t.starts_with("settings:"));
-    let looks_permission = yes_no_options
-        || (!cc_chatting
-            && (recent.contains("do you want to proceed")
-                || recent.contains("don't ask again")
-                || recent.contains("don’t ask again")
-                || recent.contains("yes, and ")
-                || (recent.contains("allow") && recent.contains("deny"))
-                || (recent.contains("permission")
-                    && (recent.contains("allow") || recent.contains("grant")))
-                || guess.kind == PromptKind::YesNo));
+    // 只有 `continue?` 这类弱确认句（没有 `(y/n)` 记号）不单独构成授权：构建输出里一行问号结尾的话
+    // 也长这样。它在下面按「等输入」处理，nx_watch 要屏幕静止一阵才叫醒模型
+    let strong_yes_no = guess.kind == PromptKind::YesNo && guess.confidence >= 0.9;
+    let looks_permission = !at_shell
+        && (yes_no_options
+            || (!cc_chatting
+                && (recent.contains("do you want to proceed")
+                    || recent.contains("don't ask again")
+                    || recent.contains("don’t ask again")
+                    || recent.contains("yes, and ")
+                    || (near.contains("allow") && near.contains("deny"))
+                    || (near.contains("permission")
+                        && (near.contains("allow") || near.contains("grant")))
+                    || strong_yes_no)));
     if looks_permission {
-        let options = parse_options(lines);
+        let mut options = parse_options(lines);
+        if options.is_empty() {
+            if let Some(a) = &arrow_opts {
+                options = a.clone();
+            }
+        }
         let permanent = options.iter().any(|c| c.grants_permanent);
         let mut d = draft(
             SituationKind::Permission,
@@ -669,6 +895,17 @@ fn rule(lines: &[&str], alt: bool, guess: PromptGuess, program: Program, hints: 
         );
     }
 
+    // 3e) 方向键菜单（inquirer `? Pick one: (Use arrow keys)` + `❯ React`）：无编号，只能方向键 + 回车
+    if let Some(opts) = arrow_opts.filter(|o| o.len() >= 2) {
+        return draft(
+            SituationKind::Menu,
+            0.85,
+            "prompt:arrow-menu",
+            topic_of(q.clone(), &recent).or_else(|| Some("menu:select".to_string())),
+            opts,
+        );
+    }
+
     // 4) 需要内容回答的提问（截图里「是否记住」这类）
     let claude_q = program == Program::ClaudeCode && q.is_some();
     let script_q = recent.contains("input:")
@@ -700,13 +937,41 @@ fn rule(lines: &[&str], alt: bool, guess: PromptGuess, program: Program, hints: 
         );
     }
 
+    // 5a) REPL 提示符（`>>> ` / `mysql> ` / `irb(main):001:0> ` / node 的 `> `）：程序在等一条语句
+    if guess.kind == PromptKind::Repl && program != Program::ClaudeCode {
+        return draft(
+            SituationKind::AwaitingInput,
+            if guess.confidence >= 0.8 { 0.85 } else { 0.5 },
+            "prompt:repl",
+            Some("repl:statement".to_string()),
+            Vec::new(),
+        );
+    }
+
     // 5b) 光标行停在一句自由文本提示上（`Enter installation directory [/opt/app]: `）
     if hints.free_text_strong && guess.kind != PromptKind::ShellPrompt {
-        return draft(
+        // npm init 的 `package name: (myapp) `：默认值记进主题，回车即采用
+        let default = lines.last().and_then(|l| offered_default(l));
+        let mut d = draft(
             SituationKind::AwaitingInput,
             0.6,
             FREE_TEXT_PROMPT,
-            None,
+            default.as_ref().map(|v| format!("input:default={v}")),
+            Vec::new(),
+        );
+        if default.is_some() {
+            d.evidence.push("prompt:default-offered".to_string());
+        }
+        return d;
+    }
+
+    // 5c) 弱确认句（`Continue?` 而没有 `(y/n)`）：当「等输入」，不当授权
+    if guess.kind == PromptKind::YesNo && !at_shell {
+        return draft(
+            SituationKind::AwaitingInput,
+            0.5,
+            "prompt:yes-no-weak",
+            q.clone().or_else(|| Some(last.chars().take(80).collect())),
             Vec::new(),
         );
     }
@@ -881,6 +1146,15 @@ pub fn classify(snap: &ScreenSnapshot, now_ms: i64, stale_limit_ms: i64) -> Situ
             }
         }
     }
+    // git 用 `LESS=FRX`：less 跑在主屏幕上，最后一行只剩一个 `:`。屏幕静止了一阵、上面是一屏内容时才认
+    if guess.kind == PromptKind::Unknown && !snap.alt {
+        if let Some((last, before)) = raw.split_last() {
+            let before: Vec<&str> = before.iter().map(|s| s.as_str()).collect();
+            if let Some(g) = prompt::normal_screen_pager(&before, last, snap.idle_frames >= STATIC_FRAMES) {
+                guess = g;
+            }
+        }
+    }
     let typed_prompt = !snap.alt && raw.last().map_or(false, |l| shell_prompt_with_text(l));
     let mut program = detect_program(&lower, snap.alt, guess.kind);
     let stale_cc = program == Program::ClaudeCode;
@@ -899,7 +1173,24 @@ pub fn classify(snap: &ScreenSnapshot, now_ms: i64, stale_limit_ms: i64) -> Situ
         free_text_strong: raw.last().map_or(false, |l| free_text_strong(l)),
         selector: raw.iter().rev().take(RECENT_LINES.max(12)).any(|l| selector_line(l)),
     };
-    let mut d = rule(&non_empty, snap.alt, guess, program, hints);
+    let arrow_opts = parse_arrow_menu(&raw);
+    let arrow = arrow_opts.is_some();
+    let mut d = rule(&non_empty, snap.alt, guess, program, hints, arrow_opts);
+    // 选中之后怎么提交（见 `SubmitStyle`）：带编号且有 `❯` 选中标记 / Claude Code 的选择卡按数字即提交；
+    // 无编号的方向键菜单只能方向键；其余行式提示（`Select [1-3]: `）编号后要回车
+    if matches!(
+        d.kind,
+        SituationKind::Permission | SituationKind::Menu | SituationKind::Question
+    ) && !d.options.is_empty()
+    {
+        if d.options.iter().all(|o| o.index.is_none()) {
+            if arrow {
+                d.evidence.push(SUBMIT_ARROW.to_string());
+            }
+        } else if hints.selector || program == Program::ClaudeCode {
+            d.evidence.push(SUBMIT_DIGIT.to_string());
+        }
+    }
     if typed_prompt && stale_cc && !d.evidence.iter().any(|e| e == SHELL_PROMPT_VISIBLE) {
         d.evidence.push(SHELL_PROMPT_VISIBLE.to_string());
     }
@@ -1331,5 +1622,189 @@ mod tests {
         assert!(!shell_prompt_with_text("echo a > f"));
         assert!(!shell_prompt_with_text("# a markdown heading"));
         assert!(!shell_prompt_with_text("Installing packages... 45%"));
+    }
+
+    // ───────────── clean_line 不再把 `>` 当框线（REPL / whiptail）─────────────
+
+    #[test]
+    fn clean_line_keeps_repl_prompts_and_buttons() {
+        assert_eq!(clean_line(">>> "), ">>>");
+        assert_eq!(clean_line("mysql> "), "mysql>");
+        assert_eq!(clean_line("> "), ">");
+        assert_eq!(clean_line("│        <Ok>        │"), "<Ok>");
+        assert_eq!(clean_line("irb(main):001:0> "), "irb(main):001:0>");
+        // 选中标记只在行首、后面跟选项时才剥
+        assert_eq!(clean_line("│ ❯ 1. Yes      │"), "1. Yes");
+        assert_eq!(clean_line("> 2. No"), "2. No");
+        assert_eq!(clean_line("› Refactor now"), "Refactor now");
+        assert_eq!(clean_line("> quoted reply text"), "> quoted reply text");
+        assert_eq!(clean_line("PS C:\\Users\\x> "), "PS C:\\Users\\x>");
+    }
+
+    #[test]
+    fn repl_prompts_are_awaiting_input() {
+        for (name, frame) in [
+            ("python", &["$ python3", "Python 3.12.1 (main) [GCC 13.2.0] on linux", "Type \"help\" for more information.", ">>> "][..]),
+            ("mysql", &["Welcome to the MySQL monitor.  Commands end with ; or \\g.", "", "mysql> "][..]),
+            ("irb", &["$ irb", "irb(main):001:0> "][..]),
+            ("node", &["Welcome to Node.js v22.1.0.", "Type \".help\" for more information.", "> "][..]),
+        ] {
+            let x = cs(frame, false);
+            assert_eq!(x.kind, SituationKind::AwaitingInput, "{name}: {:?}", x.evidence);
+            assert!(x.evidence.iter().any(|e| e == "prompt:repl"), "{name}: {:?}", x.evidence);
+            assert!(!shell_visible(&x), "{name}");
+        }
+    }
+
+    #[test]
+    fn whiptail_ok_only_dialog_is_menu() {
+        let x = cs(
+            &[
+                "┌──────────────┤ Installer ├──────────────┐",
+                "│                                         │",
+                "│ Installation finished successfully.     │",
+                "│                                         │",
+                "│                 <Ok>                    │",
+                "│                                         │",
+                "└─────────────────────────────────────────┘",
+            ],
+            true,
+        );
+        assert_eq!(x.kind, SituationKind::Menu, "{:?}", x.evidence);
+        assert!(x.tail.contains("<Ok>"));
+    }
+
+    // ───────────── 提交方式：数字即提交 vs 编号 + 回车 ─────────────
+
+    #[test]
+    fn selector_menus_submit_on_digit_line_prompts_need_enter() {
+        for f in [&frames::CC_BASH_PERM[..], &frames::CC_EDIT_PERM[..], frames::CC_ASK_MENU, frames::CC_PLAN_APPROVAL] {
+            let x = cs(f, false);
+            assert_eq!(submit_style(&x), SubmitStyle::DigitSubmits, "{:?}", x.evidence);
+        }
+        let menu = cs(&frames::SCRIPT_MENU, false);
+        assert_eq!(menu.kind, SituationKind::Menu);
+        assert_eq!(submit_style(&menu), SubmitStyle::NeedsEnter);
+        let yn = cs(&frames::SCRIPT_YN, false);
+        assert_eq!(submit_style(&yn), SubmitStyle::NeedsEnter);
+    }
+
+    #[test]
+    fn inquirer_arrow_menu_is_menu_with_arrow_select() {
+        let x = cs(
+            &[
+                "$ npm create vite@latest",
+                "? Pick a framework: (Use arrow keys)",
+                "❯ React",
+                "  Vue",
+                "  Svelte",
+            ],
+            false,
+        );
+        assert_eq!(x.kind, SituationKind::Menu, "{:?}", x.evidence);
+        assert_eq!(submit_style(&x), SubmitStyle::ArrowSelect);
+        let texts: Vec<&str> = x.options.iter().map(|o| o.text.as_str()).collect();
+        assert_eq!(texts, ["React", "Vue", "Svelte"]);
+        assert!(x.options.iter().all(|o| o.index.is_none()));
+        // 没有方向键提示的 `> 文字`（引用、REPL 回显）不是方向键菜单
+        let y = cs(&["> some quoted text", "  more text", "  even more"], false);
+        assert_ne!(submit_style(&y), SubmitStyle::ArrowSelect);
+    }
+
+    // ───────────── 误判修正 ─────────────
+
+    #[test]
+    fn ufw_status_above_shell_prompt_is_idle_not_permission() {
+        let x = cs(
+            &[
+                "$ sudo ufw status",
+                "Status: active",
+                "",
+                "To                         Action      From",
+                "--                         ------      ----",
+                "22/tcp                     ALLOW       Anywhere",
+                "80/tcp                     DENY        Anywhere",
+                "alice@host:~$ ",
+            ],
+            false,
+        );
+        assert_eq!(x.kind, SituationKind::Idle, "{:?}", x.evidence);
+        // allow / deny 在 8 行内但不在光标附近，也不算授权
+        let y = cs(
+            &[
+                "22/tcp ALLOW Anywhere",
+                "80/tcp DENY Anywhere",
+                "rule a",
+                "rule b",
+                "rule c",
+                "still running step 4",
+            ],
+            false,
+        );
+        assert_ne!(y.kind, SituationKind::Permission);
+        // 真正的 allow / deny 提示还在
+        let z = cs(&["Grant camera access?", "   < Allow >     < Deny >"], false);
+        assert_eq!(z.kind, SituationKind::Permission, "{:?}", z.evidence);
+    }
+
+    #[test]
+    fn weak_question_mid_build_is_not_permission() {
+        let x = cs(&["Compiling foo v0.1.0", "warning: unused variable", "note: should the linker proceed?"], false);
+        assert_ne!(x.kind, SituationKind::Permission, "{:?}", x.evidence);
+        let y = cs(&["step 3 done", "Continue?"], false);
+        assert_eq!(y.kind, SituationKind::AwaitingInput, "{:?}", y.evidence);
+        // 带 (y/n) 记号的仍是授权
+        let z = cs(&["Overwrite config? (y/n) "], false);
+        assert_eq!(z.kind, SituationKind::Permission);
+    }
+
+    #[test]
+    fn npm_init_default_prompts_are_awaiting_input_with_default() {
+        let x = cs(&["This utility will walk you through creating a package.json file.", "package name: (myapp) "], false);
+        assert_eq!(x.kind, SituationKind::AwaitingInput, "{:?}", x.evidence);
+        assert_eq!(x.topic.as_deref(), Some("input:default=myapp"));
+        assert!(x.evidence.iter().any(|e| e == "prompt:default-offered"));
+        let y = cs(&["  \"license\": \"ISC\"", "}", "", "", "Is this OK? (yes) "], false);
+        assert_eq!(y.kind, SituationKind::AwaitingInput, "{:?}", y.evidence);
+        assert_eq!(y.topic.as_deref(), Some("input:default=yes"));
+        assert_eq!(offered_default("version: (1.0.0) ").as_deref(), Some("1.0.0"));
+        assert!(offered_default("(venv) user@h:~$").is_none());
+        assert!(offered_default("done (3 files)").is_none());
+    }
+
+    #[test]
+    fn git_pager_on_normal_screen_needs_static_frames() {
+        let lines = [
+            "commit 3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a",
+            "Author: Dev <dev@example.com>",
+            "Date:   Mon Nov 9 10:00:00 2026 +0800",
+            "",
+            "    fix(agent): tighten prompt rules",
+            "",
+            "commit 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+            ":",
+        ];
+        let mut s = snap(&lines, false);
+        assert_ne!(c(&s).kind, SituationKind::Pager, "屏幕刚变化时不认");
+        s.idle_frames = STATIC_FRAMES;
+        let x = c(&s);
+        assert_eq!(x.kind, SituationKind::Pager, "{:?}", x.evidence);
+        assert_eq!(x.program, Program::Pager);
+    }
+
+    #[test]
+    fn material_change_detection() {
+        let a = cs(&frames::CC_BASH_PERM, false);
+        assert!(materially_changed(&a, &a.clone()).is_none());
+        let b = cs(&frames::CC_IDLE_BOX, false);
+        assert!(materially_changed(&a, &b).is_some());
+        // 同为 shell，但提示符上敲的字变了
+        let p1 = cs(&["user@h:~/p$ ls"], false);
+        let p2 = cs(&["user@h:~/p$ rm -rf /"], false);
+        assert!(materially_changed(&p1, &p2).is_some());
+        // 进度条每帧都变，但局面没变
+        let g1 = cs(&["⠋ Thinking 12%", "esc to interrupt"], true);
+        let g2 = cs(&["⠙ Thinking 34%", "esc to interrupt"], true);
+        assert!(materially_changed(&g1, &g2).is_none());
     }
 }

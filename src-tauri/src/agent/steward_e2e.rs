@@ -135,10 +135,16 @@ fn e2e_a_question_screen_full_loop_with_receipt() {
         "notify 档应放行并留撤销窗口，实际 {verdict:?}"
     );
 
-    // 6. 注入字节：单行 + \r
+    // 6. 注入字节：单行、无换行。Claude Code 的选择卡按数字即提交，选编号时只发数字（不带 \r，
+    //    多出的回车会落到下一屏）；自由文本才以 \r 收尾
     let bytes = rec.chosen.send_bytes().expect("answer 必须可注入");
-    assert_eq!(*bytes.last().unwrap(), b'\r');
-    assert!(!bytes[..bytes.len() - 1].iter().any(|b| *b == b'\n'));
+    assert!(!bytes.iter().any(|b| *b == b'\n'));
+    if rec.chosen.option_index.is_some() {
+        assert_eq!(rec.chosen.submit, situation::SubmitStyle::DigitSubmits);
+        assert_eq!(bytes, rec.chosen.option_index.clone().unwrap().into_bytes());
+    } else {
+        assert_eq!(*bytes.last().unwrap(), b'\r');
+    }
 
     // 7. 撤销窗口（Notify 档 30s）
     let core = StewardCore::new();

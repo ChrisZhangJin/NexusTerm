@@ -210,6 +210,8 @@ export interface DecisionAction {
   text: string;
   optionIndex: string | null;
   injectable: boolean;
+  /** 选中编号后的提交方式：digit_submits 只发数字；arrow_select 不注入；旧记录缺省 = needs_enter */
+  submit?: "needs_enter" | "digit_submits" | "arrow_select";
 }
 
 export interface CtxRef {

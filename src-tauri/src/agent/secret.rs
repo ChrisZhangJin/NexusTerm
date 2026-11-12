@@ -232,6 +232,32 @@ where
     }
 }
 
+/// 写入前复核时，终端已经不在口令提示上的说明（不含任何秘密）。
+pub const PROMPT_GONE: &str =
+    "终端已经不在密码 / 口令提示上（可能用户自己输入了、提示超时退出了，或屏幕切到了别的程序），为安全起见没有写入";
+
+/// 写入前的最后一道复核：用户填卡片可能花了两分钟，这期间口令提示可能已经没了——
+/// 此时写进去的密码会被回显，甚至被 shell 当成一条命令执行（进历史记录）。
+///
+/// `still_prompting` 只在用户真的提供了密码时才调用。不在提示上时返回 `Err(WriteFailed)`，
+/// `Zeroizing` 的值随 `outcome` 一起在这里 drop 擦掉；其余结局原样放行（它们本来就不写）。
+pub fn guard_prompt(
+    outcome: SecretOutcome,
+    still_prompting: impl FnOnce() -> bool,
+) -> Result<SecretOutcome, SecretStatus> {
+    match outcome {
+        SecretOutcome::Provided(value) => {
+            if still_prompting() {
+                Ok(SecretOutcome::Provided(value))
+            } else {
+                drop(value);
+                Err(SecretStatus::WriteFailed(PROMPT_GONE.to_string()))
+            }
+        }
+        other => Ok(other),
+    }
+}
+
 /// 把输出里出现的密码原文替换掉。
 ///
 /// 正常的密码提示不回显，这是兜底：目标若其实在回显（提示没被识别成密码、`stty echo` 开着、
@@ -552,5 +578,31 @@ mod tests {
         assert_eq!(g.kind, PromptKind::Password);
         let fb = secret_feedback("a", &SecretStatus::Provided, "", Some(&g));
         assert!(fb.contains("prompt_kind=password"));
+    }
+
+    #[test]
+    fn guard_prompt_drops_value_when_prompt_is_gone() {
+        // 提示还在：原样放行
+        match guard_prompt(SecretOutcome::Provided(Zeroizing::new(SECRET.into())), || true) {
+            Ok(SecretOutcome::Provided(v)) => assert_eq!(v.as_str(), SECRET),
+            other => panic!("应当放行，实际 {other:?}"),
+        }
+        // 提示没了：不写，状态里没有密码
+        match guard_prompt(SecretOutcome::Provided(Zeroizing::new(SECRET.into())), || false) {
+            Err(st) => {
+                assert_eq!(st.code(), "failed");
+                assert!(!st.label().contains(SECRET));
+                assert!(secret_feedback("s", &st, "", None).contains("没有写入"));
+            }
+            Ok(other) => panic!("应当拒绝写入，实际 {other:?}"),
+        }
+        // 用户没提供：不必复核屏幕
+        let mut asked = false;
+        let r = guard_prompt(SecretOutcome::Declined, || {
+            asked = true;
+            false
+        });
+        assert!(matches!(r, Ok(SecretOutcome::Declined)));
+        assert!(!asked);
     }
 }

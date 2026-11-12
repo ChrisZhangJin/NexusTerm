@@ -3970,9 +3970,13 @@ pub async fn run(
                     // shell 上回车提交了危险命令则要人批准（即便越界卡已经批过，那张卡没有列这些原因）
                     let mut risk = risk;
                     let mut crossed = crossed;
+                    // 托管：放行时依据的局面，写之前要拿它和当时的屏幕再比一次
+                    let mut judged: Option<super::situation::Situation> = None;
                     if is_steward {
                         let sit = situation_now(app, state, &target_id, false);
-                        match super::steward_mode::assess_keys(&bytes, Some(&sit)) {
+                        let verdict = super::steward_mode::assess_keys(&bytes, Some(&sit));
+                        judged = Some(sit);
+                        match verdict {
                             super::steward_mode::KeysVerdict::Allow => {}
                             super::steward_mode::KeysVerdict::Refuse(why) => {
                                 emit_step(
@@ -4037,6 +4041,29 @@ pub async fn run(
                     }
 
                     drive_gate!(&target_id);
+                    // 审批卡、等控制权都可能挂上好几分钟：期间屏幕换了局面（权限卡换成下一张、
+                    // 提示符上敲的命令变了），对着旧局面批准的按键就不能再发
+                    if let Some(before) = &judged {
+                        let now_sit = situation_now(app, state, &target_id, false);
+                        if let Some(why) = super::situation::materially_changed(before, &now_sit) {
+                            let why = format!("等待期间屏幕局面变了：{why}");
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    target: Some(target_id.clone()),
+                                    target_label: Some(label.clone()),
+                                    reasons: Some(vec![why.clone()]),
+                                    ..StepPayload::new("skip", step)
+                                },
+                            );
+                            feedback.push_str(&format!(
+                                "按键没有发送：{why}（现在 kind={}）。请先用 nx_screen 看清当前屏幕，再决定要不要重发。\n",
+                                now_sit.kind.as_str()
+                            ));
+                            continue;
+                        }
+                    }
                     emit_interact(app, &session, "keys", step, &target_id, &label, Some(&shown), None, None, None);
                     let tl_seq = timeline::begin(app, &state.agent, &target_id, TlKind::Keys, &shown, None);
                     match send_keys(state, &target_id, &bytes).await {
@@ -4423,6 +4450,40 @@ pub async fn run(
                     }
                     state.agent.set_enabled(&target_id, true);
 
+                    // 终端此刻真的停在口令提示上才开卡：否则用户填的密码会被回显，甚至被 shell 当命令执行。
+                    // 模型常在命令刚发出、提示还没画出来时就调用，给提示几秒钟出现。
+                    let at_password = || {
+                        situation_now(app, state, &target_id, false).kind
+                            == super::situation::SituationKind::Password
+                    };
+                    let mut prompting = at_password();
+                    for _ in 0..6 {
+                        if prompting || cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        prompting = at_password();
+                    }
+                    if !prompting {
+                        let why = "终端当前没有停在密码 / 口令提示上".to_string();
+                        emit_step(
+                            app,
+                            &session,
+                            StepPayload {
+                                target: Some(target_id.clone()),
+                                target_label: Some(label.clone()),
+                                command: Some(reason.clone()),
+                                reasons: Some(vec![why.clone()]),
+                                ..StepPayload::new("skip", step)
+                            },
+                        );
+                        feedback.push_str(&format!(
+                            "没有打开密码卡片：会话「{label}」{why}（等了约 3 秒）。\
+                             先用 nx_wait / nx_screen 确认屏幕最后一行是 `Password:` 这类提示，再调用 nx_secret。\n"
+                        ));
+                        continue;
+                    }
+
                     // 卡片上提示终端是否真的在要密码：不是时输入可能被回显。
                     let guess = classify_session(state, &target_id, false);
                     let request_id = uuid::Uuid::new_v4().simple().to_string();
@@ -4451,18 +4512,25 @@ pub async fn run(
                     // 放弃时 `answered` 随 break 被 drop，`Zeroizing` 擦掉密码。
                     drive_gate!(&target_id);
 
-                    // 写入前记起点：之后的才是这个密码引出的输出
-                    let mark = state.agent.pushed(&target_id).unwrap_or_default();
-                    let (status, tail) = secret::deliver(
-                        answered,
-                        |payload| {
-                            let target_id = target_id.clone();
-                            async move { write_to(state, &target_id, &payload).await }
-                        },
-                        secret::SECRET_SETTLE,
-                        || state.agent.since(&target_id, mark).unwrap_or_default(),
-                    )
-                    .await;
+                    // 填卡片最多两分钟：这期间提示可能已经没了（用户自己输了 / 超时退出 / 换了屏）。
+                    // 写之前再认一次屏幕，不是口令提示就不写，密码随 `Zeroizing` 在复核里擦掉
+                    let (status, tail) = match secret::guard_prompt(answered, at_password) {
+                        Err(status) => (status, String::new()),
+                        Ok(answered) => {
+                            // 写入前记起点：之后的才是这个密码引出的输出
+                            let mark = state.agent.pushed(&target_id).unwrap_or_default();
+                            secret::deliver(
+                                answered,
+                                |payload| {
+                                    let target_id = target_id.clone();
+                                    async move { write_to(state, &target_id, &payload).await }
+                                },
+                                secret::SECRET_SETTLE,
+                                || state.agent.since(&target_id, mark).unwrap_or_default(),
+                            )
+                            .await
+                        }
+                    };
                     marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
                     let after = classify_session(state, &target_id, false);
                     // 时间线只记占位 + 原因 + 结局码，没有密码，也不记其后的输出尾部
