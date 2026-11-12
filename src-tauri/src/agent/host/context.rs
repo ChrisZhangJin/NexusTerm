@@ -199,6 +199,7 @@ mod tests {
                 Check::Manual { text: "PR 页面绿了".into() },
             ],
             yolo: false,
+            criteria_confirmed: false,
         }
     }
     fn item(id: &str, kind: &str, strength: &str, text: &str, extra: serde_json::Value) -> CtxItem {

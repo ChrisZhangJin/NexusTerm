@@ -4025,8 +4025,18 @@ pub async fn run(
                     };
                     // 托管：逐条核验完成判据（只读、过闸），不靠模型自己说完成
                     let ctx = h.ctx();
-                    let mut prober = ActProber { app, state, runtime, run_key: &run_key, console: &h.console_id, step, cancel: &cancel };
-                    let results = super::host::verify::verify(&ctx.contract.success_criteria, &ctx.policy(), &mut prober).await;
+                    let mut prober =
+                        ActProber { app, state, runtime, run_key: &run_key, console: &h.console_id, step, cancel: &cancel, host: h };
+                    // 用户确认过的判据按普通托管写入过闸执行；YOLO 判据只跑只读命令。每条沿用执行通道的上限
+                    h.flush_progress(&messages, step);
+                    let results = super::host::verify::verify(
+                        &ctx.contract.success_criteria,
+                        &ctx.policy(),
+                        ctx.contract.criteria_confirmed,
+                        super::executor::CHECK_CAP,
+                        &mut prober,
+                    )
+                    .await;
                     let evidence = super::host::verify::evidence_text(&results);
                     emit_step(
                         app,
@@ -5652,9 +5662,15 @@ struct ActProber<'a> {
     console: &'a str,
     step: usize,
     cancel: &'a Arc<AtomicBool>,
+    host: &'a HostShared,
 }
 
 impl super::host::verify::Prober for ActProber<'_> {
+    fn approve(&mut self, cmd: &str, reasons: &[String]) -> impl std::future::Future<Output = bool> + Send {
+        let card = hosted_approval_card(&format!("（完成判据）{cmd}"), reasons);
+        async move { self.host.approve(card).await }
+    }
+
     fn screen(&self) -> String {
         situation_now(self.app, self.state, self.console, false).tail
     }
@@ -5666,9 +5682,13 @@ impl super::host::verify::Prober for ActProber<'_> {
                 control::PauseWait::Ready => {}
                 _ => return Err("已取消".to_string()),
             }
-            run_one(self.state, self.app, self.console, &cmd, self.step, "判据核验", self.console, Some(self.cancel), true)
-                .await
-                .map(|o| o.output)
+            let o = run_one(self.state, self.app, self.console, &cmd, self.step, "判据核验", self.console, Some(self.cancel), true)
+                .await?;
+            // 执行通道自己的上限到了：命令还没结束，按超时判不通过
+            if o.reason == ExecEnd::Timeout {
+                return Err(format!("超时（{}）", tail_chars(o.output.trim(), 300)));
+            }
+            Ok(o.output)
         }
     }
 }
