@@ -1,7 +1,7 @@
 /**
- * 托管夺权与采集门控：
- * - xterm 自己生成的字节（焦点 / 鼠标 / 查询应答）不算用户敲键，不能触发夺权；
- * - 只有托管中的 console 才采屏幕帧、跑心跳、上报敲键；新签契约立刻补一帧全量。
+ * 用户敲键判定与采集门控：
+ * - xterm 自己生成的字节（焦点 / 鼠标 / 查询应答）不算用户敲键，不能让托管任务让路；
+ * - 只有托管中的 console 才采屏幕帧、跑心跳；新签契约立刻补一帧全量。
  */
 
 import { test } from "node:test";
@@ -9,13 +9,11 @@ import assert from "node:assert/strict";
 
 import type { Terminal } from "@xterm/xterm";
 import {
-  emitInput,
   isXtermGenerated,
   registerTerm,
   setScreenCaptureEnabled,
   setScreenDeltaSink,
   setStewardConsoles,
-  setUserKeySink,
   type ScreenDelta,
 } from "../../src/lib/termRegistry";
 import { isUserTyping } from "../../src/lib/control";
@@ -75,29 +73,6 @@ test("真实按键 / 粘贴 / 方向键都不算 xterm 生成", () => {
 test("Agent 控制闸复用同一判定：鼠标 / 焦点不暂停 Agent", () => {
   for (const d of GENERATED) assert.equal(isUserTyping(d), false, JSON.stringify(d));
   for (const d of USER) assert.equal(isUserTyping(d), true, JSON.stringify(d));
-});
-
-test("只有真·用户输入、且 console 在托管中，才上报夺权", () => {
-  const calls: string[] = [];
-  setUserKeySink((id) => calls.push(id));
-  try {
-    // 没有契约：一律不报（后端也只会回 -1，白跑一次 IPC）
-    emitInput("tab-k1", "a");
-    assert.deepEqual(calls, []);
-
-    setStewardConsoles(["tab-k1"]);
-    for (const d of GENERATED) emitInput("tab-k1", d);
-    assert.deepEqual(calls, [], "焦点 / 鼠标 / 应答不能触发夺权");
-    emitInput("tab-k1", "y");
-    assert.deepEqual(calls, ["tab-k1"]);
-
-    // 别的终端没契约，照样不报
-    emitInput("tab-k2", "y");
-    assert.deepEqual(calls, ["tab-k1"]);
-  } finally {
-    setUserKeySink(null);
-    setStewardConsoles([]);
-  }
 });
 
 // ————————————————————————— 采集门控 —————————————————————————
@@ -209,20 +184,3 @@ test("没有契约时不采帧、不起心跳；签约立刻补全量帧，停�
   }
 });
 
-test("终端注销时清掉夺权节流记录：同 id 重建后第一下键照样上报", () => {
-  const calls: string[] = [];
-  setUserKeySink((id) => calls.push(id));
-  setStewardConsoles(["re-1"]);
-  try {
-    const un = registerTerm("re-1", fakeTerm([]));
-    emitInput("re-1", "a");
-    un();
-    const un2 = registerTerm("re-1", fakeTerm([]));
-    emitInput("re-1", "b");
-    un2();
-    assert.deepEqual(calls, ["re-1", "re-1"]);
-  } finally {
-    setUserKeySink(null);
-    setStewardConsoles([]);
-  }
-});

@@ -4,19 +4,13 @@
  * 事件只订阅一份（在 AgentPanel 的 `useAgentRun` 里，本页经 `run` 桥读取与操作），
  * 所以审批 / 密码卡片不会在「对话」与「托管」两处各答一次。
  *
- * 下面是原有的零 LLM Steward（局面 / 决策 / 注入 / 回执），现在收进「诊断」。
+ * 守护进程只观察（局面 / 空转 / 断流事件），动手的唯一入口是托管任务（`host_*` 命令，
+ * 胶囊与卡片见 HostCard）。旧的零 LLM 决策卡 / 升级卡 / 撤销窗口 / 接管交还 / 恢复 /
+ * Planner 界面随后端写路径在 PR8 删除。
  *
- * P2「托管控制台」：Steward 的眼睛（局面 / 事件）+ 手（决策 / 注入 / 回执）。
- *
- * P0 验屏幕帧持续同步、P1 验常驻只读观察，P2 在同一面板里补上：
- * 决策记录与依据引用、升级卡（建议 / 备选 / 倒计时 / 一键确认）、自动应答总闸、
- * 以及用户预先承载的偏好 / 意向 / 知识 / 剧本编辑区。
- *
- * 布局：顶部一张主卡（目标终端 / 目标 / 开始停止 / 档位 / 接管交还 / 自动应答 / 一行状态），
- * 下面是终端列表、局面、决策、事件；计数器 / 阈值 / 帧指纹等内部细节收进「诊断」。
- *
- * 决策编译零 LLM；自动应答每次冷启动默认关闭，打开后密码 / 永久扩权 / 断流 /
- * 低置信度 / approve 档依然 fail-closed。设计见 docs/nexus-agent-steward-design.md。
+ * 布局：顶部一张主卡（目标终端 / 目标 / 档位 / 开始停止 / 一行状态），托管卡片与实况，
+ * 下面是终端列表、局面；决策记录 / 复盘 / 事件 / 帧指纹等内部细节收进「诊断」。
+ * 设计见 docs/nexus-host-unified-design.md。
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -48,31 +42,20 @@ import {
   OUTCOME_LABELS,
   REF_LABELS,
   TIER_LABELS,
-  authorityToSave,
   contractStatusLabel,
-  decisionAwaiting,
   eventLabel,
   programLabel,
   situationLabel,
   stewardApi,
   stewardConsoleIds,
-  stewardStatusLine,
-  syncAuthDraft,
   tierLabel,
-  type AbsenceSummary,
   type AuditEntry,
-  type AuthDraft,
-  type Authority,
   type ConsoleInfo,
-  type CoreView,
   type DecisionRecord,
   type Explanation,
-  type OwnershipState,
-  type PlaybookCandidate,
   type ReviewReport,
   type ScreenSnapshot,
   type Situation,
-  type StewardCheckpoint,
   type StewardContract,
   type StewardEvent,
   type StewardEventKind,
@@ -146,22 +129,9 @@ export interface StewardPanelProps {
 
 const TIERS: Array<{ value: StewardTier; label: string; hint: string }> = [
   { value: "auto", label: TIER_LABELS.auto, hint: "范围内自主执行，事后可查" },
-  { value: "notify", label: TIER_LABELS.notify, hint: "自主执行并立即通知，30s 内可撤销" },
-  { value: "approve", label: TIER_LABELS.approve, hint: "先给建议 + 倒计时，你一键确认后才写" },
+  { value: "notify", label: TIER_LABELS.notify, hint: "自主执行并立即通知，可接管并纠正" },
+  { value: "approve", label: TIER_LABELS.approve, hint: "每次写入都先等你批准" },
 ];
-
-const OWNERSHIP_LABELS: Record<OwnershipState, string> = {
-  agent_driving: "托管中（可替你应答）",
-  observing_only: "你接管中（Steward 只观察）",
-  suspended: "已暂停（保留现场）",
-};
-
-/** console 列表上的短徽标：后端 status 是该 console 的真实所有权态 */
-const CONSOLE_OWNER_BADGE: Record<string, string> = {
-  agent_driving: "托管中",
-  observing_only: "你接管中",
-  suspended: "已暂停",
-};
 
 /** 事件流后端最多留 200 条：全拉下来，局面按 console 过滤，列表只显示最近 60 条 */
 const EVENTS_FETCH = 200;
@@ -185,15 +155,10 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
   const [manual, setManual] = useState<Situation | null>(null);
   const [showTail, setShowTail] = useState(false);
   const [showCtx, setShowCtx] = useState(false);
-  // —— P3-P5：托管核心 / 交还摘要 / 授权 / 现场恢复 / 复盘 ——
-  const [core, setCore] = useState<CoreView | null>(null);
-  const [absence, setAbsence] = useState<AbsenceSummary | null>(null);
-  const [checkpoints, setCheckpoints] = useState<StewardCheckpoint[]>([]);
+  // —— 复盘 / 审计 / 解释链（只读决策记录）——
   const [review, setReview] = useState<ReviewReport | null>(null);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
-  const [candidates, setCandidates] = useState<PlaybookCandidate[]>([]);
   const [explanation, setExplanation] = useState<Explanation | null>(null);
-  const [showOps, setShowOps] = useState(false);
   const [showReview, setShowReview] = useState(false);
   const [selected, setSelected] = useState(sessionId);
   const [goal, setGoal] = useState("");
@@ -219,8 +184,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
     updateBudgetPref({ maxSteps: Number(stepsDraft) });
     setStepsDraft(null);
   };
-  const [clock, setClock] = useState(Date.now());
-  const [correction, setCorrection] = useState("");
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
   /** 用户在列表里手动点过别的终端（非当前标签）时记下；为 null 时跟随当前标签 */
@@ -228,15 +191,13 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
 
   const loadOnce = useCallback(async () => {
     try {
-      const [list, signed, rt, evs, recs, cv, cps, snap] = await Promise.all([
+      const [list, signed, rt, evs, recs, snap] = await Promise.all([
         stewardApi.listConsoles(),
         stewardApi.status(),
         stewardApi.runtime(),
         // 全量拉取避免前端游标在「清空事件」后倒退，seq 由后端单调分配。
         stewardApi.events(0, EVENTS_FETCH),
         stewardApi.decisions(20),
-        stewardApi.coreView(),
-        stewardApi.checkpoints(),
         stewardApi.screenGet(selectedRef.current),
       ]);
       setConsoles(list);
@@ -246,8 +207,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
       setRuntime(rt);
       setEvents(evs);
       setDecisions(recs);
-      setCore(cv);
-      setCheckpoints(cps);
       setSnapshot(snap);
       setErr(null);
     } catch (e) {
@@ -283,11 +242,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
     return () => window.clearInterval(timer);
   }, [refresh]);
 
-  useEffect(() => {
-    const timer = window.setInterval(() => setClock(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, []);
-
   // 后端推事件时立刻刷一次，不必等 1.5s 轮询
   useEffect(() => {
     let cancelled = false;
@@ -318,23 +272,16 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
   const contractId = contract?.id ?? null;
 
   const label = (id: string) => sessions?.find((s) => s.id === id)?.label ?? id;
-  /** 契约 id 形如 steward-<tabId>-<ts>，人看不懂；换成它所属终端的名字 */
+  /** 契约 id 人看不懂；换成它所属终端的名字 */
   const contractName = (cid: string) => {
-    const consoleId =
-      contracts.find((c) => c.id === cid)?.consoleId ??
-      checkpoints.find((c) => c.contractId === cid)?.consoleId;
+    const consoleId = contracts.find((c) => c.id === cid)?.consoleId;
     return consoleId ? label(consoleId) : cid;
   };
   const state = runtime?.consoles.find((c) => c.consoleId === selected) ?? null;
   const consoleInfo = consoles.find((c) => c.id === selected) ?? null;
-  const own = core?.ownership.find((o) => o.consoleId === selected) ?? null;
-  const undoList = core?.liveUndos ?? [];
-  const contractAuth: Authority | null = contract
-    ? (core?.authorities.find(([id]) => id === contract.id)?.[1] ?? null)
-    : null;
 
   // 目标框 / 档位：按「终端 + 契约 id」加载。换终端或契约换了才重填，用户正在改的不被轮询冲掉；
-  // 同一份契约在后端换了档（交还时屏幕漂移会自动降「需确认」档）也跟上。
+  // 同一份契约在后端换了档（接驳时屏幕漂移会自动降「需确认」档）也跟上。
   const formRef = useRef<{ console: string; contractId: string | null; tier: StewardTier | null }>({
     console: "",
     contractId: null,
@@ -357,72 +304,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, contractId, contract?.authorityTier]);
 
-  // 授权草稿按契约 id 绑定（见 syncAuthDraft）；依赖用内容而不是对象，避免每轮轮询都重同步
-  const [authDraft, setAuthDraft] = useState<AuthDraft | null>(null);
-  const authKey = contractAuth ? JSON.stringify(contractAuth) : "";
-  useEffect(() => {
-    setAuthDraft((prev) => syncAuthDraft(prev, contractId, contractAuth));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [contractId, authKey]);
-  const draft = authDraft && authDraft.contractId === contractId ? authDraft : null;
-  const editDraft = (patch: Partial<Authority>) =>
-    setAuthDraft((d) => (d ? { ...d, authority: { ...d.authority, ...patch }, dirty: true } : d));
-
-  const takeover = async () => {
-    try {
-      await stewardApi.takeover(selected);
-      await refresh();
-    } catch (e) {
-      setErr(`接管失败：${String(e)}`);
-    }
-  };
-
-  const handback = async () => {
-    try {
-      const sum = await stewardApi.handback(selected);
-      setAbsence(sum);
-      await refresh();
-    } catch (e) {
-      setErr(`交还失败：${String(e)}`);
-    }
-  };
-
-  const undoAction = async (seq: number) => {
-    try {
-      await stewardApi.undo(seq);
-      await refresh();
-    } catch (e) {
-      setErr(`撤销失败：${String(e)}`);
-    }
-  };
-
-  const doResume = async (cid: string) => {
-    try {
-      await stewardApi.resume(cid);
-      await refresh();
-    } catch (e) {
-      setErr(`恢复失败：${String(e)}`);
-    }
-  };
-
-  const togglePlanner = async () => {
-    try {
-      await stewardApi.setPlanner(!core?.plannerEnabled);
-      await refresh();
-    } catch (e) {
-      setErr(`切换 Planner 失败：${String(e)}`);
-    }
-  };
-
-  const doPlanNow = async () => {
-    try {
-      await stewardApi.planNow(selected);
-      await refresh();
-    } catch (e) {
-      setErr(`Planner 调用失败：${String(e)}`);
-    }
-  };
-
   const doExplain = async (seq: number) => {
     try {
       setExplanation(await stewardApi.explain(seq));
@@ -440,32 +321,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
     }
   };
 
-  const loadDistill = async () => {
-    try {
-      setCandidates(await stewardApi.distill());
-    } catch (e) {
-      setErr(`蒸馏预览失败：${String(e)}`);
-    }
-  };
-
-  const saveAuthority = async () => {
-    // 草稿只能写回它来源的那份契约；档位以契约当前值为准（只由顶部选择框改）
-    const toSave = authorityToSave(draft, contractId, contractAuth);
-    if (!contractId || !toSave) return;
-    setBusy(true);
-    try {
-      const saved = await stewardApi.setAuthority(contractId, toSave);
-      setAuthDraft((d) =>
-        d && d.contractId === contractId ? { contractId, authority: saved, dirty: false } : d
-      );
-      await refresh();
-    } catch (e) {
-      setErr(`更新授权失败：${String(e)}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
   // 局面卡：「立即分类」与事件流里该 console 最近一条局面，取帧更新的那个
   const latestEventSituation =
     [...events]
@@ -475,17 +330,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
     manual && (!latestEventSituation || manual.frameId >= latestEventSituation.frameId)
       ? manual
       : latestEventSituation;
-
-  const awaiting = decisions.filter((d) => d.consoleId === selected && decisionAwaiting(d, clock)).length;
-  const status = stewardStatusLine({
-    hasContract: !!contract,
-    ownership: own?.state ?? null,
-    suspensionReason: own?.suspensionReason ?? null,
-    executionEnabled: !!runtime?.executionEnabled,
-    awaiting,
-    situation: state?.kind ?? situation?.kind ?? null,
-    stale: state?.stale ?? false,
-  });
 
   /**
    * 开始托管 = 后端 `host_start`：先拿这个终端的租约，再签契约（前端据此开始上报屏幕帧 —— 眼睛），
@@ -503,7 +347,7 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
     }
   };
 
-  /** 停止托管：先停这一轮 Agent（幂等），再把契约一并停掉 —— 否则零 LLM 的 Steward 会接着在该终端上动手 */
+  /** 停止托管：先停这一轮 Agent（幂等），再把契约一并停掉 —— 否则这个终端会一直被当成托管中采帧 */
   const stopHosting = async () => {
     if (busy) return;
     setBusy(true);
@@ -533,19 +377,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
     }
   };
 
-  const amend = async () => {
-    if (!contract || !goal.trim() || busy) return;
-    setBusy(true);
-    try {
-      await stewardApi.amend(contract.id, goal.trim(), tier);
-      await refresh();
-    } catch (e) {
-      setErr(`更新目标 / 档位失败：${String(e)}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const classifyNow = async () => {
     if (!selected) return;
     try {
@@ -554,44 +385,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
       await stewardApi.wake();
     } catch (e) {
       setErr(`立即分类失败：${String(e)}`);
-    }
-  };
-
-  const decideNow = async () => {
-    try {
-      await stewardApi.decideNow(selected);
-      await refresh();
-    } catch (e) {
-      setErr(`立即决策失败：${String(e)}`);
-    }
-  };
-
-  const toggleExecution = async () => {
-    try {
-      await stewardApi.setExecution(!runtime?.executionEnabled);
-      await stewardApi.wake();
-      await refresh();
-    } catch (e) {
-      setErr(`切换自动应答失败：${String(e)}`);
-    }
-  };
-
-  const approve = async (seq: number) => {
-    try {
-      await stewardApi.approve(seq);
-      await refresh();
-    } catch (e) {
-      setErr(`执行建议失败：${String(e)}`);
-    }
-  };
-
-  const reject = async (seq: number) => {
-    try {
-      await stewardApi.reject(seq, correction.trim() || undefined);
-      setCorrection("");
-      await refresh();
-    } catch (e) {
-      setErr(`接管失败：${String(e)}`);
     }
   };
 
@@ -624,16 +417,12 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
     }
   };
 
-  const execOn = !!runtime?.executionEnabled;
-  const driving = !own || own.state === "agent_driving";
-  // 目标框 / 档位改过还没保存到契约上
-  const formDirty = !!contract && (tier !== contract.authorityTier || goal.trim() !== contract.goal);
   /** 托管那一轮发起在当前选中的终端上：实况与控制键才在这里显示 */
   const runHere = run.session !== null && run.session === selected;
   const promptsPending = runHere ? pendingPrompts(run.messages) : 0;
   /** 选中终端上的托管任务（含刚结束的结局） */
   const selectedHost = selected ? run.hostFor(selected) : null;
-  /** 状态行：AI 托管在跑时说「它现在在干什么」，否则回落到规则式 Steward 的状态 */
+  /** 状态行：AI 托管在跑时说「它现在在干什么」 */
   const runStatus: { text: string; tone: "idle" | "active" | "warn" } =
     run.active && !runHere
       ? { text: `AI 托管正在「${label(run.session ?? "")}」上运行，切到该终端查看实况`, tone: "active" }
@@ -653,15 +442,12 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
                   ? { text: run.notReadyReason ?? "Nexus AI Agent 尚未配置完成，请先去设置", tone: "warn" }
                   : !contract
                     ? { text: "未开始：选择一个终端，写下目标，点「开始托管」", tone: "idle" }
-                    : { text: status.text, tone: status.tone };
+                    : state?.stale
+                      ? { text: "屏幕帧断流 — 终端可能已关闭", tone: "warn" }
+                      : { text: "已签托管契约：屏幕识别在盯屏，托管状态见下方卡片", tone: "idle" };
 
-  /** 一条决策记录；`withCard` 为真时（且仍在等你确认）带上「按建议执行 / 我自己来」升级卡 */
-  const renderDecision = (d: DecisionRecord, withCard: boolean) => {
-            const card = d.escalation;
-            const left = card
-              ? Math.max(0, Math.ceil((card.createdAt + card.timeoutMs - clock) / 1000))
-              : 0;
-            const showCard = withCard && decisionAwaiting(d, clock);
+  /** 一条决策记录（托管写入 / 反射代答各一条），可展开依据与解释链 */
+  const renderDecision = (d: DecisionRecord) => {
             return (
               <div key={d.seq} className={`st-dec ${d.outcome}`}>
                 <div className="st-dec-head">
@@ -695,30 +481,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
                     备选：{d.candidates.map((c) => `${ACTION_LABELS[c.kind] ?? c.kind}「${c.text}」`).join(" / ") || "—"}
                   </div>
                 </details>
-                {showCard && card && (
-                  <div className="st-esc">
-                    <div className="st-esc-head">
-                      待你确认 · 剩余 {left}s · 超时默认：{card.defaultAction.text}
-                    </div>
-                    <div className="st-esc-why">
-                      建议：{card.recommendation.text}（{card.why.length} 条依据）
-                    </div>
-                    <div className="st-form-row st-center">
-                      <button className="st-btn primary" onClick={() => void approve(d.seq)}>
-                        按建议执行
-                      </button>
-                      <input
-                        className="st-input"
-                        value={correction}
-                        onChange={(e) => setCorrection(e.target.value)}
-                        placeholder="可选：写下纠正，会存成 Learned 偏好"
-                      />
-                      <button className="st-btn danger" onClick={() => void reject(d.seq)}>
-                        我自己来
-                      </button>
-                    </div>
-                  </div>
-                )}
               </div>
             );
   };
@@ -731,7 +493,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
           <span className="st-name">目标终端：{label(selected)}</span>
           {runHere && run.active && <span className="st-badge on">AI 托管中</span>}
           {contract && <span className="st-badge on">{contractStatusLabel(contract.status)}</span>}
-          {contract && own && <span className="st-badge">{OWNERSHIP_LABELS[own.state]}</span>}
         </div>
         <textarea
           className="st-goal"
@@ -758,6 +519,19 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
               >
                 开始托管
               </button>
+              <select
+                className="st-select"
+                value={tier}
+                disabled={busy}
+                onChange={(e) => setTier(e.target.value as StewardTier)}
+                title={"授权档位：" + (TIERS.find((t) => t.value === tier)?.hint ?? "")}
+              >
+                {TIERS.map((t) => (
+                  <option key={t.value} value={t.value}>
+                    {t.label}
+                  </option>
+                ))}
+              </select>
               <label className="st-meta" title="这一轮最长跑多久，到点会暂停等你点「继续」（后端上限 24 小时）">
                 最长
                 <select
@@ -849,27 +623,12 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
         {!(runHere && run.active && run.paused && isBudgetPause(run.pauseKind)) && (
           <div className={`st-status ${runStatus.tone}`}>{runStatus.text}</div>
         )}
-        {absence && (
-          <div className="st-card">
-            <div className="st-esc-head">
-              离开 {Math.round(absence.durationMs / 1000)}s · 你接管 {absence.takeoverCount} 次 · 屏幕
-              {absence.screenAligned ? "对齐" : "漂移（已降「需确认」档）"}
-            </div>
-            <div className="st-esc-why">
-              已做 {absence.done.length} 条：{absence.done.join("；") || "—"}
-            </div>
-            <div className="st-esc-why">
-              待决 {absence.pending.length} 条：{absence.pending.join("；") || "—"}
-            </div>
-            <div className="st-evidence">下一步：{absence.nextStep}</div>
-          </div>
-        )}
       </div>
 
       <div className="st-note">
         <strong>AI 托管</strong>：由大模型替你在这个终端里执行命令、操作交互程序（含 Claude Code 之类的控制台工具），
         并用屏幕识别盯着长任务跑完。危险命令仍会先问你；密码只会请你本人输入；不会替你选「不再询问 / 永久允许」这类选项。
-        下方「诊断」里是原有的规则式 Steward（不调大模型）的细节。
+        下方「诊断」里是屏幕识别（不调大模型、不写终端）与决策记录的细节。
       </div>
 
       {(err || run.error) && <div className="st-err">{err ?? run.error}</div>}
@@ -909,11 +668,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
         </div>
       )}
 
-      {/* 规则式 Steward 的待确认建议：要你点头才执行，不能藏进折叠的诊断里 */}
-      {decisions
-        .filter((d) => d.consoleId === selected && decisionAwaiting(d, clock))
-        .map((d) => renderDecision(d, true))}
-
       <div className="st-head">
         <span>终端 · {consoles.length} 个</span>
         <div>
@@ -944,13 +698,8 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
               {pill && <span className={`st-badge host-pill ${pill.tone}`}>{pill.label}</span>}
               <span className="st-badge">{c.kind}</span>
               {c.alt && <span className="st-badge alt">全屏</span>}
-              {c.status !== "none" && (
-                <span className={`st-badge${c.status === "agent_driving" ? " on" : ""}`}>
-                  {CONSOLE_OWNER_BADGE[c.status] ?? "托管中"}
-                </span>
-              )}
+              {c.status !== "none" && !pill && <span className="st-badge on">{contractStatusLabel(c.status)}</span>}
               {cs?.kind && <span className="st-badge situation">{situationLabel(cs.kind)}</span>}
-              {cs?.injectedCount ? <span className="st-badge hot">注入 {cs.injectedCount}</span> : null}
             </button>
           );
         })}
@@ -961,7 +710,7 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
           <span>当前局面 · {label(selected)}</span>
           <span className="st-meta">
             {state
-              ? `${state.stale ? "帧断流" : "帧新鲜"}${state.pendingReceipt ? " · 等回执" : ""}`
+              ? (state.stale ? "帧断流" : "帧新鲜")
               : "该终端尚未托管"}
           </span>
         </div>
@@ -1009,53 +758,11 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
       </div>
 
       <details className="st-diag">
-        <summary>诊断（规则式 Steward：决策 / 事件 / 屏幕快照 / 授权 / 复盘）</summary>
+        <summary>诊断（屏幕识别 / 决策记录 / 事件 / 屏幕快照 / 复盘）</summary>
         <div className="st-diag-body">
           <div className="st-form-row st-center">
-            <select
-              className="st-select"
-              value={tier}
-              onChange={(e) => setTier(e.target.value as StewardTier)}
-              title={"规则式 Steward 的档位：" + (TIERS.find((t) => t.value === tier)?.hint ?? "")}
-            >
-              {TIERS.map((t) => (
-                <option key={t.value} value={t.value}>
-                  {t.label}
-                </option>
-              ))}
-            </select>
-            {contract && (
-              <button
-                className={`st-btn${formDirty ? " primary" : ""}`}
-                disabled={busy || !goal.trim() || !formDirty}
-                onClick={() => void amend()}
-                title="热更新目标与档位，不重启托管"
-              >
-                保存修改
-              </button>
-            )}
-            {contract &&
-              (driving ? (
-                <button className="st-btn" onClick={() => void takeover()} title="规则式 Steward：立刻转观察态，绝不再写这个终端">
-                  我来接管
-                </button>
-              ) : (
-                <button className="st-btn primary" onClick={() => void handback()} title="交还给规则式 Steward：先读屏对齐再给「离开期间」摘要">
-                  交还托管
-                </button>
-              ))}
-            <button
-              className={`st-btn${execOn ? " warn" : ""}`}
-              onClick={() => void toggleExecution()}
-              title="规则式 Steward 的总闸（与 AI 托管无关）：每次冷启动默认关闭；打开后仍受安全策略 fail-closed 约束"
-            >
-              {execOn ? "规则自动应答：开" : "规则自动应答：关（只建议）"}
-            </button>
           <button className="st-btn" onClick={() => void classifyNow()} title="当场分类一帧，核对判据">
             立即分类
-          </button>
-          <button className="st-btn" onClick={() => void decideNow()} title="当场编译一条决策并落库，不注入">
-            立即决策
           </button>
           <button className="st-btn" onClick={() => setShowCtx((v) => !v)}>
             {showCtx ? "收起依据" : "编辑依据"}
@@ -1069,161 +776,17 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
         </div>
         <div className="st-dec-list">
           {decisions.length === 0 && (
-            <div className="st-empty">还没有决策。制造一个提问 / 权限确认，或点「立即决策」。</div>
+            <div className="st-empty">还没有决策。托管任务每次写入（含反射代答）都会在这里留一条。</div>
           )}
-          {[...decisions].reverse().map((d) => renderDecision(d, false))}
+          {[...decisions].reverse().map((d) => renderDecision(d))}
         </div>
       </div>
 
       <div className="st-runtime">
-        <button className="st-btn" onClick={() => setShowOps((v) => !v)}>
-          {showOps ? "收起托管核心" : "托管核心（撤销 / 授权 / 恢复）"}
-        </button>
         <button className="st-btn" onClick={() => setShowReview((v) => !v)}>
-          {showReview ? "收起复盘" : "复盘（审计 / 蒸馏 / 解释链）"}
-        </button>
-        <button
-          className={`st-btn${core?.plannerEnabled ? " warn" : ""}`}
-          onClick={() => void togglePlanner()}
-          title="LLM Planner 兜底总闸：默认关闭、不持久化；只有规则编不出回复时才调模型，结果仍过 PolicyEngine"
-        >
-          Planner：{core?.plannerEnabled ? "开" : "关"}
-          {core ? `（在途 ${core.llmInflight}/2）` : ""}
+          {showReview ? "收起复盘" : "复盘（审计 / 解释链）"}
         </button>
       </div>
-
-      {showOps && (
-        <div className="st-sit">
-          <div className="st-sit-head">
-            <span>所有权 · {label(selected)}</span>
-            <span className="st-meta">
-              {own
-                ? `${OWNERSHIP_LABELS[own.state]} · 接管 ${own.takeoverCount} 次 · 夺权延迟 ${
-                    own.takeoverLatencyMs >= 0 ? `${own.takeoverLatencyMs}ms` : "—"
-                  }`
-                : "这个终端还没有所有权槽（开始托管后创建）"}
-            </span>
-          </div>
-          {core?.plannerEnabled && (
-            <div className="st-form-row">
-              <button
-                className="st-btn"
-                onClick={() => void doPlanNow()}
-                title="真·LLM 兜底：规则编不出回复时调模型，结果仍要过 PolicyEngine"
-              >
-                立即规划
-              </button>
-            </div>
-          )}
-          {undoList.length > 0 && (
-            <div className="st-esc">
-              <div className="st-esc-head">
-                撤销窗口 · {undoList.length} 条（「通知后执行」档执行后 30s 内可一键回滚）
-              </div>
-              {undoList.map((u) => (
-                <div key={u.seq} className="st-form-row st-center">
-                  <span className="st-dec-seq">#{u.seq}</span>
-                  <span className="st-ellipsis" title={u.action.text}>
-                    {label(u.consoleId)} · {ACTION_LABELS[u.action.kind] ?? u.action.kind}「{u.action.text}」
-                  </span>
-                  <span className="st-meta">
-                    剩 {Math.max(0, Math.ceil((u.expiresAt - clock) / 1000))}s
-                  </span>
-                  <button className="st-btn danger" onClick={() => void undoAction(u.seq)}>
-                    撤销并接管
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-          {contract && draft && (
-            <div className="st-form">
-              <div className="st-form-title">
-                授权 · {label(contract.consoleId)}
-                <span className="st-meta">档位用顶部的选择框改</span>
-              </div>
-              <div className="st-form-row st-center">
-                <label className="st-meta" title="允许自动选中 don't ask again 类永久扩权选项；强烈建议关闭">
-                  <input
-                    type="checkbox"
-                    checked={draft.authority.allowPermanentGrant}
-                    onChange={(e) => editDraft({ allowPermanentGrant: e.target.checked })}
-                  />
-                  永久扩权
-                </label>
-                <label className="st-meta">
-                  预算步数
-                  <input
-                    className="st-input"
-                    type="number"
-                    min={0}
-                    value={draft.authority.maxSteps}
-                    onChange={(e) => editDraft({ maxSteps: Number(e.target.value) || 0 })}
-                  />
-                </label>
-                <label className="st-meta">
-                  预算分钟
-                  <input
-                    className="st-input"
-                    type="number"
-                    min={0}
-                    value={draft.authority.maxMinutes}
-                    onChange={(e) => editDraft({ maxMinutes: Number(e.target.value) || 0 })}
-                  />
-                </label>
-                <label className="st-meta" title="意向 deadline（分钟），0 = 不限；到期收尾摘要 + 保留现场">
-                  deadline 分钟
-                  <input
-                    className="st-input"
-                    type="number"
-                    min={0}
-                    value={Math.round(draft.authority.timeboxMs / 60000)}
-                    onChange={(e) => editDraft({ timeboxMs: (Number(e.target.value) || 0) * 60000 })}
-                  />
-                </label>
-                <button className="st-btn primary" disabled={busy || !draft.dirty} onClick={() => void saveAuthority()}>
-                  保存授权
-                </button>
-                {draft.dirty && contractAuth && (
-                  <button
-                    className="st-btn"
-                    onClick={() => setAuthDraft({ contractId: contract.id, authority: contractAuth, dirty: false })}
-                  >
-                    放弃修改
-                  </button>
-                )}
-              </div>
-              <div className="st-evidence">
-                硬禁：{contractAuth?.deny.join(" / ") || "—"} · 提权白名单：
-                {contractAuth?.allow.join(" / ") || "—"} · host 作用域：
-                {contractAuth?.hostScope.join(" / ") || "全部已注册终端"}
-              </div>
-            </div>
-          )}
-          <div className="st-form">
-            <div className="st-form-title">现场恢复 · {checkpoints.length} 份</div>
-            {checkpoints.length === 0 && (
-              <div className="st-empty">还没有落盘的现场。每个决策闭环或每 30s 自动保存一次。</div>
-            )}
-            {checkpoints.slice(0, 5).map((cp) => (
-              <div key={cp.contractId} className="st-form-row st-center st-nowrap">
-                <span className="st-badge">{label(cp.consoleId)}</span>
-                <span className="st-ellipsis" title={cp.goal || "（无目标）"}>
-                  {cp.goal || "（无目标）"}
-                </span>
-                <span className="st-meta">
-                  {contractStatusLabel(cp.state)} · {tierLabel(cp.authority.tier)} · 步 {cp.spent.steps} · 决策{" "}
-                  {cp.lastDecisions.length} 条
-                  {cp.pendingEscalation ? ` · 待决 #${cp.pendingEscalation[0]}` : ""}
-                </span>
-                <button className="st-btn primary" onClick={() => void doResume(cp.contractId)}>
-                  恢复
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
 
       {explanation && (
         <div className="st-esc">
@@ -1255,9 +818,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
               <button className="st-btn" onClick={() => void loadReview()} title="跨会话复盘 + 统一审计时间线">
                 生成复盘
               </button>
-              <button className="st-btn" onClick={() => void loadDistill()} title="预览可沉淀的剧本候选">
-                蒸馏预览
-              </button>
             </div>
           </div>
           {review && (
@@ -1288,22 +848,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
                 ))}
             </div>
           )}
-          {candidates.length > 0 && (
-            <div className="st-form">
-              <div className="st-form-title">剧本候选 · {candidates.length} 条（循环每 60s 自动写入 Brain）</div>
-              {candidates.slice(0, 8).map((c) => (
-                <div key={c.id} className="st-form-row st-center st-nowrap">
-                  <span className="st-badge">{c.occurrences} 次</span>
-                  <span className="st-ellipsis" title={c.input.text}>
-                    {c.input.text}
-                  </span>
-                  <span className="st-meta">
-                    {c.matchProgram ?? "任意程序"} · {c.matchKind ?? "任意局面"}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
         </div>
       )}
 
@@ -1327,12 +871,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
                 <div className="st-ev-body">
                   <div className="st-ev-msg">{e.message}</div>
                   {e.suggestion && <div className="st-card">建议：{e.suggestion}</div>}
-                  {e.decision && (
-                    <div className="st-card">
-                      决策 #{e.decision.seq} · {ACTION_LABELS[e.decision.chosen.kind] ?? e.decision.chosen.kind} ·{" "}
-                      {OUTCOME_LABELS[e.decision.outcome] ?? e.decision.outcome}
-                    </div>
-                  )}
                 </div>
               </div>
             ))}
@@ -1357,25 +895,16 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
 
 
           <div className="st-evidence">
-            内部说明：开始托管后 Steward 常驻读屏、识别局面；你敲键即夺权（100ms SLA），交还时给「离开期间」
-            摘要；「通知后执行」档留 30s 撤销窗口；断连 / 强杀后凭 Checkpoint 恢复现场（屏幕漂移自动降「需确认」档）。
-            决策编译零 LLM，Planner 只是兜底且默认关。
+            内部说明：签约后屏幕识别常驻读屏、识别局面、判空转与断流，只出建议、不写终端。
+            动手只有托管任务一个入口；你一敲键它就让路，交还后回到原来的状态。
           </div>
           <div className="st-evidence">
-            {runtime?.running ? "Steward 运行中" : "Steward 未运行"} · tick {runtime?.tickCount ?? 0} · 分类{" "}
-            {runtime?.classifyCount ?? 0} · 决策 {runtime?.decisionCount ?? 0} · 注入{" "}
-            <strong className={runtime?.injectedCount ? "st-hot" : ""}>{runtime?.injectedCount ?? 0}</strong> · 待回执{" "}
-            {runtime?.pendingReceipts ?? 0} · 待确认 {runtime?.escalations ?? 0} · 事件 seq {runtime?.eventSeq ?? 0} ·{" "}
-            <strong className="st-zero">LLM {runtime?.llmCalls ?? 0}</strong>
-          </div>
-          <div className="st-evidence">
-            所有权 {core?.ownership.length ?? 0} 槽 · 撤销窗口 {undoList.length} · 现场 {core?.checkpointCount ?? 0} 份 ·
-            待恢复 {core?.resumeQueue.length ?? 0} · 写锁 {core?.writeLocked.length ?? 0} · 单调时钟{" "}
-            {((core?.elapsedMs ?? 0) / 1000) | 0}s
+            {runtime?.running ? "屏幕识别运行中" : "屏幕识别未运行"} · tick {runtime?.tickCount ?? 0} · 分类{" "}
+            {runtime?.classifyCount ?? 0} · 事件 seq {runtime?.eventSeq ?? 0}
           </div>
           {state && (
             <div className="st-evidence">
-              {label(selected)}：心跳 {state.heartbeatMs}ms · 同局面 {state.sameTicks} 次 · 已注入 {state.injectedCount}
+              {label(selected)}：心跳 {state.heartbeatMs}ms · 同局面 {state.sameTicks} 次
             </div>
           )}
           {consoleInfo && (
@@ -1390,14 +919,6 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
             <div className="st-contract">
               契约 {contract.id} · {contract.hostKey} · {tierLabel(contract.authorityTier)} · 意向{" "}
               {contract.intentIds.length} 条
-            </div>
-          )}
-          {core && (
-            <div className="st-evidence">
-              时间盒：读屏回执 {core.timebox.screenAckMs / 1000}s · 写后回执 {core.timebox.receiptMs / 1000}s · 单步{" "}
-              {core.timebox.stepMs / 60000}min · 空闲 {core.timebox.idleMs / 60000}min · 无进展{" "}
-              {core.timebox.noProgressMs / 60000}min · 意向 deadline{" "}
-              {core.timebox.deadlineMs ? `${Math.round(core.timebox.deadlineMs / 60000)}min` : "不限"}
             </div>
           )}
           <div className="st-form-row">

@@ -31,7 +31,6 @@ export function registerTerm(id: string, term: Terminal): () => void {
       lastOutput.delete(id);
       outputCount.delete(id);
       inputTaps.delete(id);
-      userKeyLast.delete(id);
       dropCaptureState(id);
     }
   };
@@ -91,24 +90,9 @@ type InputTap = (data: string) => void;
 const inputTaps = new Map<string, Set<InputTap>>();
 
 /**
- * P3 接管夺权：用户敲键 → Steward 100ms 内转 ObservingOnly。
- * 与 screenDeltaSink 同模式：termRegistry 保持纯函数、不依赖 Tauri，
- * IPC 出口由 App 注入。节流到每 console 250ms 一次——夺权是一次性状态切换，
- * 连发字节里只有第一下有意义，后端 SLA 看的是首个键的处理延迟。
- */
-type UserKeySink = (consoleId: string, keyAtMs: number) => void;
-let userKeySink: UserKeySink | null = null;
-const userKeyLast = new Map<string, number>();
-const USER_KEY_MIN_GAP_MS = 250;
-
-export function setUserKeySink(fn: UserKeySink | null): void {
-  userKeySink = fn;
-}
-
-/**
  * xterm **自己**生成、却同样经 `onData` 冒出来的字节：焦点进出、鼠标上报、
  * 对远端查询的自动应答（光标位置 / 设备属性 / 状态 / 模式 / 窗口尺寸 / OSC / DCS）。
- * 这些不是用户动手，当成敲键会让 Steward 无缘无故被夺权（开了鼠标追踪的 TUI 里
+ * 这些不是用户动手，当成敲键会让托管任务无缘无故让路（开了鼠标追踪的 TUI 里
  * 鼠标一晃就是一串）。一次 onData 可能连着好几段，整串都由这些组成才算。
  *
  * 与 `macro.isTerminalReply` 同一思路、覆盖面更大；放这里是因为 macro 依赖本模块，
@@ -137,7 +121,7 @@ export function isXtermGenerated(data: string): boolean {
 }
 
 /**
- * 当前有托管契约的 console。只有它们才采屏幕帧、发心跳、上报敲键夺权 ——
+ * 当前有托管契约的 console。只有它们才采屏幕帧、发心跳 ——
  * 没签契约的终端没人读这些帧，每 2s 一次的全屏重建 + 哈希 + IPC 纯属浪费。
  * App / 托管面板轮询契约列表后调 `setStewardConsoles` 喂进来。
  */
@@ -150,7 +134,6 @@ export function setStewardConsoles(ids: Iterable<string>): void {
   if (added.length === 0 && removed.length === 0) return;
   for (const id of removed) {
     stewardConsoles.delete(id);
-    userKeyLast.delete(id);
     dropCaptureState(id);
   }
   for (const id of added) stewardConsoles.add(id);
@@ -181,14 +164,6 @@ export function onInput(id: string, fn: InputTap): () => void {
 }
 
 export function emitInput(id: string, data: string): void {
-  // 只有真·用户输入、且这个 console 正在被托管时才上报；其余情况后端也只会回 -1
-  if (userKeySink && stewardConsoles.has(id) && data.length > 0 && !isXtermGenerated(data)) {
-    const now = Date.now();
-    if (now - (userKeyLast.get(id) ?? 0) >= USER_KEY_MIN_GAP_MS) {
-      userKeyLast.set(id, now);
-      userKeySink(id, now);
-    }
-  }
   const set = inputTaps.get(id);
   if (!set) return;
   for (const fn of set) fn(data);

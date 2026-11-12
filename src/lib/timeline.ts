@@ -15,8 +15,7 @@ export type TimelineKind =
   | "output"
   | "secret"
   | "wait"
-  | "screen"
-  | "decision";
+  | "screen";
 
 /** 与后端 `TimelineEvent`（camelCase）一一对应 */
 export interface TimelineEvent {
@@ -115,7 +114,6 @@ export const KIND_META: Record<TimelineKind, { icon: string; label: string }> = 
   secret: { icon: "•••", label: "密码" },
   wait: { icon: "…", label: "等待" },
   screen: { icon: "▣", label: "读屏" },
-  decision: { icon: "◆", label: "托管决策" },
 };
 
 const PROMPT_LABEL: Record<string, string> = {
