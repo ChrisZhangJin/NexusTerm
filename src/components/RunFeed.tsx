@@ -6,6 +6,7 @@
  * 只会被答一次）。
  */
 
+import { DiffView } from "./DiffView";
 import { useEffect, useRef, useState } from "react";
 import { MemoryStepCard } from "./HostMemory";
 import { isHandEyeKind } from "../lib/agentRun";
@@ -181,6 +182,25 @@ function StepCard({ step }: { step: AgentStep }) {
     return <div className="ap-note ap-paused">{step.text ?? ""}</div>;
   }
   if (step.kind === "memory") return <MemoryStepCard step={step} />;
+  // 文件工具：读 / 查找 / 搜索一行带过；写 / 改带差异预览
+  if (step.kind === "file") {
+    const failed = step.text !== undefined && step.text !== "完成";
+    return (
+      <div className={`ap-step file${failed ? " danger" : ""}`}>
+        <div className="ap-step-head">
+          <span className="ap-step-tag">文件</span>
+          {step.targetLabel ? (
+            <span className="ap-step-where" title={step.target}>
+              {step.targetLabel}
+            </span>
+          ) : null}
+        </div>
+        <div className="ap-step-why">{step.command ?? ""}</div>
+        {failed ? <div className="ap-step-why">{step.text}</div> : null}
+        {step.output ? <DiffView diff={step.output} /> : null}
+      </div>
+    );
+  }
   // 工具调用卡片：把「调了哪个工具、传了什么参数」原样摆出来，让调用过程看得见。
   // 没有它时，模型想开新标签页会写出 `new-tab` 这种不存在的命令，敲进去只换来
   // command not found —— 看起来就像它答应了却没动手。
@@ -424,18 +444,31 @@ function ApproveCard({
   const scope = req.kind === "scope";
   // skill：技能回放的逐步确认 / 偏离选择，按钮文案按语义写成「确认 / 拒绝」
   const skill = req.kind === "skill";
+  // file：写 / 改文件，卡上带差异预览；file_sensitive：路径在受保护清单里
+  const file = req.kind === "file" || req.kind === "file_sensitive";
   return (
     <div className={`ap-approve${settled ? (result ? " ok" : " no") : ""}`}>
       <div className="ap-step-head">
-        <span className="ap-step-tag">{scope ? "超出作用范围 · 需要批准" : skill ? "技能 · 需要确认" : "需要批准"}</span>
+        <span className="ap-step-tag">
+          {scope
+            ? "超出作用范围 · 需要批准"
+            : skill
+              ? "技能 · 需要确认"
+              : req.kind === "file_sensitive"
+                ? "写受保护路径 · 需要批准"
+                : file
+                  ? "写文件 · 需要批准"
+                  : "需要批准"}
+        </span>
         <span className="ap-step-where" title={req.target}>
           {req.targetLabel || "未知会话"}
         </span>
       </div>
       <pre className="ap-code">{req.command}</pre>
+      {req.diff ? <DiffView diff={req.diff} open /> : null}
       {req.reasons.length > 0 && (
         <div className="ap-step-why">
-          {scope ? "越界原因" : skill ? "说明" : "风险提示"}：{req.reasons.join("；")}
+          {scope ? "越界原因" : skill || file ? "说明" : "风险提示"}：{req.reasons.join("；")}
         </div>
       )}
       {settled ? (
@@ -445,7 +478,7 @@ function ApproveCard({
       ) : (
         <div className="ap-approve-row">
           <button className="btn primary" disabled={!busy} onClick={() => onDecide(true)}>
-            {scope ? "允许越界操作" : skill ? "确认" : "允许执行"}
+            {scope ? "允许越界操作" : skill ? "确认" : file ? "允许写入" : "允许执行"}
           </button>
           <button className="btn" disabled={!busy} onClick={() => onDecide(false)}>
             拒绝

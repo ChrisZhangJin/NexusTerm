@@ -119,6 +119,9 @@ const MAX_FEEDBACK_CHARS: usize = 6000;
 pub struct AgentTarget {
     pub id: String,
     pub label: String,
+    /// 终端的当前目录（前端探测到的）。文件工具的相对路径按它补全；未知为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// 一次 Agentic 运行的请求。
@@ -238,6 +241,8 @@ pub enum AgentAction {
     AskUser { question: String, options: Vec<super::host::CardOption>, recommendation: Option<String> },
     /// 托管专用（`nx_complete`）：宣告目标完成。唯一的完成途径。
     Complete { summary: String, evidence: Vec<String> },
+    /// 文件工具（`nx_read` / `nx_write` / `nx_edit` / `nx_glob` / `nx_grep`，见 `files_tool`）
+    File(super::files_tool::FileCall),
 }
 
 /// 对标签页能做些什么。
@@ -749,6 +754,10 @@ pub fn tool_specs() -> Vec<llm::ToolSpec> {
             }),
         },
     ]
+    .into_iter()
+    // 文件工具（读 / 写 / 改 / 查找 / 搜索），对话与托管都有
+    .chain(super::files::file_tool_specs())
+    .collect()
 }
 
 /// 模型在终端语境下习惯写 `{"command":["uptime","df -h"]}`（一排命令），
@@ -802,6 +811,11 @@ fn tool_action_name(name: &str) -> Option<&'static str> {
         TOOL_SKILL => Some("skill"),
         TOOL_ASK_USER => Some("ask_user"),
         TOOL_COMPLETE => Some("complete"),
+        super::files::TOOL_READ => Some("read"),
+        super::files::TOOL_WRITE => Some("write"),
+        super::files::TOOL_EDIT => Some("edit"),
+        super::files::TOOL_GLOB => Some("glob"),
+        super::files::TOOL_GREP => Some("grep"),
         _ => None,
     }
 }
@@ -850,6 +864,12 @@ pub fn actions_from_tool_call(call: &llm::ToolCall) -> Vec<AgentAction> {
     };
     if matches!(action, "ask_user" | "complete") {
         return parse_host_action(action, &args);
+    }
+    if let Some(c) = super::files_tool::FileCall::parse(call.name.trim(), &args) {
+        return vec![AgentAction::File(c)];
+    }
+    if matches!(action, "read" | "write" | "edit" | "glob" | "grep") {
+        return Vec::new(); // 文件工具缺必填参数
     }
     if let Some(obj) = args.as_object_mut() {
         obj.insert("action".into(), serde_json::Value::String(action.into()));
@@ -904,6 +924,11 @@ pub fn tool_label(name: &str, args: &str) -> &'static str {
         TOOL_MEMORY => "主机备忘",
         TOOL_ASK_USER => "向你提问",
         TOOL_COMPLETE => "宣告完成",
+        super::files::TOOL_READ => "读文件",
+        super::files::TOOL_WRITE => "写文件",
+        super::files::TOOL_EDIT => "改文件",
+        super::files::TOOL_GLOB => "查找文件",
+        super::files::TOOL_GREP => "搜索文件内容",
         TOOL_SKILL => match serde_json::from_str::<serde_json::Value>(args)
             .ok()
             .and_then(|v| v.get("op").and_then(|o| o.as_str()).map(|s| s.to_string()))
@@ -1021,6 +1046,9 @@ pub struct ApprovePayload {
     pub target: String,
     pub target_label: String,
     pub reasons: Vec<String>,
+    /// `kind:"file"`：写 / 改文件的差异预览（敏感时已脱敏）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 /// 给 UI 展示的单次执行结果（手动执行按钮也用它）。
@@ -1200,6 +1228,9 @@ fn parse_block(raw: &str) -> Vec<AgentAction> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim()) {
         if let Some(a @ ("ask_user" | "complete")) = v.get("action").and_then(|a| a.as_str()) {
             return parse_host_action(a, &v);
+        }
+        if let Some(a @ ("read" | "write" | "edit" | "glob" | "grep")) = v.get("action").and_then(|a| a.as_str()) {
+            return super::files_tool::FileCall::parse(&format!("nx_{a}"), &v).map(AgentAction::File).into_iter().collect();
         }
     }
     match serde_json::from_str::<ExecBlock>(raw.trim()) {
@@ -1518,12 +1549,17 @@ pub const AGENTIC_SYSTEM_PROMPT_INTRO: &str = concat!(
 /// 之前自定义路径用的是压缩版说明，结果用户的提示词里写着「只给结论与必要命令」，
 /// 模型就真把 shell 直接抄进围栏 —— 协议写歪了，界面上什么都不发生。
 pub const ACTION_PROTOCOL: &str = concat!(
-    "【优先用工具】你有 nx_exec / nx_send_keys / nx_wait / nx_watch / nx_screen / nx_secret / nx_export / nx_open_tab / nx_tab / nx_memory / nx_skill 共十一个工具。",
+    "【优先用工具】你有 nx_exec / nx_send_keys / nx_wait / nx_watch / nx_screen / nx_secret / nx_export / nx_open_tab / nx_tab / nx_memory / nx_skill / nx_read / nx_write / nx_edit / nx_glob / nx_grep 共十六个工具。",
     "能用工具调用时**直接用工具**，不要写成下面的围栏文本；",
     "只有当你确认自己无法发起工具调用时，才退化成围栏代码块。\n",
     "**绝不要把界面动作当成 shell 命令**：`new-tab`、`reconnect`、`close-tab`、",
     "`switch-tab`、`list-tabs`、`rename-tab` 这些在终端里根本不存在，",
     "敲过去只会得到 command not found。它们对应的都是 nx_tab / nx_open_tab 工具。\n\n",
+    "【文件】看文件用 nx_read（带行号），改文件先 nx_read 看清原文再 nx_edit（old_string 要和原文逐字一致），",
+    "整文件新建 / 覆盖用 nx_write，找文件用 nx_glob，搜内容用 nx_grep。路径写绝对路径或以 ~ 开头。",
+    "**nx_exec 只接受单行命令**：多行脚本、配置、heredoc 一类的内容，先用 nx_write 写成文件，再 nx_exec 执行它",
+    "（例如写 /tmp/fix.sh 后 nx_exec `sh /tmp/fix.sh`），不要用 printf / echo 硬拼多行。",
+    "写文件会按审批设置请用户确认，并展示差异。\n\n",
     "【要执行命令时】在回复里写且只写这样一个围栏代码块（不写 action 等同 \"exec\"）：\n",
     "```nx-exec\n{\"action\":\"exec\",\"target\":\"<会话id>\",\"command\":\"<命令>\"}\n```\n",
     "一次要对多台机器发同一批命令时，用 targets / commands 两个数组：\n",
@@ -3162,6 +3198,7 @@ fn resolve_targets(req: &AgentRunRequest) -> Vec<AgentTarget> {
         vec![AgentTarget {
             id: req.session_id.clone(),
             label: "当前会话".into(),
+            cwd: None,
         }]
     } else {
         req.targets.clone()
@@ -3199,7 +3236,7 @@ fn locate(
 /// 越界批准通过后把会话并入范围：同一会话本轮之内不再重复弹窗。
 fn admit(targets: &mut Vec<AgentTarget>, id: &str, label: &str) {
     if !in_scope(id, targets) {
-        targets.push(AgentTarget { id: id.to_string(), label: label.to_string() });
+        targets.push(AgentTarget { id: id.to_string(), label: label.to_string(), cwd: None });
     }
 }
 
@@ -3281,6 +3318,7 @@ async fn ask_beyond_scope(
         target: target_id.to_string(),
         target_label: target_label.to_string(),
         reasons: reasons.clone(),
+        diff: None,
     };
     if request_approval(app, runtime, session, &payload).await {
         return true;
@@ -3970,8 +4008,17 @@ pub async fn run(
                         }
                         _ => None,
                     };
-                    let (verdict, refused) =
-                        hosted_authorize(h, &ctx, &action, &text, sit.as_ref(), || h.flush_progress(&messages, step)).await;
+                    // 写文件的审批要带差异预览，在分支里算好 diff 之后再问；这里只拿结论（Deny 直接拦）
+                    let (verdict, refused) = if matches!(action, AgentAction::File(_)) {
+                        let g = super::host::gate::authorize(&ctx.policy(), &action, None);
+                        let why = match &g {
+                            Gate::Deny(w) => Some(w.clone()),
+                            _ => None,
+                        };
+                        (g, why)
+                    } else {
+                        hosted_authorize(h, &ctx, &action, &text, sit.as_ref(), || h.flush_progress(&messages, step)).await
+                    };
                     for u in h.take_user() {
                         push_user(&mut messages, u);
                     }
@@ -3992,6 +4039,92 @@ pub async fn run(
             }
             // 一轮内的多个动作共用同一个 step 号：UI 按 step 折叠，同一步归在一张卡里
             match action {
+                AgentAction::File(mut call) => {
+                    let summary = call.summary();
+                    let Some((target_id, label, _)) = gate_target(
+                        app,
+                        state,
+                        runtime,
+                        &session,
+                        step,
+                        &mut targets,
+                        call.target(),
+                        |l| format!("在「{l}」上{summary}"),
+                        call.tool(),
+                        Vec::new(),
+                        &mut feedback,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    // 相对路径：按前端探测到的当前目录补全（托管再看接驳线索里的 cwd），不知道就报错让模型换绝对路径
+                    let cwd = targets
+                        .iter()
+                        .find(|t| t.id == target_id)
+                        .and_then(|t| t.cwd.clone())
+                        .or_else(|| host.as_ref().filter(|h| h.console_id == target_id).and_then(|h| h.saved_console()).and_then(|c| c.cwd));
+                    if let Err(why) = call.absolutize(cwd.as_deref()) {
+                        emit_step(app, &session, StepPayload { command: Some(summary.clone()), reasons: Some(vec![why.clone()]), ..StepPayload::new("skip", step) });
+                        feedback.push_str(&format!("{why}\n"));
+                        continue;
+                    }
+                    let transport = match super::files::transport_for(state, &target_id).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            emit_step(app, &session, StepPayload { command: Some(call.summary()), reasons: Some(vec![e.to_string()]), ..StepPayload::new("skip", step) });
+                            feedback.push_str(&format!("文件工具在「{label}」上不可用：{e}。请改用 nx_exec。\n"));
+                            continue;
+                        }
+                    };
+                    let ops = super::files::FileOps::new(&*transport, super::files::FileOpsConfig::default());
+                    // 写入放行：托管 = gate::authorize 的结论；对话 = exec mode（审批模式下写文件从不静默）
+                    let wgate = if !call.is_write() {
+                        super::files_tool::WriteGate::Auto
+                    } else if host.is_some() {
+                        match host_write.as_ref().map(|w| &w.gate) {
+                            Some(Gate::Approve(r)) => super::files_tool::WriteGate::Approve(r.clone()),
+                            Some(Gate::Deny(w)) => super::files_tool::WriteGate::Deny(w.clone()),
+                            _ => super::files_tool::WriteGate::Auto,
+                        }
+                    } else if cfg.exec_mode.is_approval() {
+                        super::files_tool::WriteGate::Approve(vec!["审批模式：写文件前要你确认".into()])
+                    } else {
+                        super::files_tool::WriteGate::Auto
+                    };
+                    if call.is_write() {
+                        drive_gate!(&target_id);
+                    }
+                    let mut approver = FileApprover { app, runtime, session: &session, target: &target_id, label: &label, host: host.as_deref() };
+                    let out = super::files_tool::run(&ops, &call, wgate, &mut approver, acct.redact).await;
+                    drop(ops);
+                    if let Some(h) = &host {
+                        for u in h.take_user() {
+                            push_user(&mut messages, u);
+                        }
+                    }
+                    if trace_on {
+                        trace::record(&session, step, "file", &format!("{}（{}）{}", out.summary, call.path().unwrap_or("-"), if out.ok { "" } else { " 未完成" }));
+                    }
+                    let tl_seq = timeline::begin(app, &state.agent, &target_id, TlKind::File, &out.summary, None);
+                    timeline::finish(app, &state.agent, &target_id, tl_seq, out.diff.as_deref().unwrap_or(""), None, false);
+                    emit_step(
+                        app,
+                        &session,
+                        StepPayload {
+                            target: Some(target_id.clone()),
+                            target_label: Some(label.clone()),
+                            command: Some(out.summary.clone()),
+                            text: Some(if out.ok { "完成".into() } else { out.feedback.trim().to_string() }),
+                            output: out.diff.clone(),
+                            ..StepPayload::new("file", step)
+                        },
+                    );
+                    feedback.push_str(&out.feedback);
+                    if out.change.is_some() {
+                        host_did!();
+                    }
+                }
                 AgentAction::AskUser { question, options, recommendation } => {
                     emit_step(
                         app,
@@ -4182,6 +4315,7 @@ pub async fn run(
                             target: target_id.clone(),
                             target_label: target_label.into(),
                             reasons: risk.reasons.clone(),
+                            diff: None,
                         };
                         let approved = request_approval(app, runtime, &session, &req_payload).await;
                         if trace_on {
@@ -4495,6 +4629,7 @@ pub async fn run(
                             target: target_id.clone(),
                             target_label: label.clone(),
                             reasons: reasons.clone(),
+                            diff: None,
                         };
                         let approved = request_approval(app, runtime, &session, &req_payload).await;
                         if trace_on {
@@ -5740,6 +5875,45 @@ fn reattach_screen_feedback(sit: &super::situation::Situation) -> String {
     )
 }
 
+/// 文件写入的审批：托管 = 不设超时的 WaitingHuman 审批卡；对话 = 现有的审批卡（带差异预览）。
+struct FileApprover<'a> {
+    app: &'a AppHandle,
+    runtime: &'a ActRuntime,
+    session: &'a str,
+    target: &'a str,
+    label: &'a str,
+    host: Option<&'a HostShared>,
+}
+
+impl super::files_tool::Approver for FileApprover<'_> {
+    fn approve(&mut self, req: &super::files_tool::WriteApproval) -> impl std::future::Future<Output = bool> + Send {
+        let req = req.clone();
+        // 受保护路径的卡要把路径写在标题上：批准的就是「这一次写这个路径」
+        let title = if req.sensitive_path { format!("写入受保护路径 {}：{}", req.path, req.summary) } else { req.summary.clone() };
+        async move {
+            match self.host {
+                Some(h) => {
+                    let mut card = hosted_approval_card(&title, &req.reasons);
+                    card.diff = Some(req.diff.clone());
+                    h.approve(card).await
+                }
+                None => {
+                    let payload = ApprovePayload {
+                        request_id: uuid::Uuid::new_v4().simple().to_string(),
+                        kind: if req.sensitive_path { "file_sensitive" } else { "file" },
+                        command: title,
+                        target: self.target.to_string(),
+                        target_label: self.label.to_string(),
+                        reasons: req.reasons.clone(),
+                        diff: Some(req.diff.clone()),
+                    };
+                    request_approval(self.app, self.runtime, self.session, &payload).await
+                }
+            }
+        }
+    }
+}
+
 /// 托管写入的强制点：`gate::authorize` 一次；Approve 就挂起等批准（不设超时）。
 /// 返回 (结论, 拒绝原因)：拒绝原因有值 = 不写，把它反馈给模型。
 async fn hosted_authorize(
@@ -6306,6 +6480,87 @@ mod tests {
         assert_eq!(lvl, Some(Level::L2));
     }
 
+    // ——— 文件工具接线 ———
+
+    fn file_write(path: &str, content: &str) -> AgentAction {
+        AgentAction::File(super::super::files_tool::FileCall::Write(super::super::files::WriteArgs {
+            target: None,
+            path: path.into(),
+            content: content.into(),
+            create_dirs: false,
+        }))
+    }
+
+    #[test]
+    fn hosted_file_write_goes_through_authorize() {
+        use super::super::host::gate::authorize;
+        let mut ctx = ctx_with("auto");
+        // 契约 deny 里写路径：命中就拦
+        ctx.authority.deny = vec!["/etc/nginx".into()];
+        assert!(matches!(authorize(&ctx.policy(), &file_write("/etc/nginx/nginx.conf", "x"), None), Gate::Deny(_)));
+        assert_eq!(authorize(&ctx.policy(), &file_write("/srv/app/a.conf", "x"), None), Gate::Allow);
+        // 脚本内容里有 rm 不算「删除」：内容不执行，执行它的那条 nx_exec 另过闸门
+        let ctx2 = ctx_with("auto");
+        assert_eq!(authorize(&ctx2.policy(), &file_write("/tmp/fix.sh", "rm -rf /tmp/build\n"), None), Gate::Allow);
+        // 「不许它改文件」：deny file_write
+        let mut ctx3 = ctx_with("auto");
+        ctx3.authority.deny = vec!["file_write".into()];
+        assert!(matches!(authorize(&ctx3.policy(), &file_write("/tmp/a", "x"), None), Gate::Deny(_)));
+        // approve 档每次写文件都要批；读文件不过闸
+        assert!(matches!(authorize(&ctx_with("approve").policy(), &file_write("/tmp/a", "x"), None), Gate::Approve(_)));
+        let read = AgentAction::File(super::super::files_tool::FileCall::Read(super::super::files::ReadArgs {
+            target: None,
+            path: "/etc/hosts".into(),
+            offset: None,
+            limit: None,
+        }));
+        assert_eq!(authorize(&ctx_with("approve").policy(), &read, None), Gate::Allow);
+        assert!(super::super::host::record::describe_write(&read).is_none());
+        assert_eq!(super::super::host::record::describe_write(&file_write("/tmp/a", "x")).unwrap().0, "file_write");
+    }
+
+    #[test]
+    fn hosted_file_write_hard_pref_matches_path_and_content() {
+        use super::super::host::gate::{authorize, HardRule};
+        let mut ctx = ctx_with("auto");
+        let pref = super::super::profile::CtxItem {
+            id: "p-key".into(),
+            kind: "preference".into(),
+            text: "不要往文件里写明文密钥".into(),
+            strength: "hard".into(),
+            scope: "global".into(),
+            source: "user".into(),
+            evidence: String::new(),
+            extra: serde_json::json!({ "denyPattern": "AKIA[0-9A-Z]{16}" }),
+            contract_id: String::new(),
+            position: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+        ctx.hard = HardRule::from_prefs(&[pref]);
+        let g = authorize(&ctx.policy(), &file_write("/srv/app/.env", "KEY=AKIAIOSFODNN7EXAMPLE\n"), None);
+        assert!(matches!(g, Gate::Deny(ref w) if w.contains("p-key")), "{g:?}");
+    }
+
+    #[test]
+    fn file_tools_are_declared_parsed_and_listed() {
+        let names: Vec<&str> = tool_specs().iter().map(|s| s.name).collect();
+        for t in [super::super::files::TOOL_READ, super::super::files::TOOL_WRITE, super::super::files::TOOL_EDIT, super::super::files::TOOL_GLOB, super::super::files::TOOL_GREP] {
+            assert!(names.contains(&t), "对话模式缺 {t}");
+            assert!(hosted_tool_specs().iter().any(|s| s.name == t), "托管模式缺 {t}");
+            assert!(tool_action_name(t).is_some());
+            assert!(ACTION_PROTOCOL.lines().next().unwrap().contains(t));
+        }
+        let call = llm::ToolCall { name: "nx_edit".into(), arguments: r#"{"path":"/a","oldString":"x","newString":"y"}"#.into() };
+        assert!(matches!(actions_from_tool_call(&call).as_slice(), [AgentAction::File(c)] if c.is_write()));
+        let bad = llm::ToolCall { name: "nx_read".into(), arguments: "{}".into() };
+        assert!(actions_from_tool_call(&bad).is_empty());
+        assert!(unknown_tool_names(&[call, bad]).is_empty());
+        // 围栏协议同形
+        assert!(matches!(extract_actions(&block(r#"{"action":"read","path":"/etc/hosts"}"#)).as_slice(), [AgentAction::File(_)]));
+        assert!(ACTION_PROTOCOL.contains("先用 nx_write 写成文件，再 nx_exec"));
+    }
+
     #[test]
     fn notify_tier_executes_then_notifies() {
         let ctx = ctx_with("notify");
@@ -6709,8 +6964,8 @@ mod tests {
 
     fn scope_targets() -> Vec<AgentTarget> {
         vec![
-            AgentTarget { id: "a".into(), label: "web-01".into() },
-            AgentTarget { id: "b".into(), label: "db-01".into() },
+            AgentTarget { id: "a".into(), label: "web-01".into(), cwd: None },
+            AgentTarget { id: "b".into(), label: "db-01".into(), cwd: None },
         ]
     }
 
@@ -7593,7 +7848,7 @@ mod tests {
         for spec in tool_specs() {
             assert!(first.contains(spec.name), "工具清单漏了 {}：{first}", spec.name);
         }
-        assert!(first.contains(&format!("共{}个工具", ["", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二"][tool_specs().len()])), "{first}");
+        assert!(first.contains(&format!("共{}个工具", ["", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八"][tool_specs().len()])), "{first}");
     }
 
     #[test]
@@ -7608,7 +7863,7 @@ mod tests {
 
     #[test]
     fn plan_message_redacts_terminal_content_only_when_on() {
-        let t = AgentTarget { id: "s1".into(), label: "本机".into() };
+        let t = AgentTarget { id: "s1".into(), label: "本机".into(), cwd: None };
         let r = plain_req("帮我看看", false);
         let blocks = [(&t, SECRET_CTX.to_string())];
         let on = build_plan_message(&r, &blocks, None, "", true);
@@ -7621,7 +7876,7 @@ mod tests {
 
     #[test]
     fn plan_message_redacts_fullscreen_capture() {
-        let t = AgentTarget { id: "s1".into(), label: "本机".into() };
+        let t = AgentTarget { id: "s1".into(), label: "本机".into(), cwd: None };
         let r = plain_req("q", true);
         let msg = build_plan_message(
             &r,

@@ -31,6 +31,8 @@ pub const TAG_FORCE_PUSH: &str = "force_push";
 pub const TAG_DELETE: &str = "delete";
 pub const TAG_SECRET: &str = "secret";
 pub const TAG_PERMANENT_GRANT: &str = "permanent_grant";
+/// 写 / 改文件（`nx_write` / `nx_edit`）。契约 deny 里写 `file_write` 就是「不许它改文件」
+pub const TAG_FILE_WRITE: &str = "file_write";
 
 /// Hard 偏好正则的编译上限，防止用户写出病态 pattern 拖慢每一次写入。
 const HARD_RE_SIZE_LIMIT: usize = 1 << 16;
@@ -113,6 +115,8 @@ fn write_of(a: &AgentAction) -> Result<Option<Write>, String> {
             w("open", lines, command.clone())
         }
         AgentAction::Tab { op: TabOp::Close, target, .. } => w("tab_close", target.iter().cloned().collect(), None),
+        // 写 / 改文件：deny 关键字与硬偏好正则按「路径 + 新内容」匹配；内容不执行，不推导命令类标签
+        AgentAction::File(call) if call.is_write() => w(TAG_FILE_WRITE, call.write_lines(), None),
         AgentAction::Tab { op: TabOp::Reconnect, target, .. } => {
             w("tab_reconnect", target.iter().cloned().collect(), None)
         }
@@ -187,7 +191,7 @@ pub fn authorize(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>) -> Ga
     let auth = &p.authority;
 
     // 1. deny：标签精确命中，或自定义关键字出现在要提交的文本里
-    let tags = derive_tags(&w, sit);
+    let tags = if w.category == TAG_FILE_WRITE { vec![TAG_FILE_WRITE] } else { derive_tags(&w, sit) };
     if let Some(t) = tags.iter().find(|t| auth.denies(t)) {
         return Gate::Deny(format!("契约禁止此类操作（{t}），没有写入。换一个不触及禁项的做法，或用 nx_ask_user 请用户处理"));
     }

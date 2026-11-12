@@ -372,6 +372,8 @@ export interface AgentMessage {
 export interface AgentTarget {
   id: string;
   label: string;
+  /** 终端当前目录（文件工具补全相对路径用） */
+  cwd?: string | null;
   /** 重启后找回这个 console 用的线索（托管时传给后端存进 ConsoleRef） */
   hint?: HostConsoleHint;
 }
@@ -493,11 +495,13 @@ export interface AgentApproveRequest {
    * skill：技能回放里的逐步确认（审批模式）/ 偏离后让用户选「继续 / 重试 / 中止」。
    * 缺省按 danger 处理（兼容旧载荷）。
    */
-  kind?: "danger" | "scope" | "skill";
+  kind?: "danger" | "scope" | "skill" | "file" | "file_sensitive";
   command: string;
   target: string;
   targetLabel: string;
   reasons: string[];
+  /** kind=file：写 / 改文件的差异预览 */
+  diff?: string;
 }
 
 /**
@@ -848,6 +852,8 @@ export interface HostHumanCard {
   options: HostCardOption[];
   recommendation?: string | null;
   reasons: string[];
+  /** 写文件审批卡上的差异预览 */
+  diff?: string | null;
   createdWallMs: number;
 }
 

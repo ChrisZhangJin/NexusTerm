@@ -35,6 +35,7 @@ pub fn describe_write(a: &AgentAction) -> Option<(&'static str, String)> {
             }
             ("open", t)
         }
+        AgentAction::File(call) if call.is_write() => ("file_write", call.summary()),
         AgentAction::Tab { op: TabOp::Close, target, .. } => {
             ("tab_close", format!("关闭标签页 {}", target.as_deref().unwrap_or("当前")))
         }

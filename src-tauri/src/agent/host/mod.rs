@@ -137,6 +137,9 @@ pub struct HumanCard {
     /// 审批原因 / 看门狗附带的最近决策摘要
     #[serde(default)]
     pub reasons: Vec<String>,
+    /// 写文件审批卡上的差异预览（敏感时已脱敏）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
     pub created_wall_ms: i64,
 }
 
@@ -149,6 +152,7 @@ impl HumanCard {
             options: Vec::new(),
             recommendation: None,
             reasons: Vec::new(),
+            diff: None,
             created_wall_ms: now_wall_ms,
         }
     }

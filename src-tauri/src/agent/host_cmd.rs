@@ -306,6 +306,8 @@ pub fn host_start(
     }
     let console = console_ref_of(&state, &console_id, &hint);
     let label = console.label.clone();
+    // 文件工具的相对路径按它补全
+    let hint_cwd = console.cwd.clone();
     let snap = HostCheckpoint::new(contract.clone(), core.authority(&contract_id), console, now_ms());
     let io = AppHostIo {
         app: app.clone(),
@@ -326,7 +328,7 @@ pub fn host_start(
     let req = AgentRunRequest {
         session_id: console_id.clone(),
         question: goal,
-        targets: vec![AgentTarget { id: console_id, label }],
+        targets: vec![AgentTarget { id: console_id, label, cwd: hint_cwd }],
         console_text,
         console_alt: console_alt.unwrap_or(false),
         mode: Some("steward".to_string()),
@@ -954,7 +956,7 @@ fn spawn_resumed(app: AppHandle, h: Arc<HostShared>, old: Option<Arc<HostShared>
         let req = AgentRunRequest {
             session_id: h.console_id.clone(),
             question: c.contract.goal.clone(),
-            targets: vec![AgentTarget { id: h.console_id.clone(), label: c.label.clone() }],
+            targets: vec![AgentTarget { id: h.console_id.clone(), label: c.label.clone(), cwd: h.saved_console().and_then(|c| c.cwd) }],
             console_text: None,
             console_alt: false,
             mode: Some("steward".to_string()),

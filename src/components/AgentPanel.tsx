@@ -338,7 +338,8 @@ export function AgentPanel({
     const alive = new Map(sessions.map((s) => [s.id, s.label]));
     return activeScope
       .filter((id) => id === sessionId || alive.has(id))
-      .map((id) => ({ id, label: alive.get(id) ?? "当前会话" }));
+      // cwd：文件工具的相对路径按它补全（前端探测到的终端当前目录）
+      .map((id) => ({ id, label: alive.get(id) ?? "当前会话", cwd: sessions.find((s) => s.id === id)?.hint?.cwd ?? null }));
   };
 
   /** Agentic：这一条会真的在终端里跑命令。
