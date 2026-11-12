@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 use super::act::{
+    AgentAction,
     classify_session, emit_control, emit_interact, emit_step, gate_drive, gate_target,
     keys_risk, reject_command, request_approval, request_screen, run_one, send_keys_marked,
     session_alive, write_to, ActRuntime, AgentTarget, ApprovePayload, ControlLease, RunLogGuard,
@@ -402,9 +403,45 @@ pub trait SkillIo {
     /// 把偏离交给 LLM，返回它的原始文本（JSON 由引擎解析）。
     async fn llm_decide(&mut self, system: &str, user: &str) -> Result<String, String>;
     fn progress(&mut self, ev: ProgressEvent);
+    /// 写入前的契约 / 局面把关（托管：`gate::authorize`，契约 deny 与 Hard 规则对每个渲染后的步骤生效；
+    /// 对话：按键过 `assess_keys`）。默认放行（测试替身）。
+    async fn policy_check(&mut self, _w: PolicyWrite<'_>) -> PolicyVerdict {
+        PolicyVerdict::Allow
+    }
+}
+
+/// 要把关的一次写入（渲染之后的最终文本 / 字节）。
+#[derive(Debug, Clone, Copy)]
+pub enum PolicyWrite<'a> {
+    Exec(&'a str),
+    Keys(&'a [u8]),
+}
+
+/// 把关结论。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyVerdict {
+    Allow,
+    /// 要人批准（附原因）
+    Approve(Vec<String>),
+    /// 不写
+    Deny(String),
 }
 
 // ——————————————————————————————— 状态机（纯） ———————————————————————————————
+
+/// 字节 → 按键串（`interact::parse_keys` 能原样解回来）：可见 ASCII 原样，`<` / `\\` 转义，其余 `\xNN`。
+pub(crate) fn bytes_to_keys(bytes: &[u8]) -> String {
+    let mut s = String::new();
+    for &b in bytes {
+        match b {
+            b'<' => s.push_str("<lt>"),
+            b'\\' => s.push_str("\\\\"),
+            0x20..=0x7e => s.push(b as char),
+            _ => s.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    s
+}
 
 /// 一次偏离的细节。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1306,12 +1343,21 @@ impl<I: SkillIo> Engine<'_, I> {
         }
         // 渲染之后才评估：模板安全、代入后危险的命令照样拦
         let risk = danger::assess(command);
-        let req = WriteReq {
+        let mut req = WriteReq {
             what: format!("执行：{}", command.trim()),
             reasons: if risk.dangerous { risk.reasons } else { Vec::new() },
             dangerous: risk.dangerous,
             always_ask: false,
         };
+        // 契约（托管：deny / Hard 规则 / 档位）对每个渲染后的步骤生效，不是只看技能名
+        match self.io.policy_check(PolicyWrite::Exec(command)).await {
+            PolicyVerdict::Allow => {}
+            PolicyVerdict::Approve(r) => {
+                req.reasons.extend(r);
+                req.always_ask = true;
+            }
+            PolicyVerdict::Deny(why) => return StepEnd::Declined(why),
+        }
         match self.gate_write(&req).await {
             Gate::Go => {}
             g => return g.into_end(),
@@ -1385,15 +1431,26 @@ impl<I: SkillIo> Engine<'_, I> {
         // 含回车会提交终端当前行（可能是之前拼起来 / 历史里翻出来的），见 `act::keys_risk`
         let risk = keys_risk(bytes);
         let dangerous = risk.as_ref().is_some_and(|r| r.len() > 1);
-        let req = WriteReq {
+        let mut req = WriteReq {
             what: format!("发送按键：{shown}"),
             reasons: risk.clone().unwrap_or_default(),
             dangerous,
             // 没有回车的按键步骤不用问（与 Agentic 循环一致）；模型给的按键一律问
             always_ask: from_llm,
         };
+        // 看着屏幕把关（口令提示上打字 / 选「永久允许」一律拒；托管再加契约）
+        let mut policy_ask = false;
+        match self.io.policy_check(PolicyWrite::Keys(bytes)).await {
+            PolicyVerdict::Allow => {}
+            PolicyVerdict::Approve(r) => {
+                req.reasons.extend(r);
+                req.always_ask = true;
+                policy_ask = true;
+            }
+            PolicyVerdict::Deny(why) => return Err(StepEnd::Declined(why)),
+        }
         // 没有回车 → 只是往行里加字，策略不要求审批（模型来源除外，见 always_ask）
-        if risk.is_none() && !from_llm {
+        if risk.is_none() && !from_llm && !policy_ask {
             // 仍要过范围 + 控制权两道闸，只是跳过审批
             if self.io.is_cancelled() {
                 return Err(StepEnd::Cancelled);
@@ -1562,6 +1619,31 @@ impl TauriIo<'_> {
 }
 
 impl SkillIo for TauriIo<'_> {
+    async fn policy_check(&mut self, w: PolicyWrite<'_>) -> PolicyVerdict {
+        let sit = super::act::situation_now(self.app, self.state, &self.target, false);
+        if let Some(h) = self.runtime.host.live(&self.run) {
+            // 托管：与 Agent 自己的写入同一个强制点
+            let action = match w {
+                PolicyWrite::Exec(c) => AgentAction::Exec { target: None, command: c.to_string() },
+                PolicyWrite::Keys(b) => AgentAction::Keys { target: None, keys: bytes_to_keys(b) },
+            };
+            return match super::host::gate::authorize(&h.ctx().policy(), &action, Some(&sit)) {
+                super::host::gate::Gate::Deny(why) => PolicyVerdict::Deny(why),
+                super::host::gate::Gate::Approve(r) => PolicyVerdict::Approve(r),
+                _ => PolicyVerdict::Allow,
+            };
+        }
+        match w {
+            PolicyWrite::Exec(_) => PolicyVerdict::Allow,
+            PolicyWrite::Keys(b) => match super::steward_mode::assess_keys(b, Some(&sit)) {
+                super::steward_mode::KeysVerdict::Allow => PolicyVerdict::Allow,
+                super::steward_mode::KeysVerdict::Refuse(why) => PolicyVerdict::Deny(why),
+                super::steward_mode::KeysVerdict::Approve(r) if self.cfg.exec_mode.is_approval() => PolicyVerdict::Approve(r),
+                super::steward_mode::KeysVerdict::Approve(_) => PolicyVerdict::Allow,
+            },
+        }
+    }
+
     fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
@@ -2054,6 +2136,8 @@ mod tests {
         events: Vec<ProgressEvent>,
         keys: Vec<String>,
         cmds: Vec<String>,
+        /// 契约把关：命中这个子串的命令 / 按键一律 Deny（模拟托管契约的 deny 规则）
+        deny: Option<&'static str>,
     }
 
     impl FakeIo {
@@ -2076,6 +2160,7 @@ mod tests {
                 events: Vec::new(),
                 keys: Vec::new(),
                 cmds: Vec::new(),
+                deny: None,
             }
         }
         fn exec_ok(mut self, out: &str) -> Self {
@@ -2097,6 +2182,16 @@ mod tests {
     }
 
     impl SkillIo for FakeIo {
+        async fn policy_check(&mut self, w: PolicyWrite<'_>) -> PolicyVerdict {
+            let text = match w {
+                PolicyWrite::Exec(c) => c.to_string(),
+                PolicyWrite::Keys(b) => String::from_utf8_lossy(b).into_owned(),
+            };
+            match self.deny {
+                Some(d) if text.contains(d) => PolicyVerdict::Deny(format!("命中契约禁项「{d}」，没有写入")),
+                _ => PolicyVerdict::Allow,
+            }
+        }
         fn is_cancelled(&self) -> bool {
             self.cancelled
         }
@@ -2540,6 +2635,31 @@ mod tests {
     }
 
     // ——— 引擎 ———
+
+    #[tokio::test]
+    async fn contract_deny_blocks_rendered_skill_steps() {
+        // 技能名本身无害，渲染后的步骤命中契约禁项：这一步不写，整个技能停下
+        let s = skill(serde_json::json!([{"kind":"exec","command":"systemctl restart {{svc}}"}]), None);
+        let mut io = FakeIo::new().exec_ok("done");
+        io.deny = Some("restart nginx");
+        let r = run(&mut io, &s, &opts()).await;
+        assert!(io.cmds.is_empty(), "被拒的步骤一条都没执行");
+        assert_eq!(results(&r), ["declined"]);
+        // 按键步骤同样过闸
+        let k = skill(serde_json::json!([{"kind":"keys","keys":"rm -rf /<Enter>"}]), None);
+        let mut io = FakeIo::new();
+        io.deny = Some("rm -rf");
+        let r = run(&mut io, &k, &opts()).await;
+        assert!(io.keys.is_empty());
+        assert_eq!(results(&r), ["declined"]);
+    }
+
+    #[test]
+    fn bytes_to_keys_round_trips() {
+        for b in [&b"ls -la\r"[..], b"a<b\\c", b"\x1b[B\x03", "中文".as_bytes()] {
+            assert_eq!(crate::agent::interact::parse_keys(&bytes_to_keys(b)).unwrap(), b, "{:?}", bytes_to_keys(b));
+        }
+    }
 
     #[tokio::test]
     async fn happy_path_runs_all_steps_in_order() {

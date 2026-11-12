@@ -3603,6 +3603,8 @@ pub async fn run(
     let mut llm_down = false;
     // 最近一次重试用尽的错误摘要（托管暂停卡上给人看）
     let mut last_llm_error = String::new();
+    // 上下文超长时的「压缩后重试」这一轮用过没有（拿到正常回复就清零）
+    let mut context_retry_used = false;
     // 用户接管且等到超时的次数（见 `MAX_TOOK_OVER`）
     let mut took_over_times = 0usize;
     // 服务方不认 tools 时置 false：此后一律走围栏协议，不再每轮都白试一次。
@@ -3680,6 +3682,22 @@ pub async fn run(
                     &session,
                     StepPayload {
                         text: Some("被托管的终端已经关闭，托管挂起；重新接驳前不会再写入。".into()),
+                        ..StepPayload::new("note", step)
+                    },
+                );
+                match h.park().await {
+                    ParkEnd::Running => {}
+                    _ => break,
+                }
+            }
+            // 意向期限到了：暂停（Paused{Deadline}），只有用户「继续」能离开
+            if h.check_deadline(super::steward::now_ms()) {
+                h.flush_progress(&messages, step);
+                emit_step(
+                    app,
+                    &session,
+                    StepPayload {
+                        text: Some("到了约定的期限，托管已暂停；要接着做请点「加预算继续」。".into()),
                         ..StepPayload::new("note", step)
                     },
                 );
@@ -3839,7 +3857,10 @@ pub async fn run(
             },
         );
         let reply = match retrying.await {
-            Ok(r) => r,
+            Ok(r) => {
+                context_retry_used = false;
+                r
+            }
             Err(f) if f.kind == llm::FailureKind::Cancelled => {
                 // 与循环顶的取消同一出口：正常收尾，不当成出错
                 emit_step(app, &session, StepPayload { text: Some("已取消。".into()), ..StepPayload::new("note", step) });
@@ -3869,6 +3890,37 @@ pub async fn run(
                 let e = f.error;
                 if trace_on {
                     trace::record(&session, step, "error", &e.to_string());
+                }
+                let msg = e.to_string();
+                // 上下文超长：先狠狠压一次再试（只试一次，免得反复压反复撞）
+                let action = llm_failure_action(host.is_some(), &msg, context_retry_used);
+                if action == LlmFailAction::CompactRetry {
+                    context_retry_used = true;
+                    force_compact(&mut messages);
+                    emit_step(
+                        app,
+                        &session,
+                        StepPayload {
+                            text: Some("模型说上下文太长：已把较早的步骤压缩成笔记，重试一次。".into()),
+                            ..StepPayload::new("note", step)
+                        },
+                    );
+                    continue;
+                }
+                // 托管：任何非取消的模型错误（401 / 403 / 404 / 额度 / 仍然超长…）都不收场，
+                // 暂停（模型不可用）等用户修好配置后「继续」—— 几十步的进度不该因为一个 Key 过期而作废
+                if action == LlmFailAction::Pause {
+                    emit_step(
+                        app,
+                        &session,
+                        StepPayload {
+                            text: Some(format!("模型请求失败：{}。托管已暂停，修好后点「加预算继续」。", error_headline(&msg))),
+                            ..StepPayload::new("note", step)
+                        },
+                    );
+                    llm_down = true;
+                    last_llm_error = error_headline(&msg).to_string();
+                    continue;
                 }
                 runtime.runlog.mark_error(&session);
                 if continuing {
@@ -4107,20 +4159,17 @@ pub async fn run(
                 if let Some((kind, text)) = super::host::record::describe_write(&action) {
                     let ctx = h.ctx();
                     let sit = match &action {
-                        AgentAction::Keys { target, .. } => {
+                        AgentAction::Keys { target, .. } | AgentAction::Exec { target, .. } => {
                             let tid = locate(target.as_deref(), &targets, &session).map(|(i, _)| i).unwrap_or_else(|i| i);
                             Some(situation_now(app, state, &tid, false))
                         }
                         _ => None,
                     };
                     // 写文件的审批要带差异预览，在分支里算好 diff 之后再问；这里只拿结论（Deny 直接拦）
+                    // 写文件：路径要先补全（相对路径 / ~ 展开）才能按契约 deny / Hard 规则匹配，
+                    // 授权放到分支里解析完路径之后做（那时也有差异预览可以给审批卡）
                     let (verdict, refused) = if matches!(action, AgentAction::File(_)) {
-                        let g = super::host::gate::authorize(&ctx.policy(), &action, None);
-                        let why = match &g {
-                            Gate::Deny(w) => Some(w.clone()),
-                            _ => None,
-                        };
-                        (g, why)
+                        (Gate::Allow, None)
                     } else {
                         hosted_authorize(h, &ctx, &action, &text, sit.as_ref(), || h.flush_progress(&messages, step)).await
                     };
@@ -4191,6 +4240,22 @@ pub async fn run(
                         }
                     };
                     let ops = super::files::FileOps::new(&*transport, super::files::FileOpsConfig::default());
+                    // 托管：按解析后的真实路径（~ 已展开）授权；补全前的写法也一并匹配，任一命中 deny 都不写
+                    if let (Some(h), true) = (&host, call.is_write()) {
+                        let resolved = match call.path() {
+                            Some(p) => ops.resolve(p).await.ok(),
+                            None => None,
+                        };
+                        let gate = hosted_file_gate(&h.ctx().policy(), &call, resolved.as_deref());
+                        if let Gate::Deny(why) = &gate {
+                            emit_step(app, &session, StepPayload { command: Some(call.summary()), reasons: Some(vec![why.clone()]), ..StepPayload::new("skip", step) });
+                            feedback.push_str(&format!("「{}」没有执行：{why}\n", call.summary()));
+                            continue;
+                        }
+                        if let Some(w) = host_write.as_mut() {
+                            w.gate = gate;
+                        }
+                    }
                     // 写入放行：托管 = gate::authorize 的结论；对话 = exec mode（审批模式下写文件从不静默）
                     let wgate = if !call.is_write() {
                         super::files_tool::WriteGate::Auto
@@ -4372,6 +4437,24 @@ pub async fn run(
                         feedback.push_str(&failure_feedback(&command, target_label, why));
                         continue;
                     }
+                    // 终端此刻不在 shell 提示符上（[Y/n] 提问、Claude Code 输入框、分页器、REPL…）：
+                    // `命令 + 回车` 会被当成那里的答复 / 输入提交出去。先等一下提示符（上一条命令刚结束时
+                    // 提示符可能还没画出来），等不到就不写，让模型改用 nx_send_keys / nx_secret
+                    if let Err(why) = wait_shell_ready(|| situation_now(app, state, &target_id, false)).await {
+                        emit_step(
+                            app,
+                            &session,
+                            StepPayload {
+                                target: Some(target_id.clone()),
+                                target_label: Some(target_label.into()),
+                                command: Some(command.trim().into()),
+                                reasons: Some(vec![why.clone()]),
+                                ..StepPayload::new("skip", step)
+                            },
+                        );
+                        feedback.push_str(&not_at_prompt_feedback(&command, target_label, &why));
+                        continue;
+                    }
 
                     let risk = assess(&command);
                     // 越界闸门：不看 exec mode，自动模式也要弹。
@@ -4467,6 +4550,22 @@ pub async fn run(
 
                     // 审批都过了、真要写之前最后看一眼：别往用户正在打的字里插命令
                     drive_gate!(&target_id);
+                    // 审批 / 交还可能等了很久：写之前再确认终端还停在 shell 提示符上（同 keys_recheck 的道理）
+                    if let Err(why) = wait_shell_ready(|| situation_now(app, state, &target_id, false)).await {
+                        emit_step(
+                            app,
+                            &session,
+                            StepPayload {
+                                target: Some(target_id.clone()),
+                                target_label: Some(target_label.into()),
+                                command: Some(command.trim().into()),
+                                reasons: Some(vec![format!("等待期间局面变了：{why}")]),
+                                ..StepPayload::new("skip", step)
+                            },
+                        );
+                        feedback.push_str(&not_at_prompt_feedback(&command, target_label, &format!("等待批准 / 交还期间局面变了：{why}")));
+                        continue;
+                    }
                     let tl_seq = timeline::begin(app, &state.agent, &target_id, TlKind::Command, command.trim(), None);
                     match run_one(
                         state,
@@ -4703,13 +4802,16 @@ pub async fn run(
                     let mut risk = risk;
                     let mut crossed = crossed;
                     // 托管：放行时依据的局面，写之前要拿它和当时的屏幕再比一次
-                    let mut judged: Option<super::situation::Situation> = None;
+                    let judged: Option<super::situation::Situation>;
                     // 托管：`gate::authorize` 已按同一局面判过（assess_keys），写前复核仍用那份局面
                     if host.is_some() {
                         judged = host_write.as_ref().and_then(|w| w.sit.clone());
-                    } else if is_steward {
+                    } else {
+                        // 对话模式也看着屏幕把关（任何执行模式）：口令提示上打字、选「不再询问 / 永久允许」
+                        // 一律拒绝；要人批准的（shell 上回车提交危险命令等）在审批模式 / 旧托管模式出卡，
+                        // 自动模式与 nx_exec 一致直接放行
                         let sit = situation_now(app, state, &target_id, false);
-                        let verdict = super::steward_mode::assess_keys(&bytes, Some(&sit));
+                        let verdict = chat_keys_verdict(&bytes, &sit, is_steward || cfg.exec_mode.is_approval());
                         judged = Some(sit);
                         match verdict {
                             super::steward_mode::KeysVerdict::Allow => {}
@@ -5983,6 +6085,154 @@ fn hosted_approval_card(text: &str, reasons: &[String]) -> super::host::HumanCar
 
 /// 发按键前的最后复核（托管与旧 steward 模式共用）：`judged` 是放行 / 批准时依据的局面
 /// （托管 = `gate::authorize` 当时抓的那份）。审批 / 交还控制权可能等了很久，屏幕换了局面就不发。
+/// 对话模式（非托管）的按键把关：`assess_keys` 在所有模式下都跑。Refuse 一律拒；
+/// Approve 只在要审批时（审批模式 / 旧托管模式）出卡，自动模式按放行处理（与 nx_exec 一致）。
+fn chat_keys_verdict(bytes: &[u8], sit: &super::situation::Situation, approval: bool) -> super::steward_mode::KeysVerdict {
+    use super::steward_mode::KeysVerdict;
+    match super::steward_mode::assess_keys(bytes, Some(sit)) {
+        KeysVerdict::Approve(_) if !approval => KeysVerdict::Allow,
+        v => v,
+    }
+}
+
+/// 终端此刻能不能接一条 `nx_exec`（`命令 + 回车`）：不在 shell 提示符上就返回原因。
+/// 停在提问 / 授权 / 菜单 / 密码 / 分页器 / 等输入（REPL、Claude Code 输入框）上，或前台是全屏 / TUI 程序时，
+/// 那一行会被当成那里的答复提交出去。认不出（Unknown）、正在跑（Progress）、报错（Error）不拦。
+pub(super) fn exec_blocker(sit: &super::situation::Situation) -> Option<String> {
+    use super::situation::{Program, SituationKind as K};
+    if sit.evidence.iter().any(|e| e == super::situation::SHELL_PROMPT_VISIBLE) && sit.kind != K::Password {
+        return None;
+    }
+    let what = match sit.kind {
+        K::Question => Some("一个提问（如 [Y/n]）"),
+        K::Permission => Some("一张授权确认"),
+        K::Menu => Some("一个选择菜单"),
+        K::Password => Some("密码 / 口令提示"),
+        K::Pager => Some("分页器"),
+        K::AwaitingInput => Some("一个等输入的程序（REPL / 输入框）"),
+        _ => None,
+    };
+    if let Some(w) = what {
+        return Some(format!("终端此刻停在{w}上，不是 shell 提示符"));
+    }
+    match sit.program {
+        Program::ClaudeCode | Program::Vim | Program::Pager | Program::Tui if sit.kind != K::Idle => {
+            Some(format!("终端前台是 {} 程序，不是 shell 提示符", sit.program.as_str()))
+        }
+        _ => None,
+    }
+}
+
+/// 等终端回到 shell 提示符（上一条命令刚结束、提示符还没画出来时给它一点时间），最多约 1.5 秒。
+pub(super) async fn wait_shell_ready(mut now: impl FnMut() -> super::situation::Situation) -> Result<(), String> {
+    const WAIT: Duration = Duration::from_millis(1_500);
+    const POLL: Duration = Duration::from_millis(150);
+    let start = tokio::time::Instant::now();
+    loop {
+        match exec_blocker(&now()) {
+            None => return Ok(()),
+            Some(why) if start.elapsed() >= WAIT => return Err(why),
+            Some(_) => tokio::time::sleep(POLL).await,
+        }
+    }
+}
+
+fn not_at_prompt_feedback(command: &str, label: &str, why: &str) -> String {
+    format!(
+        "命令 `{}` 没有发到「{label}」：{why}。直接敲过去会被当成那里的答复 / 输入提交。\
+         要回答它请用 nx_send_keys（密码用 nx_secret）；要跑命令就先让程序退出（如 q / <C-c> / Esc），\
+         用 nx_screen 确认回到提示符后再 nx_exec。\n",
+        command.trim()
+    )
+}
+
+/// 不可重试的模型错误怎么办。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LlmFailAction {
+    /// 上下文超长：狠压一次再试
+    CompactRetry,
+    /// 托管：暂停（模型不可用），等用户修好后继续
+    Pause,
+    /// 对话：收场报错
+    Fail,
+}
+
+pub(super) fn llm_failure_action(hosted: bool, msg: &str, retried: bool) -> LlmFailAction {
+    if is_context_overflow(msg) && !retried {
+        LlmFailAction::CompactRetry
+    } else if hosted {
+        LlmFailAction::Pause
+    } else {
+        LlmFailAction::Fail
+    }
+}
+
+/// 服务方说「上下文 / 提示词太长」。各家措辞不同，按常见说法认。
+pub(super) fn is_context_overflow(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "maximum context length",
+        "context length",
+        "context window",
+        "prompt is too long",
+        "too many tokens",
+        "input is too long",
+        "request too large",
+        "reduce the length",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
+        || msg.contains("上下文过长")
+        || msg.contains("超出最大长度")
+}
+
+/// 狠狠压一次：预算取当前估算的一半。
+pub(super) fn force_compact(messages: &mut Vec<ChatMessage>) -> bool {
+    let budget = (super::compact::total_tokens(messages) / 2).max(1_000);
+    super::compact::compact(messages, budget)
+}
+
+/// 托管写文件的授权：补全后的路径与 `~` 展开后的真实路径各过一次 `gate::authorize`，取更严的那个
+/// （Deny > Approve > Notify > Allow）。
+pub(super) fn hosted_file_gate(
+    policy: &super::host::gate::HostPolicy,
+    call: &super::files_tool::FileCall,
+    resolved: Option<&str>,
+) -> Gate {
+    let rank = |g: &Gate| match g {
+        Gate::Deny(_) => 3,
+        Gate::Approve(_) => 2,
+        Gate::Notify => 1,
+        Gate::Allow => 0,
+    };
+    let mut best = super::host::gate::authorize(policy, &AgentAction::File(call.clone()), None);
+    if let Some(r) = resolved.filter(|r| Some(*r) != call.path()) {
+        let c = with_path(call.clone(), r);
+        let g = super::host::gate::authorize(policy, &AgentAction::File(c), None);
+        if rank(&g) > rank(&best) {
+            best = g;
+        }
+    }
+    best
+}
+
+/// 换掉文件调用的路径（解析后的真实路径）。
+fn with_path(call: super::files_tool::FileCall, path: &str) -> super::files_tool::FileCall {
+    use super::files_tool::FileCall as F;
+    match call {
+        F::Write(mut a) => {
+            a.path = path.to_string();
+            F::Write(a)
+        }
+        F::Edit(mut a) => {
+            a.path = path.to_string();
+            F::Edit(a)
+        }
+        other => other,
+    }
+}
+
 fn keys_recheck(judged: &super::situation::Situation, now: &super::situation::Situation) -> Option<String> {
     super::situation::materially_changed(judged, now).map(|why| format!("等待期间屏幕局面变了：{why}"))
 }
@@ -6182,7 +6432,7 @@ async fn try_reflex(
     let brain = app.try_state::<super::profile::StewardBrain>()?;
     let ctx = h.ctx();
     let playbook = brain.match_playbook(sit, &ctx.contract.host_key);
-    let super::host::reflex::Reflex::Answer { bytes, keys, record, playbook_id } =
+    let super::host::reflex::Reflex::Answer { bytes, keys, record, playbook_id, notify } =
         super::host::reflex::decide(playbook, sit, &ctx, super::steward::now_ms())
     else {
         return None;
@@ -6218,6 +6468,18 @@ async fn try_reflex(
     }
     let seq = super::host::record::persist(app, &record);
     brain.remember_decision(seq, &record);
+    if notify {
+        // 通知档：代答写完了，照常发通知卡（可接管 + 纠正）
+        let notice = HostNotice {
+            contract_id: h.contract_id().to_string(),
+            seq,
+            kind: "keys",
+            text: format!("[reflex] 按剧本 [P:{playbook_id}] 回答了「{keys}」"),
+            undo_window_ms: ctx.authority.undo_window_ms,
+            ts_ms: super::steward::now_ms(),
+        };
+        let _ = app.emit(&format!("nx://host/{}/notify", h.contract_id()), notice);
+    }
     Some(Reflexed::Answered(format!(
         "[reflex] 按剧本 [P:{playbook_id}] 回答了「{keys}」（局面：{}），没有叫醒模型；继续盯着",
         sit.kind.as_str()
@@ -7143,6 +7405,123 @@ mod tests {
         // 提交判定：回车 / 按编号即提交的菜单上发数字算；<Down> 不算
         assert!(keys_submit(b"y\r", &before));
         assert!(!keys_submit(b"\x1b[B", &before));
+    }
+
+    // ——— 复审修复（X 组） ———
+
+    fn cc_permission() -> super::super::situation::Situation {
+        use super::super::situation::{Choice, Program, Situation, SituationKind};
+        Situation {
+            frame_id: 2,
+            screen_hash: "h".into(),
+            program: Program::ClaudeCode,
+            kind: SituationKind::Permission,
+            topic: Some("Do you want to proceed?".into()),
+            options: vec![
+                Choice { index: Some("1".into()), text: "Yes".into(), grants_permanent: false },
+                Choice { index: Some("2".into()), text: "Yes, and don't ask again for this command".into(), grants_permanent: true },
+                Choice { index: Some("3".into()), text: "No".into(), grants_permanent: false },
+            ],
+            confidence: 0.95,
+            tail: "Do you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again for this command\n  3. No".into(),
+            evidence: vec![super::super::situation::SUBMIT_DIGIT.to_string()],
+            stale_ms: 0,
+            signature: "cc-perm".into(),
+        }
+    }
+
+    #[test]
+    fn chat_keys_refuse_permanent_pick_in_every_mode() {
+        use super::super::steward_mode::KeysVerdict;
+        let sit = cc_permission();
+        for approval in [true, false] {
+            assert!(matches!(chat_keys_verdict(b"2", &sit, approval), KeysVerdict::Refuse(_)), "approval={approval}");
+        }
+        // 选「本次允许」照常
+        assert!(!matches!(chat_keys_verdict(b"1", &sit, false), KeysVerdict::Refuse(_)));
+        // 口令提示上打字：拒
+        let mut pw = sit.clone();
+        pw.kind = super::super::situation::SituationKind::Password;
+        pw.options.clear();
+        assert!(matches!(chat_keys_verdict(b"hunter2\r", &pw, false), KeysVerdict::Refuse(_)));
+    }
+
+    fn shell_idle() -> super::super::situation::Situation {
+        use super::super::situation::{Program, Situation, SituationKind};
+        Situation {
+            frame_id: 3,
+            screen_hash: "s".into(),
+            program: Program::Shell,
+            kind: SituationKind::Idle,
+            topic: None,
+            options: vec![],
+            confidence: 0.9,
+            tail: "$ ".into(),
+            evidence: vec![],
+            stale_ms: 0,
+            signature: "idle".into(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exec_refused_at_a_yes_no_prompt_and_allowed_after_redraw() {
+        let yn = q("Do you want to continue? [Y/n]");
+        assert!(exec_blocker(&yn).is_some());
+        assert!(exec_blocker(&cc_permission()).is_some());
+        assert!(exec_blocker(&shell_idle()).is_none());
+        // 一直停在 [Y/n] 上：等满 1.5s 后拒绝
+        let t0 = tokio::time::Instant::now();
+        assert!(wait_shell_ready(|| yn.clone()).await.is_err());
+        assert!(t0.elapsed() >= Duration::from_millis(1_500));
+        // 上一条命令刚结束、提示符晚一点才画出来：等到了就放行
+        let n = std::cell::Cell::new(0);
+        let r = wait_shell_ready(|| {
+            n.set(n.get() + 1);
+            if n.get() < 3 { yn.clone() } else { shell_idle() }
+        })
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn llm_failures_park_hosted_and_compact_on_overflow() {
+        let e401 = "HTTP 401 Unauthorized: invalid api key";
+        assert_eq!(llm_failure_action(true, e401, false), LlmFailAction::Pause, "托管：401 暂停而不是失败");
+        assert_eq!(llm_failure_action(false, e401, false), LlmFailAction::Fail);
+        let long = "400: This model's maximum context length is 128000 tokens";
+        assert_eq!(llm_failure_action(false, long, false), LlmFailAction::CompactRetry);
+        assert_eq!(llm_failure_action(true, long, true), LlmFailAction::Pause, "压过一次还超长：托管暂停");
+        assert_eq!(llm_failure_action(false, long, true), LlmFailAction::Fail);
+        assert!(is_context_overflow("prompt is too long: 210000 tokens > 200000 maximum"));
+        // 狠压：长历史压到一半以内
+        let mut msgs = vec![ChatMessage::user("任务")];
+        for i in 0..30 {
+            msgs.push(ChatMessage::assistant(format!("第 {i} 步")));
+            msgs.push(ChatMessage::user("x".repeat(3_000)));
+        }
+        let before = super::super::compact::total_tokens(&msgs);
+        assert!(force_compact(&mut msgs));
+        assert!(super::super::compact::total_tokens(&msgs) < before);
+    }
+
+    #[test]
+    fn hosted_file_gate_matches_resolved_path() {
+        let mut ctx = ctx_with("auto");
+        ctx.authority.deny = vec!["/home/me/.config/app".into()];
+        let call = super::super::files_tool::FileCall::Write(super::super::files::WriteArgs {
+            target: None,
+            path: "~/.config/app/settings.toml".into(),
+            content: "x".into(),
+            create_dirs: false,
+        });
+        // 原始写法 `~/…` 匹配不上 deny，解析后的真实路径匹配上：拦
+        assert_eq!(super::super::host::gate::authorize(&ctx.policy(), &AgentAction::File(call.clone()), None), Gate::Allow);
+        let g = hosted_file_gate(&ctx.policy(), &call, Some("/home/me/.config/app/settings.toml"));
+        assert!(matches!(g, Gate::Deny(_)), "{g:?}");
+        // 反过来：deny 写的是 ~ 形式，原始写法就能匹配
+        let mut ctx2 = ctx_with("auto");
+        ctx2.authority.deny = vec!["~/.config/app".into()];
+        assert!(matches!(hosted_file_gate(&ctx2.policy(), &call, Some("/home/me/.config/app/settings.toml")), Gate::Deny(_)));
     }
 
     #[test]
