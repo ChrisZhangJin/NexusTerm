@@ -2419,3 +2419,12 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .host-checks li { word-break: break-word; }
 .host-checks li.ok { color: var(--accent); }
 .host-checks li.no { color: var(--danger); }
+
+/* ——— 文件工具：差异预览 ——— */
+.ap-diff { margin-top: 4px; }
+.ap-diff > summary { cursor: pointer; font-size: 11px; color: var(--text-dim); }
+.ap-diff-body { white-space: pre; overflow-x: auto; max-height: 360px; }
+.ap-diff-add { color: #7ec699; }
+.ap-diff-del { color: #e06c75; }
+.ap-diff-hunk { color: #61afef; }
+.ap-diff-meta { color: var(--text-dim); }
