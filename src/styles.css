@@ -2415,3 +2415,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .host-question { white-space: pre-wrap; word-break: break-word; margin-bottom: 6px; }
 .host-yolo.on { color: var(--danger); font-weight: 600; }
 .host-notice .st-esc-head { color: var(--accent); }
+.host-checks { margin: 4px 0; padding-left: 18px; font-size: 11.5px; color: var(--text-dim); }
+.host-checks li { word-break: break-word; }
+.host-checks li.ok { color: var(--accent); }
+.host-checks li.no { color: var(--danger); }

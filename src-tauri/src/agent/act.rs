@@ -3890,6 +3890,13 @@ pub async fn run(
             }
             // 托管：没有动作的回复不是结束，按 nx_ask_user(text) 处理 —— 挂起等用户答复
             if let Some(h) = &host {
+                // 看门狗：这一轮没有动作（只说话）。连续几轮这样就是空转（Thrash），提示跟着用户的答复一起给模型
+                let sit = situation_now(app, state, &h.console_id, false);
+                let obs = super::host::watchdog::StepObs { action_fp: 0, sig: sit.signature.clone(), fb_hash: fnv(&text), acted: false };
+                if let Some((alarm, _)) = h.watch_step(obs) {
+                    feedback.push_str(&alarm.hint());
+                    feedback.push('\n');
+                }
                 h.flush_progress(&messages, step);
                 if !park_on_no_action(h, &text, &mut messages, &mut feedback).await {
                     break;
@@ -3922,6 +3929,9 @@ pub async fn run(
         partial_answer.clear();
 
         took_over = false;
+        // 看门狗要的这一轮指纹（动作被下面的循环消费掉之前算）
+        let round_fp = action_fingerprint(&actions);
+        let round_all_watch = actions.iter().all(|a| matches!(a, AgentAction::Watch { .. }));
         // 本轮里模型调用了 nx_complete / 对话模式下的 nx_ask_user：做完这一步就收场
         let mut finished = false;
         for action in actions {
@@ -4009,12 +4019,57 @@ pub async fn run(
                         }
                     }
                     emit_step(app, &session, StepPayload { text: Some(text), ..StepPayload::new("answer", step) });
-                    if let Some(h) = &host {
-                        // TODO(PR7)：在这里跑 `host::verify(success_criteria)`：有未满足项发 CompleteRejected
-                        // （反馈「未满足：…」、仍 Running），只剩 Manual 项出 ManualCheck 卡；现在直接视为全部通过
-                        let _ = h.apply(HostEvent::CompleteVerified { summary, checks: Vec::new() });
+                    let Some(h) = &host else {
+                        finished = true;
+                        break;
+                    };
+                    // 托管：逐条核验完成判据（只读、过闸），不靠模型自己说完成
+                    let ctx = h.ctx();
+                    let mut prober = ActProber { app, state, runtime, run_key: &run_key, console: &h.console_id, step, cancel: &cancel };
+                    let results = super::host::verify::verify(&ctx.contract.success_criteria, &ctx.policy(), &mut prober).await;
+                    let evidence = super::host::verify::evidence_text(&results);
+                    emit_step(
+                        app,
+                        &session,
+                        StepPayload { text: Some(format!("完成判据核验：\n{evidence}")), ..StepPayload::new("note", step) },
+                    );
+                    match super::host::verify::verdict(&results) {
+                        super::host::verify::Verdict::AllPassed => {
+                            let _ = h.apply(HostEvent::CompleteVerified { summary, checks: results });
+                            finished = true;
+                        }
+                        super::host::verify::Verdict::Unmet(unmet) => {
+                            // 仍 Running：「未满足：…」经副作用并进下一步的反馈，附逐条证据
+                            let _ = h.apply(HostEvent::CompleteRejected(unmet));
+                            for f in h.take_feedback() {
+                                feedback.push_str(&f);
+                                feedback.push('\n');
+                            }
+                            feedback.push_str("（nx_complete 没有被接受，任务仍在进行。逐条结果：\n");
+                            feedback.push_str(&evidence);
+                            feedback.push_str("）\n");
+                        }
+                        super::host::verify::Verdict::ManualOnly => {
+                            // 自动项都过了，只剩人工项：出确认卡；批准 → Completed，驳回 → 带着用户的话回到 Running
+                            let mut card = hosted_card(
+                                &format!("AI 说已经完成：{summary}\n自动判据都通过了，剩下的需要你确认。"),
+                                Vec::new(),
+                                None,
+                            );
+                            card.kind = super::host::CardKind::ManualCheck { summary: summary.clone(), checks: results.clone() };
+                            card.reasons = results.iter().map(|r| format!("{} {}：{}", if r.passed { "✓" } else { "待确认" }, r.check.describe(), r.detail)).collect();
+                            h.flush_progress(&messages, step);
+                            match h.ask(card).await {
+                                ParkEnd::Running => {
+                                    for f in h.take_feedback() {
+                                        feedback.push_str(&f);
+                                        feedback.push('\n');
+                                    }
+                                }
+                                _ => finished = true,
+                            }
+                        }
                     }
-                    finished = true;
                     break;
                 }
                 AgentAction::Reject { command, hint } => {
@@ -4668,6 +4723,7 @@ pub async fn run(
                     let mut last_hash = String::new();
                     let mut last_beat = std::time::Instant::now();
                     let mut stop: Option<(super::watch::Reason, super::situation::Situation)> = None;
+                    let mut reflexes = 0usize;
                     loop {
                         if cancel.load(Ordering::Relaxed) {
                             stop = Some((super::watch::Reason::Cancelled, situation_now(app, state, &target_id, false)));
@@ -4727,6 +4783,21 @@ pub async fn run(
                             elapsed_ms,
                             &wcfg,
                         ) {
+                            // 托管的反射快路径：要人处理的局面若有确定的剧本答案、闸门直接放行，就代答并接着盯，
+                            // 不叫醒模型（零 LLM 调用）。同一次盯梢最多代答几次，防止和程序来回打转
+                            if let (Some(h), super::watch::Reason::NeedsAttention(_)) = (&host, r) {
+                                if reflexes < MAX_REFLEX_PER_WATCH {
+                                    if let Some(note) = try_reflex(app, state, runtime, h, &run_key, &target_id, &sit, &cancel).await {
+                                        reflexes += 1;
+                                        feedback.push_str(&note);
+                                        feedback.push('\n');
+                                        emit_step(app, &session, StepPayload { text: Some(note), ..StepPayload::new("note", step) });
+                                        last_change = std::time::Instant::now();
+                                        tokio::time::sleep(Duration::from_millis(super::watch::POLL_MS)).await;
+                                        continue;
+                                    }
+                                }
+                            }
                             stop = Some((r, sit));
                             break;
                         }
@@ -5313,6 +5384,18 @@ pub async fn run(
             h.set_spent(meter.contract_spent());
             // 周期快照：距上次 ≥30s 且对话变了才克隆历史落盘（不是每步都克隆）
             h.tick_progress(&messages, step);
+            // 看门狗：每步喂一次观察。L1 往反馈里加提示；L2 强制出卡（附最近 5 条决策记录）
+            if !finished && !h.is_terminal() {
+                let sit = situation_now(app, state, &h.console_id, false);
+                // nx_watch 一挂就是几分钟，反馈里的计时每次都不同：只有屏幕真变了才算进展
+                let fb_hash = if round_all_watch { fnv(&sit.screen_hash) } else { fnv(&feedback) };
+                let obs = super::host::watchdog::StepObs { action_fp: round_fp, sig: sit.signature.clone(), fb_hash, acted: true };
+                if let Some((alarm, level)) = h.watch_step(obs) {
+                    if !watchdog_react(app, state, h, &session, step, &alarm, level, &mut messages, &mut feedback).await {
+                        break;
+                    }
+                }
+            }
         }
         if finished {
             break;
@@ -5477,6 +5560,154 @@ fn hosted_approval_card(text: &str, reasons: &[String]) -> super::host::HumanCar
 /// （托管 = `gate::authorize` 当时抓的那份）。审批 / 交还控制权可能等了很久，屏幕换了局面就不发。
 fn keys_recheck(judged: &super::situation::Situation, now: &super::situation::Situation) -> Option<String> {
     super::situation::materially_changed(judged, now).map(|why| format!("等待期间屏幕局面变了：{why}"))
+}
+
+/// 一次盯梢里反射代答的上限：超过就叫醒模型（多半是剧本和程序在来回打转）。
+const MAX_REFLEX_PER_WATCH: usize = 3;
+
+/// 稳定的 64 位哈希（FNV-1a），看门狗指纹用：进程间 / 重启后一致，能随 checkpoint 持久化。
+fn fnv(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// 一轮动作的指纹：每个动作的「种类 + 目标 + 规整后的命令 / 按键」。空白差异不算不同。
+fn action_fingerprint(actions: &[AgentAction]) -> u64 {
+    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let parts: Vec<String> = actions
+        .iter()
+        .map(|a| match a {
+            AgentAction::Exec { target, command } => format!("exec|{}|{}", target.as_deref().unwrap_or(""), norm(command)),
+            AgentAction::Keys { target, keys } => format!("keys|{}|{}", target.as_deref().unwrap_or(""), norm(keys)),
+            other => norm(&format!("{other:?}")),
+        })
+        .collect();
+    fnv(&parts.join("\n"))
+}
+
+/// 看门狗警报的处置。返回 false = 任务已取消 / 结束，主循环该退出。
+#[allow(clippy::too_many_arguments)]
+async fn watchdog_react(
+    app: &AppHandle,
+    state: &AppState,
+    h: &HostShared,
+    session: &str,
+    step: usize,
+    alarm: &super::host::watchdog::Alarm,
+    level: super::host::watchdog::Level,
+    messages: &mut Vec<ChatMessage>,
+    feedback: &mut String,
+) -> bool {
+    let hint = alarm.hint();
+    emit_step(app, session, StepPayload { text: Some(hint.clone()), ..StepPayload::new("note", step) });
+    if level == super::host::watchdog::Level::L1 {
+        feedback.push_str(&hint);
+        feedback.push('\n');
+        return true;
+    }
+    // L2：同一问题提示过一次还在发生 → 停下来问人，卡片附最近的决策记录
+    let card = watchdog_card(alarm, recent_decisions(state, h.contract_id(), super::host::watchdog::L2_RECENT_DECISIONS));
+    h.flush_progress(messages, step);
+    host_ask(h, card, messages).await
+}
+
+/// 看门狗 L2 卡片：警报 + 最近的决策记录，等人决定怎么继续。
+fn watchdog_card(alarm: &super::host::watchdog::Alarm, records: Vec<String>) -> super::host::HumanCard {
+    let mut card = hosted_card(
+        &format!("{}\n提示过一次仍未改善，先停下来等你看一眼：要它怎么继续？", alarm.hint()),
+        Vec::new(),
+        None,
+    );
+    card.kind = super::host::CardKind::Watchdog;
+    card.reasons = records;
+    card
+}
+
+/// 某契约最近几条决策记录（新的在前），给看门狗卡片看。
+fn recent_decisions(state: &AppState, contract_id: &str, n: usize) -> Vec<String> {
+    state
+        .store
+        .steward_decisions(200)
+        .into_iter()
+        .filter_map(|(seq, outcome, raw)| {
+            let r: super::decision::DecisionRecord = serde_json::from_str(&raw).ok()?;
+            (r.contract_id == contract_id).then(|| {
+                format!("#{seq} {} 「{}」→ {outcome}{}", r.chosen.kind, r.chosen.text, if r.llm_used { "" } else { "（反射）" })
+            })
+        })
+        .take(n)
+        .collect()
+}
+
+/// 判据核验用的现场：读屏走 `situation_now`；命令走与 nx_exec 相同的执行通道（先过控制权闸）。
+struct ActProber<'a> {
+    app: &'a AppHandle,
+    state: &'a AppState,
+    runtime: &'a ActRuntime,
+    run_key: &'a str,
+    console: &'a str,
+    step: usize,
+    cancel: &'a Arc<AtomicBool>,
+}
+
+impl super::host::verify::Prober for ActProber<'_> {
+    fn screen(&self) -> String {
+        situation_now(self.app, self.state, self.console, false).tail
+    }
+
+    fn run(&mut self, cmd: &str) -> impl std::future::Future<Output = Result<String, String>> + Send {
+        let cmd = cmd.to_string();
+        async move {
+            match gate_drive(self.app, self.runtime, self.run_key, self.console, self.cancel).await {
+                control::PauseWait::Ready => {}
+                _ => return Err("已取消".to_string()),
+            }
+            run_one(self.state, self.app, self.console, &cmd, self.step, "判据核验", self.console, Some(self.cancel), true)
+                .await
+                .map(|o| o.output)
+        }
+    }
+}
+
+/// 反射代答：剧本 + 策略 + 托管闸门都放行时，在同一租约下写入（写前过控制权闸与 keys_recheck），
+/// 落一条 `DecisionRecord{llm_used:false}`。返回给模型的那一行 `[reflex] …`；不代答返回 None（叫醒模型）。
+#[allow(clippy::too_many_arguments)]
+async fn try_reflex(
+    app: &AppHandle,
+    state: &AppState,
+    runtime: &ActRuntime,
+    h: &HostShared,
+    run_key: &str,
+    target: &str,
+    sit: &super::situation::Situation,
+    cancel: &AtomicBool,
+) -> Option<String> {
+    let brain = app.try_state::<super::profile::StewardBrain>()?;
+    let ctx = h.ctx();
+    let playbook = brain.match_playbook(sit, &ctx.contract.host_key);
+    let super::host::reflex::Reflex::Answer { bytes, keys, record, playbook_id } =
+        super::host::reflex::decide(playbook, sit, &ctx, super::steward::now_ms())
+    else {
+        return None;
+    };
+    if gate_drive(app, runtime, run_key, target, cancel).await != control::PauseWait::Ready {
+        return None;
+    }
+    // 判定之后屏幕换了局面就不发（与 nx_send_keys 同一条复核）
+    if keys_recheck(sit, &situation_now(app, state, target, false)).is_some() {
+        return None;
+    }
+    if let Err(e) = send_keys(state, target, &bytes).await {
+        tracing::warn!("反射代答写入失败：{e}");
+        return None;
+    }
+    let seq = super::steward_loop::persist_decision(app, &record);
+    brain.remember_decision(seq, &record);
+    Some(format!("[reflex] 按剧本 [P:{playbook_id}] 回答了「{keys}」（局面：{}），没有叫醒模型；继续盯着", sit.kind.as_str()))
 }
 
 /// 接驳后强制读屏的结果（喂给模型）。屏幕尾部已脱敏（出网前还会再过一遍闸门）。
@@ -5934,6 +6165,125 @@ mod tests {
         assert!(why.contains("等待期间屏幕局面变了"));
         // 局面没变则照发
         assert!(keys_recheck(&judged, &judged.clone()).is_none());
+    }
+
+    // ——— PR7：判据核验 / 看门狗 ———
+
+    #[tokio::test(start_paused = true)]
+    async fn criteria_fail_stays_running_with_evidence() {
+        let (h, io) = super::super::host::driver::tests::shared();
+        let unmet = vec!["命令成功：`grep -q ok /tmp/r` —— 退出码 1；".to_string()];
+        assert_eq!(h.apply(HostEvent::CompleteRejected(unmet)).unwrap(), HostPhase::Running);
+        let fb = h.take_feedback();
+        assert_eq!(fb.len(), 1);
+        assert!(fb[0].starts_with("未满足：") && fb[0].contains("退出码 1"), "{fb:?}");
+        assert_eq!(*io.released.lock(), 0, "没完成就不放租约");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_only_card_then_approve_completes() {
+        use super::super::host::{Check, CheckResult};
+        let (h, io) = super::super::host::driver::tests::shared();
+        let checks = vec![
+            CheckResult { check: Check::FileExists { path: "/srv/dist".into() }, passed: true, detail: "存在".into() },
+            CheckResult { check: Check::Manual { text: "页面能打开".into() }, passed: false, detail: "待人工确认".into() },
+        ];
+        let mut card = hosted_card("AI 说已经完成", Vec::new(), None);
+        card.kind = super::super::host::CardKind::ManualCheck { summary: "部署完成".into(), checks: checks.clone() };
+        let id = card.id.clone();
+        let h2 = h.clone();
+        let task = tokio::spawn(async move { h2.ask(card).await });
+        settle().await;
+        assert!(matches!(h.phase(), HostPhase::WaitingHuman { .. }));
+        h.send(HostEvent::Answer(super::super::host::CardReply { card_id: id, text: String::new(), approved: Some(true) }));
+        match task.await.unwrap() {
+            ParkEnd::Ended(HostPhase::Completed { summary, checks }) => {
+                assert_eq!(summary, "部署完成");
+                assert!(checks.iter().all(|c| c.passed), "人工项确认后算通过");
+            }
+            e => panic!("{e:?}"),
+        }
+        assert_eq!(*io.released.lock(), 1, "完成才放租约");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_alarm_l1_then_l2_card_with_records() {
+        use super::super::host::watchdog::{Alarm, Level, StepObs};
+        let (h, _io) = super::super::host::driver::tests::shared();
+        let acts = vec![exec("systemctl restart nginx")];
+        let fp = action_fingerprint(&acts);
+        // 空白不同算同一个动作
+        assert_eq!(fp, action_fingerprint(&[exec("systemctl  restart   nginx ")]));
+        let obs = || StepObs { action_fp: fp, sig: "shell:failed".into(), fb_hash: fnv("Job failed"), acted: true };
+        let mut got = Vec::new();
+        for _ in 0..6 {
+            if let Some(x) = h.watch_step(obs()) {
+                got.push(x);
+            }
+        }
+        assert!(matches!(got[0], (Alarm::Loop { n: 3, .. }, Level::L1)), "{got:?}");
+        let l2 = got.iter().find(|(a, l)| matches!(a, Alarm::Loop { .. }) && *l == Level::L2);
+        assert!(l2.is_some(), "同一警报再来一次升 L2：{got:?}");
+        let card = watchdog_card(&l2.unwrap().0, vec!["#12 exec 「systemctl restart nginx」→ applied".into()]);
+        assert_eq!(card.kind, super::super::host::CardKind::Watchdog);
+        assert_eq!(card.reasons.len(), 1);
+        // L2 卡片让任务挂起等人
+        let h2 = h.clone();
+        let task = tokio::spawn(async move { h2.ask(card).await });
+        settle().await;
+        assert!(matches!(h.phase(), HostPhase::WaitingHuman { ref card } if card.kind == super::super::host::CardKind::Watchdog));
+        h.send(HostEvent::Stop);
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn no_progress_and_thrash_alarms() {
+        use super::super::host::watchdog::{Alarm, StepObs};
+        let (h, _io) = super::super::host::driver::tests::shared();
+        let mut got = Vec::new();
+        for i in 0..6u64 {
+            // 每步动作不同，但屏幕和反馈都没变
+            if let Some((a, _)) = h.watch_step(StepObs { action_fp: i, sig: "s".into(), fb_hash: 7, acted: true }) {
+                got.push(a);
+            }
+        }
+        assert!(got.iter().any(|a| matches!(a, Alarm::NoProgress { .. })), "{got:?}");
+        let (h, _io) = super::super::host::driver::tests::shared();
+        let mut got = Vec::new();
+        for i in 0..3u64 {
+            if let Some((a, _)) = h.watch_step(StepObs { action_fp: 0, sig: format!("s{i}"), fb_hash: i, acted: false }) {
+                got.push(a);
+            }
+        }
+        assert!(matches!(got.as_slice(), [Alarm::Thrash { rounds: 3 }]), "{got:?}");
+    }
+
+    #[test]
+    fn watchdog_state_survives_checkpoint_restore() {
+        use super::super::host::checkpoint::HostCheckpoint;
+        use super::super::host::watchdog::{Level, StepObs};
+        let (h, _io) = super::super::host::driver::tests::shared();
+        let obs = || StepObs { action_fp: 42, sig: "same".into(), fb_hash: 1, acted: true };
+        let mut l1 = false;
+        for _ in 0..3 {
+            l1 |= matches!(h.watch_step(obs()), Some((_, Level::L1)));
+        }
+        assert!(l1);
+        // 落盘 → 读回 → 新任务恢复（rebase）后，同一警报再来就是 L2，而不是从 L1 重新开始
+        let ctx = h.ctx();
+        let mut cp = HostCheckpoint::new(ctx.contract, ctx.authority, Default::default(), 1);
+        cp.watchdog = h.watchdog();
+        let back = HostCheckpoint::from_json(&cp.to_json(2).unwrap()).unwrap();
+        assert_eq!(back.watchdog, h.watchdog());
+        let (h2, _io) = super::super::host::driver::tests::shared();
+        h2.restore_watchdog(back.watchdog);
+        let mut lvl = None;
+        for _ in 0..3 {
+            if let Some((_, l)) = h2.watch_step(obs()) {
+                lvl = Some(l);
+            }
+        }
+        assert_eq!(lvl, Some(Level::L2));
     }
 
     #[test]

@@ -147,6 +147,10 @@ impl HostIo for AppHostIo {
         record_progress(&mut self.snap.lock(), messages, step, spent);
     }
 
+    fn note_watchdog(&self, w: &super::host::watchdog::WatchdogState) {
+        self.snap.lock().watchdog = w.clone();
+    }
+
     fn note_notice(&self, notice: Option<&str>) {
         *self.notice.lock() = notice.map(str::to_string);
     }
@@ -690,6 +694,7 @@ fn shared_from_checkpoint(app: &AppHandle, cp: &HostCheckpoint) -> Arc<HostShare
     ctx.label = cp.console.label.clone();
     h.set_ctx(ctx, None);
     h.set_spent(cp.spent);
+    h.restore_watchdog(cp.watchdog.clone());
     h
 }
 
