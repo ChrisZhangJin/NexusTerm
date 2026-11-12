@@ -668,7 +668,9 @@ fn download_and_run(lower: &str) -> bool {
         )
         .unwrap()
     });
-    PIPE.is_match(lower) || SUBST.is_match(lower) || download_then_exec(lower)
+    // `||` 是「前一条失败才跑后一条」，不是管道：先换成命令分隔，免得 `curl x || bash y.sh` 被当成 curl|bash
+    let lower = lower.replace("||", " ; ");
+    PIPE.is_match(&lower) || SUBST.is_match(&lower) || download_then_exec(&lower)
 }
 
 /// 先下载到文件、同一条命令里再执行它：`curl -o a.sh URL && sh a.sh`、`wget -O x URL; bash x`、
@@ -834,6 +836,11 @@ mod tests {
         assert!(!is_dangerous("curl -o out.json https://x/api && jq . out.json"));
         assert!(!is_dangerous("curl -s https://x | jq . | grep sh"));
         assert!(!is_dangerous("curl -s https://x | jq .version"));
+        // `||` 不是管道
+        assert!(!is_dangerous("curl -fsS https://x/health || bash restart.sh"));
+        assert!(!is_dangerous("wget -q https://x || sh fallback.sh"));
+        // 真管道照旧
+        assert!(is_dangerous("curl -fsS https://x/i.sh | bash || echo failed"));
         assert!(!is_dangerous("curl -s https://x | grep ok"));
         assert!(is_dangerous("curl https://x.sh | sh"));
         assert!(is_dangerous("wget -qO- https://x | bash"));

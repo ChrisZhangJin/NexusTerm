@@ -340,7 +340,7 @@ pub async fn run<A: Approver>(
 /// - nx_edit：new_string 里的占位符多于 old_string；
 /// - nx_write：差异里新增行的占位符多于删除行；预览不完整、看不全差异时，内容里出现占位符就拒。
 pub(crate) fn placeholder_wipe(call: &FileCall, pending: &PendingChange) -> Option<String> {
-    let n = |t: &str| t.matches(redact::PLACEHOLDER).count();
+    let n = placeholder_count;
     let more = match call {
         FileCall::Edit(a) => n(&a.new_string) > n(&a.old_string),
         FileCall::Write(a) => {
@@ -371,6 +371,25 @@ pub(crate) fn placeholder_wipe(call: &FileCall, pending: &PendingChange) -> Opti
             redact::PLACEHOLDER
         )
     })
+}
+
+/// 文本里「看起来是脱敏占位符」的个数：`[REDACTED]` 及大小写 / 带类型的变体（`[redacted]`、
+/// `[REDACTED:EMAIL]`）、`<redacted>`，以及凭据名键（password / secret / token / api_key…）的**整个值**
+/// 是 `***`（≥3 个星号）的写法。正文里的 `***粗体***`、`***` 分隔线不算。
+pub(crate) fn placeholder_count(text: &str) -> usize {
+    use std::sync::OnceLock;
+    static TAGS: OnceLock<regex::Regex> = OnceLock::new();
+    static STARS: OnceLock<regex::Regex> = OnceLock::new();
+    let tags = TAGS.get_or_init(|| {
+        regex::Regex::new(r"(?i)\[redacted(?:[:\-][^\]\n]{0,40})?\]|<redacted>").expect("占位符正则")
+    });
+    let stars = STARS.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?im)^[ \t]*(?:export[ \t]+|-[ \t]+)?["']?[A-Za-z0-9_.\-]*(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|passphrase|credential|auth)[A-Za-z0-9_]*["']?[ \t]*[:=][ \t]*["']?\*{3,}["']?[ \t]*[,;]?[ \t]*$"#,
+        )
+        .expect("星号占位正则")
+    });
+    tags.find_iter(text).count() + stars.find_iter(text).count()
 }
 
 async fn prepare(ops: &FileOps<'_>, call: &FileCall, allow_sensitive: bool) -> Result<PendingChange, FileError> {
@@ -615,6 +634,46 @@ mod tests {
         });
         assert!(run(&ops, &good_edit, WriteGate::Auto, &mut ask(true), false).await.ok);
         assert!(String::from_utf8(t.get("/home/me/app/.env").unwrap()).unwrap().contains("DB_PASSWORD=hunter2hunter2"));
+    }
+
+    #[test]
+    fn placeholder_variants_are_counted_but_markdown_stars_are_not() {
+        for (t, n) in [
+            ("KEY=[REDACTED]", 1),
+            ("KEY=[redacted]", 1),
+            ("mail=[REDACTED:EMAIL]", 1),
+            ("token: <redacted>", 1),
+            ("DB_PASSWORD=***", 1),
+            ("  api_key: \"******\"", 1),
+            ("export SECRET_TOKEN='****'", 1),
+            ("password: ***,", 1),
+            ("a=[REDACTED]\nb=[redacted]\nTOKEN=***", 3),
+            // 不算
+            ("This is ***bold*** text", 0),
+            ("***", 0),
+            ("---\n***\n---", 0),
+            ("note=***", 0),
+            ("PASSWORD=***real", 0),
+            ("rating: *** (3 stars)", 0),
+        ] {
+            assert_eq!(placeholder_count(t), n, "{t:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn star_and_lowercase_variants_are_refused_on_write() {
+        let t = FakeTransport::new("/home/me");
+        let original = b"DB_HOST=db\nDB_PASSWORD=hunter2hunter2\nAPI_TOKEN=tok-abc\n";
+        t.add_file("/home/me/app/.env", original);
+        let ops = FileOps::new(&t, FileOpsConfig::default());
+        for bad in ["DB_HOST=db2\nDB_PASSWORD=***\nAPI_TOKEN=tok-abc\n", "DB_HOST=db2\nDB_PASSWORD=[redacted]\nAPI_TOKEN=tok-abc\n"] {
+            let out = run(&ops, &write_call("/home/me/app/.env", bad), WriteGate::Auto, &mut ask(true), false).await;
+            assert!(!out.ok, "{bad:?}");
+            assert_eq!(t.get("/home/me/app/.env").unwrap(), original.to_vec());
+        }
+        // Markdown 里的 *** 照常写
+        let ok = run(&ops, &write_call("/home/me/README.md", "# T\n\n***\n\n***bold***\n"), WriteGate::Auto, &mut ask(true), false).await;
+        assert!(ok.ok, "{}", ok.feedback);
     }
 
     #[tokio::test]
