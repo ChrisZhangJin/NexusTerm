@@ -365,7 +365,9 @@ mod tests {
         // 没禁 delete：rm 不再被拒，但仍要过 danger（rm 一律需要批准）
         assert!(is_approve(&authorize(&p, &exec("rm -rf /tmp/x"), None)));
         assert!(is_approve(&authorize(&p, &exec("rm a.txt"), None)));
-        assert_eq!(authorize(&p, &exec("git push --force"), None), Gate::Allow);
+        // 没禁 force_push：不再被拒，但 danger 把强推判为需要批准
+        assert!(is_approve(&authorize(&p, &exec("git push --force"), None)));
+        assert_eq!(authorize(&p, &exec("git push origin main"), None), Gate::Allow);
     }
 
     #[test]
