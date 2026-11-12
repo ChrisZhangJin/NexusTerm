@@ -310,6 +310,7 @@ pub fn run() {
             agent::cmd::agent_history_load,
             agent::cmd::agent_history_save,
             agent::cmd::agent_history_clear,
+            agent::cmd::agent_conversation_reset,
             agent::cmd::agent_stats,
             agent::cmd::agent_user_command,
             agent::cmd::agent_timeline,

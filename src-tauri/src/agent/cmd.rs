@@ -115,6 +115,12 @@ pub async fn agent_history_save(
     state.store.agent_conv_save(&cleaned)
 }
 
+/// 「新对话」：下一次提问不再接着之前的模型消息历史（面板上的记录不动）。
+#[tauri::command]
+pub fn agent_conversation_reset(state: State<'_, AppState>) -> Result<(), String> {
+    state.store.agent_llm_clear()
+}
+
 /// 「清空对话」：真删已保存的对话与运行摘要。
 #[tauri::command]
 pub fn agent_history_clear(state: State<'_, AppState>) -> Result<(), String> {

@@ -7,6 +7,7 @@
  */
 
 import { DiffView } from "./DiffView";
+import { TodoList } from "./TodoList";
 import { useEffect, useRef, useState } from "react";
 import { MemoryStepCard } from "./HostMemory";
 import { isHandEyeKind } from "../lib/agentRun";
@@ -182,6 +183,8 @@ function StepCard({ step }: { step: AgentStep }) {
     return <div className="ap-note ap-paused">{step.text ?? ""}</div>;
   }
   if (step.kind === "memory") return <MemoryStepCard step={step} />;
+  // 计划清单：整表替换，每次都画最新一版
+  if (step.kind === "todo") return <TodoList items={step.todo ?? []} />;
   // 文件工具：读 / 查找 / 搜索一行带过；写 / 改带差异预览
   if (step.kind === "file") {
     const failed = step.text !== undefined && step.text !== "完成";

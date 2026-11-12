@@ -243,6 +243,8 @@ pub enum AgentAction {
     Complete { summary: String, evidence: Vec<String> },
     /// 文件工具（`nx_read` / `nx_write` / `nx_edit` / `nx_glob` / `nx_grep`，见 `files_tool`）
     File(super::files_tool::FileCall),
+    /// 计划清单（`nx_todo`，整表替换，见 `todo`）
+    Todo(Vec<super::todo::TodoItem>),
 }
 
 /// 对标签页能做些什么。
@@ -757,6 +759,7 @@ pub fn tool_specs() -> Vec<llm::ToolSpec> {
     .into_iter()
     // 文件工具（读 / 写 / 改 / 查找 / 搜索），对话与托管都有
     .chain(super::files::file_tool_specs())
+    .chain(std::iter::once(super::todo::tool_spec()))
     .collect()
 }
 
@@ -816,6 +819,7 @@ fn tool_action_name(name: &str) -> Option<&'static str> {
         super::files::TOOL_EDIT => Some("edit"),
         super::files::TOOL_GLOB => Some("glob"),
         super::files::TOOL_GREP => Some("grep"),
+        super::todo::TOOL_TODO => Some("todo"),
         _ => None,
     }
 }
@@ -864,6 +868,9 @@ pub fn actions_from_tool_call(call: &llm::ToolCall) -> Vec<AgentAction> {
     };
     if matches!(action, "ask_user" | "complete") {
         return parse_host_action(action, &args);
+    }
+    if action == "todo" {
+        return super::todo::parse(&args).map(AgentAction::Todo).into_iter().collect();
     }
     if let Some(c) = super::files_tool::FileCall::parse(call.name.trim(), &args) {
         return vec![AgentAction::File(c)];
@@ -929,6 +936,7 @@ pub fn tool_label(name: &str, args: &str) -> &'static str {
         super::files::TOOL_EDIT => "改文件",
         super::files::TOOL_GLOB => "查找文件",
         super::files::TOOL_GREP => "搜索文件内容",
+        super::todo::TOOL_TODO => "更新计划",
         TOOL_SKILL => match serde_json::from_str::<serde_json::Value>(args)
             .ok()
             .and_then(|v| v.get("op").and_then(|o| o.as_str()).map(|s| s.to_string()))
@@ -1008,6 +1016,9 @@ pub struct StepPayload {
     /// `kind:"paused"` 专用：为什么暂停（`steps` | `time` | `output` | `user`）。只有分类，没有内容。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pause_kind: Option<String>,
+    /// `kind:"todo"` 专用：整张计划清单
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub todo: Option<Vec<super::todo::TodoItem>>,
 }
 
 impl StepPayload {
@@ -1030,6 +1041,7 @@ impl StepPayload {
             memory_id: None,
             skill_status: None,
             pause_kind: None,
+            todo: None,
         }
     }
 }
@@ -1228,6 +1240,9 @@ fn parse_block(raw: &str) -> Vec<AgentAction> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim()) {
         if let Some(a @ ("ask_user" | "complete")) = v.get("action").and_then(|a| a.as_str()) {
             return parse_host_action(a, &v);
+        }
+        if v.get("action").and_then(|a| a.as_str()) == Some("todo") {
+            return super::todo::parse(&v).map(AgentAction::Todo).into_iter().collect();
         }
         if let Some(a @ ("read" | "write" | "edit" | "glob" | "grep")) = v.get("action").and_then(|a| a.as_str()) {
             return super::files_tool::FileCall::parse(&format!("nx_{a}"), &v).map(AgentAction::File).into_iter().collect();
@@ -1549,7 +1564,7 @@ pub const AGENTIC_SYSTEM_PROMPT_INTRO: &str = concat!(
 /// 之前自定义路径用的是压缩版说明，结果用户的提示词里写着「只给结论与必要命令」，
 /// 模型就真把 shell 直接抄进围栏 —— 协议写歪了，界面上什么都不发生。
 pub const ACTION_PROTOCOL: &str = concat!(
-    "【优先用工具】你有 nx_exec / nx_send_keys / nx_wait / nx_watch / nx_screen / nx_secret / nx_export / nx_open_tab / nx_tab / nx_memory / nx_skill / nx_read / nx_write / nx_edit / nx_glob / nx_grep 共十六个工具。",
+    "【优先用工具】你有 nx_exec / nx_send_keys / nx_wait / nx_watch / nx_screen / nx_secret / nx_export / nx_open_tab / nx_tab / nx_memory / nx_skill / nx_read / nx_write / nx_edit / nx_glob / nx_grep / nx_todo 共十七个工具。",
     "能用工具调用时**直接用工具**，不要写成下面的围栏文本；",
     "只有当你确认自己无法发起工具调用时，才退化成围栏代码块。\n",
     "**绝不要把界面动作当成 shell 命令**：`new-tab`、`reconnect`、`close-tab`、",
@@ -1560,6 +1575,8 @@ pub const ACTION_PROTOCOL: &str = concat!(
     "**nx_exec 只接受单行命令**：多行脚本、配置、heredoc 一类的内容，先用 nx_write 写成文件，再 nx_exec 执行它",
     "（例如写 /tmp/fix.sh 后 nx_exec `sh /tmp/fix.sh`），不要用 printf / echo 硬拼多行。",
     "写文件会按审批设置请用户确认，并展示差异。\n\n",
+    "【计划】三步以上的任务先用 nx_todo 列出计划（每次调用整表替换），推进时更新每项状态",
+    "（pending / in_progress / done）；清单会一直显示在系统提示的「当前计划」里，历史被压缩也不会丢。\n\n",
     "【要执行命令时】在回复里写且只写这样一个围栏代码块（不写 action 等同 \"exec\"）：\n",
     "```nx-exec\n{\"action\":\"exec\",\"target\":\"<会话id>\",\"command\":\"<命令>\"}\n```\n",
     "一次要对多台机器发同一批命令时，用 targets / commands 两个数组：\n",
@@ -3488,11 +3505,16 @@ pub async fn run(
     }
     // 上一轮摘要拼在第一条 user 消息前面（同一条消息，避免连续两条 user）；
     // 落盘时已脱敏，开关为真时出网前再过一遍闸门。
-    let mut messages = vec![ChatMessage::user(format!(
-        "{}{}",
-        scrub(acct.redact, &prior_runs),
-        plan_message(state, req, &targets, max_bytes, capture.as_deref(), acct.redact)
-    ))];
+    // 对话模式的连续性：同一面板对话里的追问接着之前的模型消息历史（已压缩、已脱敏）；
+    // 「新对话」清掉它之后才从零开始（那时带上最近几轮运行摘要）
+    let continuing = host.is_none() && !req.is_steward();
+    let prior_history = if continuing { load_chat_history(state) } else { Vec::new() };
+    let plan_text = plan_message(state, req, &targets, max_bytes, capture.as_deref(), acct.redact);
+    let mut messages = if prior_history.is_empty() {
+        vec![ChatMessage::user(format!("{}{}", scrub(acct.redact, &prior_runs), plan_text))]
+    } else {
+        seed_followup(prior_history, plan_text)
+    };
 
     let session = req.session_id.clone();
     let trace_on = cfg.trace;
@@ -3538,6 +3560,12 @@ pub async fn run(
     let specs = if host.is_some() { hosted_tool_specs() } else { tool_specs() };
     // 本轮动作里是否撞上了「用户接管且超时」：置位后跳出当前动作列表，别再逐个空等
     let mut took_over: bool;
+    // 原生工具调用的回执配对：上一条 assistant 发起的调用 id，以及每个调用在 feedback 里的起点
+    // （id = "" 是哨兵：之后的文字不属于任何调用）。循环顶据此把 feedback 切成逐个调用的 tool_result
+    let mut round_ids: Vec<String> = Vec::new();
+    let mut spans: Vec<(String, usize)> = Vec::new();
+    // 计划清单（nx_todo）：每轮渲染进系统提示；托管随 checkpoint 落盘
+    let mut todo: Vec<super::todo::TodoItem> = host.as_ref().map(|h| h.todo()).unwrap_or_default();
     // 托管：这个动作过了 `gate::authorize` 之后的结论；真正写成功时（`host_did!`）落决策记录 / 发通知卡
     let mut host_write: Option<HostWrite>;
     macro_rules! host_did {
@@ -3714,24 +3742,12 @@ pub async fn run(
         }
         step += 1;
 
-        if !feedback.is_empty() {
+        if !feedback.is_empty() || !round_ids.is_empty() {
             if trace_on {
                 trace::record(&session, step, "feedback", &feedback);
             }
-            // 所有喂回模型的终端内容（命令输出、屏幕、错误、命令原文）都在这唯一的入口脱敏：
-            // 各个动作分支往 feedback 里拼的是原文，漏一处分支就是一次外泄，所以不在分支里逐个处理。
             meter.spent.output_chars += feedback.chars().count() as u64;
-            let text = scrub(acct.redact, &feedback);
-            // 模型请求失败暂停后恢复时，上一条 user 还没得到回复：并进去而不是再起一条，
-            // 不少网关会拒绝连续两条同角色的消息。
-            match messages.last_mut() {
-                Some(last) if last.role == "user" => {
-                    last.content.push_str("\n");
-                    last.content.push_str(&text);
-                }
-                _ => messages.push(ChatMessage::user(text)),
-            }
-            feedback.clear();
+            flush_round(&mut messages, &mut feedback, &mut round_ids, &mut spans, acct.redact);
         }
 
         // 长任务（托管动辄上百步）：历史太长就把很早的步骤折成一条笔记，别撑爆上下文窗口。
@@ -3745,9 +3761,12 @@ pub async fn run(
         let asked_tools = if use_tools { specs.as_slice() } else { &[] };
         // 限流 / 5xx / 超时这类临时故障先退避重试（每次重试在面板上落一张提示卡）；
         // 重试用尽不收场，而是暂停等人点「继续」—— 一个 429 不该把几十步的进度和历史全扔掉。
+        // 计划清单每轮都渲染进系统提示（历史压缩折不掉它）
+        let plan = super::todo::render(&todo);
+        let system_now = if plan.is_empty() { system.clone() } else { format!("{system}\n\n{plan}") };
         let retrying = llm::complete_reply_retrying(
             acct,
-            &system,
+            &system_now,
             &messages,
             asked_tools,
             &cancel,
@@ -3802,6 +3821,10 @@ pub async fn run(
                     trace::record(&session, step, "error", &e.to_string());
                 }
                 runtime.runlog.mark_error(&session);
+                if continuing {
+                    flush_round(&mut messages, &mut feedback, &mut round_ids, &mut spans, acct.redact);
+                    save_chat_history(state, &messages);
+                }
                 // 先把自己这一轮从登记表里摘掉，再报错 —— 否则会话会被永久卡住「运行中」
                 runtime.finish(&run_key);
                 let _ = app.emit(&format!("nx://agent/error/{session}"), e.to_string());
@@ -3816,10 +3839,22 @@ pub async fn run(
 
         // 工具优先：有结构化调用就不再看围栏 —— 模型常常两种都写，
         // 若两边都收，同一件事会被执行两遍。
-        let actions: Vec<AgentAction> = if reply.tool_calls.is_empty() {
-            extract_actions(&reply.text)
+        // 原生工具调用的 id（服务方没给就补一个），动作与它来自哪个调用一一对应
+        let call_ids: Vec<String> = reply
+            .tool_calls
+            .iter()
+            .enumerate()
+            .map(|(n, c)| if c.id.trim().is_empty() { format!("call_{step}_{n}") } else { c.id.clone() })
+            .collect();
+        let (actions, action_ids): (Vec<AgentAction>, Vec<String>) = if reply.tool_calls.is_empty() {
+            (extract_actions(&reply.text), Vec::new())
         } else {
-            reply.tool_calls.iter().flat_map(actions_from_tool_call).collect()
+            reply
+                .tool_calls
+                .iter()
+                .zip(&call_ids)
+                .flat_map(|(c, id)| actions_from_tool_call(c).into_iter().map(move |a| (a, id.clone())))
+                .unzip()
         };
         if trace_on {
             trace_round(&session, step, &reply, &actions);
@@ -3827,7 +3862,21 @@ pub async fn run(
 
         // 进了历史的这条 assistant 消息：带工具调用时不能原样存，
         // 否则下一轮会被接口以「tool_calls 后面必须跟 tool 回执」拒掉。
-        messages.push(ChatMessage::assistant(describe_tool_calls(&reply)));
+        // 服务方认 tools：assistant 带原生 tool_use（id 配对，下一条 user 逐个回执）；
+        // 不认（围栏协议）：照旧把调用写成人话进历史
+        if reply.tools_supported && !reply.tool_calls.is_empty() {
+            let calls: Vec<llm::ToolUse> = reply
+                .tool_calls
+                .iter()
+                .zip(&call_ids)
+                .map(|(c, id)| llm::ToolUse { id: id.clone(), name: c.name.clone(), arguments: c.arguments.clone() })
+                .collect();
+            round_ids = call_ids.clone();
+            spans.clear();
+            messages.push(ChatMessage::assistant_calls(reply.text.clone(), calls));
+        } else {
+            messages.push(ChatMessage::assistant(describe_tool_calls(&reply)));
+        }
         meter.spent.output_chars += reply.text.chars().count() as u64;
 
         // 叫了不存在的工具：`actions_from_tool_call` 对它一个动作都不产出。不能静默吞掉 ——
@@ -3972,7 +4021,13 @@ pub async fn run(
         let round_all_watch = actions.iter().all(|a| matches!(a, AgentAction::Watch { .. }));
         // 本轮里模型调用了 nx_complete / 对话模式下的 nx_ask_user：做完这一步就收场
         let mut finished = false;
-        for action in actions {
+        for (ai, action) in actions.into_iter().enumerate() {
+            // 这个动作的输出归哪个工具调用（回执配对）
+            if let Some(id) = action_ids.get(ai) {
+                if spans.last().map(|s| &s.0) != Some(id) {
+                    spans.push((id.clone(), feedback.len()));
+                }
+            }
             // 取消是**硬停**：余下动作不执行，循环顶随即收场，不再请模型写结论
             // （用户点取消就是不想再等它，也不想再花一次调用）。
             if cancel.load(Ordering::Relaxed) {
@@ -4039,6 +4094,14 @@ pub async fn run(
             }
             // 一轮内的多个动作共用同一个 step 号：UI 按 step 折叠，同一步归在一张卡里
             match action {
+                AgentAction::Todo(items) => {
+                    todo = items;
+                    if let Some(h) = &host {
+                        h.set_todo(todo.clone());
+                    }
+                    emit_step(app, &session, StepPayload { todo: Some(todo.clone()), ..StepPayload::new("todo", step) });
+                    feedback.push_str(&super::todo::ack(&todo));
+                }
                 AgentAction::File(mut call) => {
                     let summary = call.summary();
                     let Some((target_id, label, _)) = gate_target(
@@ -5523,6 +5586,10 @@ pub async fn run(
             }
         }
 
+        // 之后（看门狗提示等）追加的文字不属于任何调用
+        if !spans.is_empty() {
+            spans.push((String::new(), feedback.len()));
+        }
         if let Some(h) = &host {
             // 每个「动作 + 反馈」周期之后落一次现场（含契约级花费）
             meter.tick();
@@ -5559,6 +5626,11 @@ pub async fn run(
         }
     }
 
+    if continuing {
+        // 收尾那一轮的回执也要配上，再落盘给下一次追问续用
+        flush_round(&mut messages, &mut feedback, &mut round_ids, &mut spans, acct.redact);
+        save_chat_history(state, &messages);
+    }
     runtime.finish(&run_key);
     Ok(())
 }
@@ -5630,6 +5702,118 @@ async fn host_ask(h: &HostShared, card: super::host::HumanCard, messages: &mut V
 }
 
 /// 追加一条用户消息；上一条已经是用户消息就并进去（不少网关拒绝连续两条同角色）。
+/// 把这一轮的 feedback 收进对话：按 `spans` 切成逐个调用的 tool_result（没轮到执行的补「没有执行」，
+/// 失败 / 被拒的标 is_error），其余文字作为普通文本；脱敏在这里统一做（feedback 是原文）。
+/// 没有原生调用时退回老规矩：并进上一条 user（不起连续两条 user）。
+fn flush_round(
+    messages: &mut Vec<ChatMessage>,
+    feedback: &mut String,
+    round_ids: &mut Vec<String>,
+    spans: &mut Vec<(String, usize)>,
+    redact: bool,
+) {
+    let fb = std::mem::take(feedback);
+    let (general, per) = split_feedback(&fb, spans);
+    let results: Vec<llm::ToolResult> = round_ids
+        .iter()
+        .map(|id| match per.iter().find(|(k, _)| k == id) {
+            Some((_, t)) => llm::ToolResult {
+                id: id.clone(),
+                content: if t.trim().is_empty() { "（完成，没有输出）".to_string() } else { scrub(redact, t.trim_end()) },
+                is_error: looks_failed(t),
+            },
+            None => llm::ToolResult { id: id.clone(), content: llm::UNRUN_RESULT.to_string(), is_error: true },
+        })
+        .collect();
+    let text = scrub(redact, general.trim_end());
+    round_ids.clear();
+    spans.clear();
+    attach_round(messages, text, results);
+}
+
+/// feedback 按调用切段：第一个调用之前、以及哨兵（id 为空）之后的文字是「通用」的。
+fn split_feedback(fb: &str, spans: &[(String, usize)]) -> (String, Vec<(String, String)>) {
+    let mut general = String::new();
+    let mut per: Vec<(String, String)> = Vec::new();
+    let first = spans.first().map_or(fb.len(), |s| s.1.min(fb.len()));
+    general.push_str(&fb[..first]);
+    for (i, (id, start)) in spans.iter().enumerate() {
+        let end = spans.get(i + 1).map_or(fb.len(), |s| s.1).min(fb.len());
+        let start = (*start).min(end);
+        let seg = &fb[start..end];
+        if id.is_empty() {
+            general.push_str(seg);
+        } else if let Some(p) = per.iter_mut().find(|(k, _)| k == id) {
+            p.1.push_str(seg);
+        } else {
+            per.push((id.clone(), seg.to_string()));
+        }
+    }
+    (general, per)
+}
+
+/// 回执是不是「没成」：被拒 / 失败 / 没执行。按各分支写进 feedback 的固定说法认。
+fn looks_failed(t: &str) -> bool {
+    ["没有执行", "未获执行", "没有发送", "未发送", "没有写入", "失败", "被拦下", "不在作用范围", "不可用"]
+        .iter()
+        .any(|k| t.contains(k))
+}
+
+/// 回执挂到对的地方：上一条 assistant 带调用 → 紧随其后的 user（问人的答复可能已经先建好了它）；
+/// 没有回执 → 普通文本按老规矩并进上一条 user。
+fn attach_round(messages: &mut Vec<ChatMessage>, text: String, results: Vec<llm::ToolResult>) {
+    if results.is_empty() {
+        if !text.is_empty() {
+            push_user(messages, text);
+        }
+        return;
+    }
+    match messages.last_mut() {
+        Some(last) if last.role == "user" && last.tool_results.is_empty() => {
+            last.tool_results = results;
+            if !text.is_empty() {
+                last.content = if last.content.is_empty() { text } else { format!("{text}\n{}", last.content) };
+            }
+        }
+        _ => messages.push(ChatMessage::results(text, results)),
+    }
+}
+
+/// 读回对话模式的模型消息历史；读不回来的条目丢掉，配对修好。
+fn load_chat_history(state: &AppState) -> Vec<ChatMessage> {
+    chat_history_from(state.store.agent_llm_load())
+}
+
+/// 落盘：压缩到预算内、全文脱敏（不看开关：静止数据里不该有凭据形态的文本；密码通道的值本来就不进历史），
+/// 配对修好。失败只记日志。
+fn save_chat_history(state: &AppState, messages: &[ChatMessage]) {
+    if let Err(e) = state.store.agent_llm_save(&chat_history_values(messages)) {
+        tracing::warn!("保存对话历史失败：{e}");
+    }
+}
+
+pub(super) fn chat_history_values(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+    let mut msgs = super::host::checkpoint::HostCheckpoint::prepare_messages(messages.to_vec());
+    llm::repair_tool_pairing(&mut msgs);
+    msgs.iter().filter_map(|m| serde_json::to_value(m).ok()).collect()
+}
+
+pub(super) fn chat_history_from(values: Vec<serde_json::Value>) -> Vec<ChatMessage> {
+    let mut msgs: Vec<ChatMessage> = values.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+    // 截断可能从中间开始：历史必须以 user 开头
+    while msgs.first().is_some_and(|m| m.role != "user") {
+        msgs.remove(0);
+    }
+    llm::repair_tool_pairing(&mut msgs);
+    msgs
+}
+
+/// 追问：之前的历史 + 这一次的问题（含当前屏幕）。上一条若是 user（上一轮收尾的回执）就并进去。
+pub(super) fn seed_followup(mut prior: Vec<ChatMessage>, question: String) -> Vec<ChatMessage> {
+    push_user(&mut prior, format!("（接着同一段对话的新问题）\n{question}"));
+    prior
+}
+
 fn push_user(messages: &mut Vec<ChatMessage>, text: String) {
     match messages.last_mut() {
         Some(last) if last.role == "user" => {
@@ -6551,14 +6735,148 @@ mod tests {
             assert!(tool_action_name(t).is_some());
             assert!(ACTION_PROTOCOL.lines().next().unwrap().contains(t));
         }
-        let call = llm::ToolCall { name: "nx_edit".into(), arguments: r#"{"path":"/a","oldString":"x","newString":"y"}"#.into() };
+        let call = llm::ToolCall { id: String::new(), name: "nx_edit".into(), arguments: r#"{"path":"/a","oldString":"x","newString":"y"}"#.into() };
         assert!(matches!(actions_from_tool_call(&call).as_slice(), [AgentAction::File(c)] if c.is_write()));
-        let bad = llm::ToolCall { name: "nx_read".into(), arguments: "{}".into() };
+        let bad = llm::ToolCall { id: String::new(), name: "nx_read".into(), arguments: "{}".into() };
         assert!(actions_from_tool_call(&bad).is_empty());
         assert!(unknown_tool_names(&[call, bad]).is_empty());
         // 围栏协议同形
         assert!(matches!(extract_actions(&block(r#"{"action":"read","path":"/etc/hosts"}"#)).as_slice(), [AgentAction::File(_)]));
         assert!(ACTION_PROTOCOL.contains("先用 nx_write 写成文件，再 nx_exec"));
+    }
+
+    // ——— 原生回执 / 计划 / 对话连续 ———
+
+    fn calls(ids: &[&str]) -> ChatMessage {
+        ChatMessage::assistant_calls(
+            "",
+            ids.iter().map(|i| llm::ToolUse { id: i.to_string(), name: "nx_exec".into(), arguments: "{}".into() }).collect(),
+        )
+    }
+
+    #[test]
+    fn flush_round_splits_feedback_per_call_with_deny_and_cancel() {
+        let mut msgs = vec![ChatMessage::user("任务"), calls(&["c1", "c2", "c3"])];
+        let mut fb = String::from("（模型调用了不存在的工具 nx_foo）\n");
+        let mut spans = vec![("c1".to_string(), fb.len())];
+        fb.push_str("$ ls\na b\n");
+        spans.push(("c2".to_string(), fb.len()));
+        fb.push_str("「rm -rf /」没有执行：契约禁止\n");
+        // c3：用户点了停止，循环在它之前跳出 —— 没有 span
+        spans.push((String::new(), fb.len()));
+        fb.push_str("[看门狗] 提示\n");
+        let mut ids = vec!["c1".to_string(), "c2".to_string(), "c3".to_string()];
+        flush_round(&mut msgs, &mut fb, &mut ids, &mut spans, false);
+        assert!(fb.is_empty() && ids.is_empty() && spans.is_empty());
+        let u = msgs.last().unwrap();
+        assert_eq!(u.role, "user");
+        let got: Vec<(&str, bool)> = u.tool_results.iter().map(|r| (r.id.as_str(), r.is_error)).collect();
+        assert_eq!(got, vec![("c1", false), ("c2", true), ("c3", true)]);
+        assert!(u.tool_results[0].content.contains("a b"));
+        assert_eq!(u.tool_results[2].content, llm::UNRUN_RESULT);
+        assert!(u.content.contains("不存在的工具") && u.content.contains("看门狗"), "通用文字留在文本里：{}", u.content);
+        // 请求体两家都配得上
+        for p in [llm::Provider::Anthropic, llm::Provider::OpenAI] {
+            let w = llm::wire_messages(p, "S", &msgs, true);
+            let n_results = w
+                .iter()
+                .map(|m| match p {
+                    llm::Provider::OpenAI => usize::from(m["role"] == "tool"),
+                    llm::Provider::Anthropic => m["content"].as_array().map_or(0, |b| b.iter().filter(|x| x["type"] == "tool_result").count()),
+                })
+                .sum::<usize>();
+            assert_eq!(n_results, 3);
+        }
+    }
+
+    #[test]
+    fn ask_reply_after_calls_gets_the_results_attached() {
+        // nx_ask_user 的答复先用 push_user 建好了 user 消息，回执要挂到同一条上（不起两条 user）
+        let mut msgs = vec![ChatMessage::user("任务"), calls(&["q1"])];
+        push_user(&mut msgs, "用户答复：用 staging".into());
+        let mut fb = String::new();
+        let mut spans = vec![("q1".to_string(), 0)];
+        fb.push_str("已向用户提问\n");
+        let mut ids = vec!["q1".to_string()];
+        flush_round(&mut msgs, &mut fb, &mut ids, &mut spans, false);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2].tool_results.len(), 1);
+        assert!(msgs[2].content.contains("用户答复"));
+    }
+
+    #[test]
+    fn plain_feedback_still_merges_into_last_user() {
+        let mut msgs = vec![ChatMessage::user("任务"), ChatMessage::assistant("（调用工具 nx_exec：{}）")];
+        let mut fb = String::from("输出一\n");
+        flush_round(&mut msgs, &mut fb, &mut Vec::new(), &mut Vec::new(), false);
+        let mut fb = String::from("输出二\n");
+        flush_round(&mut msgs, &mut fb, &mut Vec::new(), &mut Vec::new(), false);
+        assert_eq!(msgs.len(), 3, "不起连续两条 user");
+        assert!(msgs[2].content.contains("输出一") && msgs[2].content.contains("输出二"));
+    }
+
+    #[test]
+    fn todo_tool_parses_and_plan_survives_compaction() {
+        let call = llm::ToolCall {
+            id: "t1".into(),
+            name: super::super::todo::TOOL_TODO.into(),
+            arguments: r#"{"items":[{"text":"装依赖","status":"done"},{"text":"跑测试","status":"in_progress"}]}"#.into(),
+        };
+        let items = match actions_from_tool_call(&call).as_slice() {
+            [AgentAction::Todo(v)] => v.clone(),
+            a => panic!("{a:?}"),
+        };
+        assert!(tool_specs().iter().any(|s| s.name == super::super::todo::TOOL_TODO));
+        assert!(hosted_tool_specs().iter().any(|s| s.name == super::super::todo::TOOL_TODO));
+        // 计划不在消息历史里，而是每轮渲染进系统提示：历史压缩成什么样都不影响它
+        let mut msgs = vec![ChatMessage::user("任务")];
+        for i in 0..40 {
+            msgs.push(ChatMessage::assistant(format!("第 {i} 步")));
+            msgs.push(ChatMessage::user("x".repeat(2_000)));
+        }
+        assert!(super::super::compact::compact(&mut msgs, 3_000));
+        let plan = super::super::todo::render(&items);
+        assert!(plan.contains("[x] 装依赖") && plan.contains("[>] 跑测试"));
+        // 托管：清单随 checkpoint 落盘 / 读回
+        let (h, _io) = super::super::host::driver::tests::shared();
+        h.set_todo(items.clone());
+        let ctx = h.ctx();
+        let mut cp = super::super::host::checkpoint::HostCheckpoint::new(ctx.contract, ctx.authority, Default::default(), 1);
+        cp.todo = h.todo();
+        let back = super::super::host::checkpoint::HostCheckpoint::from_json(&cp.to_json(2).unwrap()).unwrap();
+        assert_eq!(back.todo, items);
+        // 旧现场没有 todo 字段也能读
+        let mut v: serde_json::Value = serde_json::from_str(&cp.to_json(2).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("todo");
+        assert!(super::super::host::checkpoint::HostCheckpoint::from_json(&v.to_string()).unwrap().todo.is_empty());
+    }
+
+    #[test]
+    fn followup_continues_history_and_new_conversation_resets() {
+        let (store, _) = crate::store::tests::temp_store_at("llm-continuity");
+        let first = vec![
+            ChatMessage::user("磁盘满了吗"),
+            calls(&["d1"]),
+            ChatMessage::results("", vec![llm::ToolResult { id: "d1".into(), content: "/ 92% sk-proj-abcdefghijklmnopqrstuvwxyz1234".into(), is_error: false }]),
+            ChatMessage::assistant("根分区 92%，建议清理日志。"),
+        ];
+        store.agent_llm_save(&chat_history_values(&first)).unwrap();
+        // 下一次提问：接着之前的历史
+        let prior = chat_history_from(store.agent_llm_load());
+        assert_eq!(prior.len(), 4);
+        assert_eq!(prior[1].tool_calls[0].id, "d1", "结构化调用原样续用");
+        assert!(!prior[2].tool_results[0].content.contains("abcdefghijklmnopqrstuvwxyz1234"), "落盘前脱敏");
+        let next = seed_followup(prior, "那清理哪些日志？".into());
+        assert_eq!(next.len(), 5);
+        assert!(next[4].content.contains("清理哪些日志"));
+        assert!(next[0].content.contains("磁盘满了吗"));
+        // 「新对话」：清掉后从零开始
+        store.agent_llm_clear().unwrap();
+        assert!(chat_history_from(store.agent_llm_load()).is_empty());
+        // 面板记录（global scope）不受影响
+        store.agent_conv_save(&[serde_json::json!({"id": "m1"})]).unwrap();
+        store.agent_llm_clear().unwrap();
+        assert_eq!(store.agent_conv_load().len(), 1);
     }
 
     #[test]
@@ -6574,6 +6892,7 @@ mod tests {
         let hs = hosted_tool_specs();
         assert!(hs.iter().any(|s| s.name == TOOL_ASK_USER) && hs.iter().any(|s| s.name == TOOL_COMPLETE));
         let ask = llm::ToolCall {
+            id: String::new(),
             name: TOOL_ASK_USER.into(),
             arguments: r#"{"question":"删旧日志吗？","options":[{"label":"删","reply":"删掉"},{"label":"","reply":"x"}],"recommendation":"删"}"#.into(),
         };
@@ -6585,9 +6904,10 @@ mod tests {
                 recommendation: Some("删".into()),
             }]
         );
-        let empty = llm::ToolCall { name: TOOL_ASK_USER.into(), arguments: r#"{"question":"  "}"#.into() };
+        let empty = llm::ToolCall { id: String::new(), name: TOOL_ASK_USER.into(), arguments: r#"{"question":"  "}"#.into() };
         assert!(actions_from_tool_call(&empty).is_empty(), "空问题不产出动作");
         let done = llm::ToolCall {
+            id: String::new(),
             name: TOOL_COMPLETE.into(),
             arguments: r#"{"summary":"测试全过","evidence":["cargo test: ok"]}"#.into(),
         };
@@ -7187,6 +7507,7 @@ mod tests {
     #[test]
     fn tool_call_maps_to_tab_action() {
         let call = llm::ToolCall {
+            id: String::new(),
             name: TOOL_TAB.into(),
             arguments: r#"{"op":"reconnect","target":"tab-9"}"#.into(),
         };
@@ -7203,6 +7524,7 @@ mod tests {
     #[test]
     fn tool_call_maps_to_open_ssh_action() {
         let call = llm::ToolCall {
+            id: String::new(),
             name: TOOL_OPEN.into(),
             arguments: r#"{"kind":"ssh","sessionRecordId":"rec-1","label":"db-01"}"#.into(),
         };
@@ -7219,6 +7541,7 @@ mod tests {
     #[test]
     fn tool_call_maps_to_exec_action() {
         let call = llm::ToolCall {
+            id: String::new(),
             name: TOOL_EXEC.into(),
             arguments: r#"{"target":"s1","command":"uptime"}"#.into(),
         };
@@ -7233,6 +7556,7 @@ mod tests {
     #[test]
     fn tool_name_beats_a_smuggled_action_field() {
         let call = llm::ToolCall {
+            id: String::new(),
             name: TOOL_EXEC.into(),
             arguments: r#"{"action":"tab","command":"rm -rf /"}"#.into(),
         };
@@ -7247,6 +7571,7 @@ mod tests {
     #[test]
     fn tool_call_accepts_array_commands() {
         let call = llm::ToolCall {
+            id: String::new(),
             name: TOOL_EXEC.into(),
             arguments: r#"{"target":"s1","command":["uptime","df -h"]}"#.into(),
         };
@@ -7263,26 +7588,26 @@ mod tests {
     /// 后面却什么都没发生，那就是最招骂的「它说要做，然后没有然后」。
     #[test]
     fn empty_tool_actions_produce_a_correction_hint() {
-        let call = llm::ToolCall { name: TOOL_TAB.into(), arguments: r#"{"op":"bogus"}"#.into() };
+        let call = llm::ToolCall { id: String::new(), name: TOOL_TAB.into(), arguments: r#"{"op":"bogus"}"#.into() };
         assert!(actions_from_tool_call(&call).is_empty());
     }
 
     #[test]
     fn unknown_tool_call_yields_nothing() {
         // 未知工具宁可什么都不做，也不要按名字去猜它想干什么
-        let call = llm::ToolCall { name: "nx_destroy_everything".into(), arguments: "{}".into() };
+        let call = llm::ToolCall { id: String::new(), name: "nx_destroy_everything".into(), arguments: "{}".into() };
         assert!(actions_from_tool_call(&call).is_empty());
         // 空参数（模型直接调了没传参）也不能崩，由后面的必填字段校验丢掉
-        let call = llm::ToolCall { name: TOOL_TAB.into(), arguments: "".into() };
+        let call = llm::ToolCall { id: String::new(), name: TOOL_TAB.into(), arguments: "".into() };
         assert!(actions_from_tool_call(&call).is_empty());
-        let call = llm::ToolCall { name: TOOL_TAB.into(), arguments: "not json".into() };
+        let call = llm::ToolCall { id: String::new(), name: TOOL_TAB.into(), arguments: "not json".into() };
         assert!(actions_from_tool_call(&call).is_empty());
     }
 
     // —————————————— 手和眼：工具声明 / 解析 ——————————————
 
     fn call(name: &str, args: &str) -> llm::ToolCall {
-        llm::ToolCall { name: name.into(), arguments: args.into() }
+        llm::ToolCall { id: String::new(), name: name.into(), arguments: args.into() }
     }
 
     #[test]
@@ -7928,7 +8253,7 @@ mod tests {
     /// 不存在的工具不能被静默吞掉：要点名告诉模型，并列出真正可用的工具。
     #[test]
     fn unknown_tools_are_reported_by_name() {
-        let call = |n: &str| llm::ToolCall { name: n.into(), arguments: "{}".into() };
+        let call = |n: &str| llm::ToolCall { id: String::new(), name: n.into(), arguments: "{}".into() };
         let calls = vec![call("nx_destroy"), call(TOOL_SCREEN), call("nx_destroy"), call(" bash ")];
         let unknown = unknown_tool_names(&calls);
         assert_eq!(unknown, vec!["nx_destroy".to_string(), "bash".to_string()]);
@@ -7949,6 +8274,7 @@ mod tests {
             text: "先看看有哪些标签页。".into(),
             reasoning: String::new(),
             tool_calls: vec![llm::ToolCall {
+                id: String::new(),
                 name: TOOL_TAB.into(),
                 arguments: r#"{"op":"list"}"#.into(),
             }],

@@ -43,6 +43,9 @@ pub struct HostCheckpoint {
     pub last_screen_hash: String,
     #[serde(default)]
     pub watchdog: WatchdogState,
+    /// 计划清单（nx_todo）；旧现场没有该字段 → 空
+    #[serde(default)]
+    pub todo: Vec<super::super::todo::TodoItem>,
     pub created_wall_ms: i64,
     pub saved_wall_ms: i64,
 }
@@ -85,6 +88,7 @@ impl HostCheckpoint {
             woke_hash: HashMap::new(),
             last_screen_hash: String::new(),
             watchdog: WatchdogState::default(),
+            todo: Vec::new(),
             created_wall_ms: now_wall_ms,
             saved_wall_ms: now_wall_ms,
         }

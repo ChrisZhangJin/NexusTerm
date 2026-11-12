@@ -224,6 +224,8 @@ export const api = {
   agentHistorySave: (messages: unknown[]) => invoke<void>("agent_history_save", { messages }),
   /** 「清空对话」：真删已保存的对话与运行摘要。 */
   agentHistoryClear: () => invoke<void>("agent_history_clear"),
+  /** 「新对话」：下一次提问不再接着之前的模型消息历史（面板记录不动） */
+  agentConversationReset: () => invoke<void>("agent_conversation_reset"),
   // ——— Skill（Phase 3.1）。校验失败的 reject 文案是换行分隔的全部问题。———
   /** 最近更新在前；`query` 非空时按名称 / 描述子串搜索 */
   skillList: (query?: string) => invoke<Skill[]>("skill_list", { query: query ?? null }),

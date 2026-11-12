@@ -57,6 +57,8 @@ pub struct HostStatus {
     pub label: String,
     /// 给人看的提示（例如接驳后降为确认档的原因）
     pub notice: Option<String>,
+    /// 计划清单（nx_todo）
+    pub todo: Vec<super::todo::TodoItem>,
 }
 
 impl HostStatus {
@@ -70,6 +72,7 @@ impl HostStatus {
             phase: phase.clone(),
             label: h.ctx().label,
             notice: h.notice(),
+            todo: h.todo(),
         }
     }
 }
@@ -120,6 +123,7 @@ impl HostIo for AppHostIo {
             phase: phase.clone(),
             label: self.snap.lock().console.label.clone(),
             notice: self.notice.lock().clone(),
+            todo: self.snap.lock().todo.clone(),
         };
         emit_status(&self.app, &st);
     }
@@ -145,6 +149,11 @@ impl HostIo for AppHostIo {
 
     fn note_progress(&self, messages: &[ChatMessage], step: usize, spent: &Spent) {
         record_progress(&mut self.snap.lock(), messages, step, spent);
+    }
+
+    fn note_todo(&self, todo: &[super::todo::TodoItem], phase: &HostPhase) {
+        self.snap.lock().todo = todo.to_vec();
+        self.emit(phase);
     }
 
     fn note_watchdog(&self, w: &super::host::watchdog::WatchdogState) {
@@ -700,6 +709,7 @@ fn shared_from_checkpoint(app: &AppHandle, cp: &HostCheckpoint) -> Arc<HostShare
     h.set_ctx(ctx, None);
     h.set_spent(cp.spent);
     h.restore_watchdog(cp.watchdog.clone());
+    h.set_todo(cp.todo.clone());
     h
 }
 
