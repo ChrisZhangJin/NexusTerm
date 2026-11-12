@@ -134,7 +134,7 @@ export function setStewardConsoles(ids: Iterable<string>): void {
   if (added.length === 0 && removed.length === 0) return;
   for (const id of removed) {
     stewardConsoles.delete(id);
-    dropCaptureState(id);
+    if (!agentConsoles.has(id)) dropCaptureState(id);
   }
   for (const id of added) stewardConsoles.add(id);
   // 新签的契约立刻补一帧全量：后端马上就有屏幕可读，不必等下一次输出或心跳
@@ -148,6 +148,47 @@ export function setStewardConsoles(ids: Iterable<string>): void {
 
 export function isStewardConsole(id: string): boolean {
   return stewardConsoles.has(id);
+}
+
+/**
+ * 有 Agent 运行（对话模式也算）正在驾驶的 console：运行期间也采屏幕帧，结束就停。
+ * 后端在控制权变化时发 `nx://agent/capture {session, on}`（on = 不再是用户在驾驶），App 喂进来。
+ * 平时（没有契约、没有运行）零采集。
+ */
+const agentConsoles = new Set<string>();
+
+/** 纯函数：一次 capture 事件之后的「Agent 驾驶中」集合 */
+export function applyCapture(prev: ReadonlySet<string>, ev: { session: string; on: boolean }): Set<string> {
+  const next = new Set(prev);
+  if (ev.on) next.add(ev.session);
+  else next.delete(ev.session);
+  return next;
+}
+
+/** 纯函数：此刻该采集的 console = 托管契约 ∪ Agent 驾驶中 */
+export function captureTargets(steward: ReadonlySet<string>, agent: ReadonlySet<string>): Set<string> {
+  return new Set([...steward, ...agent]);
+}
+
+function isCaptured(id: string): boolean {
+  return stewardConsoles.has(id) || agentConsoles.has(id);
+}
+
+export function setAgentCapture(session: string, on: boolean): void {
+  const had = agentConsoles.has(session);
+  if (had === on) return;
+  const next = applyCapture(agentConsoles, { session, on });
+  agentConsoles.clear();
+  for (const id of next) agentConsoles.add(id);
+  if (on) {
+    if (registry.has(session)) {
+      pendingFull.add(session);
+      scheduleCapture(session, 0);
+    }
+  } else if (!stewardConsoles.has(session)) {
+    dropCaptureState(session);
+  }
+  syncCaptureHeartbeat();
 }
 
 export function onInput(id: string, fn: InputTap): () => void {
@@ -283,6 +324,8 @@ export interface ScreenDelta {
   alt: boolean;
   cursorX: number;
   cursorY: number;
+  /** 应用光标键模式（DECCKM） */
+  appCursor?: boolean;
   hash: string;
   full: boolean;
   lines: ScreenLine[];
@@ -362,7 +405,7 @@ export function setScreenCaptureEnabled(on: boolean): void {
   captureEnabled = on;
   if (on) {
     for (const id of registry.keys()) {
-      if (!stewardConsoles.has(id)) continue;
+      if (!isCaptured(id)) continue;
       pendingFull.add(id);
       scheduleCapture(id);
     }
@@ -372,7 +415,7 @@ export function setScreenCaptureEnabled(on: boolean): void {
 
 /** 有开关、且至少一个托管中的 console 时才跑心跳 */
 function syncCaptureHeartbeat(): void {
-  if (captureEnabled && stewardConsoles.size > 0) startCaptureHeartbeat();
+  if (captureEnabled && (stewardConsoles.size > 0 || agentConsoles.size > 0)) startCaptureHeartbeat();
   else stopCaptureHeartbeat();
 }
 
@@ -381,7 +424,7 @@ function startCaptureHeartbeat(): void {
   captureHeartbeat = window.setInterval(() => {
     if (!captureEnabled || !deltaSink) return;
     // hash 不变的帧只带 frameId + 空 lines，后端仍会累 idleFrames 并刷新 updatedAt
-    for (const id of stewardConsoles) {
+    for (const id of captureTargets(stewardConsoles, agentConsoles)) {
       if (registry.has(id)) scheduleCapture(id, 0);
     }
   }, CAPTURE_HEARTBEAT_MS);
@@ -418,7 +461,7 @@ function dropCaptureState(id: string): void {
 
 function scheduleCapture(id: string, delay = CAPTURE_DEBOUNCE_MS): void {
   // 没签契约的终端连定时器都不排：onWriteParsed 是热路径，这里只读两个布尔 + 一次 Set 查找
-  if (!captureEnabled || !deltaSink || !stewardConsoles.has(id)) return;
+  if (!captureEnabled || !deltaSink || !isCaptured(id)) return;
   const existing = captureTimers.get(id);
   if (existing !== undefined) window.clearTimeout(existing);
   const timer = window.setTimeout(() => {
@@ -431,7 +474,7 @@ function scheduleCapture(id: string, delay = CAPTURE_DEBOUNCE_MS): void {
 function captureFrame(id: string, force = false): void {
   const term = registry.get(id);
   if (!term || !captureEnabled || !deltaSink) return;
-  if (!force && !stewardConsoles.has(id)) return;
+  if (!force && !isCaptured(id)) return;
   try {
     const buf = term.buffer.active;
     const alt = buf.type !== "normal";
@@ -446,6 +489,8 @@ function captureFrame(id: string, force = false): void {
     const rows = term.rows;
     const cursorX = buf.cursorX;
     const cursorY = buf.cursorY;
+    // 应用光标键模式（DECCKM）：后端据此把方向键发成 SS3
+    const appCursor = !!term.modes?.applicationCursorKeysMode;
     const hash = frameHash(lines, alt, cols, rows, cursorX, cursorY);
     const prev = captureFrames.get(id);
     const structural =
@@ -475,6 +520,7 @@ function captureFrame(id: string, force = false): void {
       alt,
       cursorX,
       cursorY,
+      appCursor,
       hash,
       full,
       lines: changes,
