@@ -1145,6 +1145,17 @@ fn advance_record(
     }
 }
 
+/// 「LLM 托管中，跳过」事件的最小间隔，免得每个 tick 都刷一条。
+const LLM_SKIP_EVENT_MS: i64 = 30_000;
+
+/// 这个 console 是否被 LLM 托管那一路占着：控制表里不是 `UserDriving`
+/// （`AgentDriving` = LLM 正在驾驶；`Paused` = 用户暂停 / 接管了它，同样不该由 Steward 越俎代庖）。
+fn llm_run_owns(app: &AppHandle, console_id: &str) -> bool {
+    app.try_state::<AppState>()
+        .map(|st| st.act.control.state(console_id) != super::control::ControlState::UserDriving)
+        .unwrap_or(false)
+}
+
 /// 同一签名短期回来（回显抖动）不重复编译 / 注入。
 const DECISION_COOLDOWN_MS: i64 = 30_000;
 
@@ -1190,6 +1201,7 @@ pub fn spawn_daemon(
         let mut states: HashMap<String, StewardState> = HashMap::new();
         let mut last_cp: HashMap<String, i64> = HashMap::new();
         let mut last_distill_ms: i64 = 0;
+        let mut last_llm_skip: HashMap<String, i64> = HashMap::new();
         loop {
             let now = now_ms();
             let mono = core.elapsed_ms();
@@ -1402,6 +1414,18 @@ pub fn spawn_daemon(
                     }
                     core.ownership()
                         .note(&console_id, "decision", format!("用户接管决策 #{seq}"), mono);
+                    continue;
+                }
+                // 互斥：LLM 托管正在驾驶这个终端时，用户批准的升级卡也不注入（两个「手」不能同时写）。
+                // 不消费 seq、不重排队（否则每个 tick 都刷一条事件），直接丢弃并明说，用户可在交还后重新批准。
+                if llm_run_owns(&app, &rec.console_id) {
+                    events.push(sys_event(
+                        &rec.console_id,
+                        &rec.contract_id,
+                        StewardEventKind::PolicyDenied,
+                        format!("决策 #{seq} 已确认但未执行：LLM 托管中，跳过（不与 LLM 托管同时写终端）"),
+                        now,
+                    ));
                     continue;
                 }
                 // 只认 Brain 里那条记录的动作，不接受任意文本，避免升级卡变成后门。
@@ -1662,6 +1686,25 @@ pub fn spawn_daemon(
                         );
                     }
                     events.extend(produced);
+                }
+
+                // ── 互斥：LLM 托管（act::run）正在驾驶 / 用户暂停了它 → 只看不写 ────
+                // 眼睛（上面的采集与分类）照常工作；决策与注入让给 LLM 那一路，
+                // 否则两个「手」会同时往同一个终端写。
+                if llm_run_owns(&app, &c.console_id) {
+                    if now - last_llm_skip.get(&c.console_id).copied().unwrap_or(0)
+                        >= LLM_SKIP_EVENT_MS
+                    {
+                        last_llm_skip.insert(c.console_id.clone(), now);
+                        events.push(sys_event(
+                            &c.console_id,
+                            &c.id,
+                            StewardEventKind::PolicyDenied,
+                            "LLM 托管中，跳过（零 LLM 托管循环只观察、不决策不注入）",
+                            now,
+                        ));
+                    }
+                    continue;
                 }
 
                 // ── P5 场景 C：空转时按局面主动推进，而不是只描述现象 ────

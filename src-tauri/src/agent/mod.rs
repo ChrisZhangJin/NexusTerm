@@ -40,6 +40,7 @@ pub mod situation;
 pub mod skilltool;
 pub mod steward;
 pub mod steward_loop;
+pub mod steward_mode;
 pub mod decision;
 pub mod profile;
 pub mod steward_cmd;
@@ -58,6 +59,8 @@ mod steward_e2e;
 pub mod timeline;
 pub mod trace;
 pub mod usercmd;
+pub mod watch;
+pub mod compact;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -27,9 +27,9 @@ use tokio::time::{sleep, Instant};
 
 /// 一次 `nx_send_keys` 解码后最多允许多少字节。
 ///
-/// 按键是「手速」级别的输入。256 字节够敲一条长命令或一串方向键；
-/// 更长的内容（粘贴一整个文件）不该走这条路，也不该让一次工具调用无声地倾倒进终端。
-pub const MAX_KEYS_BYTES: usize = 256;
+/// 4096 字节够给 Claude Code 之类的工具敲一整段需求（中文一个字 3 字节），也够一长串方向键；
+/// 再长的内容（粘贴一整个文件）不该走这条路，也不该让一次工具调用无声地倾倒进终端。
+pub const MAX_KEYS_BYTES: usize = 4096;
 
 /// 解析按键串。成功返回要写入的字节，失败返回给模型看的原因。
 pub fn parse_keys(src: &str) -> Result<Vec<u8>, String> {
@@ -410,7 +410,7 @@ mod tests {
         assert!(parse_keys(&"a".repeat(MAX_KEYS_BYTES)).is_ok());
         assert!(parse_keys(&"a".repeat(MAX_KEYS_BYTES + 1)).is_err());
         // 转义展开后才超限也要拦
-        assert!(parse_keys(&"<Up>".repeat(100)).is_err());
+        assert!(parse_keys(&"<Up>".repeat(1400)).is_err());
     }
 
     #[test]

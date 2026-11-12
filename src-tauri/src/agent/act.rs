@@ -135,6 +135,47 @@ pub struct AgentRunRequest {
     /// 这类程序自己接管了屏幕，旁路抓不到真实输出，要提示模型改用抓取 skill。
     #[serde(default)]
     pub console_alt: bool,
+    /// 运行模式。`"steward"` = 托管（自主跑到目标完成，见 `steward_mode`）；缺省 / null = 普通对话。
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// 可选的预算覆盖（会被夹紧）。缺省时托管用 400 步 / 360 分钟，普通运行用配置里的预算。
+    #[serde(default)]
+    pub budget: Option<RunBudgetOverride>,
+}
+
+/// 请求里的预算覆盖：只覆盖给了的字段。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunBudgetOverride {
+    #[serde(default)]
+    pub max_steps: Option<u32>,
+    #[serde(default)]
+    pub max_minutes: Option<u32>,
+}
+
+impl AgentRunRequest {
+    /// 是不是托管模式。
+    pub fn is_steward(&self) -> bool {
+        self.mode.as_deref().map(str::trim) == Some("steward")
+    }
+}
+
+/// 本轮生效的预算：配置预算（托管则换成托管默认）+ 请求覆盖，最后夹紧。
+pub fn effective_budget(base: budget::RunBudget, req: &AgentRunRequest) -> budget::RunBudget {
+    let mut b = base;
+    if req.is_steward() {
+        b.max_steps = super::steward_mode::STEWARD_MAX_STEPS;
+        b.max_minutes = super::steward_mode::STEWARD_MAX_MINUTES;
+    }
+    if let Some(o) = &req.budget {
+        if let Some(n) = o.max_steps {
+            b.max_steps = n;
+        }
+        if let Some(m) = o.max_minutes {
+            b.max_minutes = m;
+        }
+    }
+    b.clamped()
 }
 
 /// 模型下发的一个动作。九选一：
@@ -165,6 +206,13 @@ pub enum AgentAction {
         pattern: Option<String>,
         timeout_ms: Option<u64>,
         quiet_ms: Option<u64>,
+    },
+    /// 盯住一个长任务（`nx_watch`）：一次挂住，直到它要人处理 / 结束 / 卡住 / 超时。
+    Watch {
+        target: Option<String>,
+        until: Option<String>,
+        timeout_ms: Option<u64>,
+        stall_ms: Option<u64>,
     },
     /// 读目标会话此刻的 xterm 屏幕（含 alt screen）。
     Screen { target: Option<String> },
@@ -278,6 +326,12 @@ struct ExecBlock {
     /// `wait` 专用：连续多久没有新输出就返回（毫秒）。
     #[serde(default)]
     quiet_ms: Option<u64>,
+    /// `watch` 专用：命中即返回的文字（子串或 `/regex/`，同 `pattern`）。
+    #[serde(default)]
+    until: Option<String>,
+    /// `watch` 专用：屏幕连续多久没变化就算卡住（毫秒）。
+    #[serde(default)]
+    stall_ms: Option<u64>,
     /// `memory` 专用：要记的备忘文本（`op:"add"`）。类别复用 `kind`、操作复用 `op`。
     #[serde(default)]
     text: Option<String>,
@@ -305,6 +359,7 @@ pub const TOOL_OPEN: &str = "nx_open_tab";
 pub const TOOL_TAB: &str = "nx_tab";
 pub const TOOL_KEYS: &str = "nx_send_keys";
 pub const TOOL_WAIT: &str = "nx_wait";
+pub const TOOL_WATCH: &str = "nx_watch";
 pub const TOOL_SCREEN: &str = "nx_screen";
 pub const TOOL_SECRET: &str = "nx_secret";
 pub const TOOL_MEMORY: &str = "nx_memory";
@@ -413,7 +468,7 @@ pub fn tool_specs() -> Vec<llm::ToolSpec> {
                     },
                     "keys": {
                         "type": "string",
-                        "description": "按键串，解码后最长 256 字节。普通字符原样发送；\
+                        "description": "按键串，解码后最长 4096 字节。**不会自动追加回车**——要提交请自己带 <Enter>。普通字符原样发送；\
                                         转义：\\r 回车、\\n 换行、\\t 制表、\\e ESC、\\\\ 反斜杠、\\xNN 任意字节（\\x03 = Ctrl-C）；\
                                         具名键：<Enter> <Tab> <Esc> <Space> <BS> <Del> <Up> <Down> <Left> <Right> \
                                         <Home> <End> <PgUp> <PgDn> <F1>…<F12>、<C-a>…<C-z>（Ctrl 组合，如 <C-c> <C-d>）、\
@@ -449,6 +504,34 @@ pub fn tool_specs() -> Vec<llm::ToolSpec> {
                         "type": "integer",
                         "description": "连续这么久（毫秒）没有新输出就算静止并返回。\
                                         没给 pattern 时默认 1500；给了 pattern 时不设，只等命中或超时。"
+                    }
+                }
+            }),
+        },
+        llm::ToolSpec {
+            name: TOOL_WATCH,
+            description: "盯住一个长时间运行的任务（脚本 / 构建 / 安装 / Claude Code 等），一次挂住，\
+                          直到：屏幕出现需要你处理的局面（提问 / 授权 / 密码 / 菜单 / 等输入 / 报错）、\
+                          回到 shell 提示符（任务结束）、`until` 命中、屏幕长时间没变化（卡住）或超时。\
+                          比反复 nx_wait 轮询省步数。不往终端写任何东西。".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "目标会话 id。省略表示当前会话。"
+                    },
+                    "timeoutMs": {
+                        "type": "integer",
+                        "description": "最长盯多久（毫秒），默认 600000（10 分钟），上限 3600000（1 小时）。"
+                    },
+                    "until": {
+                        "type": "string",
+                        "description": "可选：新输出里出现这段文字就立刻返回。直接写是子串；/正则/（可加 i）按正则。"
+                    },
+                    "stallMs": {
+                        "type": "integer",
+                        "description": "屏幕连续这么久（毫秒）没有任何变化就判定卡住并返回，默认 120000。"
                     }
                 }
             }),
@@ -610,6 +693,7 @@ fn tool_action_name(name: &str) -> Option<&'static str> {
         TOOL_TAB => Some("tab"),
         TOOL_KEYS => Some("keys"),
         TOOL_WAIT => Some("wait"),
+        TOOL_WATCH => Some("watch"),
         TOOL_SCREEN => Some("screen"),
         TOOL_SECRET => Some("secret"),
         TOOL_MEMORY => Some("memory"),
@@ -652,6 +736,7 @@ pub fn actions_from_tool_call(call: &llm::ToolCall) -> Vec<AgentAction> {
         "tab" => parse_tab(block).into_iter().collect(),
         "keys" => parse_keys_action(block),
         "wait" => parse_wait(block),
+        "watch" => parse_watch(block),
         "screen" => parse_screen(block),
         "secret" => parse_secret(block),
         "memory" => parse_memory(block),
@@ -684,6 +769,7 @@ pub fn tool_label(name: &str, args: &str) -> &'static str {
         TOOL_OPEN => "新建标签页",
         TOOL_KEYS => "发送按键",
         TOOL_WAIT => "等待输出",
+        TOOL_WATCH => "盯住任务",
         TOOL_SCREEN => "读取屏幕",
         TOOL_SECRET => "请求输入密码",
         TOOL_MEMORY => "主机备忘",
@@ -986,6 +1072,7 @@ fn parse_block(raw: &str) -> Vec<AgentAction> {
             "tab" => parse_tab(block).into_iter().collect(),
             "keys" => parse_keys_action(block),
             "wait" => parse_wait(block),
+            "watch" => parse_watch(block),
             "screen" => parse_screen(block),
             "secret" => parse_secret(block),
             "skill" => parse_skill(block),
@@ -1108,6 +1195,14 @@ fn parse_wait(block: ExecBlock) -> Vec<AgentAction> {
             quiet_ms: block.quiet_ms,
         })
         .collect()
+}
+
+/// `action:"watch"`：参数全可选。`until` 为空串视为没给。
+fn parse_watch(block: ExecBlock) -> Vec<AgentAction> {
+    let until = block.until.filter(|p| !p.is_empty());
+    // 一次只盯一个会话：多目标会把「挂住」变成串行的几小时
+    let target = fan_targets(block.target, block.targets).into_iter().next().flatten();
+    vec![AgentAction::Watch { target, until, timeout_ms: block.timeout_ms, stall_ms: block.stall_ms }]
 }
 
 /// `action:"screen"`：读屏幕。
@@ -1331,7 +1426,7 @@ pub const ACTION_PROTOCOL: &str = concat!(
     "方向键与 Tab 补全，以及 **Ctrl-C 打断卡住的进程（`<C-c>`）**、Ctrl-D 退出 REPL（`<C-d>`）。",
     "按键串语法：普通字符原样发；转义 `\\r` 回车 `\\n` 换行 `\\t` 制表 `\\e` ESC `\\\\` 反斜杠 `\\xNN` 任意字节；",
     "具名键 `<Enter> <Tab> <Esc> <Space> <BS> <Del> <Up> <Down> <Left> <Right> <Home> <End> <PgUp> <PgDn> <F1>…<F12>`、",
-    "`<C-a>`…`<C-z>`、`<M-x>`、`<lt>`（字面 `<`）。解码后最长 256 字节，超了请拆开。",
+    "`<C-a>`…`<C-z>`、`<M-x>`、`<lt>`（字面 `<`）。解码后最长 4096 字节，超了请拆开。**给 Claude Code 等 TUI 输入文字时，先发文字（不带回车），再单独发一次 `<Enter>` 提交**（一次连发容易被当成粘贴而没提交）。",
     "要跑一条普通命令并拿它的输出，仍用 nx_exec —— 它会替你等命令结束；send_keys 不会。\n",
     "· **nx_wait{pattern?, timeoutMs?, quietMs?}**：等新输出里出现某段文字（直接写是子串，`/正则/` 加 i 可忽略大小写），",
     "或等输出静止；不往终端写任何东西。发完按键、启动了长任务后用它等一个提示 / 结束标志，",
@@ -1352,6 +1447,10 @@ pub const ACTION_PROTOCOL: &str = concat!(
     "nx_exec 还可能返回「状态：终端停在等待输入的提示上」——命令**没有**结束，是卡在了交互提示，",
     "按 `prompt_kind` 与 `提示` 处理（yes_no → send_keys 回答；password → nx_secret；pager → `q`；repl → 在里面输入或 `<C-d>`）。\n",
     "send_keys 与 exec 一样受作用范围与审批约束；审批模式下含回车的按键会弹窗让人确认。\n\n",
+    "【盯住长任务 nx_watch】**nx_watch{target?, timeoutMs?, until?, stallMs?}**：长时间运行的脚本 / 构建 / 安装 / Claude Code 等，",
+    "启动之后用它一次挂住（默认最长 10 分钟，上限 1 小时），直到屏幕出现需要你处理的局面（提问 / 授权 / 密码 / 菜单 / 等输入 / 报错）、",
+    "回到 shell 提示符、`until` 命中、屏幕 `stallMs`（默认 2 分钟）没变化或超时才返回；返回里有停下的原因、局面与屏幕尾部。",
+    "比反复 nx_wait 轮询省步数。不往终端写任何东西。围栏写法 `{\"action\":\"watch\",\"timeoutMs\":600000}`。\n\n",
     "【主机备忘 nx_memory】除上面那八个，你还有第九个工具 **nx_memory{op, text?, kind?, id?}**：",
     "替目标会话所在的主机读 / 记 / 忘**长期备忘**。`op=read` 列出这台主机已有的备忘（带 id）；",
     "`op=add` 记一条（`kind` 取 prompt / sudo / path / quirk / other）；`op=forget` 按 id 删一条。",
@@ -1663,6 +1762,63 @@ fn push_guess(s: &mut String, guess: Option<&PromptGuess>) {
 pub(super) fn classify_session(state: &AppState, id: &str, alt: bool) -> PromptGuess {
     let tail = state.agent.context(id, CLASSIFY_TAIL_BYTES).unwrap_or_default();
     prompt::classify(&tail, alt)
+}
+
+/// 前端屏幕帧多新才算「还在流」（毫秒）。超过就退回旁路缓冲。
+const FRAME_FRESH_MS: i64 = 10_000;
+
+/// 此刻目标会话的局面：优先用前端采的屏幕帧（`ScreenStore` + `situation::classify`），
+/// 帧不存在 / 断流了就退回旁路缓冲的启发式分类。**总有一个结果**，调用方不必处理缺失。
+///
+/// 密码提示的 `tail` 恒为占位串（两条路径一致），不会把口令提示行带进反馈。
+pub(super) fn situation_now(
+    app: &AppHandle,
+    state: &AppState,
+    id: &str,
+    alt: bool,
+) -> super::situation::Situation {
+    use super::situation::{self, Program, SituationKind};
+    let now = super::steward::now_ms();
+    if let Some(snap) = app.try_state::<super::steward::ScreenStore>().and_then(|s| s.get(id)) {
+        if snap.updated_at > 0 && now - snap.updated_at <= FRAME_FRESH_MS {
+            return situation::classify(&snap, now, FRAME_FRESH_MS);
+        }
+    }
+    let tail = state.agent.context(id, CLASSIFY_TAIL_BYTES).unwrap_or_default();
+    let guess = prompt::classify(&tail, alt);
+    let mut evidence: Vec<String> = Vec::new();
+    let (kind, program) = match guess.kind {
+        prompt::PromptKind::Password => (SituationKind::Password, Program::Unknown),
+        prompt::PromptKind::YesNo => (SituationKind::Question, Program::Unknown),
+        prompt::PromptKind::Pager => (SituationKind::Pager, Program::Pager),
+        prompt::PromptKind::Menu => (SituationKind::Menu, Program::Unknown),
+        prompt::PromptKind::Repl => (SituationKind::AwaitingInput, Program::Unknown),
+        prompt::PromptKind::ShellPrompt => (SituationKind::Idle, Program::Shell),
+        // 没有屏幕帧时同样认「光标行停在一句自由文本提示上」，免得 `目录 [/opt/app]: ` 看不见
+        prompt::PromptKind::Unknown if tail.lines().rev().find(|l| !l.trim().is_empty()).map_or(false, |l| situation::free_text_prompt(l)) => {
+            evidence.push(situation::FREE_TEXT_PROMPT.to_string());
+            (SituationKind::AwaitingInput, Program::Unknown)
+        }
+        prompt::PromptKind::Unknown => (SituationKind::Unknown, Program::Unknown),
+    };
+    let shown_tail = if kind == SituationKind::Password {
+        "[redacted: credential prompt]".to_string()
+    } else {
+        tail_chars(tail.trim(), SCREEN_MAX_BYTES)
+    };
+    super::situation::Situation {
+        frame_id: 0,
+        screen_hash: String::new(),
+        program,
+        kind,
+        topic: None,
+        options: Vec::new(),
+        confidence: guess.confidence,
+        tail: shown_tail,
+        evidence,
+        stale_ms: 0,
+        signature: String::new(),
+    }
 }
 
 /// 写入超时的提示文案。独立于 `is_channel_closed`：只是一次写超时，
@@ -2304,6 +2460,8 @@ pub struct ActRuntime {
     pub runlog: super::history::RunLogs,
     /// 进行中各轮运行的相位（在跑 / 暂停 / 待暂停），见 `budget.rs`。只在内存里。
     pub phases: budget::PhaseTable,
+    /// 正在跑的托管运行（run id）。只用来给审批选更长的等待上限。
+    steward_runs: Mutex<std::collections::HashSet<String>>,
 }
 
 impl ActRuntime {
@@ -2317,7 +2475,22 @@ impl ActRuntime {
             control: control::ControlTable::new(),
             runlog: super::history::RunLogs::default(),
             phases: budget::PhaseTable::default(),
+            steward_runs: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// 登记 / 摘掉一轮托管运行。
+    pub(super) fn mark_steward(&self, run: &str, on: bool) {
+        let mut g = self.steward_runs.lock();
+        if on {
+            g.insert(run.to_string());
+        } else {
+            g.remove(run);
+        }
+    }
+
+    pub(super) fn is_steward(&self, run: &str) -> bool {
+        self.steward_runs.lock().contains(run)
     }
 
     /// 用户侧的控制权操作（敲键盘 / 接管 / 交还）：改状态，**真的变了才**推事件。
@@ -2536,6 +2709,18 @@ impl Drop for PhaseGuard<'_> {
     }
 }
 
+/// 托管运行的登记：任何出口 drop 时摘掉。
+pub(super) struct StewardGuard<'a> {
+    pub(super) rt: &'a ActRuntime,
+    pub(super) run: String,
+}
+
+impl Drop for StewardGuard<'_> {
+    fn drop(&mut self) {
+        self.rt.mark_steward(&self.run, false);
+    }
+}
+
 /// 暂停期间轮询相位的间隔。
 const PHASE_POLL: Duration = Duration::from_millis(200);
 
@@ -2663,7 +2848,13 @@ pub(super) async fn request_approval(
     let rx = runtime.register(&payload.request_id);
     let _ = app.emit(&format!("nx://agent/approve/{session_id}"), payload.clone());
 
-    let decision = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
+    // 托管时人多半不在电脑前：审批等得久一点（30 分钟），超时仍按拒绝
+    let wait = if runtime.is_steward(session_id) {
+        Duration::from_secs(super::steward_mode::STEWARD_APPROVAL_TIMEOUT_SECS)
+    } else {
+        APPROVAL_TIMEOUT
+    };
+    let decision = match tokio::time::timeout(wait, rx).await {
         Ok(Ok(approved)) => approved,
         // Err = 超时；Ok(Err) = UI 那一头先没了（窗口关了 / 页面重载）
         _ => {
@@ -2954,6 +3145,10 @@ pub async fn run(
     let _lease = ControlLease { app, rt: runtime, run: req.session_id.clone() };
     runtime.phases.start(&req.session_id);
     let _phase = PhaseGuard { rt: runtime, run: req.session_id.clone() };
+    // 托管：全自动跑，预算更大、审批等得更久；不看 exec_mode：危险命令一律走审批（Exec），按键按屏幕局面把关（见 `steward_mode`）
+    let is_steward = req.is_steward();
+    runtime.mark_steward(&req.session_id, is_steward);
+    let _steward = StewardGuard { rt: runtime, run: req.session_id.clone() };
     if let Some(st) = runtime.control.acquire(&req.session_id, &req.session_id) {
         emit_control(app, &req.session_id, &[req.session_id.clone()], st);
     }
@@ -2986,7 +3181,10 @@ pub async fn run(
         None
     };
 
-    let system = IfAgentic::pick(&acct.system_prompt);
+    let mut system = IfAgentic::pick(&acct.system_prompt);
+    if is_steward {
+        system.push_str(super::steward_mode::STEWARD_ADDENDUM);
+    }
     // 上一轮摘要拼在第一条 user 消息前面（同一条消息，避免连续两条 user）；
     // 落盘时已脱敏，开关为真时出网前再过一遍闸门。
     let mut messages = vec![ChatMessage::user(format!(
@@ -3003,12 +3201,14 @@ pub async fn run(
     let mut step = 0usize;
     let mut feedback = String::new();
     // 运行预算（4.6）：自本轮开始 / 最近一次「继续」起累计；用尽即暂停等用户，不是收场。
-    let limits = cfg.budget.clamped();
+    let limits = effective_budget(cfg.budget, req);
     let mut spent = BudgetSpent::default();
     let mut seg_start = std::time::Instant::now();
     // 会话 id → 本轮里上一次动过它（exec / 按键 / 等待）之后缓冲的位置，供 `nx_wait` 当起点：
     // 模型思考的那几秒里到达的输出也该算「新输出」，否则等的提示早出现了反而永远等不到。
     let mut marks: HashMap<String, u64> = HashMap::new();
+    // nx_watch 因「等输入」叫醒模型时的屏幕哈希（按终端）：同一屏幕原样再盯，不再为它叫醒
+    let mut woke_hash: HashMap<String, String> = HashMap::new();
     // 动作块写歪的次数。允许模型改一次，但不许它拿这个把步数刷完。
     let mut misfires = 0usize;
     // 用户接管且等到超时的次数（见 `MAX_TOOK_OVER`）
@@ -3099,6 +3299,15 @@ pub async fn run(
             feedback.clear();
         }
 
+        // 长任务（托管动辄上百步）：历史太长就把很早的步骤折成一条笔记，别撑爆上下文窗口
+        if super::compact::total_chars(&messages) > super::compact::COMPACT_THRESHOLD_CHARS
+            && super::compact::compact(&mut messages, super::compact::COMPACT_THRESHOLD_CHARS)
+        {
+            tracing::info!("上下文过长，已折叠较早的步骤（现 {} 条）", messages.len());
+            if trace_on {
+                trace::record(&session, step, "compact", &format!("历史折叠后 {} 条", messages.len()));
+            }
+        }
         let asked_tools = if use_tools { specs.as_slice() } else { &[] };
         let reply = match llm::complete_reply(acct, &system, &messages, asked_tools, Some(&cancel))
             .await
@@ -3320,7 +3529,8 @@ pub async fn run(
                         danger_cleared = risk.dangerous;
                     }
 
-                    if cfg.exec_mode.is_approval() && risk.dangerous && !danger_cleared {
+                    // 托管模式无人逐步看着：危险命令一律要人批准，不论 exec_mode 是 Agentic 还是 Approval
+                    if (is_steward || cfg.exec_mode.is_approval()) && risk.dangerous && !danger_cleared {
                         let request_id = uuid::Uuid::new_v4().simple().to_string();
                         let req_payload = ApprovePayload {
                             request_id: request_id.clone(),
@@ -3577,7 +3787,8 @@ pub async fn run(
                     };
                     let shown = interact::display_keys(&bytes);
                     // 审批模式下含回车的按键要人点头（原因见 `keys_risk`）；自动模式不把关，与 exec 一致。
-                    let risk = if cfg.exec_mode.is_approval() { keys_risk(&bytes) } else { None };
+                    // 托管模式改由下面按屏幕局面判断（`steward_mode::assess_keys`），这里不预设风险。
+                    let risk = if cfg.exec_mode.is_approval() && !is_steward { keys_risk(&bytes) } else { None };
                     let Some((target_id, label, crossed)) = gate_target(
                         app,
                         state,
@@ -3595,6 +3806,34 @@ pub async fn run(
                     else {
                         continue;
                     };
+                    // 托管：看着屏幕把关。口令提示 / 永久授权直接拒绝（反馈里不回显按键，免得带出口令）；
+                    // shell 上回车提交了危险命令则要人批准（即便越界卡已经批过，那张卡没有列这些原因）
+                    let mut risk = risk;
+                    let mut crossed = crossed;
+                    if is_steward {
+                        let sit = situation_now(app, state, &target_id, false);
+                        match super::steward_mode::assess_keys(&bytes, Some(&sit)) {
+                            super::steward_mode::KeysVerdict::Allow => {}
+                            super::steward_mode::KeysVerdict::Refuse(why) => {
+                                emit_step(
+                                    app,
+                                    &session,
+                                    StepPayload {
+                                        target: Some(target_id.clone()),
+                                        target_label: Some(label.clone()),
+                                        reasons: Some(vec![why.clone()]),
+                                        ..StepPayload::new("skip", step)
+                                    },
+                                );
+                                feedback.push_str(&format!("按键没有发送：{why}\n"));
+                                continue;
+                            }
+                            super::steward_mode::KeysVerdict::Approve(reasons) => {
+                                risk = Some(reasons);
+                                crossed = false;
+                            }
+                        }
+                    }
                     // 越界弹窗已经把风险原因并在同一张卡里了，批准即覆盖两件事，不再弹第二次
                     if let (Some(reasons), false) = (&risk, crossed) {
                         let req_payload = ApprovePayload {
@@ -3750,6 +3989,182 @@ pub async fn run(
                         app, &session, "wait", step, &target_id, &label, Some(&shown),
                         Some(verdict.into()), Some(tail_chars(res.output.trim(), SCREEN_MAX_BYTES)),
                         Some(&guess),
+                    );
+                    feedback.push_str(&fb);
+                    feedback.push('\n');
+                }
+
+                AgentAction::Watch { target, until, timeout_ms, stall_ms } => {
+                    let pat = match until.as_deref().map(Pattern::parse).transpose() {
+                        Ok(p) => p,
+                        Err(why) => {
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    command: until.clone(),
+                                    reasons: Some(vec![format!("until 无效：{why}")]),
+                                    ..StepPayload::new("skip", step)
+                                },
+                            );
+                            feedback.push_str(&format!(
+                                "nx_watch 的 until 无效：{why}。子串直接写；正则写成 /正则/（可加 i）。请修正后重发。\n"
+                            ));
+                            continue;
+                        }
+                    };
+                    let shown = until.clone().unwrap_or_else(|| "（盯到需要处理 / 结束）".into());
+                    let Some((target_id, label, _)) = gate_target(
+                        app,
+                        state,
+                        runtime,
+                        &session,
+                        step,
+                        &mut targets,
+                        target.as_deref(),
+                        |l| format!("盯住「{l}」的任务进度"),
+                        &shown,
+                        Vec::new(),
+                        &mut feedback,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    if !session_alive(state, &target_id) {
+                        feedback.push_str(&format!("会话「{label}」不存在或已关闭，无法盯它。\n"));
+                        continue;
+                    }
+                    let wcfg = super::watch::WatchCfg::from_args(timeout_ms, stall_ms);
+                    state.agent.set_enabled(&target_id, true);
+                    // 盯梢不写 pty，但也要先登记驾驶：零 LLM 托管循环据此对这个终端只看不写
+                    if let Some(st) = runtime.control.acquire(&target_id, &session) {
+                        emit_control(app, &target_id, &[session.clone()], st);
+                    }
+                    let mark = marks
+                        .get(&target_id)
+                        .copied()
+                        .or_else(|| state.agent.pushed(&target_id))
+                        .unwrap_or_default();
+                    emit_interact(
+                        app, &session, "watch", step, &target_id, &label, Some(&shown),
+                        Some(format!("盯着中（最长 {} 分钟）……", (wcfg.timeout_ms / 60_000).max(1))), None, None,
+                    );
+                    let tl_seq = timeline::begin(app, &state.agent, &target_id, TlKind::Wait, &shown, Some("盯住"));
+                    let started = std::time::Instant::now();
+                    let mut paused_for = Duration::ZERO;
+                    let mut last_change = std::time::Instant::now();
+                    let mut last_pushed = state.agent.pushed(&target_id).unwrap_or_default();
+                    let mut last_hash = String::new();
+                    let mut last_beat = std::time::Instant::now();
+                    let mut stop: Option<(super::watch::Reason, super::situation::Situation)> = None;
+                    loop {
+                        if cancel.load(Ordering::Relaxed) {
+                            stop = Some((super::watch::Reason::Cancelled, situation_now(app, state, &target_id, false)));
+                            break;
+                        }
+                        // 用户点了「暂停」：别一直挂着，交回主循环去 hold_paused
+                        if runtime.phases.pause_requested(&session) {
+                            stop = Some((super::watch::Reason::Paused, situation_now(app, state, &target_id, false)));
+                            break;
+                        }
+                        // 用户在终端里动了键盘（控制权 Paused）：等他交还；暂停的时间不算盯梢时长
+                        if runtime.control.state(&target_id) == ControlState::Paused {
+                            let t0 = std::time::Instant::now();
+                            match gate_drive(app, runtime, &session, &target_id, &cancel).await {
+                                control::PauseWait::Ready => {
+                                    paused_for += t0.elapsed();
+                                    last_change = std::time::Instant::now();
+                                }
+                                control::PauseWait::Cancelled => continue,
+                                control::PauseWait::TookOver => {
+                                    took_over = true;
+                                    break;
+                                }
+                            }
+                        }
+                        let sit = situation_now(app, state, &target_id, false);
+                        let pushed = state.agent.pushed(&target_id).unwrap_or_default();
+                        // 单一变化信号：旁路字节计数，加上「有屏幕帧时」的帧哈希。
+                        // 局面来源在帧 / 旁路缓冲之间切换时哈希会在 "" 与真值间跳变，不能当作屏幕变了
+                        let frame_changed = sit.frame_id != 0 && sit.screen_hash != last_hash;
+                        if pushed != last_pushed || frame_changed {
+                            last_pushed = pushed;
+                            last_change = std::time::Instant::now();
+                        }
+                        if sit.frame_id != 0 {
+                            last_hash = sit.screen_hash.clone();
+                        }
+                        let elapsed_ms = started.elapsed().saturating_sub(paused_for).as_millis() as u64;
+                        if let Some(p) = &pat {
+                            let new = state.agent.since(&target_id, mark).unwrap_or_default();
+                            if p.is_match(&new) {
+                                stop = Some((super::watch::Reason::Matched, sit));
+                                break;
+                            }
+                        }
+                        // 上次就是为这个静止的屏幕叫醒的，模型又原样盯回来：等输入这一条不再算数，
+                        // 屏幕变了（哈希不同）才重新生效；卡住 / 超时照常
+                        let rewake = sit.kind == super::situation::SituationKind::AwaitingInput
+                            && sit.frame_id != 0
+                            && woke_hash.get(&target_id) == Some(&sit.screen_hash);
+                        let verdict_kind = if rewake { super::situation::SituationKind::Unknown } else { sit.kind };
+                        if let Some(r) = super::watch::watch_verdict(
+                            verdict_kind,
+                            sit.program,
+                            super::situation::shell_visible(&sit),
+                            last_change.elapsed().as_millis() as u64,
+                            elapsed_ms,
+                            &wcfg,
+                        ) {
+                            stop = Some((r, sit));
+                            break;
+                        }
+                        if last_beat.elapsed() >= Duration::from_secs(60) {
+                            last_beat = std::time::Instant::now();
+                            emit_interact(
+                                app, &session, "watch", step, &target_id, &label, Some(&shown),
+                                Some(format!("已盯 {} 分钟，局面：{}", elapsed_ms / 60_000, sit.kind.as_str())), None, None,
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_millis(super::watch::POLL_MS)).await;
+                    }
+                    let elapsed_ms = started.elapsed().saturating_sub(paused_for).as_millis() as u64;
+                    marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
+                    let guess = classify_session(state, &target_id, false);
+                    if let Some((super::watch::Reason::NeedsAttention(super::situation::SituationKind::AwaitingInput), s)) = &stop {
+                        if s.frame_id != 0 {
+                            woke_hash.insert(target_id.clone(), s.screen_hash.clone());
+                        }
+                    }
+                    let Some((reason, sit)) = stop else {
+                        // 被接管等超时：主循环尾部统一给「用户接管了」的反馈
+                        timeline::finish(app, &state.agent, &target_id, tl_seq, "", Some(&guess), false);
+                        // 起止两张卡的 command 必须一致，前端才会把它们合并
+                        emit_interact(
+                            app, &session, "watch", step, &target_id, &label, Some(&shown),
+                            Some("用户接管，已停止盯梢".into()), Some(String::new()), Some(&guess),
+                        );
+                        continue;
+                    };
+                    // 反馈尾部是已脱敏的局面尾部；命中 until 时附上命中那段新输出
+                    let extra = if reason == super::watch::Reason::Matched {
+                        state.agent.since(&target_id, mark).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    // 口令提示不附新输出（哪怕是 until 命中的那段）
+                    let extra = if sit.kind == super::situation::SituationKind::Password { String::new() } else { extra };
+                    let fb = super::watch::render_feedback(
+                        &label, reason, elapsed_ms, Some(&sit), "", &extra, MAX_FEEDBACK_CHARS,
+                    );
+                    if trace_on {
+                        trace::record(&session, step, "watch", &format!("{label}（{target_id}）{} {shown}\n{}", reason.label(), sit.tail));
+                    }
+                    timeline::finish(app, &state.agent, &target_id, tl_seq, &sit.tail, Some(&guess), false);
+                    emit_interact(
+                        app, &session, "watch", step, &target_id, &label, Some(&shown),
+                        Some(reason.label()), Some(sit.tail.clone()), Some(&guess),
                     );
                     feedback.push_str(&fb);
                     feedback.push('\n');
@@ -4737,6 +5152,8 @@ mod tests {
             targets: vec![],
             console_text: None,
             console_alt: false,
+            mode: None,
+            budget: None,
         };
         let resolved = resolve_targets(&req);
         assert_eq!(resolved.len(), 1);
@@ -5244,7 +5661,7 @@ mod tests {
 
     #[test]
     fn protocol_teaches_new_tools_and_forbids_typing_passwords() {
-        for key in ["nx_send_keys", "nx_wait", "nx_screen", "<C-c>", "256 字节"] {
+        for key in ["nx_send_keys", "nx_wait", "nx_screen", "<C-c>", "4096 字节"] {
             assert!(ACTION_PROTOCOL.contains(key), "协议缺少：{key}");
         }
         assert!(ACTION_PROTOCOL.contains("绝不要用 send_keys / exec 输入密码"));
@@ -5446,7 +5863,71 @@ mod tests {
             targets: Vec::new(),
             console_text: None,
             console_alt: alt,
+            mode: None,
+            budget: None,
         }
+    }
+
+    #[test]
+    fn run_request_mode_and_budget_deserialize_camel_case() {
+        let r: AgentRunRequest = serde_json::from_str(
+            r#"{"sessionId":"s","question":"q","mode":"steward","budget":{"maxSteps":50,"maxMinutes":10}}"#,
+        )
+        .unwrap();
+        assert!(r.is_steward());
+        let o = r.budget.unwrap();
+        assert_eq!((o.max_steps, o.max_minutes), (Some(50), Some(10)));
+        // 缺省 / null：普通对话
+        let n: AgentRunRequest =
+            serde_json::from_str(r#"{"sessionId":"s","question":"q","mode":null,"budget":null}"#).unwrap();
+        assert!(!n.is_steward() && n.budget.is_none());
+        let d: AgentRunRequest = serde_json::from_str(r#"{"sessionId":"s","question":"q"}"#).unwrap();
+        assert!(!d.is_steward());
+    }
+
+    #[test]
+    fn steward_budget_defaults_and_override() {
+        let base = budget::RunBudget::default();
+        let mut r = plain_req("q", false);
+        assert_eq!(effective_budget(base, &r), base.clamped());
+        r.mode = Some("steward".into());
+        let b = effective_budget(base, &r);
+        assert_eq!((b.max_steps, b.max_minutes), (400, 360));
+        r.budget = Some(RunBudgetOverride { max_steps: Some(30), max_minutes: None });
+        let b = effective_budget(base, &r);
+        assert_eq!((b.max_steps, b.max_minutes), (30, 360));
+        // 越界被夹紧
+        r.budget = Some(RunBudgetOverride { max_steps: Some(u32::MAX), max_minutes: Some(u32::MAX) });
+        let b = effective_budget(base, &r);
+        assert!(b.max_steps <= budget::MAX_STEPS_CEIL && b.max_minutes <= budget::MAX_MINUTES_CEIL);
+    }
+
+    #[test]
+    fn watch_tool_is_declared_and_parses() {
+        assert!(tool_specs().iter().any(|s| s.name == TOOL_WATCH));
+        let acts = actions_from_tool_call(&call(
+            TOOL_WATCH,
+            r#"{"target":"s1","timeoutMs":5000,"until":"/done/i","stallMs":9000}"#,
+        ));
+        assert_eq!(
+            acts,
+            vec![AgentAction::Watch {
+                target: Some("s1".into()),
+                until: Some("/done/i".into()),
+                timeout_ms: Some(5000),
+                stall_ms: Some(9000),
+            }]
+        );
+        assert_eq!(
+            actions_from_tool_call(&call(TOOL_WATCH, "{}")),
+            vec![AgentAction::Watch { target: None, until: None, timeout_ms: None, stall_ms: None }]
+        );
+        assert_eq!(
+            extract_actions(&block(r#"{"action":"watch","timeoutMs":1000}"#)),
+            vec![AgentAction::Watch { target: None, until: None, timeout_ms: Some(1000), stall_ms: None }]
+        );
+        assert_eq!(tool_label(TOOL_WATCH, "{}"), "盯住任务");
+        assert!(ACTION_PROTOCOL.contains("nx_watch"));
     }
 
     #[test]

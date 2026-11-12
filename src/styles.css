@@ -2378,7 +2378,22 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   background: var(--bg-panel); color: var(--text-dim); font-size: 11.5px; line-height: 1.5;
 }
 .st-status.active { border-left-color: var(--accent); color: var(--text); }
+.st-num { width: 64px; margin: 0 4px; padding: 2px 4px; background: var(--bg, transparent); color: inherit; border: 1px solid var(--border, #444); border-radius: 4px; }
+.st-budget-banner {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 8px; padding: 10px 12px; border-radius: 6px;
+  border: 1px solid #e5c07b; border-left-width: 4px;
+  background: rgba(229, 192, 123, 0.12); color: #e5c07b; font-weight: 600;
+}
+.st-budget-banner > span { flex: 1 1 220px; }
 .st-status.warn { border-left-color: #e5c07b; color: #e5c07b; }
+
+/* AI 托管实况：运行卡片流（与「对话」同一套 .ap-step / .ap-approve 卡片），限高、内部滚动 */
+.st-run { flex: none; display: flex; flex-direction: column; gap: 6px; }
+.st-feed {
+  max-height: 46vh; min-height: 60px; overflow-y: auto; padding: 8px;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel);
+}
 
 /* 诊断：计数器 / 阈值 / 帧指纹等内部细节，默认收起 */
 .st-diag { flex: none; color: var(--text-dim); }

@@ -1,43 +1,28 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { UnlistenFn } from "@tauri-apps/api/event";
 import ConfirmDialog, { type ConfirmOptions } from "./ConfirmDialog";
 import SkillManager from "./SkillManager";
-import { HostMemoryDialog, MemoryStepCard } from "./HostMemory";
+import { HostMemoryDialog } from "./HostMemory";
 import Timeline from "./Timeline";
-import StewardPanel from "./StewardPanel";
+import StewardPanel, { type StewardRunBridge } from "./StewardPanel";
 import { RecordingBadge } from "./RecorderBar";
-import {
-  api,
-  onAgentApprove,
-  onAgentControl,
-  onAgentDone,
-  onAgentError,
-  onAgentSecret,
-  onAgentStep,
-  onAgentToken,
-} from "../api";
+import { RunCard, isRunCard } from "./RunFeed";
+import { api } from "../api";
 import { isAgentReady, useAgentConfig } from "../lib/agent";
-import { nextPause, pauseBannerText, type PauseKind } from "../lib/agentBudget";
-import { toFriendlyError } from "../lib/errors";
+import { pauseBannerText, type StewardBudgetPref } from "../lib/agentBudget";
 import {
-  applyControl,
-  drivingSessions,
-  pausedSessions,
-  type ControlState,
-} from "../lib/control";
+  finishWithoutAnswer,
+  sliceFromMessage,
+  uid,
+  withError,
+} from "../lib/agentRun";
+import { toFriendlyError } from "../lib/errors";
 import { enterVerdict, ImeGuard, isImeKey, keyInfoFrom } from "../lib/ime";
 import { matchSessions, scanMention } from "../lib/mention";
 import { useAgentHistory } from "../lib/useAgentHistory";
-import type {
-  AgentApproveRequest,
-  AgentDoneReason,
-  AgentMessage,
-  AgentSecretRequest,
-  AgentStep,
-  AgentTarget,
-  Skill,
-  SkillInput,
-} from "../types";
+import { useAgentRun } from "../lib/useAgentRun";
+import { stewardApi, stewardConsoleIds } from "../lib/steward";
+import { setStewardConsoles } from "../lib/termRegistry";
+import type { AgentMessage, AgentTarget, Skill, SkillInput } from "../types";
 
 export interface AgentPanelProps {
   /** 当前会话 id（绑定哪个终端） */
@@ -65,37 +50,6 @@ export interface AgentPanelProps {
   onGetConsole?: (sessionId: string) => { text: string; alt: boolean } | null;
 }
 
-/** 单个会话的对话状态。按 sessionId 分桶，切会话时彼此完全隔离。 */
-interface Conversation {
-  messages: AgentMessage[];
-  /** 这个会话正在等一次回答的流结束 */
-  busy: boolean;
-  /** 上一次是被「切走会话 / 收起面板」打断的 —— 半截答案不可信，要提示 */
-  interrupted: boolean;
-  /**
-   * 这一轮此刻停在暂停上（预算用尽 / 手动暂停）。后端同一轮还占着会话、等「继续」或「停止」。
-   * 只从 `paused` / `resumed` 步骤推出；一轮结束时对话状态被整体重建，标记随之消失。
-   */
-  paused?: PauseKind;
-}
-
-/** 「停止时同时发 Ctrl-C」的本机偏好（"1" = 开，默认关） */
-const LS_STOP_CTRL_C = "nx.agent.stopCtrlC";
-
-const EMPTY_CONV: Conversation ={ messages: [], busy: false, interrupted: false };
-
-/** 撞到 max_tokens 时追加在答案末尾的说明 */
-const TRUNCATED_HINT = "\n\n— 回答被长度限制截断，可以让它继续，或缩小问题范围再问一次。";
-/** 一个字都没收到就 done 了（被过滤 / 空回复）：不能给用户留一个空气泡 */
-const EMPTY_ANSWER = "（本次没有返回内容）";
-const CANCELLED_ANSWER = "（已取消）";
-/** 一轮跑完却没等到结论（多半是用户点了停止）时补的那句话 */
-const NO_CONCLUSION = "（这一轮没有给出结论：上面的步骤就是它做过的全部事情。）";
-
-let seq = 0;
-/** 纯前端的消息 id。不用 crypto.randomUUID：Tauri 的 WebView 不保证是安全上下文。 */
-const uid = () => `m${Date.now().toString(36)}-${(seq++).toString(36)}`;
-
 type Segment =
   | { kind: "text"; text: string }
   | { kind: "code"; lang: string; text: string };
@@ -118,226 +72,6 @@ function splitSegments(text: string): Segment[] {
   }
   if (last < text.length) out.push({ kind: "text", text: text.slice(last) });
   return out;
-}
-
-/** 收到一个增量文本块：追加到当前正在流的那条助手消息上 */
-function withToken(c: Conversation, chunk: string): Conversation {
-  const msgs = c.messages.slice();
-  const last = msgs[msgs.length - 1];
-  if (last && last.role === "assistant" && last.streaming) {
-    msgs[msgs.length - 1] = { ...last, text: last.text + chunk };
-    return { ...c, messages: msgs };
-  }
-  // 正常路径下提问时已经先建好占位消息；真走到这儿说明后端漏了顺序，补一条别丢字
-  msgs.push({ id: uid(), role: "assistant", text: chunk, ts: Date.now(), streaming: true });
-  return { ...c, messages: msgs };
-}
-
-/**
- * 收到 done：这是唯一的正常收尾信号（后端保证一定发，取消时 reason=cancelled）。
- * 前端不做任何超时兜底 —— 猜出来的结束会和后端状态打架。
- */
-function withDone(c: Conversation, reason: AgentDoneReason): Conversation {
-  return {
-    messages: c.messages.map((m) => {
-      if (!m.streaming) return m;
-      const text = reason === "length" ? m.text + TRUNCATED_HINT : m.text;
-      return {
-        ...m,
-        streaming: false,
-        text: text.trim()
-          ? text
-          : reason === "cancelled"
-            ? CANCELLED_ANSWER
-            : EMPTY_ANSWER,
-      };
-    }),
-    busy: false,
-    interrupted: false,
-  };
-}
-
-/** 收到 error：终态，其后不会再有 done。把当前助手消息整条换成错误文案。 */
-function withError(c: Conversation, msg: string): Conversation {
-  const msgs = c.messages.slice();
-  const idx = msgs.findIndex((m) => m.role === "assistant" && m.streaming);
-  if (idx >= 0) {
-    msgs[idx] = { ...msgs[idx], streaming: false, error: true, text: msg };
-  } else {
-    msgs.push({ id: uid(), role: "assistant", text: msg, ts: Date.now(), error: true });
-  }
-  return { messages: msgs, busy: false, interrupted: false };
-}
-
-/**
- * 追加一个过程步骤。`result` 会回填到它对应的那条 `exec` 上合成**一张**卡片：
- * 拆成两张会把对话拉长一倍，也看不出哪个结果属于哪条命令。
- */
-function withStep(c: Conversation, step: AgentStep): Conversation {
-  const msgs = c.messages.slice();
-  if (step.kind === "result") {
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i];
-      const s = m.step;
-      if (
-        s &&
-        s.kind === "exec" &&
-        s.output === undefined &&
-        s.target === step.target &&
-        s.command === step.command
-      ) {
-        msgs[i] = {
-          ...m,
-          step: { ...s, kind: "result", output: step.output, promptKind: step.promptKind ?? s.promptKind },
-        };
-        return { ...c, messages: msgs };
-      }
-    }
-  }
-  // 密码通道：收尾步骤（带 secretStatus）并回同一目标、同一理由的进行中卡片。
-  // 注意不能用 output 判断进行中——收尾时可能没有输出尾部（undefined）。
-  if (step.kind === "secret" && step.secretStatus !== undefined) {
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i];
-      const s = m.step;
-      if (
-        s &&
-        s.kind === "secret" &&
-        s.secretStatus === undefined &&
-        s.target === step.target &&
-        s.command === step.command
-      ) {
-        msgs[i] = { ...m, step };
-        return { ...c, messages: msgs };
-      }
-    }
-  }
-  // 「手和眼」三类卡（按键 / 等待 / 读屏）：收尾（output 有值）合并回同一目标、同一内容的进行中卡片，
-  // 与 exec → result 同理，别把一次动作拆成两张卡。
-  if (
-    (step.kind === "keys" || step.kind === "wait" || step.kind === "screen") &&
-    step.output !== undefined
-  ) {
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i];
-      const s = m.step;
-      if (
-        s &&
-        s.kind === step.kind &&
-        s.output === undefined &&
-        s.target === step.target &&
-        s.command === step.command
-      ) {
-        msgs[i] = { ...m, step };
-        return { ...c, messages: msgs };
-      }
-    }
-  }
-  // 技能回放进度卡：同一步（同 command）的进行中卡片原地更新为收尾；重试时上一张已收尾，另起一张。
-  if (step.kind === "skill") {
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const s = msgs[i].step;
-      if (s && s.kind === "skill" && s.target === step.target && s.command === step.command) {
-        if (s.output === undefined) msgs[i] = { ...msgs[i], step };
-        else msgs.push({ id: uid(), role: "assistant", text: "", ts: Date.now(), step });
-        return { ...c, messages: msgs };
-      }
-    }
-  }
-  // 纯展示用的「还在等」心跳：合并进对应的 exec 卡片，不单独起一张卡；
-  // 对应的卡片已经收尾（或从没出现过，比如面板是后打开的）就直接丢弃，
-  // 不能退化成下面的"推一条新消息"，那样会在对话里冒出一张没头没尾的孤卡。
-  if (step.kind === "waiting") {
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i];
-      const s = m.step;
-      if (
-        s &&
-        s.kind === "exec" &&
-        s.output === undefined &&
-        s.target === step.target &&
-        s.command === step.command
-      ) {
-        msgs[i] = { ...m, step: { ...s, elapsedSecs: step.elapsedSecs } };
-        return { ...c, messages: msgs };
-      }
-    }
-    return c;
-  }
-  msgs.push({ id: uid(), role: "assistant", text: "", ts: Date.now(), step });
-  return { ...c, messages: msgs };
-}
-
-/** 追加一张待批卡片。真正的执行由用户在卡片上点头后才继续。 */
-function withApprove(c: Conversation, req: AgentApproveRequest): Conversation {
-  return {
-    ...c,
-    messages: [...c.messages, { id: uid(), role: "assistant", text: "", ts: Date.now(), approve: req }],
-  };
-}
-
-/** 记录用户对某张待批卡片的答复（卡片自己据此变成「已允许 / 已拒绝」的终态）。 */
-function withDecision(
-  c: Conversation,
-  requestId: string,
-  approved: boolean
-): Conversation {
-  return {
-    ...c,
-    messages: c.messages.map((m) =>
-      m.approve?.requestId === requestId ? { ...m, approveResult: approved } : m
-    ),
-  };
-}
-
-/** 追加一张密码卡片（模型请求用户输入密码）。卡片里的输入值只在组件本地 state，不进会话。 */
-function withSecret(c: Conversation, req: AgentSecretRequest): Conversation {
-  return {
-    ...c,
-    messages: [...c.messages, { id: uid(), role: "assistant", text: "", ts: Date.now(), secret: req }],
-  };
-}
-
-/** 记录密码卡片的结局（卡片据此变成终态，输入框消失） */
-function withSecretResult(
-  c: Conversation,
-  requestId: string,
-  result: "submitted" | "skipped" | "expired"
-): Conversation {
-  return {
-    ...c,
-    messages: c.messages.map((m) =>
-      m.secret?.requestId === requestId ? { ...m, secretResult: result } : m
-    ),
-  };
-}
-
-/** 暂停 / 继续步骤改变对话的暂停标记（其余步骤原样，不产生新对象）。 */
-function withPauseState(c: Conversation, step: AgentStep): Conversation {
-  const next = nextPause(c.paused, step);
-  return next === c.paused ? c : { ...c, paused: next };
-}
-
-/** Agentic 一轮的结束语落地：既不置也不用补 markup，直接作为一条完整助手消息。 */
-function withConclusion(c: Conversation, text: string): Conversation {
-  const trimmed = text.trim();
-  return {
-    busy: false,
-    interrupted: false,
-    messages: [
-      ...c.messages,
-      { id: uid(), role: "assistant", text: trimmed || EMPTY_ANSWER, ts: Date.now() },
-    ],
-  };
-}
-
-/**
- * 一轮结束却**没等到**结论时兜的那一步（多半是用户点了停止）。判据是「busy 仍为
- * true」：有结论的话 kind=answer 走 `withConclusion` 早把它置回 false 了。
- * 不补这一步界面会永远转圈。
- */
-function finishWithoutAnswer(c: Conversation): Conversation {
-  return withConclusion(c, NO_CONCLUSION);
 }
 
 /** 清空对话的确认框文案（真删已保存的对话与运行摘要） */
@@ -375,10 +109,13 @@ export function AgentPanel({
   const [memOpen, setMemOpen] = useState(false);
 
   /**
-   * Agent 面向全局：整个应用只有**一份**对话。
+   * Agent 面向全局：整个应用只有**一份**对话（`useAgentRun`，对话与托管两个视图共用，
+   * 事件只订阅这一份 —— 审批 / 密码卡片不会被两处各答一次）。
    * 切标签只换「当前会话」这个上下文，不换聊天记录 —— 助手是同一个助手。
    */
-  const [conv, setConv] = useState<Conversation>(EMPTY_CONV);
+  const [err, setErr] = useState<string | null>(null);
+  const run = useAgentRun({ sessionId, onError: setErr });
+  const { conv, setConv, patch, runSession, setRunSession, pausedIds, drivingIds } = run;
   const [input, setInput] = useState("");
   /** 输入框。`@` 联想要在选中一项之后把光标放回原处，所以得拿得到它 */
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -402,12 +139,10 @@ export function AgentPanel({
     const ta = taRef.current;
     if (ta) ta.selectionStart = ta.selectionEnd = input.length;
   }, [input]);
-  const [err, setErr] = useState<string | null>(null);
-  /**
-   * 这一轮实际发起的会话。事件订阅挂在它上面，而**不跟随 sessionId** ——
-   * 用户切到别的标签时，正在跑的那条流仍要收得到，否则答案会断在半截。
-   */
-  const [runSession, setRunSession] = useState<string | null>(null);
+  /** 当前 / 最近一轮是「对话」发起的还是「托管」发起的（只决定托管页要不要认领这一轮） */
+  const [runMode, setRunMode] = useState<"chat" | "steward">("chat");
+  /** 托管那一轮起手时挂上的目标消息 id：托管页只展示它之后的消息 */
+  const [stewardFromId, setStewardFromId] = useState<string | null>(null);
   const [pending, setPending] = useState<
     { kind: "clear" } | { kind: "clearConv" } | { kind: "cmd"; cmd: string } | null
   >(null);
@@ -437,10 +172,6 @@ export function AgentPanel({
   /** 本轮的作用范围：scoped 为空时就是「仅当前会话」 */
   const activeScope = scoped && scoped.length > 0 ? scoped : [sessionId];
 
-  const patch = useCallback((fn: (c: Conversation) => Conversation) => {
-    setConv((prev) => fn(prev));
-  }, []);
-
   // ——— 对话持久化：重载 / 重启后恢复，变化时防抖写盘 ———
   const history = useAgentHistory(
     messages,
@@ -450,118 +181,6 @@ export function AgentPanel({
       []
     )
   );
-
-  // ——— 终端控制权（人 / Agent / 暂停） ———
-
-  /** 本轮涉及的各会话的控制权状态（只留活跃的；userDriving 的会被删掉） */
-  const [control, setControl] = useState<Record<string, ControlState>>({});
-  const pausedIds = pausedSessions(control);
-  const drivingIds = drivingSessions(control);
-  /** 「停止」时是否同时给被驾驶的终端发 Ctrl-C。默认关，选择记在本机 */
-  const [stopCtrlC, setStopCtrlC] = useState<boolean>(
-    () => localStorage.getItem(LS_STOP_CTRL_C) === "1"
-  );
-  const toggleStopCtrlC = (on: boolean) => {
-    setStopCtrlC(on);
-    localStorage.setItem(LS_STOP_CTRL_C, on ? "1" : "0");
-  };
-
-  // ——— 会话切换 / 收起时的收尾 ———
-
-  /**
-   * 切走会话或收起面板都会 unlisten，之后流跑完我们也收不到。把消息从 streaming
-   * 摘下并标记 interrupted，否则切回来是一个永远转圈的「正在回答」。
-   */
-  const markInterrupted = useCallback(() => {
-    setConv((c) => {
-      const streaming = c.messages.some((m) => m.streaming);
-      if (!c.busy && !streaming) return c;
-      return {
-        busy: false,
-        interrupted: streaming,
-        messages: streaming
-          ? c.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m))
-          : c.messages,
-      };
-    });
-  }, []);
-
-  // 面板收起时事件订阅会断掉，把还在转圈的那条消息摘下来。
-  // **切换会话不触发** —— 对话是全局的，流不该因为切标签而中断。
-  useEffect(() => {
-    if (!visible) markInterrupted();
-  }, [visible, markInterrupted]);
-
-  // ——— 事件订阅：按 sessionId 订阅，切会话即整体换掉 ———
-
-  useEffect(() => {
-    if (!visible || !runSession) return;
-    let disposed = false;
-    const unlisteners: UnlistenFn[] = [];
-
-    void (async () => {
-      try {
-        const [offToken, offDone, offError, offStep, offApprove, offSecret, offControl] = await Promise.all([
-          onAgentToken(runSession, (chunk) => {
-            if (!disposed) patch((c) => withToken(c, chunk));
-          }),
-          onAgentDone(runSession, (p) => {
-            if (!disposed) patch((c) => withDone(c, p.reason));
-          }),
-          onAgentError(runSession, (msg) => {
-            if (!disposed) patch((c) => withError(c, msg));
-          }),
-          onAgentStep(runSession, (step) => {
-            if (disposed) return;
-            // kind=answer 是这一轮的总结，作为一条完整的助手消息落地并收掉 busy；
-            // 其余都当作过程卡片逐条追加。
-            patch((c) =>
-              step.kind === "answer"
-                ? withConclusion(c, step.text ?? "")
-                : withPauseState(withStep(c, step), step)
-            );
-          }),
-          onAgentApprove(runSession, (req) => {
-            if (!disposed) patch((c) => withApprove(c, req));
-          }),
-          onAgentSecret(runSession, (req) => {
-            if (!disposed) patch((c) => withSecret(c, req));
-          }),
-          onAgentControl(runSession, (p) => {
-            if (!disposed) setControl((s) => applyControl(s, p));
-          }),
-        ]);
-        // 竞态：listen 是异步的，等它 resolve 时这一轮可能已经结束了 —— 这时要立刻退订
-        if (disposed) {
-          offToken();
-          offDone();
-          offError();
-          offStep();
-          offApprove();
-          offSecret();
-          offControl();
-          return;
-        }
-        unlisteners.push(offToken, offDone, offError, offStep, offApprove, offSecret, offControl);
-        // 订阅之前就已经在跑的一轮（面板刚打开 / 重新挂载）：对一次账，补上发起会话的状态
-        api
-          .agentControlGet(runSession)
-          .then((st) => {
-            if (!disposed) setControl((s) => applyControl(s, { session: runSession, state: st }));
-          })
-          .catch(() => {});
-      } catch {
-        // 订阅失败：提问时会在 agentRun 上抛出真错误，这里不必再弹一次
-      }
-    })();
-
-    return () => {
-      disposed = true;
-      unlisteners.forEach((f) => f());
-      // 订阅断了就收不到后续变化，留着旧状态只会让横幅卡在屏幕上
-      setControl({});
-    };
-  }, [runSession, visible, patch]);
 
   // ——— 清空记忆 ———
 
@@ -635,17 +254,23 @@ export function AgentPanel({
    * 不再提前立一个空的助手泡：这一轮的过程是一张张 step 卡片，
    * 结论等它自己给出时才落地 —— 先立一个空泡只会让对话里多一条空气泡。
    */
-  const startRun = (q: string) => {
-    setInput("");
-    historyIndexRef.current = -1;
-    draftRef.current = "";
+  const startRun = (q: string, mode: "chat" | "steward" = "chat"): string => {
+    // 托管是从「托管」页发起的，不该顺手清掉对话输入框里还没发的草稿
+    if (mode === "chat") {
+      setInput("");
+      historyIndexRef.current = -1;
+      draftRef.current = "";
+    }
     setErr(null);
     stickRef.current = true;
+    setRunMode(mode);
+    const id = uid();
     patch((c) => ({
       busy: true,
       interrupted: false,
-      messages: [...c.messages, { id: uid(), role: "user" as const, text: q, ts: Date.now() }],
+      messages: [...c.messages, { id, role: "user" as const, text: q, ts: Date.now() }],
     }));
+    return id;
   };
 
   // ——— `@会话名` 联想 ———
@@ -723,6 +348,55 @@ export function AgentPanel({
   };
 
   /**
+   * 托管页点「开始托管」：在指定终端上起一轮 steward 模式的 Agent（LLM 是手和脑，
+   * 屏幕识别是眼睛）。与 runAgentic 同一条链路 —— 同一份订阅、同一份对话状态；
+   * 契约（让前端开始采集该终端屏幕帧）由调用方先签好。
+   * 和 runAgentic 一样：`await` 到的是整轮跑完，失败已发过 error 事件。
+   */
+  const runSteward = async (sid: string, goal: string, budget?: StewardBudgetPref): Promise<void> => {
+    if (run.conv.busy) return;
+    setRunSession(sid);
+    setStewardFromId(startRun(`托管目标：${goal}`, "steward"));
+    const snap = onGetConsole?.(sid) ?? null;
+    const label = sessions.find((x) => x.id === sid)?.label ?? "当前会话";
+    try {
+      await api.agentRun({
+        sessionId: sid,
+        question: goal,
+        targets: [{ id: sid, label }],
+        consoleText: snap?.text,
+        consoleAlt: snap?.alt,
+        mode: "steward",
+        budget: budget ? { maxSteps: budget.maxSteps, maxMinutes: budget.maxMinutes } : undefined,
+      });
+    } catch (e) {
+      patch((c) => withError(c, toFriendlyError(e).message));
+    } finally {
+      patch((c) => (c.busy ? finishWithoutAnswer(c) : c));
+      // 这一轮结束（跑完 / 出错 / 被取消）：契约一并停掉，否则零 LLM 的 Steward 会按旧档位
+      // 在该终端上接着动手，而界面早已不显示「托管中」。放在这里（常驻的 AgentPanel）而不是
+      // StewardPanel：切到「对话」页时 StewardPanel 会卸载，它的 effect 就收不到这个时刻了。
+      // 手动「停止」已经停过契约时这里是幂等空操作（后端返回 false）。
+      void stopContractFor(sid);
+    }
+  };
+
+  /** 停掉某终端上的托管契约（没有 / 已停就什么都不做；失败静默 —— 面板 1.5s 轮询会对账） */
+  const stopContractFor = async (sid: string) => {
+    try {
+      const list = await stewardApi.status();
+      const c = list.find((x) => x.consoleId === sid);
+      if (c) {
+        await stewardApi.stop(c.id);
+        // 托管页若已卸载就没人轮询去撤采集门控了，这里顺手对一次
+        setStewardConsoles(stewardConsoleIds(await stewardApi.status()));
+      }
+    } catch {
+      /* 对账由 StewardPanel 的轮询负责 */
+    }
+  };
+
+  /**
    * 技能管理器里点「运行」：关掉管理器，在当前会话上回放。
    * 与 runAgentic 同构（订阅挂到本次会话、busy 转圈、停止按钮同一条取消路径）；
    * 进度 / 审批 / 密码卡片都走这条会话的事件频道，所以必须由面板而不是管理器自己发起。
@@ -740,81 +414,6 @@ export function AgentPanel({
       patch((c) => withError(c, toFriendlyError(e).message));
     } finally {
       patch((c) => (c.busy ? finishWithoutAnswer(c) : c));
-    }
-  };
-
-  const cancel = async () => {
-    const sid = runSession ?? sessionId;
-    if (!sid) return;
-    try {
-      // 幂等：没有在跑时后端什么都不做
-      await api.agentRunCancel(sid, stopCtrlC);
-    } catch (e) {
-      setErr(`取消失败：${toFriendlyError(e).message}`);
-    }
-  };
-
-  /** 手动「暂停」：当前这一步做完后停下，把终端还给用户。 */
-  const pauseRun = async () => {
-    const sid = runSession ?? sessionId;
-    if (!sid) return;
-    try {
-      await api.agentRunPause(sid);
-    } catch (e) {
-      setErr(`暂停失败：${toFriendlyError(e).message}`);
-    }
-  };
-
-  /** 「继续」：同一轮、同一段对话，换一份新预算接着做。 */
-  const resumeRun = async () => {
-    const sid = runSession ?? sessionId;
-    if (!sid) return;
-    try {
-      await api.agentRunResume(sid);
-    } catch (e) {
-      setErr(`继续失败：${toFriendlyError(e).message}`);
-    }
-  };
-
-  /** 「接管」：让 Agent 立刻让路（等同于自己敲了键）。对所有正被驾驶的会话生效。 */
-  const takeover = () => {
-    for (const id of drivingIds) void api.agentControlTakeover(id).catch(() => {});
-  };
-  /** 「交还」：Paused → Agent 继续。 */
-  const handback = () => {
-    for (const id of pausedIds) void api.agentControlHandback(id).catch(() => {});
-  };
-
-  /** 用户在审批卡片上的选择。后端收不到（超时）也照样把卡片置成终态。 */
-  const decide = async (req: AgentApproveRequest, approved: boolean) => {
-    try {
-      await api.agentApprove(req.requestId, approved);
-    } catch (e) {
-      setErr(`提交审批结果失败：${toFriendlyError(e).message}`);
-      return;
-    }
-    patch((c) => withDecision(c, req.requestId, approved));
-  };
-
-  /**
-   * 用户在密码卡片上的选择：`value` 给了就是提交密码，`undefined` 是跳过。
-   * 值经 `agent_secret_ack` 直达后端写进 pty —— 不进对话 state、不进模型上下文。
-   * 返回 `null` 表示已处理（卡片已置成终态），否则返回要在卡片内联显示的错误文案
-   * （例如密码含控制字符被后端拒绝：这种情况后端没消耗登记，卡片保持打开可重输）。
-   */
-  const answerSecret = async (
-    req: AgentSecretRequest,
-    value?: string
-  ): Promise<string | null> => {
-    try {
-      const accepted = await api.agentSecretAck(req.requestId, value);
-      // false：这个请求已经超时 / 被取消 / 重复提交，后端不再等了
-      patch((c) =>
-        withSecretResult(c, req.requestId, accepted ? (value === undefined ? "skipped" : "submitted") : "expired")
-      );
-      return null;
-    } catch (e) {
-      return toFriendlyError(e).message;
     }
   };
 
@@ -840,6 +439,33 @@ export function AgentPanel({
     if (p.kind === "clear") void clearMemory();
     else if (p.kind === "clearConv") void clearConversation();
     else void insertCommand(p.cmd);
+  };
+
+  /** 托管页看到的这一轮：只含托管那一轮的消息，动作全部转给同一份 `useAgentRun` */
+  const stewardOwned = runMode === "steward";
+  const stewardBridge: StewardRunBridge = {
+    session: stewardOwned ? runSession : null,
+    active: busy && stewardOwned,
+    otherBusy: busy && !stewardOwned,
+    messages: sliceFromMessage(messages, stewardFromId),
+    paused: !!conv.paused,
+    pauseText: conv.paused ? pauseBannerText(conv.paused) : undefined,
+    pauseKind: conv.paused,
+    userPaused: pausedIds.length > 0,
+    driving: drivingIds.length > 0,
+    stopCtrlC: run.stopCtrlC,
+    toggleStopCtrlC: run.toggleStopCtrlC,
+    start: runSteward,
+    cancel: run.cancel,
+    pause: run.pauseRun,
+    resume: run.resumeRun,
+    takeover: run.takeover,
+    handback: run.handback,
+    decide: run.decide,
+    answerSecret: run.answerSecret,
+    ready: ready.ok,
+    notReadyReason: ready.reason,
+    error: err,
   };
 
   if (!visible || !sessionId) return null;
@@ -899,7 +525,7 @@ export function AgentPanel({
       )}
 
       {view === "steward" && (
-        <StewardPanel sessionId={sessionId} sessions={sessions} />
+        <StewardPanel sessionId={sessionId} sessions={sessions} run={stewardBridge} />
       )}
 
       <div className="ap-status">
@@ -945,26 +571,14 @@ export function AgentPanel({
             )}
             {messages.map((m) => {
               // 过程卡片不是对话泡：整幅宽度更能排得下命令与输出
-              if (m.step) return <StepCard key={m.id} step={m.step} />;
-              if (m.approve) {
+              if (isRunCard(m)) {
                 return (
-                  <ApproveCard
+                  <RunCard
                     key={m.id}
-                    req={m.approve}
-                    result={m.approveResult}
+                    message={m}
                     busy={busy}
-                    onDecide={(ok) => void decide(m.approve!, ok)}
-                  />
-                );
-              }
-              if (m.secret) {
-                return (
-                  <SecretCard
-                    key={m.id}
-                    req={m.secret}
-                    result={m.secretResult}
-                    busy={busy}
-                    onAnswer={(value) => answerSecret(m.secret!, value)}
+                    onDecide={(req, ok) => void run.decide(req, ok)}
+                    onAnswerSecret={run.answerSecret}
                   />
                 );
               }
@@ -1023,7 +637,7 @@ export function AgentPanel({
           {busy && conv.paused ? (
             <div className="ap-control paused" role="status">
               <span className="ap-control-text">{pauseBannerText(conv.paused)}</span>
-              <button className="btn primary" onClick={() => void resumeRun()}>
+              <button className="btn primary" onClick={() => void run.resumeRun()}>
                 继续
               </button>
             </div>
@@ -1032,7 +646,7 @@ export function AgentPanel({
               <span className="ap-control-text">
                 你正在操作终端，Agent 已暂停（不会往终端里写入）。
               </span>
-              <button className="btn primary" onClick={handback}>
+              <button className="btn primary" onClick={run.handback}>
                 交还
               </button>
             </div>
@@ -1041,7 +655,7 @@ export function AgentPanel({
               <span className="ap-control-text">
                 Agent 正在操作终端。你在终端里一敲键盘它就会自动暂停。
               </span>
-              <button className="btn" onClick={takeover}>
+              <button className="btn" onClick={run.takeover}>
                 接管
               </button>
             </div>
@@ -1216,8 +830,8 @@ export function AgentPanel({
                   >
                     <input
                       type="checkbox"
-                      checked={stopCtrlC}
-                      onChange={(e) => toggleStopCtrlC(e.target.checked)}
+                      checked={run.stopCtrlC}
+                      onChange={(e) => run.toggleStopCtrlC(e.target.checked)}
                     />
                     同时发 Ctrl-C
                   </label>
@@ -1225,12 +839,12 @@ export function AgentPanel({
                     <button
                       className="btn"
                       title="当前这一步做完后暂停，终端还给你；之后可以「继续」"
-                      onClick={() => void pauseRun()}
+                      onClick={() => void run.pauseRun()}
                     >
                       暂停
                     </button>
                   )}
-                  <button className="btn danger" onClick={() => void cancel()}>
+                  <button className="btn danger" onClick={() => void run.cancel()}>
                     停止
                   </button>
                 </>
@@ -1315,431 +929,6 @@ function SuggestionCard({
         </button>
       </div>
       <pre className="ap-code">{cmd}</pre>
-    </div>
-  );
-}
-
-/**
- * 把工具的原始参数 JSON 排成一行人话：`{"op":"list"}` → `op=list`。
- * 刻意单行而非缩进块：参数通常只有两三个字段，缩进白白占掉对话区高度。
- */
-function prettyToolArgs(raw: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed === "{}") return "";
-  try {
-    const obj = JSON.parse(trimmed) as Record<string, unknown>;
-    if (typeof obj !== "object" || obj === null) return trimmed;
-    const parts = Object.entries(obj).map(([k, v]) => {
-      if (typeof v === "string") return `${k}=${v}`;
-      return `${k}=${JSON.stringify(v)}`;
-    });
-    return parts.length ? parts.join("  ") : trimmed;
-  } catch {
-    // 模型偶尔吐出不是 JSON 的参数串。原样展示比丢掉强：
-    // 用户至少能看到它到底想传什么。
-    return trimmed;
-  }
-}
-
-/** 终端停在交互提示上时（密码 / 确认 / 分页 / 菜单 / REPL）给步骤卡片挂的小标签；shell_prompt / unknown 不显示 */
-const PROMPT_LABELS: Record<string, string> = {
-  password: "等待密码",
-  yes_no: "等待确认",
-  pager: "分页器",
-  menu: "菜单",
-  repl: "REPL",
-};
-
-function PromptBadge({ kind }: { kind?: string }) {
-  const label = kind ? PROMPT_LABELS[kind] : undefined;
-  if (!label) return null;
-  return (
-    <span className="ap-prompt-badge" title={`终端当前停在：${kind}`}>
-      {label}
-    </span>
-  );
-}
-
-/** 密码通道结局 → 卡片上的中文短语 */
-const SECRET_STATUS_LABELS: Record<string, string> = {
-  provided: "已输入",
-  declined: "已跳过",
-  timeout: "已超时",
-  cancelled: "已取消",
-  failed: "写入失败",
-};
-
-/**
- * 一次执行的卡片：命令 + 结果。「在哪台机器上跑的」必须写清楚 —— Agent 是全局的，
- * 可以同时在好几个会话上下令，只显示命令的话分不清输出来自哪台机器。
- */
-function StepCard({ step }: { step: AgentStep }) {
-  if (step.kind === "note" || step.kind === "resumed") {
-    return <div className="ap-note">{step.text ?? ""}</div>;
-  }
-  // 运行暂停（预算用尽 / 手动暂停）：做了什么 / 还差什么 / 怎么继续，多行原样展示
-  if (step.kind === "paused") {
-    return <div className="ap-note ap-paused">{step.text ?? ""}</div>;
-  }
-  if (step.kind === "memory") return <MemoryStepCard step={step} />;
-  // 工具调用卡片：把「调了哪个工具、传了什么参数」原样摆出来，让调用过程看得见。
-  // 没有它时，模型想开新标签页会写出 `new-tab` 这种不存在的命令，敲进去只换来
-  // command not found —— 看起来就像它答应了却没动手。
-  if (step.kind === "tool") {
-    return (
-      <div className="ap-step tool">
-        <div className="ap-step-head">
-          <span className="ap-step-tag">工具调用</span>
-          <span className="ap-step-tool">{step.toolLabel ?? "工具"}</span>
-        </div>
-        <div className="ap-step-why">
-          <code>{step.tool ?? ""}</code>
-          {step.toolArgs && step.toolArgs.trim() !== "{}" ? (
-            <span className="ap-tool-args">{prettyToolArgs(step.toolArgs)}</span>
-          ) : (
-            <span className="ap-tool-args dim">（无参数）</span>
-          )}
-        </div>
-      </div>
-    );
-  }
-  // `open` / `export` 没有 command / output：掉进下面那张执行卡会变成一个永远
-  // 「执行中」的空框，看着像卡住了，其实标签页早就开出来了。
-  if (step.kind === "open" || step.kind === "export" || step.kind === "tab") {
-    const isOpen = step.kind === "open";
-    const isTab = step.kind === "tab";
-    return (
-      <div className="ap-step">
-        <div className="ap-step-head">
-          <span className="ap-step-tag">
-            {isTab ? "标签页" : isOpen ? "新会话" : "导记录"}
-          </span>
-          {step.targetLabel ? (
-            <span className="ap-step-where" title={step.target}>
-              {step.targetLabel}
-            </span>
-          ) : null}
-        </div>
-        <div className="ap-step-why">{step.text ?? ""}</div>
-      </div>
-    );
-  }
-  // 密码通道的过程卡：start（secretStatus 为空）→ 收尾（带结局）。
-  // 这张卡永远不含密码本身——只有理由、结局和写入后的输出尾部（后端已掩码）。
-  if (step.kind === "secret") {
-    const finished = step.secretStatus !== undefined;
-    const out = step.output ?? "";
-    const bad = step.secretStatus === "failed" || step.secretStatus === "timeout";
-    return (
-      <div className={`ap-step${finished ? "" : " pending"}${bad ? " danger" : ""}`}>
-        <div className="ap-step-head">
-          <span className="ap-step-tag">密码</span>
-          {step.targetLabel ? (
-            <span className="ap-step-where" title={step.target}>
-              {step.targetLabel}
-            </span>
-          ) : null}
-          <PromptBadge kind={step.promptKind} />
-        </div>
-        {step.command ? <div className="ap-step-why">原因：{step.command}</div> : null}
-        <div className="ap-step-why">
-          {finished ? (SECRET_STATUS_LABELS[step.secretStatus!] ?? step.secretStatus) : "等待用户输入……"}
-          {step.text && finished ? `（${step.text}）` : ""}
-        </div>
-        {finished && out.trim() ? <pre className="ap-code ap-out-plain">{out}</pre> : null}
-      </div>
-    );
-  }
-  // 技能回放的一步：command = 「n/N 摘要」，skillStatus 是进度，text 是一句话说明
-  if (step.kind === "skill") {
-    const st = step.skillStatus ?? "running";
-    const label: Record<string, string> = {
-      running: "进行中",
-      ok: "完成",
-      deviated: "偏离",
-      failed: "失败",
-      skipped: "跳过",
-      declined: "未获批",
-    };
-    return (
-      <div className={`ap-step${st === "running" ? " pending" : ""}`}>
-        <div className="ap-step-head">
-          <span className="ap-step-tag">技能</span>
-          {step.targetLabel ? (
-            <span className="ap-step-where" title={step.target}>
-              {step.targetLabel}
-            </span>
-          ) : null}
-          <span className="ap-step-where">{label[st] ?? st}</span>
-        </div>
-        {step.command ? <pre className="ap-code">{step.command}</pre> : null}
-        {step.text && st !== "running" ? <div className="ap-step-why">{step.text}</div> : null}
-        {st === "running" ? <div className="ap-running">{step.text ?? "执行中……"}</div> : null}
-      </div>
-    );
-  }
-  // 手和眼：发按键 / 等输出 / 读屏幕。output 为空 = 进行中，有值（含空串）= 已收尾。
-  if (step.kind === "keys" || step.kind === "wait" || step.kind === "screen") {
-    const tag = step.kind === "keys" ? "按键" : step.kind === "wait" ? "等待" : "读屏";
-    const finished = step.output !== undefined;
-    const out = step.output ?? "";
-    const lines = out.split("\n").length;
-    return (
-      <div className={`ap-step${finished ? "" : " pending"}`}>
-        <div className="ap-step-head">
-          <span className="ap-step-tag">{tag}</span>
-          {step.targetLabel ? (
-            <span className="ap-step-where" title={step.target}>
-              {step.targetLabel}
-            </span>
-          ) : null}
-          {finished ? <PromptBadge kind={step.promptKind} /> : null}
-        </div>
-        {step.command ? <pre className="ap-code">{step.command}</pre> : null}
-        {step.text ? <div className="ap-step-why">{step.text}</div> : null}
-        {finished && out.trim() ? (
-          lines > 10 ? (
-            <details className="ap-out">
-              <summary>{step.kind === "screen" ? "屏幕" : "输出"} {lines} 行</summary>
-              <pre className="ap-code">{out}</pre>
-            </details>
-          ) : (
-            <pre className="ap-code ap-out-plain">{out}</pre>
-          )
-        ) : null}
-        {!finished ? (
-          <div className="ap-running">
-            <span className="ap-typing">
-              <i />
-              <i />
-              <i />
-            </span>
-            进行中…
-          </div>
-        ) : null}
-      </div>
-    );
-  }
-  if (step.kind === "skip") {
-    return (
-      <div className="ap-step danger">
-        <div className="ap-step-head">
-          <span className="ap-step-tag">未执行</span>
-          {/* 被拦下的伪命令（new-tab 之类）没有目标会话：写"未知会话"会让人以
-              为它跑去了某台机器上，而实情是它一步都没出去。没有目标就别编一个。 */}
-          {step.targetLabel ? (
-            <span className="ap-step-where" title={step.target}>
-              {step.targetLabel}
-            </span>
-          ) : null}
-        </div>
-        <pre className="ap-code">{step.command ?? ""}</pre>
-        {step.reasons?.length ? (
-          <div className="ap-step-why">原因：{step.reasons.join("；")}</div>
-        ) : null}
-      </div>
-    );
-  }
-
-  // 没有退出码这回事了：命令是否成功，由模型读下面这段真实输出自己判断，
-  // 跟真人盯着终端看一样。这里只中性地标「执行中 / 已完成」，不再染色判对错。
-  const done = step.kind === "result";
-  const tag = done ? "已完成" : "执行中";
-  const lines = (step.output ?? "").split("\n").length;
-  return (
-    <div className={`ap-step${done ? "" : " pending"}`}>
-      <div className="ap-step-head">
-        <span className="ap-step-tag">{tag}</span>
-        <span className="ap-step-where" title={step.target}>
-          {step.targetLabel ?? "未知会话"}
-        </span>
-        {done ? <PromptBadge kind={step.promptKind} /> : null}
-      </div>
-      <pre className="ap-code">{step.command ?? ""}</pre>
-      {done ? (
-        (step.output ?? "").trim() ? (
-          // 长输出折叠：一屏七八行的核对性输出最常见，全展开会把对话挤没
-          lines > 10 ? (
-            <details className="ap-out">
-              <summary>输出 {lines} 行</summary>
-              <pre className="ap-code">{step.output}</pre>
-            </details>
-          ) : (
-            <pre className="ap-code ap-out-plain">{step.output}</pre>
-          )
-        ) : (
-          <div className="ap-step-why">（该命令没有输出）</div>
-        )
-      ) : (
-        <div className="ap-running">
-          <span className="ap-typing">
-            <i />
-            <i />
-            <i />
-          </span>
-          等待输出…{step.elapsedSecs ? `（已等待 ${step.elapsedSecs} 秒）` : ""}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/**
- * 待批卡片。危险命令在这里停一下等人点头 ——
- * 这是「人在回路」唯一发生的地方，所以命令原文必须完整可见，不许折叠。
- */
-function ApproveCard({
-  req,
-  result,
-  busy,
-  onDecide,
-}: {
-  req: AgentApproveRequest;
-  result?: boolean;
-  busy: boolean;
-  onDecide: (approved: boolean) => void;
-}) {
-  const settled = result !== undefined;
-  // 越界批准与危险命令批准含义不同：前者批的是「动这台不在范围里的会话」，
-  // 标题与文案必须直说，别让人以为只是又一次命令风险提示。
-  const scope = req.kind === "scope";
-  // skill：技能回放的逐步确认 / 偏离选择，按钮文案按语义写成「确认 / 拒绝」
-  const skill = req.kind === "skill";
-  return (
-    <div className={`ap-approve${settled ? (result ? " ok" : " no") : ""}`}>
-      <div className="ap-step-head">
-        <span className="ap-step-tag">{scope ? "超出作用范围 · 需要批准" : skill ? "技能 · 需要确认" : "需要批准"}</span>
-        <span className="ap-step-where" title={req.target}>
-          {req.targetLabel || "未知会话"}
-        </span>
-      </div>
-      <pre className="ap-code">{req.command}</pre>
-      {req.reasons.length > 0 && (
-        <div className="ap-step-why">
-          {scope ? "越界原因" : skill ? "说明" : "风险提示"}：{req.reasons.join("；")}
-        </div>
-      )}
-      {settled ? (
-        <div className="ap-approve-done">
-          {result ? (scope ? "已允许，该会话已并入本轮作用范围" : skill ? "已确认" : "已允许执行") : "已拒绝 / 已超时"}
-        </div>
-      ) : (
-        <div className="ap-approve-row">
-          <button className="btn primary" disabled={!busy} onClick={() => onDecide(true)}>
-            {scope ? "允许越界操作" : skill ? "确认" : "允许执行"}
-          </button>
-          <button className="btn" disabled={!busy} onClick={() => onDecide(false)}>
-            拒绝
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/**
- * 密码卡片（nx_secret）。模型只负责「请求」，值由人在这里输入、直送后端写进终端。
- *
- * - 输入值**只存在本组件的 useState 里**：提交 / 跳过后立刻清空，
- *   不写入会话 state、不进 `AgentMessage`、不进任何日志或事件。
- * - 用 `type="password"` + `autoComplete="off"`，避免浏览器 / WebView 记住或回填。
- * - `busy` 为 false（这一轮已结束 / 被取消）后输入框禁用：后端早就不再等了。
- */
-function SecretCard({
-  req,
-  result,
-  busy,
-  onAnswer,
-}: {
-  req: AgentSecretRequest;
-  result?: "submitted" | "skipped" | "expired";
-  busy: boolean;
-  /** `value` 为 undefined = 跳过。返回内联错误文案，或 null 表示已处理 */
-  onAnswer: (value?: string) => Promise<string | null>;
-}) {
-  const [value, setValue] = useState("");
-  const [inlineErr, setInlineErr] = useState<string | null>(null);
-  const [sending, setSending] = useState(false);
-  const [left, setLeft] = useState(req.timeoutSecs);
-  const settled = result !== undefined;
-
-  // 倒计时只是提示：真正的超时在后端，到点后端会放弃等待并告诉模型「超时」
-  useEffect(() => {
-    if (settled) return;
-    const t = window.setInterval(() => setLeft((n) => (n > 0 ? n - 1 : 0)), 1000);
-    return () => window.clearInterval(t);
-  }, [settled]);
-
-  const submit = async (v?: string) => {
-    if (sending) return;
-    setSending(true);
-    setInlineErr(null);
-    const err = await onAnswer(v);
-    setSending(false);
-    if (err === null) {
-      // 无论提交还是跳过，本地输入立刻清掉
-      setValue("");
-    } else {
-      setInlineErr(err);
-    }
-  };
-
-  const unexpected = req.promptKind !== undefined && req.promptKind !== "password";
-  const dead = !busy || left === 0;
-  return (
-    <div className={`ap-approve ap-secret${settled ? (result === "submitted" ? " ok" : " no") : ""}`}>
-      <div className="ap-step-head">
-        <span className="ap-step-tag">请求输入密码</span>
-        <span className="ap-step-where" title={req.target}>
-          {req.targetLabel || "未知会话"}
-        </span>
-      </div>
-      <div className="ap-step-why">原因：{req.reason}</div>
-      {settled ? (
-        <div className="ap-approve-done">
-          {result === "submitted"
-            ? "已提交（密码只写入了终端，助手看不到它）"
-            : result === "skipped"
-              ? "已跳过"
-              : "已失效（超时或这一轮已结束）"}
-        </div>
-      ) : (
-        <form
-          className="ap-secret-form"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (value && !dead) void submit(value);
-          }}
-        >
-          {unexpected && (
-            <div className="ap-secret-warn">
-              终端看起来并没有停在密码提示上，输入可能会被回显到屏幕。
-            </div>
-          )}
-          <input
-            className="ap-secret-input"
-            type="password"
-            autoComplete="off"
-            autoCorrect="off"
-            autoCapitalize="off"
-            spellCheck={false}
-            placeholder="在此输入，回车提交"
-            value={value}
-            disabled={dead || sending}
-            onChange={(e) => setValue(e.target.value)}
-          />
-          {inlineErr && <div className="ap-secret-err">{inlineErr}</div>}
-          <div className="ap-approve-row">
-            <button className="btn primary" type="submit" disabled={dead || sending || !value}>
-              提交
-            </button>
-            <button className="btn" type="button" disabled={dead || sending} onClick={() => void submit(undefined)}>
-              跳过
-            </button>
-            <span className="ap-secret-left">{dead ? "已失效" : `${left} 秒后超时`}</span>
-          </div>
-        </form>
-      )}
     </div>
   );
 }

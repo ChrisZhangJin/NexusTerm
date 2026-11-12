@@ -1,4 +1,11 @@
 /**
+ * 托管控制台。**AI 托管**：写下目标 →「开始托管」→ 大模型（对话 Agent 的循环）当手和脑去执行，
+ * Steward 的屏幕识别当眼睛盯屏；运行实况（步骤 / 审批 / 密码卡片）直接显示在本页。
+ * 事件只订阅一份（在 AgentPanel 的 `useAgentRun` 里，本页经 `run` 桥读取与操作），
+ * 所以审批 / 密码卡片不会在「对话」与「托管」两处各答一次。
+ *
+ * 下面是原有的零 LLM Steward（局面 / 决策 / 注入 / 回执），现在收进「诊断」。
+ *
  * P2「托管控制台」：Steward 的眼睛（局面 / 事件）+ 手（决策 / 注入 / 回执）。
  *
  * P0 验屏幕帧持续同步、P1 验常驻只读观察，P2 在同一面板里补上：
@@ -14,7 +21,24 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import type { AgentTarget } from "../types";
+import type {
+  AgentApproveRequest,
+  AgentMessage,
+  AgentSecretRequest,
+  AgentTarget,
+} from "../types";
+import { pendingPrompts } from "../lib/agentRun";
+import {
+  BUDGET_EXHAUSTED_BANNER,
+  LS_STEWARD_BUDGET,
+  STEWARD_DURATION_OPTIONS,
+  MAX_STEPS_CEIL,
+  isBudgetPause,
+  parseStewardBudgetPref,
+  type PauseKind,
+  type StewardBudgetPref,
+} from "../lib/agentBudget";
+import { RunFeed } from "./RunFeed";
 import {
   ACTION_LABELS,
   EVENT_LABELS,
@@ -55,11 +79,53 @@ import {
 import { captureNow, setStewardConsoles } from "../lib/termRegistry";
 import StewardContext from "./StewardContext";
 
+/**
+ * AgentPanel 传进来的「运行桥」：同一份 `useAgentRun` 的只读视图 + 动作。
+ * 本页不自己订阅任何 agent 事件，也不自己调 agent_approve / agent_secret_ack。
+ */
+export interface StewardRunBridge {
+  /** 托管那一轮发起在哪个终端（最近一次托管；非托管起手的一轮为 null） */
+  session: string | null;
+  /** 托管那一轮此刻正在跑 */
+  active: boolean;
+  /** 另有一轮「对话 / 技能」在跑（同一时刻只允许一轮，此时不能开始托管） */
+  otherBusy: boolean;
+  /** 托管那一轮的消息（步骤 / 审批 / 密码卡片 / 结论） */
+  messages: AgentMessage[];
+  /** 这一轮停在暂停上（预算用尽 / 手动暂停）→ 可「继续」 */
+  paused: boolean;
+  pauseText?: string;
+  /** 暂停原因：steps / time / output = 预算用尽，user = 手动暂停 */
+  pauseKind?: PauseKind;
+  /** 用户敲键夺权，Agent 已让路 → 可「交还」 */
+  userPaused: boolean;
+  /** Agent 正在驾驶终端 → 可「接管」 */
+  driving: boolean;
+  stopCtrlC: boolean;
+  toggleStopCtrlC: (on: boolean) => void;
+  /** 起一轮托管；整轮跑完才 resolve（调用方不要 await 它） */
+  start: (sessionId: string, goal: string, budget?: StewardBudgetPref) => Promise<void>;
+  cancel: () => Promise<void>;
+  pause: () => Promise<void>;
+  resume: () => Promise<void>;
+  takeover: () => void;
+  handback: () => void;
+  decide: (req: AgentApproveRequest, approved: boolean) => Promise<void>;
+  answerSecret: (req: AgentSecretRequest, value?: string) => Promise<string | null>;
+  /** Nexus AI Agent 是否已配置好；没配好就不能开始托管 */
+  ready: boolean;
+  notReadyReason?: string;
+  /** agent 动作（取消 / 暂停 / 继续 / 审批）失败的一行文案 */
+  error: string | null;
+}
+
 export interface StewardPanelProps {
   /** 面板当前绑定的终端，作为默认选中项；切标签时跟着走 */
   sessionId: string;
   /** 标签树里的可读名字，由 App 传入；后端只认 id */
   sessions?: AgentTarget[];
+  /** 托管那一轮的运行桥（由 AgentPanel 提供） */
+  run: StewardRunBridge;
 }
 
 const TIERS: Array<{ value: StewardTier; label: string; hint: string }> = [
@@ -93,7 +159,7 @@ const hhmmss = (ms: number) => {
   }
 };
 
-export default function StewardPanel({ sessionId, sessions }: StewardPanelProps) {
+export default function StewardPanel({ sessionId, sessions, run }: StewardPanelProps) {
   const [consoles, setConsoles] = useState<ConsoleInfo[]>([]);
   const [contracts, setContracts] = useState<StewardContract[]>([]);
   const [snapshot, setSnapshot] = useState<ScreenSnapshot | null>(null);
@@ -118,6 +184,23 @@ export default function StewardPanel({ sessionId, sessions }: StewardPanelProps)
   const [tier, setTier] = useState<StewardTier>("notify");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** 本轮托管的长度偏好（最长时长 / 最多步数），记在本机 */
+  const [budgetPref, setBudgetPref] = useState<StewardBudgetPref>(() =>
+    parseStewardBudgetPref(localStorage.getItem(LS_STEWARD_BUDGET))
+  );
+  const updateBudgetPref = (patch: Partial<StewardBudgetPref>) => {
+    const next = parseStewardBudgetPref(JSON.stringify({ ...budgetPref, ...patch }));
+    setBudgetPref(next);
+    localStorage.setItem(LS_STEWARD_BUDGET, JSON.stringify(next));
+    return next;
+  };
+  /** 步数输入框的草稿文本：输入过程中允许为空 / 不合法，失焦或回车才解析、夹紧、落盘 */
+  const [stepsDraft, setStepsDraft] = useState<string | null>(null);
+  const commitSteps = () => {
+    if (stepsDraft === null) return;
+    updateBudgetPref({ maxSteps: Number(stepsDraft) });
+    setStepsDraft(null);
+  };
   const [clock, setClock] = useState(Date.now());
   const [correction, setCorrection] = useState("");
   const selectedRef = useRef(selected);
@@ -215,6 +298,7 @@ export default function StewardPanel({ sessionId, sessions }: StewardPanelProps)
 
   const contract = contracts.find((c) => c.consoleId === selected) ?? null;
   const contractId = contract?.id ?? null;
+
   const label = (id: string) => sessions?.find((s) => s.id === id)?.label ?? id;
   /** 契约 id 形如 steward-<tabId>-<ts>，人看不懂；换成它所属终端的名字 */
   const contractName = (cid: string) => {
@@ -385,14 +469,38 @@ export default function StewardPanel({ sessionId, sessions }: StewardPanelProps)
     stale: state?.stale ?? false,
   });
 
-  const start = async () => {
-    if (!selected || !goal.trim() || busy) return;
+  /**
+   * 开始托管 = ① 契约（让前端开始为这个终端上报屏幕帧 —— 眼睛）+ ② 起一轮 steward 模式的 Agent（手和脑）。
+   * 已有契约就沿用（目标 / 档位改过则热更新），不重签：重签会丢掉你调过的授权。
+   */
+  const startHosting = async () => {
+    if (!selected || !goal.trim() || busy || run.active || run.otherBusy || !run.ready) return;
     setBusy(true);
     try {
-      await stewardApi.start(selected, goal.trim(), tier);
+      if (!contract) await stewardApi.start(selected, goal.trim(), tier);
+      else if (formDirty) await stewardApi.amend(contract.id, goal.trim(), tier);
       await refresh();
     } catch (e) {
       setErr(`开始托管失败：${String(e)}`);
+      setBusy(false);
+      return;
+    }
+    setBusy(false);
+    // 整轮跑完才 resolve：不 await，实况由 run.messages 推过来；失败会作为错误消息出现在实况里
+    void run.start(selected, goal.trim(), budgetPref);
+  };
+
+  /** 停止托管：先停这一轮 Agent（幂等），再把契约一并停掉 —— 否则零 LLM 的 Steward 会接着在该终端上动手 */
+  const stopHosting = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      if (run.active) await run.cancel();
+      if (contract) await stewardApi.stop(contract.id);
+      setManual(null);
+      await refresh();
+    } catch (e) {
+      setErr(`停止托管失败：${String(e)}`);
     } finally {
       setBusy(false);
     }
@@ -507,6 +615,98 @@ export default function StewardPanel({ sessionId, sessions }: StewardPanelProps)
   const driving = !own || own.state === "agent_driving";
   // 目标框 / 档位改过还没保存到契约上
   const formDirty = !!contract && (tier !== contract.authorityTier || goal.trim() !== contract.goal);
+  /** 托管那一轮发起在当前选中的终端上：实况与控制键才在这里显示 */
+  const runHere = run.session !== null && run.session === selected;
+  const promptsPending = runHere ? pendingPrompts(run.messages) : 0;
+  /** 状态行：AI 托管在跑时说「它现在在干什么」，否则回落到规则式 Steward 的状态 */
+  const runStatus: { text: string; tone: "idle" | "active" | "warn" } =
+    run.active && !runHere
+      ? { text: `AI 托管正在「${label(run.session ?? "")}」上运行，切到该终端查看实况`, tone: "active" }
+      : run.active && run.paused && isBudgetPause(run.pauseKind)
+        ? { text: BUDGET_EXHAUSTED_BANNER, tone: "warn" }
+      : run.active && run.paused
+        ? { text: run.pauseText?.split("\n")[0] || "已暂停：点「继续」接着做，或「停止」", tone: "warn" }
+        : run.active && run.userPaused
+          ? { text: "你在操作终端，AI 已让路 — 点「交还」让它继续", tone: "warn" }
+          : run.active && promptsPending > 0
+            ? { text: "AI 托管中：有一项等你批准 / 输入", tone: "warn" }
+            : run.active
+              ? { text: "AI 托管中：大模型在执行，屏幕识别在盯屏。你一敲键它就让路。", tone: "active" }
+              : run.otherBusy
+                ? { text: "对话 / 技能正在运行，结束后才能开始托管", tone: "warn" }
+                : !run.ready
+                  ? { text: run.notReadyReason ?? "Nexus AI Agent 尚未配置完成，请先去设置", tone: "warn" }
+                  : !contract
+                    ? { text: "未开始：选择一个终端，写下目标，点「开始托管」", tone: "idle" }
+                    : { text: status.text, tone: status.tone };
+
+  /** 一条决策记录；`withCard` 为真时（且仍在等你确认）带上「按建议执行 / 我自己来」升级卡 */
+  const renderDecision = (d: DecisionRecord, withCard: boolean) => {
+            const card = d.escalation;
+            const left = card
+              ? Math.max(0, Math.ceil((card.createdAt + card.timeoutMs - clock) / 1000))
+              : 0;
+            const showCard = withCard && decisionAwaiting(d, clock);
+            return (
+              <div key={d.seq} className={`st-dec ${d.outcome}`}>
+                <div className="st-dec-head">
+                  <span className="st-dec-seq">#{d.seq}</span>
+                  <span className="st-kind">{ACTION_LABELS[d.chosen.kind] ?? d.chosen.kind}</span>
+                  <span className="st-badge">{tierLabel(d.tier)}</span>
+                  <span className="st-badge outcome">{OUTCOME_LABELS[d.outcome] ?? d.outcome}</span>
+                  <span className="st-meta">
+                    {label(d.consoleId)} · {hhmmss(d.tsMs)} · 置信度 {d.confidence.toFixed(2)} · LLM{" "}
+                    {d.llmUsed ? 1 : 0}
+                  </span>
+                  <button className="st-btn" onClick={() => void doExplain(d.seq)} title="展开解释链：为什么这次这么做">
+                    为什么
+                  </button>
+                </div>
+                <div className="st-dec-text">{d.chosen.text}</div>
+                <div className="st-evidence">{d.rationale}</div>
+                {d.receipt && <div className="st-evidence">回执：{d.receipt}</div>}
+                <details className="st-dec-details">
+                  <summary>依据 {d.ctxRefs.length} 条 · 备选 {d.candidates.length} 个</summary>
+                  <div className="st-refs">
+                    {d.ctxRefs.map((r, i) => (
+                      <div key={`${r.id}-${i}`} className="st-ref">
+                        <span className="st-badge">{REF_LABELS[r.source] ?? r.source}</span>
+                        <span className="st-ref-id">{r.id}</span>
+                        <span>{r.snippet}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="st-evidence">
+                    备选：{d.candidates.map((c) => `${ACTION_LABELS[c.kind] ?? c.kind}「${c.text}」`).join(" / ") || "—"}
+                  </div>
+                </details>
+                {showCard && card && (
+                  <div className="st-esc">
+                    <div className="st-esc-head">
+                      待你确认 · 剩余 {left}s · 超时默认：{card.defaultAction.text}
+                    </div>
+                    <div className="st-esc-why">
+                      建议：{card.recommendation.text}（{card.why.length} 条依据）
+                    </div>
+                    <div className="st-form-row st-center">
+                      <button className="st-btn primary" onClick={() => void approve(d.seq)}>
+                        按建议执行
+                      </button>
+                      <input
+                        className="st-input"
+                        value={correction}
+                        onChange={(e) => setCorrection(e.target.value)}
+                        placeholder="可选：写下纠正，会存成 Learned 偏好"
+                      />
+                      <button className="st-btn danger" onClick={() => void reject(d.seq)}>
+                        我自己来
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+  };
 
   return (
     <div className="ap-steward">
@@ -514,76 +714,119 @@ export default function StewardPanel({ sessionId, sessions }: StewardPanelProps)
         <div className="st-main-head">
           <span className={`st-dot${runtime?.running ? " live" : ""}`} title={runtime?.running ? "Steward 运行中" : "Steward 未运行"} />
           <span className="st-name">目标终端：{label(selected)}</span>
+          {runHere && run.active && <span className="st-badge on">AI 托管中</span>}
           {contract && <span className="st-badge on">{contractStatusLabel(contract.status)}</span>}
           {contract && own && <span className="st-badge">{OWNERSHIP_LABELS[own.state]}</span>}
         </div>
         <textarea
           className="st-goal"
           value={goal}
+          disabled={run.active}
           onChange={(e) => setGoal(e.target.value)}
-          placeholder="例如：把 claude code 的钥匙串二次弹窗分析做完并落地修复，别改设置 UI，最小改动"
-          rows={2}
+          placeholder="写下要它完成的事，例如：把 /srv/app 的依赖升级后跑完测试并汇报；或：盯着这个安装脚本跑完，遇到确认就替我答"
+          rows={3}
         />
         <div className="st-form-row st-center">
-          <select
-            className="st-select"
-            value={tier}
-            onChange={(e) => setTier(e.target.value as StewardTier)}
-            title={TIERS.find((t) => t.value === tier)?.hint}
-          >
-            {TIERS.map((t) => (
-              <option key={t.value} value={t.value}>
-                {t.label}
-              </option>
-            ))}
-          </select>
-          {!contract ? (
-            <button className="st-btn primary" disabled={busy || !goal.trim()} onClick={() => void start()}>
-              开始托管
-            </button>
-          ) : (
+          {!run.active ? (
             <>
               <button
-                className={`st-btn${formDirty ? " primary" : ""}`}
-                disabled={busy || !goal.trim() || !formDirty}
-                onClick={() => void amend()}
-                title="热更新目标与档位，不重启托管"
+                className="st-btn primary"
+                disabled={busy || !goal.trim() || run.otherBusy || !run.ready}
+                onClick={() => void startHosting()}
+                title={
+                  !run.ready
+                    ? (run.notReadyReason ?? "请先完成 Nexus AI Agent 配置")
+                    : run.otherBusy
+                      ? "对话 / 技能正在运行，结束后才能开始托管"
+                      : "签下托管契约（开始盯屏）并让 AI 去执行这个目标"
+                }
               >
-                保存修改
+                开始托管
               </button>
-              <button className="st-btn danger" disabled={busy} onClick={() => void stop()}>
-                停止托管
-              </button>
-              {driving ? (
-                <button
-                  className="st-btn"
-                  onClick={() => void takeover()}
-                  title="手动接管：Steward 立刻转观察态，绝不再写这个终端（你在终端里敲键也会自动触发）"
+              <label className="st-meta" title="这一轮最长跑多久，到点会暂停等你点「继续」（后端上限 24 小时）">
+                最长
+                <select
+                  className="st-select"
+                  value={budgetPref.maxMinutes}
+                  disabled={busy}
+                  onChange={(e) => updateBudgetPref({ maxMinutes: Number(e.target.value) })}
                 >
-                  我来接管
-                </button>
-              ) : (
-                <button
-                  className="st-btn primary"
-                  onClick={() => void handback()}
-                  title="交还给 Steward：先读屏对齐（不一致自动降「需确认」档），再给「离开期间」摘要"
-                >
-                  交还托管
+                  {STEWARD_DURATION_OPTIONS.map((o) => (
+                    <option key={o.minutes} value={o.minutes}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="st-meta" title={`最多执行多少步动作（后端上限 ${MAX_STEPS_CEIL}）`}>
+                最多
+                <input
+                  className="st-num"
+                  type="number"
+                  min={1}
+                  max={MAX_STEPS_CEIL}
+                  value={stepsDraft ?? String(budgetPref.maxSteps)}
+                  disabled={busy}
+                  onChange={(e) => setStepsDraft(e.target.value)}
+                  onBlur={commitSteps}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitSteps();
+                  }}
+                />
+                步
+              </label>
+              {contract && (
+                <button className="st-btn danger" disabled={busy} onClick={() => void stop()}>
+                  停止托管
                 </button>
               )}
             </>
+          ) : (
+            <>
+              {run.paused ? (
+                <button className="st-btn primary" onClick={() => void run.resume()} title="同一段上下文、换一份新预算接着做">
+                  继续
+                </button>
+              ) : run.userPaused ? (
+                <button className="st-btn primary" onClick={run.handback} title="把终端交还给 AI，它从暂停处继续">
+                  交还
+                </button>
+              ) : (
+                <>
+                  <button className="st-btn" onClick={() => void run.pause()} title="当前这一步做完后暂停，终端还给你；之后可以「继续」">
+                    暂停
+                  </button>
+                  {run.driving && (
+                    <button className="st-btn" onClick={run.takeover} title="让 AI 立刻让路（你在终端里敲键也会自动触发）">
+                      接管
+                    </button>
+                  )}
+                </>
+              )}
+              <button className="st-btn danger" disabled={busy} onClick={() => void stopHosting()} title="停止这一轮并结束托管契约">
+                停止
+              </button>
+              <label className="st-meta" title="停止时同时往被驾驶的终端发送 Ctrl-C，打断它正在跑的命令">
+                <input type="checkbox" checked={run.stopCtrlC} onChange={(e) => run.toggleStopCtrlC(e.target.checked)} />
+                同时发 Ctrl-C
+              </label>
+            </>
           )}
-          <button
-            className={`st-btn${execOn ? " warn" : ""}`}
-            onClick={() => void toggleExecution()}
-            title="总闸：每次冷启动默认关闭；打开后仍受安全策略 fail-closed 约束"
-          >
-            {execOn
-              ? "自动应答：开（可替你回答，密码/永久授权仍需你）"
-              : "自动应答：关（只建议，不替你输入）"}
-          </button>
         </div>
-        <div className={`st-status ${status.tone}`}>{status.text}</div>
+        {runHere && run.active && run.paused && isBudgetPause(run.pauseKind) && (
+          <div className="st-budget-banner" role="alert">
+            <span>{BUDGET_EXHAUSTED_BANNER}</span>
+            <button className="st-btn primary" onClick={() => void run.resume()} title="同一段上下文、换一份新预算接着做">
+              继续
+            </button>
+            <button className="st-btn danger" disabled={busy} onClick={() => void stopHosting()}>
+              停止
+            </button>
+          </div>
+        )}
+        {!(runHere && run.active && run.paused && isBudgetPause(run.pauseKind)) && (
+          <div className={`st-status ${runStatus.tone}`}>{runStatus.text}</div>
+        )}
         {absence && (
           <div className="st-card">
             <div className="st-esc-head">
@@ -602,24 +845,41 @@ export default function StewardPanel({ sessionId, sessions }: StewardPanelProps)
       </div>
 
       <div className="st-note">
-        托管只会应答终端里正在提问的程序（确认、选项、分页、报错）；它不会根据目标自己去执行命令。要让 AI
-        执行任务，请用「对话」。
+        <strong>AI 托管</strong>：由大模型替你在这个终端里执行命令、操作交互程序（含 Claude Code 之类的控制台工具），
+        并用屏幕识别盯着长任务跑完。危险命令仍会先问你；密码只会请你本人输入；不会替你选「不再询问 / 永久允许」这类选项。
+        下方「诊断」里是原有的规则式 Steward（不调大模型）的细节。
       </div>
 
-      {err && <div className="st-err">{err}</div>}
+      {(err || run.error) && <div className="st-err">{err ?? run.error}</div>}
+
+      {runHere && (run.active || run.messages.length > 0) && (
+        <div className="st-run">
+          <div className="st-sit-head">
+            <span>托管实况 · {label(selected)}</span>
+            <span className="st-meta">{run.active ? (run.paused ? "已暂停" : "执行中") : "已结束"}</span>
+          </div>
+          {promptsPending > 0 && (
+            <div className="st-status warn">有 {promptsPending} 项等你处理（批准 / 输入密码），见下方卡片</div>
+          )}
+          <RunFeed
+            messages={run.messages}
+            busy={run.active}
+            paused={run.paused}
+            pauseText={run.pauseText}
+            onDecide={(req, ok) => void run.decide(req, ok)}
+            onAnswerSecret={run.answerSecret}
+          />
+        </div>
+      )}
+
+      {/* 规则式 Steward 的待确认建议：要你点头才执行，不能藏进折叠的诊断里 */}
+      {decisions
+        .filter((d) => d.consoleId === selected && decisionAwaiting(d, clock))
+        .map((d) => renderDecision(d, true))}
 
       <div className="st-head">
         <span>终端 · {consoles.length} 个</span>
         <div>
-          <button className="st-btn" onClick={() => void classifyNow()} title="当场分类一帧，核对判据">
-            立即分类
-          </button>
-          <button className="st-btn" onClick={() => void decideNow()} title="当场编译一条决策并落库，不注入">
-            立即决策
-          </button>
-          <button className="st-btn" onClick={() => setShowCtx((v) => !v)}>
-            {showCtx ? "收起依据" : "编辑依据"}
-          </button>
           <button className="st-btn" onClick={() => void refresh()}>
             刷新
           </button>
@@ -708,6 +968,60 @@ export default function StewardPanel({ sessionId, sessions }: StewardPanelProps)
         )}
       </div>
 
+      <details className="st-diag">
+        <summary>诊断（规则式 Steward：决策 / 事件 / 屏幕快照 / 授权 / 复盘）</summary>
+        <div className="st-diag-body">
+          <div className="st-form-row st-center">
+            <select
+              className="st-select"
+              value={tier}
+              onChange={(e) => setTier(e.target.value as StewardTier)}
+              title={"规则式 Steward 的档位：" + (TIERS.find((t) => t.value === tier)?.hint ?? "")}
+            >
+              {TIERS.map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}
+                </option>
+              ))}
+            </select>
+            {contract && (
+              <button
+                className={`st-btn${formDirty ? " primary" : ""}`}
+                disabled={busy || !goal.trim() || !formDirty}
+                onClick={() => void amend()}
+                title="热更新目标与档位，不重启托管"
+              >
+                保存修改
+              </button>
+            )}
+            {contract &&
+              (driving ? (
+                <button className="st-btn" onClick={() => void takeover()} title="规则式 Steward：立刻转观察态，绝不再写这个终端">
+                  我来接管
+                </button>
+              ) : (
+                <button className="st-btn primary" onClick={() => void handback()} title="交还给规则式 Steward：先读屏对齐再给「离开期间」摘要">
+                  交还托管
+                </button>
+              ))}
+            <button
+              className={`st-btn${execOn ? " warn" : ""}`}
+              onClick={() => void toggleExecution()}
+              title="规则式 Steward 的总闸（与 AI 托管无关）：每次冷启动默认关闭；打开后仍受安全策略 fail-closed 约束"
+            >
+              {execOn ? "规则自动应答：开" : "规则自动应答：关（只建议）"}
+            </button>
+          <button className="st-btn" onClick={() => void classifyNow()} title="当场分类一帧，核对判据">
+            立即分类
+          </button>
+          <button className="st-btn" onClick={() => void decideNow()} title="当场编译一条决策并落库，不注入">
+            立即决策
+          </button>
+          <button className="st-btn" onClick={() => setShowCtx((v) => !v)}>
+            {showCtx ? "收起依据" : "编辑依据"}
+          </button>
+          </div>
+
       <div className="st-dec-wrap">
         <div className="st-sit-head">
           <span>决策记录 · 最近 {decisions.length} 条</span>
@@ -717,72 +1031,7 @@ export default function StewardPanel({ sessionId, sessions }: StewardPanelProps)
           {decisions.length === 0 && (
             <div className="st-empty">还没有决策。制造一个提问 / 权限确认，或点「立即决策」。</div>
           )}
-          {[...decisions].reverse().map((d) => {
-            const card = d.escalation;
-            const left = card
-              ? Math.max(0, Math.ceil((card.createdAt + card.timeoutMs - clock) / 1000))
-              : 0;
-            const showCard = decisionAwaiting(d, clock);
-            return (
-              <div key={d.seq} className={`st-dec ${d.outcome}`}>
-                <div className="st-dec-head">
-                  <span className="st-dec-seq">#{d.seq}</span>
-                  <span className="st-kind">{ACTION_LABELS[d.chosen.kind] ?? d.chosen.kind}</span>
-                  <span className="st-badge">{tierLabel(d.tier)}</span>
-                  <span className="st-badge outcome">{OUTCOME_LABELS[d.outcome] ?? d.outcome}</span>
-                  <span className="st-meta">
-                    {label(d.consoleId)} · {hhmmss(d.tsMs)} · 置信度 {d.confidence.toFixed(2)} · LLM{" "}
-                    {d.llmUsed ? 1 : 0}
-                  </span>
-                  <button className="st-btn" onClick={() => void doExplain(d.seq)} title="展开解释链：为什么这次这么做">
-                    为什么
-                  </button>
-                </div>
-                <div className="st-dec-text">{d.chosen.text}</div>
-                <div className="st-evidence">{d.rationale}</div>
-                {d.receipt && <div className="st-evidence">回执：{d.receipt}</div>}
-                <details className="st-dec-details">
-                  <summary>依据 {d.ctxRefs.length} 条 · 备选 {d.candidates.length} 个</summary>
-                  <div className="st-refs">
-                    {d.ctxRefs.map((r, i) => (
-                      <div key={`${r.id}-${i}`} className="st-ref">
-                        <span className="st-badge">{REF_LABELS[r.source] ?? r.source}</span>
-                        <span className="st-ref-id">{r.id}</span>
-                        <span>{r.snippet}</span>
-                      </div>
-                    ))}
-                  </div>
-                  <div className="st-evidence">
-                    备选：{d.candidates.map((c) => `${ACTION_LABELS[c.kind] ?? c.kind}「${c.text}」`).join(" / ") || "—"}
-                  </div>
-                </details>
-                {showCard && card && (
-                  <div className="st-esc">
-                    <div className="st-esc-head">
-                      待你确认 · 剩余 {left}s · 超时默认：{card.defaultAction.text}
-                    </div>
-                    <div className="st-esc-why">
-                      建议：{card.recommendation.text}（{card.why.length} 条依据）
-                    </div>
-                    <div className="st-form-row st-center">
-                      <button className="st-btn primary" onClick={() => void approve(d.seq)}>
-                        按建议执行
-                      </button>
-                      <input
-                        className="st-input"
-                        value={correction}
-                        onChange={(e) => setCorrection(e.target.value)}
-                        placeholder="可选：写下纠正，会存成 Learned 偏好"
-                      />
-                      <button className="st-btn danger" onClick={() => void reject(d.seq)}>
-                        我自己来
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            );
-          })}
+          {[...decisions].reverse().map((d) => renderDecision(d, false))}
         </div>
       </div>
 
@@ -1066,9 +1315,7 @@ export default function StewardPanel({ sessionId, sessions }: StewardPanelProps)
         </pre>
       </div>
 
-      <details className="st-diag">
-        <summary>诊断</summary>
-        <div className="st-diag-body">
+
           <div className="st-evidence">
             内部说明：开始托管后 Steward 常驻读屏、识别局面；你敲键即夺权（100ms SLA），交还时给「离开期间」
             摘要；「通知后执行」档留 30s 撤销窗口；断连 / 强杀后凭 Checkpoint 恢复现场（屏幕漂移自动降「需确认」档）。

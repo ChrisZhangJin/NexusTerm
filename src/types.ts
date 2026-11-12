@@ -393,6 +393,19 @@ export interface AgentRunRequest {
    * 后端据此提示模型：这类程序的输出抓不到，要用 capture-pane / docker logs 之类的 skill。
    */
   consoleAlt?: boolean;
+  /**
+   * 运行模式。缺省 / null = 普通「对话」一轮；`"steward"` = 托管：模型是手和脑、屏幕识别盯屏，
+   * 预算与审批超时更宽（后端决定），危险命令仍先问人。
+   */
+  mode?: "steward" | null;
+  /** 可选的预算覆盖（后端会夹紧）。缺省用该模式的默认预算 */
+  budget?: AgentRunBudgetOverride | null;
+}
+
+/** `agent_run` 的预算覆盖（camelCase，与后端 `RunBudgetOverride` 一致）；字段缺省 = 用默认 */
+export interface AgentRunBudgetOverride {
+  maxSteps?: number;
+  maxMinutes?: number;
 }
 
 /**
@@ -404,7 +417,7 @@ export interface AgentStep {
   /**
    * plan | tool | exec | result | skip | note | answer | open | export | tab | waiting
    * | paused（运行暂停，等用户继续 / 停止）| resumed | keys | wait | screen | skill（技能回放的一步，`command` 形如「2/5 执行：…」）| secret（前三者是「手和眼」：发按键 / 等输出 / 读屏幕；
-   * secret 是密码通道：请用户输入密码，`command` 是理由，`secretStatus` 是结局。
+   * watch（托管：盯屏等待长任务 / 脚本，`output` 为空 = 进行中）；secret 是密码通道：请用户输入密码，`command` 是理由，`secretStatus` 是结局。
    * `output` 为空 = 进行中，有值（哪怕是空串）= 已收尾，`text` 是一句话结论）
    */
   kind: string;

@@ -87,3 +87,44 @@ export function pauseBannerText(kind: PauseKind): string {
       return "本轮已暂停。点「继续」接着做，或点「停止」结束。";
   }
 }
+
+/** 托管（steward）模式本轮的长度偏好：「最长时长」与「最多步数」。后端会再夹紧到 500 步 / 1440 分钟。 */
+export interface StewardBudgetPref {
+  maxMinutes: number;
+  maxSteps: number;
+}
+
+/** 「最长时长」下拉的可选项（分钟）。 */
+export const STEWARD_DURATION_OPTIONS: ReadonlyArray<{ minutes: number; label: string }> = [
+  { minutes: 120, label: "2 小时" },
+  { minutes: 360, label: "6 小时" },
+  { minutes: 720, label: "12 小时" },
+  { minutes: 1440, label: "24 小时" },
+];
+
+export const DEFAULT_STEWARD_BUDGET_PREF: StewardBudgetPref = { maxMinutes: 360, maxSteps: 400 };
+export const LS_STEWARD_BUDGET = "nx.steward.budget";
+
+/** 读本机存的偏好：缺失 / 损坏 / 越界 都回落默认；时长只认下拉里的选项，步数夹到 [1, 500]。 */
+export function parseStewardBudgetPref(raw: string | null | undefined): StewardBudgetPref {
+  const d = DEFAULT_STEWARD_BUDGET_PREF;
+  if (!raw) return d;
+  try {
+    const o = JSON.parse(raw) as Partial<StewardBudgetPref> | null;
+    const mins = Number(o?.maxMinutes);
+    const steps = Math.round(Number(o?.maxSteps));
+    return {
+      maxMinutes: STEWARD_DURATION_OPTIONS.some((x) => x.minutes === mins) ? mins : d.maxMinutes,
+      maxSteps: Number.isFinite(steps) && steps >= 1 ? Math.min(steps, MAX_STEPS_CEIL) : d.maxSteps,
+    };
+  } catch {
+    return d;
+  }
+}
+
+/** 预算类暂停（步数 / 时间 / 输出量用尽）—— 区别于用户手动暂停。 */
+export const isBudgetPause = (k: PauseKind | undefined): boolean =>
+  k === "steps" || k === "time" || k === "output";
+
+/** 托管页预算用尽横幅。后端暂停后 1 小时没人点「继续」会自动结束这一轮。 */
+export const BUDGET_EXHAUSTED_BANNER = "已达到预算上限，点「继续」接着跑（1 小时内不点会自动结束）";

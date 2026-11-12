@@ -185,6 +185,12 @@ impl RunPhase {
     pub fn is_paused(&self) -> bool {
         matches!(self, Self::Paused(_))
     }
+
+    /// 用户要求暂停：已暂停，或已点「暂停」正等步骤边界生效。
+    /// 长时间挂住的动作（`nx_watch`）靠它尽早回到步骤边界。
+    pub fn pause_requested(&self) -> bool {
+        matches!(self, Self::Paused(_) | Self::Running { pause_pending: true })
+    }
 }
 
 /// 驱动相位转移的事件。
@@ -274,6 +280,11 @@ impl PhaseTable {
     /// 该运行此刻是否处于暂停。
     pub fn is_paused(&self, run: &str) -> bool {
         self.phase(run).is_some_and(|p| p.is_paused())
+    }
+
+    /// 该运行是否被要求暂停（含待生效）。
+    pub fn pause_requested(&self, run: &str) -> bool {
+        self.phase(run).is_some_and(|p| p.pause_requested())
     }
 }
 
@@ -597,5 +608,19 @@ mod tests {
         assert!(s.contains("还差"));
         assert!(s.contains("继续") && s.contains("停止"));
         assert!(paused_text(&PauseCause::User, 0, &[]).contains("暂停"));
+    }
+}
+
+#[cfg(test)]
+mod pause_requested_tests {
+    use super::*;
+
+    #[test]
+    fn pending_pause_counts_as_requested_but_not_paused() {
+        let pending = RunPhase::Running { pause_pending: true };
+        assert!(pending.pause_requested() && !pending.is_paused());
+        assert!(RunPhase::Paused(PauseCause::User).pause_requested());
+        assert!(!RunPhase::RUNNING.pause_requested());
+        assert!(!RunPhase::Finished.pause_requested());
     }
 }
