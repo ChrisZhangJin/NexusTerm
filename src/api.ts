@@ -9,6 +9,8 @@ import type {
   AgentRunRequest,
   HostBudgetGrant,
   HostCardReply,
+  HostCheck,
+  HostNotice,
   HostStartRequest,
   HostStatus,
   AgentScreenRequest,
@@ -344,6 +346,15 @@ export const api = {
     invoke<void>("host_resume", { contractId, budget: budget ?? null }),
   hostStatus: (contractId: string) => invoke<HostStatus | null>("host_status", { contractId }),
   hostList: () => invoke<HostStatus[]>("host_list"),
+  /** 接受（编辑后的）完成判据草稿，托管随即开跑 */
+  hostConfirmCriteria: (contractId: string, cardId: string, checks: HostCheck[]) =>
+    invoke<void>("host_confirm_criteria", { contractId, cardId, checks }),
+  /** 改契约（目标 / 档位），不重启运行 */
+  hostAmend: (contractId: string, goal?: string, authorityTier?: string) =>
+    invoke<void>("host_amend", { contractId, goal: goal ?? null, authorityTier: authorityTier ?? null }),
+  /** 通知档的纠正：记成 Learned 偏好，并把那条决策标为 rejected */
+  hostCorrect: (contractId: string, seq: number, topic: string, correction: string) =>
+    invoke<void>("host_correct", { contractId, seq, topic, correction }),
 
   /**
    * 中止该会话正在进行的一轮。幂等。
@@ -649,6 +660,14 @@ export async function onHost(
   handler: (st: HostStatus) => void
 ): Promise<UnlistenFn> {
   return listen<HostStatus>(`nx://host/${contractId}`, (ev) => handler(ev.payload));
+}
+
+/** 通知档写入后的通知卡 */
+export async function onHostNotify(
+  contractId: string,
+  handler: (n: HostNotice) => void
+): Promise<UnlistenFn> {
+  return listen<HostNotice>(`nx://host/${contractId}/notify`, (ev) => handler(ev.payload));
 }
 
 /** 所有托管任务的相位变化（面板的总表） */

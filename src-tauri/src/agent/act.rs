@@ -61,6 +61,7 @@ use super::capture;
 use super::budget::{self, BudgetCheck, BudgetSpent, PauseCause, PhaseEvent, RunPhase};
 use super::control::{self, ControlState};
 use super::danger::assess;
+use super::host::gate::Gate;
 use super::host::{HostEvent, HostShared, ParkEnd};
 use super::hostmem::{self, MemoryCall};
 use super::skilltool::{self, SkillCall};
@@ -2998,7 +2999,9 @@ pub(super) async fn gate_drive(
         if let Some(st) = runtime.control.acquire(target, &run) {
             emit_control(app, target, &[run.clone()], st);
         }
-        let ok = h.gate(|| runtime.control.state(target) == ControlState::Paused).await;
+        let console = h.console_id.clone();
+        let alive = || app.try_state::<AppState>().map_or(true, |st| session_alive(&st, &console));
+        let ok = h.gate(|| runtime.control.state(target) == ControlState::Paused, alive).await;
         return if ok && !cancel.load(Ordering::Relaxed) {
             control::PauseWait::Ready
         } else {
@@ -3438,6 +3441,13 @@ pub async fn run(
     if host.is_some() {
         system.push_str(HOSTED_ADDENDUM);
     }
+    // 托管：契约（授权 / 偏好 / 意向 / 主机备忘 / KB）接在后面；`host_amend` 时按版本号重建
+    let base_system = system.clone();
+    let mut ctx_ver = 0u64;
+    if let Some(h) = &host {
+        ctx_ver = h.ctx_version();
+        system = hosted_system(&base_system, &h.ctx());
+    }
     // 上一轮摘要拼在第一条 user 消息前面（同一条消息，避免连续两条 user）；
     // 落盘时已脱敏，开关为真时出网前再过一遍闸门。
     let mut messages = vec![ChatMessage::user(format!(
@@ -3455,8 +3465,11 @@ pub async fn run(
     let mut feedback = String::new();
     // 运行预算（4.6）：自本轮开始 / 最近一次「继续」起累计；用尽即暂停等用户，不是收场。
     let mut limits = effective_budget(cfg.budget, req);
-    let mut spent = BudgetSpent::default();
-    let mut seg_start = std::time::Instant::now();
+    // 对话：每段（开局 / 最近一次「继续」起）从零算；托管：契约级累计（随 checkpoint 持久化），段从最近一次「继续」算
+    let mut meter = match &host {
+        Some(h) => Meter::cumulative(h.spent()),
+        None => Meter::default(),
+    };
     // 会话 id → 本轮里上一次动过它（exec / 按键 / 等待）之后缓冲的位置，供 `nx_wait` 当起点：
     // 模型思考的那几秒里到达的输出也该算「新输出」，否则等的提示早出现了反而永远等不到。
     let mut marks: HashMap<String, u64> = HashMap::new();
@@ -3480,6 +3493,15 @@ pub async fn run(
     let specs = if host.is_some() { hosted_tool_specs() } else { tool_specs() };
     // 本轮动作里是否撞上了「用户接管且超时」：置位后跳出当前动作列表，别再逐个空等
     let mut took_over: bool;
+    // 托管：这个动作过了 `gate::authorize` 之后的结论；真正写成功时（`host_did!`）落决策记录 / 发通知卡
+    let mut host_write: Option<HostWrite>;
+    macro_rules! host_did {
+        () => {
+            if let (Some(h), Some(w)) = (&host, host_write.take()) {
+                hosted_applied(app, h, &session, step, w);
+            }
+        };
+    }
     // 写 pty 之前的控制权闸（`gate_drive`）：Paused 就等用户交还；取消直接跳出动作列表
     // （外层循环顶会收尾），等满上限则标记 `took_over`。
     macro_rules! drive_gate {
@@ -3502,14 +3524,36 @@ pub async fn run(
         }
         // 托管：先处理收件箱（运行期间用户按的键 / 点的「暂停」），不在 Running 就挂起到回来
         if let Some(h) = &host {
+            h.set_spent(meter.contract_spent());
             h.note_progress(&messages, step);
             h.drain();
             match h.park().await {
                 ParkEnd::Running => {}
                 _ => break,
             }
-            if absorb_host_pending(h, &mut messages, &mut feedback, &mut spent, &mut limits) {
-                seg_start = std::time::Instant::now();
+            absorb_host_pending(h, &mut messages, &mut feedback, &mut meter, &mut limits);
+            // 托管的 console 没了（tab 关了）：挂起（ConsoleGone），不再请模型往一个不存在的终端写
+            if !session_alive(state, &h.console_id) && h.console_gone() {
+                emit_step(
+                    app,
+                    &session,
+                    StepPayload {
+                        text: Some("被托管的终端已经关闭，托管挂起；重新接驳前不会再写入。".into()),
+                        ..StepPayload::new("note", step)
+                    },
+                );
+                match h.park().await {
+                    ParkEnd::Running => {}
+                    _ => break,
+                }
+            }
+            // 契约改了（host_amend / 判据确认）：重建系统提示里的 `## 托管契约` 一节，并告诉模型
+            if h.ctx_version() != ctx_ver {
+                ctx_ver = h.ctx_version();
+                system = hosted_system(&base_system, &h.ctx());
+            }
+            for note in h.take_amend_notes() {
+                push_user(&mut messages, note);
             }
         }
         if took_over_times >= MAX_TOOK_OVER {
@@ -3525,13 +3569,13 @@ pub async fn run(
         }
         // 步骤边界：预算用尽 / 用户点了「暂停」→ 暂停在这里，等「继续」或「停止」。
         // 对话历史（messages）、已做的动作、控制权等都留在本函数的局部变量里，继续 = 换新预算接着转。
-        spent.elapsed_secs = seg_start.elapsed().as_secs();
+        meter.tick();
         // 托管：预算用尽 / 模型连不上 → Paused，只有 `host_resume` 能离开；挂起期间零 LLM 调用、租约不放
         if let Some(h) = &host {
             let ev = if std::mem::take(&mut llm_down) {
                 Some(HostEvent::LlmDown(last_llm_error.clone()))
             } else {
-                match budget::check_budget(&spent, &limits) {
+                match budget::check_budget(&meter.segment(), &limits) {
                     BudgetCheck::Exhausted(reason) => Some(HostEvent::BudgetExhausted(reason.describe())),
                     BudgetCheck::Continue => None,
                 }
@@ -3553,8 +3597,7 @@ pub async fn run(
                 );
                 match h.park().await {
                     ParkEnd::Running => {
-                        absorb_host_pending(h, &mut messages, &mut feedback, &mut spent, &mut limits);
-                        seg_start = std::time::Instant::now();
+                        absorb_host_pending(h, &mut messages, &mut feedback, &mut meter, &mut limits);
                         emit_step(
                             app,
                             &session,
@@ -3571,7 +3614,7 @@ pub async fn run(
             runtime.phases.apply(&run_key, PhaseEvent::LlmUnavailable);
             Some(PauseCause::LlmError)
         } else {
-            match budget::check_budget(&spent, &limits) {
+            match budget::check_budget(&meter.segment(), &limits) {
                 BudgetCheck::Exhausted(reason) => {
                     runtime.phases.apply(&run_key, PhaseEvent::BudgetExhausted(reason));
                     Some(PauseCause::Budget { reason })
@@ -3583,10 +3626,9 @@ pub async fn run(
             }
         };
         if let Some(cause) = pause_cause {
-            match hold_paused(app, runtime, &session, step, cause, spent.steps, &cancel).await {
+            match hold_paused(app, runtime, &session, step, cause, meter.segment().steps, &cancel).await {
                 control::PauseWait::Ready => {
-                    spent = BudgetSpent::default();
-                    seg_start = std::time::Instant::now();
+                    meter.new_segment();
                     feedback.push_str(budget::RESUME_FEEDBACK);
                 }
                 control::PauseWait::Cancelled => {
@@ -3614,7 +3656,7 @@ pub async fn run(
             }
             // 所有喂回模型的终端内容（命令输出、屏幕、错误、命令原文）都在这唯一的入口脱敏：
             // 各个动作分支往 feedback 里拼的是原文，漏一处分支就是一次外泄，所以不在分支里逐个处理。
-            spent.output_chars += feedback.chars().count() as u64;
+            meter.spent.output_chars += feedback.chars().count() as u64;
             let text = scrub(acct.redact, &feedback);
             // 模型请求失败暂停后恢复时，上一条 user 还没得到回复：并进去而不是再起一条，
             // 不少网关会拒绝连续两条同角色的消息。
@@ -3722,7 +3764,7 @@ pub async fn run(
         // 进了历史的这条 assistant 消息：带工具调用时不能原样存，
         // 否则下一轮会被接口以「tool_calls 后面必须跟 tool 回执」拒掉。
         messages.push(ChatMessage::assistant(describe_tool_calls(&reply)));
-        spent.output_chars += reply.text.chars().count() as u64;
+        meter.spent.output_chars += reply.text.chars().count() as u64;
 
         // 叫了不存在的工具：`actions_from_tool_call` 对它一个动作都不产出。不能静默吞掉 ——
         // 模型会以为它做过了；更不能混进「缺少必要参数」的提示里，那会让它反复补参数。
@@ -3863,8 +3905,8 @@ pub async fn run(
             }
             // 动作边界：预算用尽 / 待生效的手动暂停 → 余下动作不执行，回到循环顶去暂停。
             // 这一步本身要先算进去（做满 N 步就停，不多做第 N+1 步）。
-            spent.elapsed_secs = seg_start.elapsed().as_secs();
-            if matches!(budget::check_budget(&spent, &limits), BudgetCheck::Exhausted(_))
+            meter.tick();
+            if matches!(budget::check_budget(&meter.segment(), &limits), BudgetCheck::Exhausted(_))
                 || runtime.phases.phase(&run_key) == Some(RunPhase::Running { pause_pending: true })
             {
                 feedback.push_str(
@@ -3873,10 +3915,43 @@ pub async fn run(
                 );
                 break;
             }
-            spent.steps += 1;
+            meter.spent.steps += 1;
             // 开始下一个动作之前先看控制权：用户正在终端里操作时不抢（读屏 / 等待也算，
             // 此刻的屏幕是用户在打字的屏幕）。发起会话始终是被驾驶的。
             drive_gate!(&session);
+            // 托管：契约的唯一强制点。每个写入动作（Exec / Keys / Secret / Skill-run / Open / Tab-close）
+            // 在这里过一次 `gate::authorize`：Deny 不写、把原因反馈给模型；Approve 挂起等批准（不设超时）；
+            // Notify / Allow 放行，Notify 在写成功后发通知卡。各分支里不再重复做托管的危险判断。
+            host_write = None;
+            if let Some(h) = &host {
+                if let Some((kind, text)) = super::host::record::describe_write(&action) {
+                    let ctx = h.ctx();
+                    let sit = match &action {
+                        AgentAction::Keys { target, .. } => {
+                            let tid = locate(target.as_deref(), &targets, &session).map(|(i, _)| i).unwrap_or_else(|i| i);
+                            Some(situation_now(app, state, &tid, false))
+                        }
+                        _ => None,
+                    };
+                    let (verdict, refused) = hosted_authorize(h, &ctx, &action, &text, sit.as_ref()).await;
+                    for u in h.take_user() {
+                        push_user(&mut messages, u);
+                    }
+                    if trace_on {
+                        trace::record(&session, step, "authorize", &format!("{kind} `{text}` → {verdict:?}"));
+                    }
+                    if let Some(why) = refused {
+                        emit_step(
+                            app,
+                            &session,
+                            StepPayload { command: Some(text.clone()), reasons: Some(vec![why.clone()]), ..StepPayload::new("skip", step) },
+                        );
+                        feedback.push_str(&format!("「{text}」没有执行：{why}\n"));
+                        continue;
+                    }
+                    host_write = Some(HostWrite { kind, text, gate: verdict, sit, rationale: reply.text.clone() });
+                }
+            }
             // 一轮内的多个动作共用同一个 step 号：UI 按 step 折叠，同一步归在一张卡里
             match action {
                 AgentAction::AskUser { question, options, recommendation } => {
@@ -4003,7 +4078,8 @@ pub async fn run(
                     }
 
                     // 托管模式无人逐步看着：危险命令一律要人批准，不论 exec_mode 是 Agentic 还是 Approval
-                    if (is_steward || cfg.exec_mode.is_approval()) && risk.dangerous && !danger_cleared {
+                    // 托管的危险判断已经在 `gate::authorize` 里做过（危险 → Approve），这里只管对话 / 旧 steward 模式
+                    if host.is_none() && (is_steward || cfg.exec_mode.is_approval()) && risk.dangerous && !danger_cleared {
                         let request_id = uuid::Uuid::new_v4().simple().to_string();
                         let req_payload = ApprovePayload {
                             request_id: request_id.clone(),
@@ -4073,6 +4149,7 @@ pub async fn run(
                             let text = feedback_for(&command, target_label, &outcome);
                             feedback.push_str(&text);
                             feedback.push('\n');
+                            host_did!();
                         }
                         Err(e) => {
                             emit_step(
@@ -4153,6 +4230,7 @@ pub async fn run(
 
                     match request_tab(app, runtime, &session, &payload).await {
                         Some(reply) if reply.ok => {
+                            host_did!();
                             // list 的结果既进卡片也喂回模型 —— 后者才是重点：
                             // 模型拿到清单才知道下一步该点哪个 id。
                             //
@@ -4285,7 +4363,10 @@ pub async fn run(
                     let mut crossed = crossed;
                     // 托管：放行时依据的局面，写之前要拿它和当时的屏幕再比一次
                     let mut judged: Option<super::situation::Situation> = None;
-                    if is_steward {
+                    // 托管：`gate::authorize` 已按同一局面判过（assess_keys），写前复核仍用那份局面
+                    if host.is_some() {
+                        judged = host_write.as_ref().and_then(|w| w.sit.clone());
+                    } else if is_steward {
                         let sit = situation_now(app, state, &target_id, false);
                         let verdict = super::steward_mode::assess_keys(&bytes, Some(&sit));
                         judged = Some(sit);
@@ -4393,6 +4474,7 @@ pub async fn run(
                             );
                             feedback.push_str(&keys_feedback(&label, &shown, &tail, Some(&guess)));
                             feedback.push('\n');
+                            host_did!();
                         }
                         Err(e) => {
                             emit_step(
@@ -4801,6 +4883,17 @@ pub async fn run(
                     let guess = classify_session(state, &target_id, false);
                     let request_id = uuid::Uuid::new_v4().simple().to_string();
                     let rx = runtime.register_secret(&request_id);
+                    // 托管：密码卡**不设超时**，相位挂到 WaitingHuman（Secret 卡）让胶囊显示「等你回答」；
+                    // 密码本身仍走密码卡直写 pty，不经 host_answer、不进收件箱
+                    let secret_card = host.as_ref().and_then(|h| {
+                        let mut c = super::host::HumanCard::ask(
+                            &request_id,
+                            &format!("请在面板的密码卡片里为「{label}」输入密码（{reason}）"),
+                            super::steward::now_ms(),
+                        );
+                        c.kind = super::host::CardKind::Secret;
+                        h.apply(HostEvent::Ask(c)).ok().map(|_| h)
+                    });
                     emit_interact(
                         app, &session, "secret", step, &target_id, &label, Some(&reason),
                         Some("等待用户输入密码……".into()), None, Some(&guess),
@@ -4813,13 +4906,24 @@ pub async fn run(
                             target_label: label.clone(),
                             reason: reason.clone(),
                             prompt_kind: Some(guess.kind.as_str().to_string()),
-                            timeout_secs: secret::SECRET_TIMEOUT.as_secs(),
+                            // 0 = 不限时（托管）
+                            timeout_secs: if host.is_some() { 0 } else { secret::SECRET_TIMEOUT.as_secs() },
                         },
                     );
-                    let answered =
-                        secret::await_secret(rx, secret::SECRET_TIMEOUT, || cancel.load(Ordering::Relaxed))
-                            .await;
+                    let wait = if host.is_some() { None } else { Some(secret::SECRET_TIMEOUT) };
+                    let answered = secret::await_secret_for(rx, wait, || cancel.load(Ordering::Relaxed)).await;
                     runtime.unregister_secret(&request_id);
+                    if let Some(h) = secret_card {
+                        // 人在驾驶时先交还，答复才合法；交还后若他还在打字，下面的 drive_gate 会再让路
+                        if matches!(h.phase(), super::host::HostPhase::UserDriving { .. }) {
+                            let _ = h.apply(HostEvent::Handback);
+                        }
+                        let _ = h.apply(HostEvent::Answer(super::host::CardReply {
+                            card_id: request_id.clone(),
+                            text: String::new(),
+                            approved: None,
+                        }));
+                    }
 
                     // 用户可能在填密码卡片的这段时间里自己动了终端：写之前再看一眼。
                     // 放弃时 `answered` 随 break 被 drop，`Zeroizing` 擦掉密码。
@@ -4881,6 +4985,9 @@ pub async fn run(
                     );
                     feedback.push_str(&secret::secret_feedback(&label, &status, &tail, Some(&after)));
                     feedback.push('\n');
+                    if status == secret::SecretStatus::Provided {
+                        host_did!();
+                    }
                 }
 
                 AgentAction::Memory { target, call } => {
@@ -4990,6 +5097,7 @@ pub async fn run(
                     marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
                     match res {
                         Ok(report) => {
+                            host_did!();
                             if trace_on {
                                 trace::record(&session, step, "skill", &super::skill_run::report_text(&report));
                             }
@@ -5131,6 +5239,7 @@ pub async fn run(
                     let spec = OpenSpec { kind, label, command };
                     match open_session(app, state, &session, spec).await {
                         Ok(outcome) => {
+                            host_did!();
                             // 人点过头的新会话并入范围：之后对它 exec / tab 不再重复弹窗。
                             admit(&mut targets, &outcome.session_id, &outcome.label);
                             // 成功也要补一条：前端确实会接出标签页，但那张卡片
@@ -5171,7 +5280,9 @@ pub async fn run(
         }
 
         if let Some(h) = &host {
-            // 每个「动作 + 反馈」周期之后落一次现场
+            // 每个「动作 + 反馈」周期之后落一次现场（含契约级花费）
+            meter.tick();
+            h.set_spent(meter.contract_spent());
             h.note_progress(&messages, step);
             h.checkpoint_now();
         }
@@ -5279,7 +5390,7 @@ fn absorb_host_pending(
     h: &HostShared,
     messages: &mut Vec<ChatMessage>,
     feedback: &mut String,
-    spent: &mut BudgetSpent,
+    meter: &mut Meter,
     limits: &mut budget::RunBudget,
 ) -> bool {
     for u in h.take_user() {
@@ -5293,9 +5404,168 @@ fn absorb_host_pending(
     if let Some(g) = grant {
         *limits = apply_grant(*limits, g);
     }
-    *spent = BudgetSpent::default();
+    meter.new_segment();
     feedback.push_str(budget::RESUME_FEEDBACK);
     true
+}
+
+/// 托管写入过了 `gate::authorize` 之后、真正写成功之前带着的东西。
+struct HostWrite {
+    kind: &'static str,
+    text: String,
+    gate: Gate,
+    /// Keys 判定时的局面（写前复核与决策记录用）
+    sit: Option<super::situation::Situation>,
+    /// 模型这一轮的说明，作为决策理由
+    rationale: String,
+}
+
+/// `nx://host/{contract_id}/notify` 的载荷：Notify 档写入后的通知卡。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostNotice {
+    pub contract_id: String,
+    /// 对应的决策记录（撤销 / 纠正按它找）；落库失败为 0
+    pub seq: i64,
+    pub kind: &'static str,
+    pub text: String,
+    pub undo_window_ms: u64,
+    pub ts_ms: i64,
+}
+
+/// 托管审批卡：批准的就是这一次写入。
+fn hosted_approval_card(text: &str, reasons: &[String]) -> super::host::HumanCard {
+    let mut card = super::host::HumanCard::ask(
+        &uuid::Uuid::new_v4().simple().to_string(),
+        &format!("批准执行：{text}"),
+        super::steward::now_ms(),
+    );
+    card.kind = super::host::CardKind::Approve;
+    card.reasons = reasons.to_vec();
+    card
+}
+
+/// 托管写入的强制点：`gate::authorize` 一次；Approve 就挂起等批准（不设超时）。
+/// 返回 (结论, 拒绝原因)：拒绝原因有值 = 不写，把它反馈给模型。
+async fn hosted_authorize(
+    h: &HostShared,
+    ctx: &super::host::HostCtx,
+    action: &AgentAction,
+    text: &str,
+    sit: Option<&super::situation::Situation>,
+) -> (Gate, Option<String>) {
+    let verdict = super::host::gate::authorize(&ctx.policy(), action, sit);
+    let refused = match &verdict {
+        Gate::Deny(why) => Some(why.clone()),
+        Gate::Approve(reasons) => {
+            let ok = h.approve(hosted_approval_card(text, reasons)).await;
+            (!ok).then(|| "用户没有批准，没有写入。换一个做法，或用 nx_ask_user 问清楚".to_string())
+        }
+        Gate::Allow | Gate::Notify => None,
+    };
+    (verdict, refused)
+}
+
+/// 托管写入成功：落一条 `DecisionRecord{llm_used:true}`；Notify 档再发一张通知卡（可接管 + 纠正）。
+fn hosted_applied(app: &AppHandle, h: &HostShared, session: &str, step: usize, w: HostWrite) {
+    let ctx = h.ctx();
+    let now = super::steward::now_ms();
+    let rec = super::host::record::hosted_decision(
+        &ctx, &h.console_id, w.kind, &w.text, &w.rationale, &w.gate, w.sit.as_ref(), now,
+    );
+    let seq = super::steward_loop::persist_decision(app, &rec);
+    if let Some(brain) = app.try_state::<super::profile::StewardBrain>() {
+        brain.remember_decision(seq, &rec);
+    }
+    if w.gate == Gate::Notify {
+        let notice = HostNotice {
+            contract_id: h.contract_id().to_string(),
+            seq,
+            kind: w.kind,
+            text: w.text.clone(),
+            undo_window_ms: ctx.authority.undo_window_ms,
+            ts_ms: now,
+        };
+        let _ = app.emit(&format!("nx://host/{}/notify", h.contract_id()), notice);
+        emit_step(
+            app,
+            session,
+            StepPayload {
+                text: Some(format!("已执行（通知档）：{}。不对的话可以「接管」并写下纠正。", w.text)),
+                ..StepPayload::new("note", step)
+            },
+        );
+    }
+}
+
+/// 系统提示 = 基础提示 + `## 托管契约` 一节。
+fn hosted_system(base: &str, ctx: &super::host::HostCtx) -> String {
+    if ctx.section.trim().is_empty() {
+        return base.to_string();
+    }
+    format!("{base}\n\n{}", ctx.section)
+}
+
+/// 预算计量。对话：每段（开局 / 最近一次「继续」）从零算；托管：`spent` 是契约级累计
+/// （随 checkpoint 持久化，暂停 / 继续 / 重启都不清零），预算按「最近一次继续以来」这一段判定 ——
+/// 否则每段的上限夹紧（`RunBudget::clamped`）会把整份契约永远卡在第一段的上限上。
+#[derive(Debug, Clone, Copy)]
+struct Meter {
+    spent: BudgetSpent,
+    /// 这一段开始时的累计值
+    base: BudgetSpent,
+    cumulative: bool,
+    seg_start: std::time::Instant,
+}
+
+impl Default for Meter {
+    fn default() -> Self {
+        Self { spent: BudgetSpent::default(), base: BudgetSpent::default(), cumulative: false, seg_start: std::time::Instant::now() }
+    }
+}
+
+impl Meter {
+    /// 托管：从契约级累计接着算（PR6 重启接驳时 `h.spent()` 来自 checkpoint）。
+    fn cumulative(s: super::checkpoint::Spent) -> Self {
+        let spent = BudgetSpent { steps: s.steps, elapsed_secs: s.elapsed_secs, output_chars: s.output_chars };
+        Self { spent, base: spent, cumulative: true, seg_start: std::time::Instant::now() }
+    }
+
+    /// 刷新耗时：段起点的累计 + 本段墙钟。
+    fn tick(&mut self) {
+        self.spent.elapsed_secs = self.base.elapsed_secs + self.seg_start.elapsed().as_secs();
+    }
+
+    /// 本段花了多少（预算按它判定）。
+    fn segment(&self) -> BudgetSpent {
+        BudgetSpent {
+            steps: self.spent.steps.saturating_sub(self.base.steps),
+            elapsed_secs: self.spent.elapsed_secs.saturating_sub(self.base.elapsed_secs),
+            output_chars: self.spent.output_chars.saturating_sub(self.base.output_chars),
+        }
+    }
+
+    /// 「继续」：开新的一段。对话清零；托管只挪段起点，累计不动。
+    fn new_segment(&mut self) {
+        self.tick();
+        if self.cumulative {
+            self.base = self.spent;
+        } else {
+            self.spent = BudgetSpent::default();
+            self.base = BudgetSpent::default();
+        }
+        self.seg_start = std::time::Instant::now();
+    }
+
+    /// 契约级花费（写进 checkpoint）。
+    fn contract_spent(&self) -> super::checkpoint::Spent {
+        super::checkpoint::Spent {
+            steps: self.spent.steps,
+            elapsed_secs: self.spent.elapsed_secs,
+            output_chars: self.spent.output_chars,
+            injections: 0,
+        }
+    }
 }
 
 /// 「加预算继续」：给了的字段覆盖，其余不变，最后夹紧。
@@ -5446,7 +5716,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_absorbs_grant_and_resets_spent() {
+    fn hosted_resume_keeps_contract_spent_and_opens_new_segment() {
         let (h, _io) = super::super::host::driver::tests::shared();
         h.apply(HostEvent::BudgetExhausted("步数".into())).unwrap();
         h.send(HostEvent::Resume {
@@ -5455,14 +5725,133 @@ mod tests {
         h.drain();
         let mut msgs = Vec::new();
         let mut fb = String::new();
-        let mut spent = BudgetSpent { steps: 400, ..Default::default() };
+        let mut meter = Meter::cumulative(super::super::checkpoint::Spent { steps: 400, ..Default::default() });
+        meter.spent.steps = 450;
         let mut limits = budget::RunBudget::default();
-        assert!(absorb_host_pending(&h, &mut msgs, &mut fb, &mut spent, &mut limits));
-        assert_eq!(spent.steps, 0);
+        assert!(absorb_host_pending(&h, &mut msgs, &mut fb, &mut meter, &mut limits));
+        assert_eq!(meter.contract_spent().steps, 450, "契约级累计不清零");
+        assert_eq!(meter.segment().steps, 0, "新的一段从零算");
         assert_eq!(limits.max_steps, 77);
         assert!(fb.contains(budget::RESUME_FEEDBACK.trim()));
         // 只吸收一次
-        assert!(!absorb_host_pending(&h, &mut msgs, &mut fb, &mut spent, &mut limits));
+        assert!(!absorb_host_pending(&h, &mut msgs, &mut fb, &mut meter, &mut limits));
+        // 对话模式：继续 = 清零
+        let mut chat = Meter::default();
+        chat.spent.steps = 9;
+        chat.new_segment();
+        assert_eq!(chat.spent.steps, 0);
+    }
+
+    // ——— 托管强制（gate::authorize 接线）———
+
+    fn ctx_with(tier: &str) -> super::super::host::HostCtx {
+        let mut c = super::super::host::HostCtx::bare("c1", "t1", "目标");
+        c.authority = super::super::policy::Authority::default().with_tier(tier);
+        c
+    }
+
+    fn exec(cmd: &str) -> AgentAction {
+        AgentAction::Exec { target: None, command: cmd.into() }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deny_blocks_exec_and_keys_without_writing() {
+        let (h, io) = super::super::host::driver::tests::shared();
+        let mut ctx = ctx_with("auto");
+        ctx.authority.deny = vec!["delete".into(), "shutdown".into()];
+        let (g, why) = hosted_authorize(&h, &ctx, &exec("rm -rf build"), "rm -rf build", None).await;
+        assert!(matches!(g, Gate::Deny(_)) && why.is_some());
+        let keys = AgentAction::Keys { target: None, keys: "sudo shutdown -h now<Enter>".into() };
+        let (g, why) = hosted_authorize(&h, &ctx, &keys, "keys", None).await;
+        assert!(matches!(g, Gate::Deny(_)) && why.unwrap().contains("shutdown"));
+        // 拒绝不出卡、不挂起：相位一直是 Running，也没有任何迁移
+        assert_eq!(h.phase(), HostPhase::Running);
+        assert!(io.saves.lock().is_empty());
+        // 只读动作不过闸
+        assert!(super::super::host::record::describe_write(&AgentAction::Screen { target: None }).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn approve_tier_parks_every_write_until_answered() {
+        let (h, _io) = super::super::host::driver::tests::shared();
+        let ctx = ctx_with("approve");
+        let h2 = h.clone();
+        let c2 = ctx.clone();
+        let task = tokio::spawn(async move { hosted_authorize(&h2, &c2, &exec("ls"), "ls", None).await });
+        settle().await;
+        let card_id = match h.phase() {
+            HostPhase::WaitingHuman { card } => {
+                assert_eq!(card.kind, super::super::host::CardKind::Approve);
+                assert!(card.question.contains("ls"));
+                card.id
+            }
+            p => panic!("approve 档连 ls 都要批：{p:?}"),
+        };
+        tokio::time::advance(Duration::from_secs(6 * 3600)).await;
+        settle().await;
+        assert!(!task.is_finished(), "审批不超时");
+        h.send(HostEvent::Answer(super::super::host::CardReply { card_id, text: String::new(), approved: Some(true) }));
+        let (g, why) = task.await.unwrap();
+        assert!(matches!(g, Gate::Approve(_)) && why.is_none());
+
+        // 拒绝 → 不写
+        let h3 = h.clone();
+        let task = tokio::spawn(async move { hosted_authorize(&h3, &ctx, &exec("ls"), "ls", None).await });
+        settle().await;
+        let card_id = match h.phase() {
+            HostPhase::WaitingHuman { card } => card.id,
+            p => panic!("{p:?}"),
+        };
+        h.send(HostEvent::Answer(super::super::host::CardReply { card_id, text: String::new(), approved: Some(false) }));
+        assert!(task.await.unwrap().1.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_pref_regex_blocks() {
+        let (h, _io) = super::super::host::driver::tests::shared();
+        let mut ctx = ctx_with("auto");
+        let pref = super::super::profile::CtxItem {
+            id: "p-main".into(),
+            kind: "preference".into(),
+            text: "不要直接改 main 分支".into(),
+            strength: "hard".into(),
+            scope: "global".into(),
+            source: "user".into(),
+            evidence: String::new(),
+            extra: serde_json::json!({ "denyPattern": "git\\s+checkout\\s+main" }),
+            contract_id: String::new(),
+            position: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+        ctx.hard = super::super::host::gate::HardRule::from_prefs(&[pref]);
+        assert_eq!(ctx.hard.len(), 1);
+        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout main"), "x", None).await;
+        assert!(matches!(g, Gate::Deny(ref w) if w.contains("p-main")), "{g:?}");
+        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout dev"), "x", None).await;
+        assert_eq!(g, Gate::Allow);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn out_of_scope_host_fails_closed() {
+        let (h, _io) = super::super::host::driver::tests::shared();
+        let mut ctx = ctx_with("auto");
+        ctx.authority.host_scope = vec!["ssh:prod-db".into()];
+        // 被托管的是 local:t1，不在契约的主机范围里
+        let (g, why) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None).await;
+        assert!(matches!(g, Gate::Deny(_)), "{g:?}");
+        assert!(why.is_some());
+        // 认不出主机（host_key 为空）同样拒
+        ctx.contract.host_key = String::new();
+        let (g, _) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None).await;
+        assert!(matches!(g, Gate::Deny(_)));
+    }
+
+    #[test]
+    fn notify_tier_executes_then_notifies() {
+        let ctx = ctx_with("notify");
+        assert_eq!(super::super::host::gate::authorize(&ctx.policy(), &exec("ls"), None), Gate::Notify);
+        assert_eq!(super::super::host::gate::authorize(&ctx_with("auto").policy(), &exec("ls"), None), Gate::Allow);
     }
 
     #[test]

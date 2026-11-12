@@ -504,7 +504,9 @@ function SecretCard({
   };
 
   const unexpected = req.promptKind !== undefined && req.promptKind !== "password";
-  const dead = !busy || left === 0;
+  // timeoutSecs = 0：托管下的密码卡不限时
+  const unlimited = req.timeoutSecs === 0;
+  const dead = !busy || (!unlimited && left === 0);
   return (
     <div className={`ap-approve ap-secret${settled ? (result === "submitted" ? " ok" : " no") : ""}`}>
       <div className="ap-step-head">
@@ -555,7 +557,7 @@ function SecretCard({
             <button className="btn" type="button" disabled={dead || sending} onClick={() => void submit(undefined)}>
               跳过
             </button>
-            <span className="ap-secret-left">{dead ? "已失效" : `${left} 秒后超时`}</span>
+            <span className="ap-secret-left">{dead ? "已失效" : unlimited ? "不限时" : `${left} 秒后超时`}</span>
           </div>
         </form>
       )}

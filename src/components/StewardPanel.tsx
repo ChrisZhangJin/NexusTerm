@@ -111,7 +111,13 @@ export interface StewardRunBridge {
   stopCtrlC: boolean;
   toggleStopCtrlC: (on: boolean) => void;
   /** 开始托管（`host_start`）：后端起好任务就 resolve，失败会作为错误消息出现在实况里 */
-  start: (sessionId: string, goal: string, budget?: StewardBudgetPref, tier?: string) => Promise<void>;
+  start: (
+    sessionId: string,
+    goal: string,
+    budget?: StewardBudgetPref,
+    tier?: string,
+    yolo?: boolean
+  ) => Promise<void>;
   cancel: () => Promise<void>;
   pause: () => Promise<void>;
   /** 加预算继续：给了预算偏好就按它换一份新上限 */
@@ -190,6 +196,8 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
   const [selected, setSelected] = useState(sessionId);
   const [goal, setGoal] = useState("");
   const [tier, setTier] = useState<StewardTier>("notify");
+  /** YOLO：直接采用 AI 起草的完成判据、不经确认就开始。每次打开面板默认关 */
+  const [yolo, setYolo] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   /** 本轮托管的长度偏好（最长时长 / 最多步数），记在本机 */
@@ -486,7 +494,7 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
     if (!selected || !goal.trim() || busy || run.active || run.otherBusy || !run.ready) return;
     setBusy(true);
     try {
-      await run.start(selected, goal.trim(), budgetPref, tier);
+      await run.start(selected, goal.trim(), budgetPref, tier, yolo);
       await refresh();
     } finally {
       setBusy(false);
@@ -779,6 +787,13 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
                   }}
                 />
                 步
+              </label>
+              <label
+                className={`st-meta host-yolo${yolo ? " on" : ""}`}
+                title="开启后直接采用 AI 起草的完成判据，不再请你确认就开始托管。只跳过这一步：授权档位和禁止项照常生效。"
+              >
+                <input type="checkbox" checked={yolo} disabled={busy} onChange={(e) => setYolo(e.target.checked)} />
+                YOLO（跳过判据确认）
               </label>
               {contract && (
                 <button className="st-btn danger" disabled={busy} onClick={() => void stop()}>

@@ -4,7 +4,7 @@
  */
 
 import type { PauseKind } from "./agentBudget";
-import type { HostHumanCard, HostPhase, HostStatus } from "../types";
+import type { HostCheck, HostHumanCard, HostPhase, HostStatus } from "../types";
 
 export type HostPillTone = "active" | "warn" | "idle" | "done" | "bad";
 
@@ -28,7 +28,16 @@ export function hostPill(p: HostPhase): HostPill {
     case "running":
       return { label: "运行中", tone: "active" };
     case "waitingHuman":
-      return { label: p.card.kind.kind === "approve" ? "等你批准" : "等你回答", tone: "warn" };
+      switch (p.card.kind.kind) {
+        case "approve":
+          return { label: "等你批准", tone: "warn" };
+        case "secret":
+          return { label: "等你输入密码", tone: "warn" };
+        case "criteriaDraft":
+          return { label: "等你确认判据", tone: "warn" };
+        default:
+          return { label: "等你回答", tone: "warn" };
+      }
     case "userDriving":
       return { label: "你在驾驶", tone: "warn" };
     case "paused":
@@ -142,4 +151,56 @@ export function hostForConsole(
   const live = mine.find((s) => !isTerminal(s.phase));
   if (live) return live;
   return mine.sort((a, b) => (a.contractId < b.contractId ? 1 : -1))[0];
+}
+
+// ——— 完成判据：草稿卡里按「一行一条」编辑 ———
+
+const CHECK_PREFIX: Array<[HostCheck["kind"], string]> = [
+  ["commandOk", "命令"],
+  ["fileExists", "文件"],
+  ["screenMatches", "屏幕"],
+  ["manual", "人工"],
+];
+
+/** 一条判据 → 一行「前缀: 内容」 */
+export function checkToLine(c: HostCheck): string {
+  switch (c.kind) {
+    case "commandOk":
+      return `命令: ${c.cmd}`;
+    case "fileExists":
+      return `文件: ${c.path}`;
+    case "screenMatches":
+      return `屏幕: ${c.re}`;
+    case "manual":
+      return `人工: ${c.text}`;
+  }
+}
+
+export const checksToText = (cs: HostCheck[]): string => cs.map(checkToLine).join("\n");
+
+/** 编辑后的文本 → 判据。空行忽略；认不出前缀的整行当人工确认项。 */
+export function textToChecks(text: string): HostCheck[] {
+  const out: HostCheck[] = [];
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    const m = /^(命令|文件|屏幕|人工)\s*[:：]\s*(.*)$/.exec(line);
+    const kind = m ? CHECK_PREFIX.find(([, p]) => p === m[1])?.[0] : undefined;
+    const body = (m ? m[2] : line).trim();
+    if (!body) continue;
+    switch (kind) {
+      case "commandOk":
+        out.push({ kind, cmd: body });
+        break;
+      case "fileExists":
+        out.push({ kind, path: body });
+        break;
+      case "screenMatches":
+        out.push({ kind, re: body });
+        break;
+      default:
+        out.push({ kind: "manual", text: body });
+    }
+  }
+  return out;
 }

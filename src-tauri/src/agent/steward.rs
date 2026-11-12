@@ -375,7 +375,19 @@ impl StewardRegistry {
         contract
     }
 
-    pub fn stop(&self, id: &str) -> bool {
+    /// 写入（用户确认过的）完成判据。
+    pub fn set_criteria(&self, id: &str, checks: Vec<super::host::Check>, yolo: bool) -> bool {
+        match self.0.lock().get_mut(id) {
+            Some(c) => {
+                c.success_criteria = checks;
+                c.yolo = yolo;
+                true
+            }
+            None => false,
+        }
+    }
+
+        pub fn stop(&self, id: &str) -> bool {
         self.0.lock().remove(id).is_some()
     }
 

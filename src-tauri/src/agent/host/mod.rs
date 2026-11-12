@@ -7,7 +7,9 @@
 
 pub mod checkpoint;
 pub mod context;
+pub mod criteria;
 pub mod driver;
+pub mod record;
 pub mod gate;
 pub mod phase;
 pub mod watchdog;
@@ -18,7 +20,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-pub use driver::{HostIo, HostShared, ParkEnd};
+pub use driver::{HostCtx, HostIo, HostShared, ParkEnd};
 pub use phase::{HostEvent, HostPhase};
 
 /// 托管运行的 id 前缀：`host:{contract_id}`，避免和同一 tab 上的对话运行在 `begin()` 处冲突。
@@ -113,6 +115,10 @@ pub enum CardKind {
     Watchdog,
     /// 只剩人工确认项的完成判定：确认即 Completed
     ManualCheck { summary: String, checks: Vec<CheckResult> },
+    /// `nx_secret`：密码走面板的密码卡片直达 pty，**不**经 `host_answer`；卡片只用来挂起相位
+    Secret,
+    /// 开始托管时模型起草的完成判据，等用户编辑 / 接受（`host_confirm_criteria`）
+    CriteriaDraft { draft: Vec<Check> },
 }
 
 /// 一张等人处理的卡片。**永远等下去**：没有倒计时，也没有默认动作。

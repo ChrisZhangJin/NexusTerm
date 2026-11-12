@@ -5,11 +5,11 @@
  * 卡片**永远等下去**：没有倒计时、没有默认动作（设计 §2 已定）。AgentPanel 与 StewardPanel 共用。
  */
 
-import { useState } from "react";
-import { api } from "../api";
+import { useEffect, useState } from "react";
+import { api, onHostNotify } from "../api";
 import { toFriendlyError } from "../lib/errors";
-import { hostButtons, hostDetail, hostPill, pendingCard } from "../lib/host";
-import type { HostBudgetGrant, HostCardReply, HostStatus } from "../types";
+import { checksToText, hostButtons, hostDetail, hostPill, isTerminal, pendingCard, textToChecks } from "../lib/host";
+import type { HostBudgetGrant, HostCardReply, HostNotice, HostStatus } from "../types";
 
 export interface HostCardProps {
   status: HostStatus;
@@ -30,6 +30,31 @@ export default function HostCard({ status, label, grant, stopCtrlC }: HostCardPr
   const card = pendingCard(status.phase);
   const btn = hostButtons(status.phase);
   const cid = status.contractId;
+  const live = !isTerminal(status.phase);
+  // 判据草稿：一行一条，可改；换了一张卡就重置
+  const draft = card?.kind.kind === "criteriaDraft" ? card.kind.draft : null;
+  const [criteria, setCriteria] = useState("");
+  useEffect(() => {
+    if (draft) setCriteria(checksToText(draft));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [card?.id]);
+  // 改目标（host_amend）
+  const [goalDraft, setGoalDraft] = useState<string | null>(null);
+  // 通知档写入后的通知卡（只留最近几条）
+  const [notices, setNotices] = useState<HostNotice[]>([]);
+  const [correction, setCorrection] = useState("");
+  useEffect(() => {
+    let off: (() => void) | null = null;
+    let disposed = false;
+    void onHostNotify(cid, (n) => setNotices((l) => [n, ...l].slice(0, 3))).then((f) => {
+      if (disposed) f();
+      else off = f;
+    });
+    return () => {
+      disposed = true;
+      off?.();
+    };
+  }, [cid]);
 
   const act = async (f: () => Promise<unknown>) => {
     if (busy) return;
@@ -52,6 +77,16 @@ export default function HostCard({ status, label, grant, stopCtrlC }: HostCardPr
     });
 
   const approve = card?.kind.kind === "approve";
+  const secret = card?.kind.kind === "secret";
+
+  /** 通知卡的「撤销」：没有真回滚 —— 先接管（AI 立刻让路），再把纠正记成偏好 */
+  const undo = (n: HostNotice) =>
+    act(async () => {
+      await api.hostTakeover(cid);
+      await api.hostCorrect(cid, n.seq, n.text, correction.trim());
+      setCorrection("");
+      setNotices((l) => l.filter((x) => x.seq !== n.seq));
+    });
 
   return (
     <div className="st-card host-card">
@@ -64,7 +99,87 @@ export default function HostCard({ status, label, grant, stopCtrlC }: HostCardPr
       </div>
       {detail && <div className="st-esc-why">{detail}</div>}
 
-      {card && (
+      {live && (
+        <div className="st-form-row st-center">
+          {goalDraft === null ? (
+            <button className="st-btn" disabled={busy} onClick={() => setGoalDraft(status.goal)} title="改目标：不重启，AI 下一步就按新目标做">
+              改目标
+            </button>
+          ) : (
+            <>
+              <input className="st-input" value={goalDraft} disabled={busy} onChange={(e) => setGoalDraft(e.target.value)} />
+              <button
+                className="st-btn primary"
+                disabled={busy || !goalDraft.trim()}
+                onClick={() =>
+                  void act(async () => {
+                    await api.hostAmend(cid, goalDraft.trim());
+                    setGoalDraft(null);
+                  })
+                }
+              >
+                保存
+              </button>
+              <button className="st-btn" disabled={busy} onClick={() => setGoalDraft(null)}>
+                取消
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
+      {notices.map((n) => (
+        <div key={n.seq} className="st-esc host-notice">
+          <div className="st-esc-head">已执行（通知档）</div>
+          <div className="host-question">{n.text}</div>
+          {live && (
+            <div className="st-form-row st-center">
+              <input
+                className="st-input"
+                value={correction}
+                disabled={busy}
+                onChange={(e) => setCorrection(e.target.value)}
+                placeholder="可选：哪里不对、下次该怎么做（会记成偏好）"
+              />
+              <button className="st-btn warn" disabled={busy} onClick={() => void undo(n)} title="AI 立刻让路，由你处理现场；纠正记成偏好">
+                撤销（接管）
+              </button>
+              <button className="st-btn" disabled={busy} onClick={() => setNotices((l) => l.filter((x) => x.seq !== n.seq))}>
+                知道了
+              </button>
+            </div>
+          )}
+        </div>
+      ))}
+
+      {card && draft && (
+        <div className="st-esc host-ask">
+          <div className="st-esc-head">确认完成判据</div>
+          <div className="st-esc-why">
+            AI 按目标起草了下面的判据，一行一条（前缀：命令 / 文件 / 屏幕 / 人工）。改好后点「接受」，托管才开始。
+          </div>
+          <textarea className="st-goal" rows={Math.max(3, criteria.split("\n").length)} value={criteria} disabled={busy} onChange={(e) => setCriteria(e.target.value)} />
+          <div className="st-form-row st-center">
+            <button
+              className="st-btn primary"
+              disabled={busy}
+              onClick={() => void act(() => api.hostConfirmCriteria(cid, card.id, textToChecks(criteria)))}
+            >
+              接受
+            </button>
+          </div>
+        </div>
+      )}
+
+      {card && secret && (
+        <div className="st-esc host-ask">
+          <div className="st-esc-head">等你输入密码</div>
+          <div className="host-question">{card.question}</div>
+          <div className="st-esc-why">密码只在下方的密码卡片里输入，直接写进终端，AI 看不到它。不限时。</div>
+        </div>
+      )}
+
+      {card && !draft && !secret && (
         <div className="st-esc host-ask">
           <div className="st-esc-head">{approve ? "等你批准" : "等你回答"}</div>
           <div className="host-question">{card.question}</div>
