@@ -9,6 +9,7 @@ import {
   SHIFT_ENTER_SEQ,
   atShellPrompt,
   lineHasShellPrompt,
+  wantsMetaEnter,
   looksLikeShellPrompt,
   shouldSendMetaEnter,
   textBeforeCursor,
@@ -77,14 +78,27 @@ test("TUI 输入行里的 `$ ` / `# ` 不会被误认", () => {
 });
 
 test("光标被关掉（Ink 程序）时即使行像提示符也不算", () => {
-  assert.equal(atShellPrompt({ before: "user@host:~$ ", cursorHidden: true }), false);
-  assert.equal(atShellPrompt({ before: "user@host:~$ ", cursorHidden: false }), true);
-  assert.equal(atShellPrompt({ before: "> hi", cursorHidden: false }), false);
+  assert.equal(atShellPrompt({ before: "user@host:~$ ", cursorHidden: true, altScreen: false }), false);
+  assert.equal(atShellPrompt({ before: "user@host:~$ ", cursorHidden: false, altScreen: false }), true);
+  assert.equal(atShellPrompt({ before: "> hi", cursorHidden: false, altScreen: false }), false);
 });
 
-test("在 shell 提示符上 Shift+Enter 保持原样，其它情况改发 ESC CR", () => {
-  assert.equal(shouldSendMetaEnter(key(), () => true), false);
-  assert.equal(shouldSendMetaEnter(key(), () => false), true);
+test("各场景下 Shift+Enter 发什么", () => {
+  const cases: [string, Parameters<typeof wantsMetaEnter>[0], boolean][] = [
+    ["vim 插入模式（备用屏、光标可见）→ \\r", { before: "    return x", cursorHidden: false, altScreen: true }, false],
+    ["less / htop（备用屏、光标可见）→ \\r", { before: ":", cursorHidden: false, altScreen: true }, false],
+    ["tmux 里的 bash 提示符 → \\r", { before: "user@host:~$ ls", cursorHidden: false, altScreen: true }, false],
+    ["tmux 里的 Claude Code（备用屏、光标关）→ ESC CR", { before: "", cursorHidden: true, altScreen: true }, true],
+    ["Claude Code（普通屏、光标关）→ ESC CR", { before: "", cursorHidden: true, altScreen: false }, true],
+    ["普通屏 bash 提示符 → \\r", { before: "user@host:~$ ", cursorHidden: false, altScreen: false }, false],
+    ["普通屏、光标可见、不像提示符 → ESC CR", { before: "> hello", cursorHidden: false, altScreen: false }, true],
+  ];
+  for (const [name, ctx, want] of cases) assert.equal(wantsMetaEnter(ctx), want, name);
+});
+
+test("纯 Shift+Enter 由屏幕判定决定发不发 ESC CR", () => {
+  assert.equal(shouldSendMetaEnter(key(), () => true), true);
+  assert.equal(shouldSendMetaEnter(key(), () => false), false);
 });
 
 test("不是 Shift+Enter / 带别的修饰键 / 输入法占着：一律不管，也不读屏", () => {

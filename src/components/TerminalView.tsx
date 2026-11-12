@@ -47,7 +47,7 @@ import {
 import { themeToXterm } from "../lib/theme";
 import { isMacOS } from "../lib/platform";
 import { installMacKeyboard, setInputTrace, traceSend } from "../lib/macInput";
-import { SHIFT_ENTER_SEQ, atShellPrompt, shouldSendMetaEnter, textBeforeCursor } from "../lib/shiftEnter";
+import { SHIFT_ENTER_SEQ, shouldSendMetaEnter, textBeforeCursor, wantsMetaEnter } from "../lib/shiftEnter";
 import { attachZmodem, type ZmodemGate } from "../lib/zmodem";
 import type { ClosedInfo, TerminalTab, Theme } from "../types";
 
@@ -887,7 +887,7 @@ export default function TerminalView({
       if (e.type !== "keydown") return true;
 
       // Shift+Enter → `ESC \r`（Meta+Enter），让 Claude Code / nanopi 这类 TUI 换行而不是提交；
-      // 停在 shell 提示符上时保持原样（当回车，含下面的灰字路径）。判定见 `lib/shiftEnter`。
+      // shell 提示符、vim / less 等备用屏程序里保持原样（当回车，含下面的灰字路径）。判定见 `lib/shiftEnter`。
       // 必须排在灰字块之前：那里对 Shift+Enter 直接 `return true` 交还 xterm。
       if (e.key === "Enter" && e.shiftKey) {
         const imeBusy = imeRef.current.captures({
@@ -899,7 +899,12 @@ export default function TerminalView({
         });
         const metaEnter = shouldSendMetaEnter(
           { key: e.key, shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, altKey: e.altKey, metaKey: e.metaKey, imeBusy },
-          () => atShellPrompt({ before: textBeforeCursor(term.buffer.active), cursorHidden: isCursorHidden(term) })
+          () =>
+            wantsMetaEnter({
+              before: textBeforeCursor(term.buffer.active),
+              cursorHidden: isCursorHidden(term),
+              altScreen: term.buffer.active.type !== "normal",
+            })
         );
         if (metaEnter) {
           e.preventDefault();

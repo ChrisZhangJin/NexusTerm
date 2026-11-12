@@ -10,12 +10,13 @@
  * 今天「当回车用」更糟。所以：
  *
  * - 光标所在的逻辑行**确实**像 shell 提示符（且光标可见）→ 保持原样，当回车；
- * - 其余一律（包括判断不了）→ 发 `ESC \r`。
+ * - 备用屏且光标可见（vim / less / htop）→ 也保持原样：`ESC` 会让 vim 退出插入模式；
+ * - 其余（光标被关掉的 Ink 程序、普通屏上判断不了的）→ 发 `ESC \r`。详见 `wantsMetaEnter`。
  *
  * 为什么不用 `lineRef.known`：敲完 `claude⏎` 行状态就被重置成「已知的空行」，
  * Claude Code 跑起来后它一直是 true，分不出 shell 和前台 TUI。
  * 为什么不只看备用屏：Claude Code / nanopi 都跑在普通屏幕上；反过来 tmux 在备用屏里，
- * 里面却是 shell —— 所以提示符检测对两种屏幕都做，备用屏只是不再额外加分。
+ * 里面可能是 shell、也可能是 Claude Code —— 所以提示符检测与「光标是否被关」对两种屏幕都做。
  *
  * 提示符的判定移植自后端 `agent/prompt.rs` 的 `shell_confidence`（只取高置信度档）。
  * 认错的代价不对称：把 TUI 当成 shell → 退回今天的行为（提交）；把 shell 当成 TUI →
@@ -97,12 +98,28 @@ export interface ShiftEnterCtx {
   before: string;
   /** DECTCEM 关了光标（Ink 程序都会关，shell 不会）；拿不到传 false */
   cursorHidden: boolean;
+  /** 当前是备用屏（vim / less / htop / tmux） */
+  altScreen: boolean;
 }
 
-/** 是否「NexusTerm 认为终端正停在 shell 提示符」：是则 Shift+Enter 保持原样（当回车） */
+/** 是否「NexusTerm 认为终端正停在 shell 提示符」 */
 export function atShellPrompt(ctx: ShiftEnterCtx): boolean {
   if (ctx.cursorHidden) return false;
   return lineHasShellPrompt(ctx.before);
+}
+
+/**
+ * 屏幕状态是否要求把 Shift+Enter 改成 `ESC \r`：
+ *
+ * - shell 提示符（两种屏幕都算，tmux 里的 shell 也是）→ 否，当回车（含灰字路径）；
+ * - 光标被关掉（Ink 程序：Claude Code / nanopi，tmux 里跑也一样）→ 是；
+ * - 备用屏 + 光标可见（vim 插入模式、less、htop、tmux 里的 shell）→ 否：
+ *   `ESC` 会让 vim 退出插入模式，保持今天的 `\r`；
+ * - 普通屏 + 光标可见 + 不像提示符（保留光标的行编辑类 TUI）→ 是。
+ */
+export function wantsMetaEnter(ctx: ShiftEnterCtx): boolean {
+  if (atShellPrompt(ctx)) return false;
+  return ctx.cursorHidden || !ctx.altScreen;
 }
 
 /** 参与判定的修饰键与输入法状态 */
@@ -116,10 +133,10 @@ export interface ShiftEnterKey {
   imeBusy: boolean;
 }
 
-/** 这一下是不是要改发 `ESC \r` 的 Shift+Enter。`atPrompt` 惰性求值：不是 Shift+Enter 就不读屏 */
-export function shouldSendMetaEnter(k: ShiftEnterKey, atPrompt: () => boolean): boolean {
+/** 这一下是不是要改发 `ESC \r` 的 Shift+Enter。`screenWants` 惰性求值（通常是 `wantsMetaEnter`）：不是 Shift+Enter 就不读屏 */
+export function shouldSendMetaEnter(k: ShiftEnterKey, screenWants: () => boolean): boolean {
   if (k.key !== "Enter" || !k.shiftKey) return false;
   if (k.ctrlKey || k.altKey || k.metaKey) return false;
   if (k.imeBusy) return false;
-  return !atPrompt();
+  return screenWants();
 }
