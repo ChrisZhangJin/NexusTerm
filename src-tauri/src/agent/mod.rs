@@ -21,6 +21,7 @@ pub mod cmd;
 pub mod control;
 pub mod danger;
 pub mod executor;
+pub mod files;
 pub mod history;
 pub mod hostmem;
 pub mod hostmem_cmd;
