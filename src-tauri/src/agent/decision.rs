@@ -16,7 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::profile::{CtxItem, IntentSpec, KnowledgeHit, PlaybookSpec};
-use super::situation::{self, Choice, Program, Situation, SituationKind};
+use super::situation::{self, Choice, Program, Situation, SituationKind, SubmitStyle};
 use super::steward::ScreenSnapshot;
 
 /// 注入后等多久必须看到新帧。设计 §2 `Timebox.receipt_ms` 的 1500ms。
@@ -41,6 +41,9 @@ pub struct DecisionAction {
     /// 编号菜单里选中的选项编号；有值时注入的是编号而不是整段文本
     pub option_index: Option<String>,
     pub injectable: bool,
+    /// 选中编号之后怎么提交（来自局面的 `situation::submit_style`）。旧记录没有这个字段 → 行式提示
+    #[serde(default)]
+    pub submit: SubmitStyle,
 }
 
 impl DecisionAction {
@@ -50,6 +53,7 @@ impl DecisionAction {
             text,
             option_index,
             injectable: true,
+            submit: SubmitStyle::NeedsEnter,
         }
     }
 
@@ -59,6 +63,7 @@ impl DecisionAction {
             text: reason.into(),
             option_index: None,
             injectable: false,
+            submit: SubmitStyle::NeedsEnter,
         }
     }
 
@@ -68,6 +73,7 @@ impl DecisionAction {
             text: reason.into(),
             option_index: None,
             injectable: false,
+            submit: SubmitStyle::NeedsEnter,
         }
     }
 
@@ -77,6 +83,7 @@ impl DecisionAction {
             text: reason.into(),
             option_index: None,
             injectable: false,
+            submit: SubmitStyle::NeedsEnter,
         }
     }
 
@@ -86,6 +93,7 @@ impl DecisionAction {
             text: summary.into(),
             option_index: None,
             injectable: false,
+            submit: SubmitStyle::NeedsEnter,
         }
     }
 
@@ -97,6 +105,7 @@ impl DecisionAction {
             text: step.into(),
             option_index: None,
             injectable: true,
+            submit: SubmitStyle::NeedsEnter,
         }
     }
 
@@ -106,19 +115,25 @@ impl DecisionAction {
 
     /// 真正要送进 PTY 的字节。文本必须单行（校验在 `profile::validate_text`），
     /// 以 `\r` 收尾表示 Enter；含换行会让交互程序收到多条命令，这里直接拒绝。
+    ///
+    /// 选编号时看 `submit`：`DigitSubmits` 的菜单（Claude Code 权限卡）按数字即提交，只发数字——
+    /// 多出的回车会落到下一屏；`ArrowSelect` 菜单输入编号 / 文字都无效、回车会提交默认项，一律不写。
     /// P3 起 `advance`（空转时催一句 / 翻页）与 `answer` 走同一条注入通道，
     /// 其余生命周期动作永远不写终端。
     pub fn send_bytes(&self) -> Option<Vec<u8>> {
         if !self.injectable || !matches!(self.kind.as_str(), "answer" | "advance") {
             return None;
         }
-        let payload = self
-            .option_index
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&self.text);
+        if self.submit == SubmitStyle::ArrowSelect {
+            return None;
+        }
+        let option = self.option_index.as_deref().filter(|s| !s.is_empty());
+        let payload = option.unwrap_or(&self.text);
         if payload.is_empty() || payload.chars().any(|c| c.is_control()) {
             return None;
+        }
+        if option.is_some() && self.submit == SubmitStyle::DigitSubmits {
+            return Some(payload.as_bytes().to_vec());
         }
         Some(format!("{payload}\r").into_bytes())
     }
@@ -239,7 +254,28 @@ impl DecisionContext {
 // ─────────────────────────── 编译 ───────────────────────────
 
 /// 主入口。顺序即 §4.3 的优先级，越靠前越早 return，保证安全闸门不会被后面的规则绕过。
+///
+/// 编出来的动作统一按局面打上提交方式（`SubmitStyle`）：卡片上的建议、备选、最终注入的都一致。
 pub fn compile(ctx: &DecisionContext) -> DecisionRecord {
+    let mut rec = compile_inner(ctx);
+    let style = situation::submit_style(&ctx.situation);
+    if style != SubmitStyle::NeedsEnter {
+        let mark = |a: &mut DecisionAction| {
+            if a.kind == "answer" || a.kind == "advance" {
+                a.submit = style;
+            }
+        };
+        mark(&mut rec.chosen);
+        rec.candidates.iter_mut().for_each(mark);
+        if let Some(card) = rec.escalation.as_mut() {
+            mark(&mut card.recommendation);
+            card.alternatives.iter_mut().for_each(mark);
+        }
+    }
+    rec
+}
+
+fn compile_inner(ctx: &DecisionContext) -> DecisionRecord {
     let sit = &ctx.situation;
     let mut refs: Vec<CtxRef> = Vec::new();
     let mut candidates: Vec<DecisionAction> = Vec::new();
@@ -1134,5 +1170,49 @@ mod tests {
         sit.evidence.push("shell:prompt-visible".into());
         let r = compile(&ctx(sit, "auto", Some(intent("i0", "继续", IntentSpec::default()))));
         assert_eq!(r.chosen.kind, "observe");
+    }
+
+    #[test]
+    fn digit_submit_menus_send_digit_only_line_prompts_add_enter() {
+        // 带 `❯` 的 Claude Code 选择卡：按数字即选中并提交，多一个回车会落到下一屏
+        let mut digit = situation(
+            SituationKind::Permission,
+            vec![choice("1", "改设置里的记住开关", false), choice("2", "不改设置，直接改代码", false)],
+        );
+        digit.evidence.push(situation::SUBMIT_DIGIT.into());
+        let r = compile(&ctx(digit, "auto", Some(intent("i0", "修复弹窗", IntentSpec::default()))));
+        assert_eq!(r.chosen.option_index.as_deref(), Some("2"));
+        assert_eq!(r.chosen.submit, SubmitStyle::DigitSubmits);
+        assert_eq!(r.chosen.send_bytes().unwrap(), b"2".to_vec());
+
+        // 行式菜单（`Enter choice [1-3]: `）：编号 + 回车
+        let line = situation(
+            SituationKind::Permission,
+            vec![choice("1", "改设置里的记住开关", false), choice("2", "不改设置，直接改代码", false)],
+        );
+        let r = compile(&ctx(line, "auto", Some(intent("i0", "修复弹窗", IntentSpec::default()))));
+        assert_eq!(r.chosen.submit, SubmitStyle::NeedsEnter);
+        assert_eq!(r.chosen.send_bytes().unwrap(), b"2\r".to_vec());
+
+        // 真实屏幕帧走一遍分类：Claude Code 权限卡 → 数字即提交；脚本菜单 → 要回车
+        let cc = situation::frames::classify_lines(&situation::frames::CC_TRUST);
+        assert_eq!(situation::submit_style(&cc), SubmitStyle::DigitSubmits);
+        let sh = situation::frames::classify_lines(&situation::frames::SCRIPT_MENU);
+        assert_eq!(situation::submit_style(&sh), SubmitStyle::NeedsEnter);
+
+        // 自由文本回答不受影响：仍以回车提交
+        let mut free = DecisionAction::answer("hello".into(), None);
+        free.submit = SubmitStyle::DigitSubmits;
+        assert_eq!(free.send_bytes().unwrap(), b"hello\r".to_vec());
+        // 方向键菜单：编号 / 文字都无效，回车会提交默认项 —— 不写
+        let mut arrow = DecisionAction::answer("React".into(), Some("1".into()));
+        arrow.submit = SubmitStyle::ArrowSelect;
+        assert!(arrow.send_bytes().is_none());
+        // 旧记录没有 submit 字段也能反序列化
+        let old: DecisionAction = serde_json::from_value(json!({
+            "kind": "answer", "text": "x", "optionIndex": "1", "injectable": true
+        }))
+        .unwrap();
+        assert_eq!(old.submit, SubmitStyle::NeedsEnter);
     }
 }
