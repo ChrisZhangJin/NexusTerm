@@ -9,6 +9,12 @@
 //! P2 在同一条循环里补上「局面 → 决策 → 注入 → 回执」闭环（`decision.rs`），
 //! 让 Steward 真的能按用户预置的意向替 CLI 作答，而不只是描述屏幕。
 //!
+//! ## PR1 止血：只观察
+//! 统一托管设计（`docs/nexus-host-unified-design.md` §1）之后，**唯一的写者是 LLM 托管运行**。
+//! 本循环不再有任何写 PTY / SSH 的路径：决策只落成 DecisionRecord / 建议卡，批准建议卡也不写；
+//! ControlTable 上有租约持有者（含暂停中的运行）时连建议都不出。下文 P2–P5 关于「注入」的描述
+//! 仅作历史说明。
+//!
 //! ## 硬边界
 //! - **默认零 LLM**：分类器、决策编译器、Playbook、意向模板全是纯函数；只有用户显式
 //!   打开 `PlannerGate` 且规则编不出回复时才走 `planner.rs`，结果仍要过 PolicyEngine。
@@ -50,11 +56,11 @@ use super::decision::{
 };
 use super::learning;
 use super::ownership::OwnershipState;
-use super::policy::{self, Authority, PolicyVerdict, UndoEntry};
+use super::policy::{self, Authority, PolicyVerdict};
 use super::profile::StewardBrain;
 use super::situation::{self, Situation, SituationKind};
 use super::steward::{now_ms, ScreenSnapshot, ScreenStore, StewardContract, StewardRegistry};
-use super::steward_core::StewardCore;
+use super::steward_core::{StewardCore, RESUME_TTL_MS};
 use crate::cmd::AppState;
 
 /// 事件流环形缓冲上限，够覆盖一次长任务的全部关键局面。
@@ -152,10 +158,12 @@ pub enum StewardEventKind {
     /// P2：决策被用户否掉 / 纠正
     DecisionRejected,
     /// P3：用户敲键夺权，Steward 转观察态
+    #[allow(dead_code)] // PR1 后守护进程不再注入 / 夺权，保留以兼容前端事件种类
     Takeover,
     /// P3：用户交还，附「离开期间」摘要
     Handback,
     /// P3：Notify 档动作进入撤销窗口
+    #[allow(dead_code)] // PR1 后守护进程不再注入 / 夺权，保留以兼容前端事件种类
     UndoWindow,
     /// P3：PolicyEngine 硬禁
     PolicyDenied,
@@ -684,10 +692,6 @@ impl StewardRuntime {
         r.llm_calls = r.llm_calls.saturating_add(1);
     }
 
-    fn mark_injection(&self) {
-        self.0.lock().injections += 1;
-    }
-
     pub fn info(
         &self,
         event_seq: u64,
@@ -785,6 +789,7 @@ impl StewardResolutions {
         Self::default()
     }
 
+    #[allow(dead_code)]
     pub fn approve(&self, seq: i64) {
         let mut q = self.0.lock();
         q.retain(|(s, _)| *s != seq);
@@ -851,24 +856,9 @@ fn set_outcome(app: &AppHandle, seq: i64, outcome: &str) {
     st.store.steward_decision_outcome(seq, outcome).ok();
 }
 
-/// 把回复送进 PTY。SSH 的 `write` 是 async，所以这里也是 async。
-/// `agent.feed` 让旁路缓冲看到「Steward 自己写了什么」，回放时不会缺这一段输入。
-async fn inject_keys(app: &AppHandle, console_id: &str, bytes: &[u8]) -> Result<(), String> {
-    let st: State<'_, AppState> = app.state();
-    if st.local.contains(console_id) {
-        st.local.write(console_id, bytes)?;
-    } else if st.sessions.contains(console_id) {
-        st.sessions
-            .write(console_id, bytes.to_vec())
-            .await
-            .map_err(|e| format!("{e:?}"))?;
-    } else {
-        return Err(format!("终端 {console_id} 已不存在，未注入"));
-    }
-    st.agent
-        .feed(console_id, bytes, crate::agent::StreamKind::In);
-    Ok(())
-}
+// PR1 止血：守护进程只观察。原先的 `inject_keys`（直写 PTY / SSH）已删除——
+// 托管改由 LLM 运行（`act::run`）在 ControlTable 租约下动手，守护进程没有任何写路径，
+// 决策只落成建议卡 / 记录（设计 §1「守护进程只观察」）。
 
 fn publish(app: &AppHandle, log: &EventLog, events: Vec<StewardEvent>) {
     let stored = log.append(events);
@@ -995,11 +985,37 @@ fn save_checkpoint(
     ok
 }
 
+/// 这个 console 此刻是否是一个活着的本地 PTY / SSH 会话。
+fn console_known(app: &AppHandle, console_id: &str) -> bool {
+    let st: State<'_, AppState> = app.state();
+    st.local.contains(console_id) || st.sessions.contains(console_id)
+}
+
+/// 恢复项本 tick 的去向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeWait {
+    /// 首帧已到：读屏对齐
+    Ready,
+    /// 还没首帧、未过 TTL：保持 Suspended，下一 tick 再看
+    Wait,
+    /// 等满 `RESUME_TTL_MS` 仍不见 console：丢弃
+    Expire,
+}
+
+/// 纯函数：有没有首帧 + 已等多久 → 去向。
+pub(crate) fn resume_wait(has_snap: bool, waited_ms: i64) -> ResumeWait {
+    if has_snap {
+        ResumeWait::Ready
+    } else if waited_ms >= RESUME_TTL_MS {
+        ResumeWait::Expire
+    } else {
+        ResumeWait::Wait
+    }
+}
+
 /// host 作用域：契约的 host_scope + 会话是否真实存在（fail-closed）。
 fn host_in_scope(app: &AppHandle, auth: &Authority, console_id: &str, host_key: &str) -> bool {
-    let st: State<'_, AppState> = app.state();
-    let known = st.local.contains(console_id) || st.sessions.contains(console_id);
-    policy::host_in_scope(auth, host_key, known)
+    policy::host_in_scope(auth, host_key, console_known(app, console_id))
 }
 
 /// P3 所有权：注入前的最后一道闸。返回 false 时循环只记录、不写终端。
@@ -1009,6 +1025,7 @@ fn may_write(core: &StewardCore, console_id: &str) -> bool {
 
 /// 注入前拿写许可。拿不到（同一 console 还有一条写入在途）就**跳过**这次注入，
 /// 而不是像以前那样 `let _permit = ...` 拿到 None 也照写——那等于没有锁。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn acquire_write(
     core: &StewardCore,
     console_id: &str,
@@ -1028,6 +1045,7 @@ pub(crate) fn acquire_write(
 /// 5. 动作可注入；PolicyEngine 重新复核不是硬禁；
 /// 6. 自动应答总闸开着；所有权允许写。
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn approval_gate(
     rec: &DecisionRecord,
     consumed: bool,
@@ -1145,15 +1163,23 @@ fn advance_record(
     }
 }
 
-/// 「LLM 托管中，跳过」事件的最小间隔，免得每个 tick 都刷一条。
-const LLM_SKIP_EVENT_MS: i64 = 30_000;
+/// 守护进程只观察时给用户的统一说明（建议卡 / 批准兜底 / 事件里共用）。
+pub(crate) const OBSERVER_ONLY_NOTE: &str =
+    "守护进程只观察、不写终端：请在终端里自己输入，或交给 LLM 托管运行处理";
 
-/// 这个 console 是否被 LLM 托管那一路占着：控制表里不是 `UserDriving`
+/// 这个 console 是否被 LLM 托管那一路占着：控制表里有任何租约持有者，或状态不是 `UserDriving`
 /// （`AgentDriving` = LLM 正在驾驶；`Paused` = 用户暂停 / 接管了它，同样不该由 Steward 越俎代庖）。
+/// 只看状态不够：运行暂停时租约仍在、状态可能被并发操作拨来拨去，持有者才是「谁占着」的真相。
 fn llm_run_owns(app: &AppHandle, console_id: &str) -> bool {
     app.try_state::<AppState>()
-        .map(|st| st.act.control.state(console_id) != super::control::ControlState::UserDriving)
+        .map(|st| control_owned(&st.act.control, console_id))
         .unwrap_or(false)
+}
+
+/// `llm_run_owns` 的纯逻辑部分，便于单测。
+pub(crate) fn control_owned(table: &super::control::ControlTable, console_id: &str) -> bool {
+    !table.holders_of(console_id).is_empty()
+        || table.state(console_id) != super::control::ControlState::UserDriving
 }
 
 /// 同一签名短期回来（回显抖动）不重复编译 / 注入。
@@ -1201,7 +1227,8 @@ pub fn spawn_daemon(
         let mut states: HashMap<String, StewardState> = HashMap::new();
         let mut last_cp: HashMap<String, i64> = HashMap::new();
         let mut last_distill_ms: i64 = 0;
-        let mut last_llm_skip: HashMap<String, i64> = HashMap::new();
+        // 当前被 LLM 运行占着的 console：只在「进入 / 离开」时记一笔，不按 tick 刷事件
+        let mut llm_owned: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
             let now = now_ms();
             let mono = core.elapsed_ms();
@@ -1271,11 +1298,37 @@ pub fn spawn_daemon(
                     continue;
                 };
                 let snap = screen.get(&c.console_id);
-                if snap.is_none() {
-                    // 前端还没把这个 tab 的首帧送上来：保持启动时的 Suspended，
-                    // 下一 tick 再核对；看不到现场时绝不恢复写入
-                    resume_later.push(contract_id);
-                    continue;
+                match resume_wait(snap.is_some(), core.resume_waited_ms(&contract_id)) {
+                    ResumeWait::Ready => core.forget_resume(&contract_id),
+                    ResumeWait::Wait => {
+                        // 前端还没把这个 tab 的首帧送上来：保持启动时的 Suspended，
+                        // 下一 tick 再核对；看不到现场时绝不恢复写入
+                        resume_later.push(contract_id);
+                        continue;
+                    }
+                    ResumeWait::Expire => {
+                        // checkpoint 里的 tab id 重启后多半不会再出现：过了 TTL 就丢弃，
+                        // 不再无限重新排队，契约也一并摘掉，免得幽灵契约继续累计时间盒 / 预算事件
+                        let msg = format!(
+                            "恢复项等了 {} 分钟仍不见 console {}：放弃自动恢复（契约已摘除）",
+                            RESUME_TTL_MS / 60_000,
+                            c.console_id
+                        );
+                        registry.stop(&contract_id);
+                        core.drop_contract(&contract_id, &c.console_id);
+                        app.state::<AppState>()
+                            .store
+                            .steward_checkpoint_state(&contract_id, "completed")
+                            .ok();
+                        events.push(sys_event(
+                            &c.console_id,
+                            &contract_id,
+                            StewardEventKind::ContractStopped,
+                            msg,
+                            now,
+                        ));
+                        continue;
+                    }
                 }
                 let verdict = super::checkpoint::resume_verdict(
                     &cp,
@@ -1333,6 +1386,11 @@ pub fn spawn_daemon(
 
             // ── P4 六档 Timebox + 预算耗尽优雅交还 ─────────────────────
             for c in &contracts {
+                // 幽灵契约（console 既没有屏幕帧、也不是活着的 PTY / SSH）不计时、不报事件：
+                // 它要么还在等恢复对齐，要么会被恢复 TTL 摘掉
+                if screen.get(&c.console_id).is_none() && !console_known(&app, &c.console_id) {
+                    continue;
+                }
                 let tb_cfg = core.timebox_config_for(&c.id);
                 let hits = core.with_timebox(&c.console_id, |t| t.check(mono, &tb_cfg));
                 for h in hits {
@@ -1360,11 +1418,39 @@ pub fn spawn_daemon(
                         );
                     }
                 }
+                // 时间盒的 Deadline / Grace 只按边沿报一次；用户按键→交还把所有权拨回
+                // AgentDriving 后，这里按电平再核一遍：过了时限就重新挂起，不被绕过
+                if let Some(h) = core.with_timebox(&c.console_id, |t| t.deadline_passed(mono, &tb_cfg)) {
+                    if core.ownership().state(&c.console_id) == OwnershipState::AgentDriving {
+                        let msg = format!("时间盒 [{}] 仍然有效：交还后保持挂起", h.as_str());
+                        core.ownership().suspend(&c.console_id, &msg, mono);
+                        events.push(sys_event(
+                            &c.console_id,
+                            &c.id,
+                            StewardEventKind::Suspended,
+                            msg,
+                            now,
+                        ));
+                    }
+                }
                 let auth = core.authority(&c.id);
-                // elapsed 每 tick 按契约自己的起点刷新；耗尽只在第一次越线时处理一次
+                // elapsed 每 tick 按契约自己的起点刷新；耗尽通知只在第一次越线时发一次
                 let spent = core.touch_elapsed(&c.id);
                 if let BudgetCheck::Exhausted(reason) = spent.check(&auth) {
                     if !core.mark_exhausted(&c.id) {
+                        // 已经报过：仍按电平复核。交还 / 误恢复把所有权拨回 AgentDriving 时重新挂起，
+                        // 预算没补之前不能继续托管（每次状态翻转只记一条，不按 tick 刷）
+                        if core.ownership().state(&c.console_id) == OwnershipState::AgentDriving {
+                            let msg = format!("{}（交还后仍未补预算）", spent.exhaust_text(reason));
+                            core.ownership().suspend(&c.console_id, &msg, mono);
+                            events.push(sys_event(
+                                &c.console_id,
+                                &c.id,
+                                StewardEventKind::BudgetExhausted,
+                                msg,
+                                now,
+                            ));
+                        }
                         continue;
                     }
                     let msg = spent.exhaust_text(reason);
@@ -1416,131 +1502,21 @@ pub fn spawn_daemon(
                         .note(&console_id, "decision", format!("用户接管决策 #{seq}"), mono);
                     continue;
                 }
-                // 互斥：LLM 托管正在驾驶这个终端时，用户批准的升级卡也不注入（两个「手」不能同时写）。
-                // 不消费 seq、不重排队（否则每个 tick 都刷一条事件），直接丢弃并明说，用户可在交还后重新批准。
-                if llm_run_owns(&app, &rec.console_id) {
-                    events.push(sys_event(
-                        &rec.console_id,
-                        &rec.contract_id,
-                        StewardEventKind::PolicyDenied,
-                        format!("决策 #{seq} 已确认但未执行：LLM 托管中，跳过（不与 LLM 托管同时写终端）"),
-                        now,
-                    ));
-                    continue;
+                // PR1：守护进程只观察，批准一张卡**不会**写终端。命令层已直接拒绝批准，
+                // 这里只兜底处理队列里残留的旧批准：消费掉、标成「只观察」并明说。
+                core.try_consume(seq);
+                set_outcome(&app, seq, "observed");
+                brain.set_decision_outcome(seq, "observed");
+                if let Some(st) = states.get_mut(&rec.console_id) {
+                    st.escalation = None;
                 }
-                // 只认 Brain 里那条记录的动作，不接受任意文本，避免升级卡变成后门。
-                // 命令层投递时已跑过一遍闸门，这里注入前再跑一遍：中间可能隔了一个 tick，
-                // 屏幕、契约、所有权都可能已经变了。
-                let auth = core.authority(&rec.contract_id);
-                let active = registry.for_console(&rec.console_id);
-                let snap = screen.get(&rec.console_id);
-                let in_scope = active
-                    .as_ref()
-                    .map(|c| host_in_scope(&app, &auth, &rec.console_id, &c.host_key))
-                    .unwrap_or(false);
-                let bytes = match approval_gate(
-                    &rec,
-                    core.is_consumed(seq),
-                    active.as_ref(),
-                    snap.as_ref(),
-                    &auth,
-                    in_scope,
-                    brain.execution_enabled(),
-                    may_write(&core, &rec.console_id),
+                events.push(sys_event(
+                    &rec.console_id,
+                    &rec.contract_id,
+                    StewardEventKind::DecisionRejected,
+                    format!("决策 #{seq} 未执行：{OBSERVER_ONLY_NOTE}"),
                     now,
-                ) {
-                    Ok(b) => b,
-                    Err(why) => {
-                        // 卡在所有权（用户正驾驶 / 暂停）时仍报 Takeover，前端据此提示先交还
-                        let kind = if may_write(&core, &rec.console_id) {
-                            StewardEventKind::PolicyDenied
-                        } else {
-                            StewardEventKind::Takeover
-                        };
-                        events.push(sys_event(
-                            &rec.console_id,
-                            &rec.contract_id,
-                            kind,
-                            format!("决策 #{seq} 已确认但未执行：{why}"),
-                            now,
-                        ));
-                        continue;
-                    }
-                };
-                let Some(_permit) = acquire_write(&core, &rec.console_id) else {
-                    // 同一 console 还有写入在途：放回队列，下一 tick 重新过闸
-                    resolutions.approve(seq);
-                    continue;
-                };
-                // 先消费再写：两次批准只会有一次走到这里之后
-                if !core.try_consume(seq) {
-                    continue;
-                }
-                brain.set_decision_outcome(seq, "approved");
-                let res = inject_keys(&app, &rec.console_id, &bytes).await;
-                let Some(st) = states.get_mut(&rec.console_id) else {
-                    continue;
-                };
-                st.escalation = None;
-                match res {
-                    Ok(()) => {
-                        let snap = screen.get(&rec.console_id);
-                        let (frame_id, frame_hash) = snap
-                            .as_ref()
-                            .map(|s| (s.frame_id, s.hash.clone()))
-                            .unwrap_or((0, String::new()));
-                        st.pending = Some(PendingReceipt {
-                            decision_seq: seq,
-                            console_id: rec.console_id.clone(),
-                            contract_id: rec.contract_id.clone(),
-                            before_frame: frame_id,
-                            before_hash: frame_hash,
-                            echo: rec
-                                .chosen
-                                .option_index
-                                .clone()
-                                .unwrap_or_else(|| rec.chosen.text.clone())
-                                .chars()
-                                .take(24)
-                                .collect(),
-                            injected_at: now,
-                            deadline_ms: now + decision::RECEIPT_WINDOW_MS,
-                        });
-                        st.injected_count += 1;
-                        runtime.mark_injection();
-                        core.bump_injection(&rec.contract_id, bytes.len());
-                        core.mark_injection();
-                        core.ownership().note(
-                            &rec.console_id,
-                            "applied",
-                            format!("按用户确认注入决策 #{seq}"),
-                            mono,
-                        );
-                        events.push(st.decision_event(
-                            StewardEventKind::ActionApplied,
-                            format!("已按用户确认注入回复（决策 #{}），等待写后回执", seq),
-                            None,
-                            Some(rec),
-                            now,
-                            0,
-                            String::new(),
-                        ));
-                    }
-                    Err(e) => {
-                        set_outcome(&app, seq, "no_receipt");
-                        core.ownership()
-                            .suspend(&rec.console_id, &format!("写入失败：{e}"), mono);
-                        events.push(st.decision_event(
-                            StewardEventKind::Suspended,
-                            format!("确认后注入失败：{e}；现场保留，不重发"),
-                            None,
-                            Some(rec),
-                            now,
-                            0,
-                            String::new(),
-                        ));
-                    }
-                }
+                ));
             }
 
             for c in &contracts {
@@ -1692,20 +1668,17 @@ pub fn spawn_daemon(
                 // 眼睛（上面的采集与分类）照常工作；决策与注入让给 LLM 那一路，
                 // 否则两个「手」会同时往同一个终端写。
                 if llm_run_owns(&app, &c.console_id) {
-                    if now - last_llm_skip.get(&c.console_id).copied().unwrap_or(0)
-                        >= LLM_SKIP_EVENT_MS
-                    {
-                        last_llm_skip.insert(c.console_id.clone(), now);
-                        events.push(sys_event(
+                    if llm_owned.insert(c.console_id.clone()) {
+                        core.ownership().note(
                             &c.console_id,
-                            &c.id,
-                            StewardEventKind::PolicyDenied,
-                            "LLM 托管中，跳过（零 LLM 托管循环只观察、不决策不注入）",
-                            now,
-                        ));
+                            "decision",
+                            "LLM 托管运行接手该终端：守护进程只观察、不出决策",
+                            mono,
+                        );
                     }
                     continue;
                 }
+                llm_owned.remove(&c.console_id);
 
                 // ── P5 场景 C：空转时按局面主动推进，而不是只描述现象 ────
                 // 与「被动等提问」用同一条 DecisionRecord / PolicyEngine / 回执链路，
@@ -1739,63 +1712,23 @@ pub fn spawn_daemon(
                             runtime.mark_decision();
                             note_checkpoint_decision(&core, c, seq);
                             push_timeline(&app, &rec);
-                            let allowed = verdict.allows_write()
-                                && decision::can_execute_with_llm(
-                                    &rec,
-                                    brain.execution_enabled(),
-                                    &auth.tier,
-                                    false,
-                                );
-                            // 步数只算真正动了手（注入）或交给人（出卡）的决策，纯观察不耗预算
+                            // PR1：守护进程只观察。策略即便放行（例如 Pager 的 `q`）也不代按，
+                            // 只出建议；步数只算交给人（出卡）的决策，纯观察不耗预算
                             let mut acted = false;
-                            if allowed {
-                                if let Some(bytes) = rec.chosen.send_bytes() {
-                                    if let Some(_permit) = acquire_write(&core, &c.console_id) {
-                                        if inject_keys(&app, &c.console_id, &bytes)
-                                            .await
-                                            .is_ok()
-                                        {
-                                            acted = true;
-                                            let (frame_id, frame_hash) = snap
-                                                .as_ref()
-                                                .map(|s| (s.frame_id, s.hash.clone()))
-                                                .unwrap_or((0, String::new()));
-                                            st.pending = Some(PendingReceipt {
-                                                decision_seq: seq,
-                                                console_id: c.console_id.clone(),
-                                                contract_id: c.id.clone(),
-                                                before_frame: frame_id,
-                                                before_hash: frame_hash,
-                                                echo: rec
-                                                    .chosen
-                                                    .text
-                                                    .chars()
-                                                    .take(24)
-                                                    .collect(),
-                                                injected_at: now,
-                                                deadline_ms: now
-                                                    + decision::RECEIPT_WINDOW_MS,
-                                            });
-                                            st.injected_count += 1;
-                                            runtime.mark_injection();
-                                            core.bump_injection(&c.id, bytes.len());
-                                            core.mark_injection();
-                                            events.push(st.decision_event(
-                                                StewardEventKind::ActionApplied,
-                                                format!(
-                                                    "空转干预：已注入「{}」，等待写后回执",
-                                                    rec.chosen.text
-                                                ),
-                                                Some(sit.clone()),
-                                                Some(rec.clone()),
-                                                now,
-                                                frame_id,
-                                                String::new(),
-                                            ));
-                                        }
-                                    }
-                                }
-                            } else if rec.escalation.is_some()
+                            let denied = matches!(verdict, PolicyVerdict::Deny { .. });
+                            if !denied && rec.escalation.is_none() {
+                                events.push(sys_event(
+                                    &c.console_id,
+                                    &c.id,
+                                    StewardEventKind::NoProgress,
+                                    format!(
+                                        "空转已识别，建议「{}」（{}）",
+                                        rec.chosen.text, OBSERVER_ONLY_NOTE
+                                    ),
+                                    now,
+                                ));
+                            } else if !denied
+                                && rec.escalation.is_some()
                                 && may_write(&core, &c.console_id)
                             {
                                 acted = true;
@@ -1809,8 +1742,8 @@ pub fn spawn_daemon(
                                 events.push(st.decision_event(
                                     StewardEventKind::Escalation,
                                     format!(
-                                        "空转已识别，建议催一句「{}」：需要确认后才注入",
-                                        rec.chosen.text
+                                        "空转已识别，建议催一句「{}」（{}）",
+                                        rec.chosen.text, OBSERVER_ONLY_NOTE
                                     ),
                                     Some(sit.clone()),
                                     Some(rec.clone()),
@@ -1884,104 +1817,10 @@ pub fn spawn_daemon(
                     );
                     continue;
                 }
-                // 步数只算注入或出卡；纯观察 / 硬禁不消耗预算
-                let mut acted = false;
-                if verdict == PolicyVerdict::Auto || matches!(verdict, PolicyVerdict::Notify { .. }) {
-                    if decision::can_execute_with_llm(
-                        &rec,
-                        brain.execution_enabled(),
-                        &auth.tier,
-                        core.planner().enabled(),
-                    ) {
-                        if let Some(bytes) = rec.chosen.send_bytes() {
-                            // 拿不到写许可（同 console 还有写入在途）就跳过，不能无锁照写
-                            let Some(_permit) = acquire_write(&core, &c.console_id) else {
-                                continue;
-                            };
-                            match inject_keys(&app, &c.console_id, &bytes).await {
-                                Ok(()) => {
-                                    acted = true;
-                                    st.injected_count += 1;
-                                    runtime.mark_injection();
-                                    core.bump_injection(&c.id, bytes.len());
-                                    core.mark_injection();
-                                    st.pending = Some(PendingReceipt {
-                                        decision_seq: seq,
-                                        console_id: c.console_id.clone(),
-                                        contract_id: c.id.clone(),
-                                        before_frame: frame_id,
-                                        before_hash: frame_hash.clone(),
-                                        echo: rec
-                                            .chosen
-                                            .option_index
-                                            .clone()
-                                            .unwrap_or_else(|| rec.chosen.text.clone())
-                                            .chars()
-                                            .take(24)
-                                            .collect(),
-                                        injected_at: now,
-                                        deadline_ms: now + decision::RECEIPT_WINDOW_MS,
-                                    });
-                                    core.ownership().note(
-                                        &c.console_id,
-                                        "applied",
-                                        format!("按意向注入决策 #{seq}"),
-                                        mono,
-                                    );
-                                    if let PolicyVerdict::Notify { undo_ms } = verdict {
-                                        core.add_undo(UndoEntry::new(&rec, undo_ms));
-                                        events.push(sys_event(
-                                            &c.console_id,
-                                            &c.id,
-                                            StewardEventKind::UndoWindow,
-                                            format!(
-                                                "决策 #{} 已执行，{}ms 内可一键撤销（转观察态 + 写 Learned 偏好）",
-                                                seq, undo_ms
-                                            ),
-                                            now,
-                                        ));
-                                    }
-                                    events.push(st.decision_event(
-                                        StewardEventKind::ActionApplied,
-                                        format!(
-                                            "已按意向注入回复（{}），等待写后回执",
-                                            rec.chosen.label()
-                                        ),
-                                        Some(sit.clone()),
-                                        Some(rec.clone()),
-                                        now,
-                                        frame_id,
-                                        frame_hash.clone(),
-                                    ));
-                                }
-                                Err(e) => {
-                                    set_outcome(&app, seq, "no_receipt");
-                                    core.ownership()
-                                        .suspend(&c.console_id, &format!("PTY/SSH 写入失败：{e}"), mono);
-                                    save_checkpoint(
-                                        &app,
-                                        &core,
-                                        c,
-                                        Some(st),
-                                        &screen,
-                                        now,
-                                        "suspended",
-                                        "写入失败，现场已保留",
-                                    );
-                                    events.push(st.decision_event(
-                                        StewardEventKind::Suspended,
-                                        format!("注入失败：{e}；已暂停托管并升级给人，不重发"),
-                                        Some(sit.clone()),
-                                        Some(rec.clone()),
-                                        now,
-                                        frame_id,
-                                        frame_hash.clone(),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                } else if matches!(verdict, PolicyVerdict::Deny { .. }) {
+                // 步数只算出卡；纯观察 / 硬禁不消耗预算。
+                // PR1：Auto / Notify 档的决策也只是建议（outcome 停在 proposed），守护进程不注入
+                let denied = matches!(verdict, PolicyVerdict::Deny { .. });
+                if denied {
                     events.push(sys_event(
                         &c.console_id,
                         &c.id,
@@ -1991,12 +1830,9 @@ pub fn spawn_daemon(
                     ));
                 }
                 // 升级卡与 verdict 解耦：Auto / Notify 档下编译器也可能因为低置信、自由文本
-                // 或报错局面留卡（此时 can_execute 不放行），以前这种卡没人挂，既不会超时也批不了
-                if !acted
-                    && !matches!(verdict, PolicyVerdict::Deny { .. })
-                    && rec.escalation.is_some()
-                {
-                    acted = true;
+                // 或报错局面留卡；卡只是建议，挂上后照常走超时收敛
+                if !denied && rec.escalation.is_some() {
+                    core.bump_step(&c.id);
                     st.escalation = Some((seq, now));
                     core.ownership().note(
                         &c.console_id,
@@ -2006,16 +1842,13 @@ pub fn spawn_daemon(
                     );
                     events.push(st.decision_event(
                         StewardEventKind::Escalation,
-                        "需要确认：已给出建议、备选与 30s 倒计时；超时按默认动作保留现场".to_string(),
+                        format!("建议卡：已给出建议与备选（{OBSERVER_ONLY_NOTE}）"),
                         Some(sit.clone()),
                         Some(rec.clone()),
                         now,
                         frame_id,
-                        frame_hash.clone(),
+                        frame_hash,
                     ));
-                }
-                if acted {
-                    core.bump_step(&c.id);
                 }
             }
 
@@ -2531,5 +2364,61 @@ mod tests {
             .map(|s| s.name)
             .collect();
         assert_eq!(kept, vec!["any".to_string(), "mine".to_string()]);
+    }
+
+    // ── PR1 止血 ──
+
+    #[test]
+    fn daemon_has_no_write_path_at_all() {
+        // 守护进程只观察：源码里不允许再出现任何写 PTY / SSH 的调用。
+        // 关键字拆开拼，免得这条测试自己命中自己。
+        let src = include_str!("steward_loop.rs");
+        for needle in [
+            concat!("sessions", ".write("),
+            concat!("local", ".write("),
+            concat!("inject", "_keys("),
+        ] {
+            assert!(!src.contains(needle), "steward_loop 不应再有写路径：{needle}");
+        }
+    }
+
+    #[test]
+    fn llm_run_holding_or_pausing_console_blocks_daemon() {
+        use super::super::control::ControlTable;
+        let t = ControlTable::new();
+        assert!(!control_owned(&t, "tab-1"), "没人驾驶时守护进程可出建议");
+        t.acquire("tab-1", "run-1");
+        assert!(control_owned(&t, "tab-1"));
+        // 托管运行暂停（hold_paused 的 steward 分支）：租约仍在 → 守护进程仍让路
+        t.pause_run("run-1");
+        assert!(control_owned(&t, "tab-1"));
+        // 用户点「交还」：状态回到 AgentDriving，持有者仍在
+        t.handback("tab-1");
+        assert!(control_owned(&t, "tab-1"));
+        t.release_run("run-1");
+        assert!(!control_owned(&t, "tab-1"), "运行结束才还给守护进程观察");
+    }
+
+    #[test]
+    fn resume_entry_for_missing_console_expires() {
+        assert_eq!(resume_wait(true, RESUME_TTL_MS * 10), ResumeWait::Ready);
+        assert_eq!(resume_wait(false, 0), ResumeWait::Wait);
+        assert_eq!(resume_wait(false, RESUME_TTL_MS - 1), ResumeWait::Wait);
+        assert_eq!(resume_wait(false, RESUME_TTL_MS), ResumeWait::Expire);
+        // 与 StewardCore 的计时联动：重新排队不刷新起点，过了 TTL 就判过期
+        let core = StewardCore::new();
+        core.push_resume("c-ghost");
+        for id in core.drain_resume() {
+            core.push_resume(&id); // 循环里「没首帧 → 下一 tick 再看」
+        }
+        core.advance_clock(RESUME_TTL_MS + 1);
+        core.push_resume("c-ghost");
+        assert_eq!(
+            resume_wait(false, core.resume_waited_ms("c-ghost")),
+            ResumeWait::Expire
+        );
+        core.drop_contract("c-ghost", "tab-ghost");
+        assert!(core.drain_resume().is_empty());
+        assert_eq!(core.resume_waited_ms("c-ghost"), 0);
     }
 }

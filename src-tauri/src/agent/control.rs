@@ -166,6 +166,35 @@ impl ControlTable {
         self.apply(session, ControlEvent::Handback)
     }
 
+    /// 运行 `run` 自己进入暂停（预算 / 用户点「暂停」）：**不撤租约**，只把它驾驶的
+    /// 会话一律标成 `Paused`。托管模式下暂停期间仍是这轮运行占着终端，
+    /// 守护进程据 `holders_of` 非空就不会趁机写入。返回变化清单。
+    pub fn pause_run(&self, run: &str) -> Vec<(String, ControlState)> {
+        self.apply_run(run, ControlEvent::Takeover)
+    }
+
+    /// `pause_run` 的反向：用户点「继续」后把这轮运行驾驶的会话交还给它。
+    pub fn resume_run(&self, run: &str) -> Vec<(String, ControlState)> {
+        self.apply_run(run, ControlEvent::Handback)
+    }
+
+    fn apply_run(&self, run: &str, ev: ControlEvent) -> Vec<(String, ControlState)> {
+        let mut map = self.inner.lock();
+        let mut changed = Vec::new();
+        for (session, e) in map.iter_mut() {
+            if !e.holders.iter().any(|h| h == run) {
+                continue;
+            }
+            let new = next(e.state, ev);
+            if new != e.state {
+                e.state = new;
+                changed.push((session.clone(), new));
+            }
+        }
+        changed.sort_by(|a, b| a.0.cmp(&b.0));
+        changed
+    }
+
     fn apply(&self, session: &str, ev: ControlEvent) -> Option<ControlState> {
         let mut map = self.inner.lock();
         let e = map.get_mut(session)?;
@@ -249,6 +278,27 @@ mod tests {
         assert_eq!(next(Paused, Takeover), Paused);
         // 交还只对 Paused 有意义
         assert_eq!(next(AgentDriving, Handback), AgentDriving);
+    }
+
+    #[test]
+    fn pause_run_keeps_lease_and_marks_paused() {
+        let t = ControlTable::new();
+        t.acquire("tab-a", "run-1");
+        t.acquire("tab-b", "run-1");
+        t.acquire("tab-c", "run-2");
+        assert_eq!(
+            t.pause_run("run-1"),
+            vec![("tab-a".to_string(), Paused), ("tab-b".to_string(), Paused)]
+        );
+        // 租约还在：守护进程据 holders 判定「LLM 运行占着」
+        assert_eq!(t.holders_of("tab-a"), vec!["run-1".to_string()]);
+        assert_eq!(t.state("tab-c"), AgentDriving, "别的运行不受影响");
+        assert!(t.pause_run("run-1").is_empty(), "幂等");
+        assert_eq!(
+            t.resume_run("run-1"),
+            vec![("tab-a".to_string(), AgentDriving), ("tab-b".to_string(), AgentDriving)]
+        );
+        assert!(t.pause_run("ghost").is_empty());
     }
 
     #[test]

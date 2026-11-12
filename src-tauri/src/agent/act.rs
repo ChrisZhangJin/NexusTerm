@@ -2760,8 +2760,12 @@ const PHASE_POLL: Duration = Duration::from_millis(200);
 /// 暂停在这里，直到用户「继续」/「停止」（取消）/ 挂太久。
 ///
 /// 1. 推一张 `paused` 卡（做了什么 / 还差什么 / 怎么继续；动作摘要已脱敏）；
-/// 2. **把控制权还给用户**（`release_control`）：暂停期间用户在终端里想干什么都行，不会被当成「抢 Agent 的方向盘」；
-/// 3. 轮询相位；收到「继续」后**重新获取**发起会话的控制权（与开局同一条 `acquire` 路径），
+/// 2. 普通对话运行：**把控制权还给用户**（`release_control`）：暂停期间用户在终端里想干什么都行，
+///    不会被当成「抢 Agent 的方向盘」；
+///    托管（steward）运行：**租约不放**（`pause_run` 只把它驾驶的会话标成 Paused）——
+///    放了租约，守护进程会以为没人托管而趁机写入，同一终端就出现两个写者（设计 §0）；
+/// 3. 轮询相位；收到「继续」后**重新获取**发起会话的控制权（与开局同一条 `acquire` 路径；
+///    托管运行先 `resume_run` 把暂停标记交还），
 ///    其余被驾驶的会话在下一个动作前由 `gate_drive` 照常重新获取并检查 Paused。
 ///    审批 / 作用范围 / 危险判断都在动作路径里，不会因为恢复而被绕过。
 ///
@@ -2790,7 +2794,14 @@ async fn hold_paused(
             ..StepPayload::new("paused", step)
         },
     );
-    runtime.release_control(app, run);
+    let steward = runtime.is_steward(run);
+    if steward {
+        for (session, st) in runtime.control.pause_run(run) {
+            emit_control(app, &session, &runtime.control.holders_of(&session), st);
+        }
+    } else {
+        runtime.release_control(app, run);
+    }
     let waited = control::wait_unpaused(
         || runtime.phases.is_paused(run),
         || cancel.load(Ordering::Relaxed),
@@ -2800,6 +2811,12 @@ async fn hold_paused(
     )
     .await;
     if waited == control::PauseWait::Ready {
+        // 用户点了「继续」就是明确交还：把暂停时标上的 Paused 撤掉
+        if steward {
+            for (session, st) in runtime.control.resume_run(run) {
+                emit_control(app, &session, &runtime.control.holders_of(&session), st);
+            }
+        }
         // 与开局相同的重新获取路径：用户若在暂停期间动过终端，之后的 gate_drive 照常生效
         if let Some(st) = runtime.control.acquire(run, run) {
             emit_control(app, run, &[run.to_string()], st);
