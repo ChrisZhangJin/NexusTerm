@@ -160,6 +160,10 @@ impl HostIo for AppHostIo {
         self.snap.lock().watchdog = w.clone();
     }
 
+    fn console_alive(&self) -> bool {
+        self.app.try_state::<AppState>().map_or(true, |st| act::session_alive(&st, &self.console_id))
+    }
+
     fn note_notice(&self, notice: Option<&str>) {
         *self.notice.lock() = notice.map(str::to_string);
     }
@@ -420,11 +424,16 @@ pub async fn host_stop(
     if h.is_terminal() {
         return Ok(false);
     }
+    let had_task = state.act.is_running(h.run_id());
     h.cancel.store(true, Ordering::Relaxed);
     act::stop_run(&app, &state, h.run_id(), send_ctrl_c.unwrap_or(false)).await;
     // 马上进终态（UI 立刻看到「已停止」），再投一个 Stop 把挂起中的任务叫醒
     let _ = h.apply(HostEvent::Stop);
     h.send(HostEvent::Stop);
+    // 启动扫描恢复的挂起行没有运行任务：没人走 finish_hosted，契约在这里收
+    if !had_task {
+        finish_hosted(&app, &h, Ok(()));
+    }
     Ok(true)
 }
 
@@ -805,6 +814,12 @@ pub async fn host_reattach(
     core: State<'_, StewardCore>,
     screen: State<'_, ScreenStore>,
 ) -> Result<(), String> {
+    // 同一份契约同时只允许一次接驳（双击 / 两个面板一起点）：否则会起两个任务，其中一个没有租约
+    let _reattaching = state
+        .act
+        .host
+        .begin_reattach(&contract_id)
+        .ok_or_else(|| "这份托管正在接驳中，请稍候".to_string())?;
     let old = hosted(&state, &contract_id)?;
     if !matches!(old.phase(), HostPhase::Suspended { .. }) {
         return Err("这份托管没有在等重新接驳".to_string());
@@ -827,6 +842,8 @@ pub async fn host_reattach(
     if !act::session_alive(&state, &console_id) {
         return Err(format!("没有 id 为「{console_id}」的终端"));
     }
+    // 打开新连接要等一阵：回来后再确认一遍还是那份挂起的任务（没被停掉 / 没被别处接走）
+    still_reattachable(&state.act.host, &contract_id, &old)?;
     if state.act.host.live_on_console(&console_id).is_some_and(|h| h.contract_id() != contract_id) {
         return Err("这个终端正被另一份托管占着".to_string());
     }
@@ -910,6 +927,18 @@ pub(crate) fn move_lease(
         }
     }
     Ok(changes)
+}
+
+/// 接驳的 await 之后复核：登记表里还是同一个任务对象，且仍挂起。
+pub(crate) fn still_reattachable(
+    sup: &super::host::HostSupervisor,
+    contract_id: &str,
+    old: &Arc<HostShared>,
+) -> Result<(), String> {
+    match sup.get(contract_id) {
+        Some(cur) if Arc::ptr_eq(&cur, old) && matches!(cur.phase(), HostPhase::Suspended { .. }) => Ok(()),
+        _ => Err("这份托管在接驳过程中已被停止或接到了别处".to_string()),
+    }
 }
 
 /// 新开连接后要恢复的工作目录 / tmux：交给模型经 nx_exec 去做（走 gate::authorize，cd / tmux attach 这类
@@ -1211,6 +1240,24 @@ mod tests {
         assert!(move_lease(&t2, run, "tab-A", "tab-B").is_err());
         assert_eq!(t2.holders_of("tab-B"), vec!["tab-B".to_string()]);
         assert_eq!(t2.holders_of("tab-A"), vec![run.to_string()]);
+    }
+
+    #[test]
+    fn reattach_rechecks_after_await() {
+        let sup = super::super::host::HostSupervisor::new();
+        let (old, _io) = super::super::host::driver::tests::shared();
+        old.apply(HostEvent::Suspend(SuspendReason::ConsoleGone)).unwrap();
+        sup.register(old.clone());
+        assert!(still_reattachable(&sup, "c1", &old).is_ok());
+        // await 期间别处已经接走（登记表里换成了新任务）：拒绝
+        let (newer, _io) = super::super::host::driver::tests::shared();
+        sup.register(newer.clone());
+        assert!(still_reattachable(&sup, "c1", &old).is_err());
+        // 或者被停掉了
+        let sup2 = super::super::host::HostSupervisor::new();
+        sup2.register(old.clone());
+        old.apply(HostEvent::Stop).unwrap();
+        assert!(still_reattachable(&sup2, "c1", &old).is_err());
     }
 
     #[test]
