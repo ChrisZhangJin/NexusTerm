@@ -62,7 +62,18 @@ fn rules() -> &'static [Rule] {
         // 单行 JSON：`{"password":"x","user":"y"}`
         let kv_json = format!(r#"(?i)"{SECRET_NAMES}"[ \t]*:[ \t]*(?P<v>"[^"\n]{{0,256}}")"#);
 
+        // 环境变量式的名字：大写、前面没有分隔符（`PGPASSWORD`、`NPMTOKEN`），或带 `_KEY_BASE` 一类后缀
+        // （`SECRET_KEY_BASE`）。只认大写，免得 `mysecret` 之类的普通词被当成键名
+        let kv_env = format!(
+            r#"\b(?:[A-Z][A-Z0-9_]*)?(?:PASSWORD|PASSWD|TOKEN|SECRET)(?:_KEY_BASE|_KEY|_BASE)?["']?[ \t]*=[ \t]*{value_eq}"#
+        );
         let patterns: Vec<(String, bool)> = vec![
+            // URL 里的用户信息：`scheme://user:pw@host`（用户名可空：`redis://:pw@cache`）
+            (r#"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@'"]*:(?P<v>[^\s/@'"]+)@"#.into(), true),
+            // `mysql -pSecret` / `-p'Secret'`（-p 后紧跟口令；单独的 `-p` 是交互输入，不动）
+            (r#"(?:^|[\s;|&(])(?:mysql|mysqldump|mysqladmin|mariadb|mariadb-dump)\b[^\n]*?[ \t]-p(?P<v>'[^'\n]*'|"[^"\n]*"|[^\s'"\-][^\s]*)"#.into(), true),
+            // `curl -u user:pw` / `--user user:pw` / `--user=user:pw`
+            (r#"\bcurl\b[^\n]*?[ \t](?:-u|--user)(?:[ \t]+|=)["']?[^\s:'"]*:(?P<v>[^\s'"]+)"#.into(), true),
             // Authorization 头里的 Bearer token（只吃空格 / Tab，不跨行）
             (r#"(?i)bearer[ \t]+[A-Za-z0-9._~+/=\-]{8,}"#.into(), false),
             // OpenAI / Anthropic 风格的前缀 key；前面要是词边界，`task-xxxx` 不算
@@ -86,6 +97,7 @@ fn rules() -> &'static [Rule] {
             (kv_colon, true),
             (kv_colon_esc, true),
             (kv_eq, true),
+            (kv_env, true),
             // 邮箱
             (r#"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#.into(), false),
             // IPv4（限定每段 0-255）
@@ -106,9 +118,41 @@ fn rules() -> &'static [Rule] {
     })
 }
 
-/// 值显然不是秘密：代码里的类型标注 / 字面量 / 已脱敏的占位符。
-/// 只对「键名 + 值」规则生效；宁可漏放这几个固定词，也别把 `password: &str` 改成乱码。
-fn keep_value(raw: &str) -> bool {
+/// 值显然不是秘密：代码里的类型标注 / 字面量 / 已脱敏的占位符 / 变量引用 / 函数调用 / 取值表达式。
+/// 只对「键名 + 值」规则生效；宁可漏放这几个固定形状，也别把 `password: &str` 改成乱码。
+///
+/// 放过（代码，不是口令）：`$VAR` `$(cmd)` `${VAR}`、`name(…`（调用）、`cfg[`（取键）、
+/// `a.b.c`（属性路径）、与键同名（`self.secret = secret`）。
+/// 仍然脱敏：引号里的字面量（`"hunter2"`）、裸的口令 / 高熵串（`hunter2`、`S3cret`）。
+fn keep_value(raw: &str, key: &str) -> bool {
+    static SHAPES: OnceLock<[Regex; 3]> = OnceLock::new();
+    let [call_open, lookup_open, dotted] = SHAPES.get_or_init(|| {
+        [
+            Regex::new(r"^[A-Za-z_][A-Za-z0-9_:.]*\(").expect("调用"),
+            Regex::new(r"^[A-Za-z_][A-Za-z0-9_.]*\[").expect("取键"),
+            Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$").expect("属性路径"),
+        ]
+    });
+    let t = raw.trim().trim_end_matches([',', ';']);
+    if t.starts_with('$') && t[1..].starts_with(|c: char| c == '(' || c == '{' || c == '_' || c.is_ascii_alphabetic()) {
+        return true;
+    }
+    if call_open.is_match(t) || lookup_open.is_match(t) {
+        return true;
+    }
+    // 属性路径：每段至少两个字符、没有「字母数字混合的长段」（`s.abc123…`、`hvs.CAES…` 是令牌，不是路径）
+    if dotted.is_match(t)
+        && t.split('.').all(|seg| {
+            let mixed = seg.chars().any(|c| c.is_ascii_digit()) && seg.chars().any(|c| c.is_ascii_alphabetic());
+            seg.len() >= 2 && !(mixed && seg.len() >= 6)
+        })
+    {
+        return true;
+    }
+    let name = key.rsplit(|c: char| matches!(c, '.' | '>' | ' ' | '\t')).next().unwrap_or(key);
+    if !name.is_empty() && t.eq_ignore_ascii_case(name) {
+        return true;
+    }
     // 函数调用（`password = read_pw();`）：值是代码，不是字面量
     static CALL: OnceLock<Regex> = OnceLock::new();
     let call = CALL.get_or_init(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_:.]*\(.*\)[;,]?$").expect("调用形正则"));
@@ -133,11 +177,13 @@ fn replace_kv(re: &Regex, text: &str) -> String {
     re.replace_all(text, |caps: &Captures| {
         let all = caps.get(0).expect("整体匹配必然存在");
         let Some(v) = caps.name("v") else { return all.as_str().to_string() };
-        if keep_value(v.as_str()) {
-            return all.as_str().to_string();
-        }
         let s = all.as_str();
         let (a, b) = (v.start() - all.start(), v.end() - all.start());
+        // 键名：值前面那段去掉分隔符（`self.secret = ` → `self.secret`）
+        let key = s[..a].trim_end_matches(|c: char| matches!(c, '=' | ':' | ' ' | '\t' | '"' | '\'')).trim();
+        if keep_value(v.as_str(), key) {
+            return all.as_str().to_string();
+        }
         format!("{}{PLACEHOLDER}{}", &s[..a], &s[b..])
     })
     .into_owned()
@@ -559,6 +605,83 @@ mod tests {
         assert_eq!(redact(ts), ts);
         assert_eq!(redact("password_file=/run/secrets/db"), "password_file=/run/secrets/db");
         assert_eq!(redact("debug: true\nauth: false\n"), "debug: true\nauth: false\n");
+    }
+
+    /// 复审 H1：表驱动。正例的「秘密」子串必须消失；反例必须原样不动。
+    #[test]
+    fn redaction_table() {
+        let positives: &[(&str, &str)] = &[
+            ("PGPASSWORD=xyz123 psql -h db", "xyz123"),
+            ("export PGPASSWORD=abc987", "abc987"),
+            ("MYSQL_PWD=foo42 mysql", "foo42"),
+            ("SECRET_KEY_BASE=deadbeef1234cafe", "deadbeef1234cafe"),
+            ("DJANGO_SECRET_KEY=abcd1234", "abcd1234"),
+            ("NPMTOKEN=npm_xyz777", "npm_xyz777"),
+            ("APITOKEN=tok999", "tok999"),
+            ("VAULT_TOKEN=s.abcdef123", "s.abcdef123"),
+            ("SLACK_WEBHOOK_SECRET=whs3cr3t", "whs3cr3t"),
+            ("GH_TOKEN=gho_short1", "gho_short1"),
+            ("HEROKU_API_KEY=her0ku", "her0ku"),
+            ("SECRET=plainsecret", "plainsecret"),
+            ("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG", "wJalrXUtnFEMI"),
+            ("client_secret=cl1ent", "cl1ent"),
+            ("mysql -u root -pS3cret db", "S3cret"),
+            ("mysql -uroot -p'S3 cret' db", "S3 cret"),
+            ("mysqldump --password=S3cret db", "S3cret"),
+            ("mariadb -h x -pHunter22", "Hunter22"),
+            ("curl -u admin:S3cret https://x", "S3cret"),
+            ("curl --user admin:Pw0rd https://x", "Pw0rd"),
+            ("curl -s -u 'admin:Qw3rty' https://x", "Qw3rty"),
+            ("curl --user=admin:Zx9 https://x", "Zx9"),
+            ("postgres://app:S3cretPg@db:5432/app", "S3cretPg"),
+            ("mysql://root:MyPw@localhost/db", "MyPw"),
+            ("https://user:HttpPw@example.com/path", "HttpPw"),
+            ("redis://:RedisPw@cache:6379", "RedisPw"),
+            ("git clone https://bob:ghTok3n@git.example.com/r.git", "ghTok3n"),
+            ("password=hunter2", "hunter2"),
+            ("password: hunter3", "hunter3"),
+            (r#"{"password": "jsonpw"}"#, "jsonpw"),
+            (r#"PASSWORD="quoted literal""#, "quoted literal"),
+            ("api_key = 'abcdef'", "abcdef"),
+            (r#"self.password = "litpw""#, "litpw"),
+            ("config.password = 'cfgpw'", "cfgpw"),
+            (r#"secret = "abc123""#, "abc123"),
+            ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("pwd: yamlpw", "yamlpw"),
+            ("token=tkn_123", "tkn_123"),
+            ("--api_key=secretvalue", "secretvalue"),
+            ("db.password = s3cret", "s3cret"),
+        ];
+        for (raw, leak) in positives {
+            let out = redact(raw);
+            assert!(!out.contains(leak), "应脱敏：{raw} → {out}");
+            assert!(out.contains(PLACEHOLDER), "{raw} → {out}");
+        }
+        let negatives: &[&str] = &[
+            r#"config.password = cfg.get("db.password")"#,
+            "auth = Auth(user, pw)",
+            "self.secret = secret",
+            "pwd=$(pwd)",
+            "PASSWORD=$DB_PASSWORD",
+            r#"password = os.environ["DB_PASSWORD"]"#,
+            r#"token = request.headers.get("X-Token")"#,
+            "secret = settings.SECRET_KEY",
+            "password = getpass.getpass()",
+            "api_key=${API_KEY}",
+            "let password = read_pw();",
+            "fn check_password(password: &str) -> bool {",
+            "password_file=/run/secrets/db",
+            "if password == stored { return true; }",
+            "auth: false",
+            "git clone https://github.com/x/y.git",
+            "TOKEN_TTL=3600",
+            "mysql -h db -P 3306 -u root -p",
+            r#"curl -u "$USER:$PASS" https://x"#,
+            "password = password",
+        ];
+        for raw in negatives {
+            assert_eq!(redact(raw), *raw, "不该脱敏");
+        }
     }
 
     #[test]

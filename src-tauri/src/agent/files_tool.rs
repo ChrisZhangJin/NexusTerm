@@ -336,6 +336,43 @@ pub async fn run<A: Approver>(
     }
 }
 
+/// 写入内容里的脱敏占位符比原来多（写回了 nx_read 给的脱敏内容）：返回拒绝理由。
+/// - nx_edit：new_string 里的占位符多于 old_string；
+/// - nx_write：差异里新增行的占位符多于删除行；预览不完整、看不全差异时，内容里出现占位符就拒。
+pub(crate) fn placeholder_wipe(call: &FileCall, pending: &PendingChange) -> Option<String> {
+    let n = |t: &str| t.matches(redact::PLACEHOLDER).count();
+    let more = match call {
+        FileCall::Edit(a) => n(&a.new_string) > n(&a.old_string),
+        FileCall::Write(a) => {
+            if n(&a.content) == 0 {
+                false
+            } else if !pending.preview_complete {
+                true
+            } else {
+                let (mut added, mut removed) = (0, 0);
+                for l in pending.change.diff_preview.lines() {
+                    if l.starts_with("+++") || l.starts_with("---") {
+                        continue;
+                    }
+                    if let Some(r) = l.strip_prefix('+') {
+                        added += n(r);
+                    } else if let Some(r) = l.strip_prefix('-') {
+                        removed += n(r);
+                    }
+                }
+                added > removed
+            }
+        }
+        _ => false,
+    };
+    more.then(|| {
+        format!(
+            "内容里有脱敏占位符 {}，写入会抹掉真实密钥；请用 nx_edit 只改需要改的行，不要整文件重写",
+            redact::PLACEHOLDER
+        )
+    })
+}
+
 async fn prepare(ops: &FileOps<'_>, call: &FileCall, allow_sensitive: bool) -> Result<PendingChange, FileError> {
     match call {
         FileCall::Write(a) => {
@@ -372,7 +409,20 @@ async fn write<A: Approver>(
         Err(e) => return fail(summary, e),
     };
     let ch = &pending.change;
-    let diff = shown(&ch.diff_preview, ch.sensitive || sensitive_path, false);
+    // 脱敏占位符写回去 = 抹掉真实密钥（模型读到的是脱敏后的内容，整文件重写会把 [REDACTED] 原样写进去）
+    if let Some(why) = placeholder_wipe(call, &pending) {
+        return FileOutcome {
+            ok: false,
+            feedback: format!("{summary} 没有执行：{why}\n"),
+            summary,
+            diff: Some(redact::redact(&ch.diff_preview)),
+            ..Default::default()
+        };
+    }
+    // 审批卡上给人看原文（人看得到自己的密钥，脱敏后的 diff 会把「改成占位符」藏起来）；
+    // 进步骤卡 / 时间线 / 运行记录 / 落盘历史的那份一律脱敏，给模型的按开关与敏感标记脱敏
+    let card_diff = ch.diff_preview.clone();
+    let diff = redact::redact(&ch.diff_preview);
     let mut reasons = match &gate {
         WriteGate::Approve(r) => r.clone(),
         _ => Vec::new(),
@@ -389,7 +439,7 @@ async fn write<A: Approver>(
         let req = WriteApproval {
             path: ch.path.clone(),
             summary: summary.clone(),
-            diff: diff.clone(),
+            diff: card_diff,
             reasons,
             sensitive_path,
             read: false,
@@ -527,6 +577,66 @@ mod tests {
         let mut a = ask(true);
         let out = run(&ops, &write_call("/home/me/.ssh/config", "Host x\n"), WriteGate::Auto, &mut a, false).await;
         assert!(out.ok && t.get("/home/me/.ssh/config").is_some(), "批准写明路径的卡之后才写");
+    }
+
+    #[tokio::test]
+    async fn rewriting_redacted_content_is_refused_and_file_unchanged() {
+        let t = FakeTransport::new("/home/me");
+        let original = b"DB_HOST=db\nDB_PASSWORD=hunter2hunter2\nOPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz1234\n";
+        t.add_file("/home/me/app/.env", original);
+        let ops = FileOps::new(&t, FileOpsConfig::default());
+        // 模型读到的是脱敏后的内容
+        let read = FileCall::Read(ReadArgs { target: None, path: "/home/me/app/.env".into(), offset: None, limit: None });
+        let r = run(&ops, &read, WriteGate::Auto, &mut ask(true), false).await;
+        assert!(r.feedback.contains(redact::PLACEHOLDER));
+        // 改一行端口、整文件写回：占位符会把真实密钥抹掉 —— 拒绝，文件不动，连卡都不出
+        let rewritten = "DB_HOST=db2\nDB_PASSWORD=[REDACTED]\nOPENAI_API_KEY=[REDACTED]\n";
+        let mut a = ask(true);
+        let out = run(&ops, &write_call("/home/me/app/.env", rewritten), WriteGate::Auto, &mut a, false).await;
+        assert!(!out.ok, "{}", out.feedback);
+        assert!(out.feedback.contains("脱敏占位符") && out.feedback.contains("nx_edit"));
+        assert!(a.asked.is_empty());
+        assert_eq!(t.get("/home/me/app/.env").unwrap(), original.to_vec());
+        // nx_edit 把占位符写进去同样拒；只改不相关的行照常
+        let bad_edit = FileCall::Edit(EditArgs {
+            target: None,
+            path: "/home/me/app/.env".into(),
+            old_string: "DB_PASSWORD=hunter2hunter2".into(),
+            new_string: "DB_PASSWORD=[REDACTED]".into(),
+            replace_all: false,
+        });
+        assert!(!run(&ops, &bad_edit, WriteGate::Auto, &mut ask(true), false).await.ok);
+        let good_edit = FileCall::Edit(EditArgs {
+            target: None,
+            path: "/home/me/app/.env".into(),
+            old_string: "DB_HOST=db".into(),
+            new_string: "DB_HOST=db2".into(),
+            replace_all: false,
+        });
+        assert!(run(&ops, &good_edit, WriteGate::Auto, &mut ask(true), false).await.ok);
+        assert!(String::from_utf8(t.get("/home/me/app/.env").unwrap()).unwrap().contains("DB_PASSWORD=hunter2hunter2"));
+    }
+
+    #[tokio::test]
+    async fn approval_card_shows_raw_diff_but_outcome_is_redacted() {
+        let t = FakeTransport::new("/home/me");
+        t.add_file("/home/me/conf.ini", b"key=sk-proj-abcdefghijklmnopqrstuvwxyz1234\nport=1\n");
+        let ops = FileOps::new(&t, FileOpsConfig::default());
+        let call = FileCall::Edit(EditArgs {
+            target: None,
+            path: "/home/me/conf.ini".into(),
+            old_string: "key=sk-proj-abcdefghijklmnopqrstuvwxyz1234".into(),
+            new_string: "key=sk-proj-zyxwvutsrqponmlkjihgfedcba9999".into(),
+            replace_all: false,
+        });
+        let mut a = ask(true);
+        let out = run(&ops, &call, WriteGate::Approve(vec![]), &mut a, false).await;
+        assert!(out.ok);
+        // 人在卡上看得到前后两个真实值，才分得清改了什么
+        assert!(a.asked[0].diff.contains("abcdefghijklmnopqrstuvwxyz1234") && a.asked[0].diff.contains("zyxwvutsrqponmlkjihgfedcba9999"));
+        // 步骤卡 / 时间线 / 运行记录用的那份是脱敏的
+        let d = out.diff.unwrap();
+        assert!(!d.contains("abcdefghijklmnopqrstuvwxyz1234") && !d.contains("zyxwvutsrqponmlkjihgfedcba9999"), "{d}");
     }
 
     #[tokio::test]
