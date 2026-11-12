@@ -55,6 +55,10 @@ fn rules() -> &'static [Rule] {
         let kv_eq = format!(r#"(?i)\b{SECRET_NAMES}["']?[ \t]*=[ \t]*{value_eq}"#);
         // 冒号形式只认行首（可带缩进、YAML 列表的 `- `、引号），避免误伤行内的 `fn f(password: &str)`
         let kv_colon = format!(r#"(?im)^[ \t]*(?:-[ \t]+)?["']?{SECRET_NAMES}["']?[ \t]*:[ \t]*{value_colon}"#);
+        // 同上，但「行首」是 JSON 字符串里转义的 `\n`（模型的工具参数：`"content":"db:\n  password: x\n"`）。
+        // 值到下一个反斜杠 / 引号为止，不吞掉后面的转义与 JSON 结构
+        let value_esc = r#"(?P<v>\\"[^"\\\n]{0,256}\\"|[^\s"'#\\][^\r\n\\"]{0,255})"#;
+        let kv_colon_esc = format!(r#"(?i)\\n[ \t]*(?:-[ \t]+)?{SECRET_NAMES}[ \t]*:[ \t]*{value_esc}"#);
         // 单行 JSON：`{"password":"x","user":"y"}`
         let kv_json = format!(r#"(?i)"{SECRET_NAMES}"[ \t]*:[ \t]*(?P<v>"[^"\n]{{0,256}}")"#);
 
@@ -80,6 +84,7 @@ fn rules() -> &'static [Rule] {
             (r#"\$(?:1|2[abxy]?|5|6|7|y|gy|sha1|md5)\$[A-Za-z0-9./$=,+\-]{8,}"#.into(), false),
             (kv_json, true),
             (kv_colon, true),
+            (kv_colon_esc, true),
             (kv_eq, true),
             // 邮箱
             (r#"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#.into(), false),
@@ -171,10 +176,6 @@ fn body_of(line: &str) -> Option<&str> {
             .expect("PEM 正文正则")
     });
     re.captures(line).and_then(|c| c.get(1)).map(|m| m.as_str())
-}
-
-fn is_body_line(line: &str) -> bool {
-    body_of(line).is_some()
 }
 
 /// 找出 PEM 私钥块（含被环形缓冲截断的残块）所在的行，返回 (按行切开的原文, 每行是否删掉)。
@@ -542,6 +543,12 @@ mod tests {
         assert_eq!(redact("  - api_key: \"abc\""), format!("  - api_key: {PLACEHOLDER}"));
         assert_eq!(redact(r#"{"user":"a","password":"x y"}"#), format!(r#"{{"user":"a","password":{PLACEHOLDER}}}"#));
         assert_eq!(redact("Secret_Key=AbC"), format!("Secret_Key={PLACEHOLDER}"));
+        // 工具参数 JSON 里转义换行后的 YAML
+        let args = r#"{"path":"/a.yml","content":"db:\n  password: S3cret pw\n  host: x\n"}"#;
+        assert_eq!(
+            redact(args),
+            format!(r#"{{"path":"/a.yml","content":"db:\n  password: {PLACEHOLDER}\n  host: x\n"}}"#)
+        );
     }
 
     #[test]
