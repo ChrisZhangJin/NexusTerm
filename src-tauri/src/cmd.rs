@@ -170,6 +170,13 @@ fn release_steward(
     core: &StewardCore,
     bus: &StewardBus,
 ) {
+    // 统一托管的终端：tab 关了只告诉托管任务（→ 挂起 ConsoleGone，等用户接到别的 tab），
+    // 契约与意向都留着 —— 停掉契约等于把一个还能接驳的托管直接作废
+    if let Some(h) = state.act.host.live_on_console(id) {
+        h.console_gone();
+        bus.wake();
+        return;
+    }
     if crate::agent::steward::release_console(registry, brain, &state.store, core, id) {
         bus.wake();
     }

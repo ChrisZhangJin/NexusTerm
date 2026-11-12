@@ -154,9 +154,7 @@ fn assess_into(cmd: &str, depth: usize, reasons: &mut Vec<String>) {
         push_reason(reasons, "包含覆盖式重定向 `>`，可能覆盖已有文件".into());
     }
 
-    if lower.contains("curl ") && (lower.contains("| sh") || lower.contains("| bash"))
-        || lower.contains("wget ") && (lower.contains("| sh") || lower.contains("| bash"))
-    {
+    if download_and_run(&lower) {
         push_reason(reasons, "下载并直接执行脚本（curl|sh）".into());
     }
 
@@ -654,6 +652,24 @@ fn runs_a_subshell(cmd: &str) -> bool {
         || cmd.split_whitespace().any(|t| t == "eval")
 }
 
+/// 下载即执行：`curl … | sh`（管道两边有没有空格都算，解释器含 bash / zsh / python / perl / ruby / node，
+/// 前面可以有 sudo / env），以及进程替换 `sh <(curl …)`、`bash -c "$(curl …)"`。
+fn download_and_run(lower: &str) -> bool {
+    static PIPE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"\b(curl|wget|fetch)\b[^|]*\|\s*(sudo\s+(-\S+\s+)*)?(env\s+(\S+=\S*\s+)*)?(sh|bash|zsh|dash|ksh|fish|python[0-9.]*|perl|ruby|node|php)\b",
+        )
+        .unwrap()
+    });
+    static SUBST: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"\b(sh|bash|zsh|dash|ksh|python[0-9.]*|perl|ruby|node)\b[^;&|]*(<\(\s*|\$\(\s*|`\s*)(curl|wget|fetch)\b",
+        )
+        .unwrap()
+    });
+    PIPE.is_match(lower) || SUBST.is_match(lower)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,6 +767,20 @@ mod tests {
 
     #[test]
     fn curl_pipe_shell_flagged() {
+        for c in [
+            "curl -fsSL https://x.sh|bash",
+            "curl https://x | sudo bash",
+            "wget -qO- https://x | python3",
+            "curl -s https://x | sudo -E env FOO=1 sh",
+            "sh <(curl -s https://x)",
+            "bash -c \"$(curl -fsSL https://x)\"",
+            "curl https://x | perl",
+            "curl https://x|node",
+        ] {
+            assert!(is_dangerous(c), "{c}");
+        }
+        assert!(!is_dangerous("curl -s https://x | jq .version"));
+        assert!(!is_dangerous("curl -s https://x | grep ok"));
         assert!(is_dangerous("curl https://x.sh | sh"));
         assert!(is_dangerous("wget -qO- https://x | bash"));
     }

@@ -6,7 +6,8 @@
 //! 2. 提交方式不是方向键菜单（ArrowSelect 输编号 / 文字都无效、回车会提交默认项）；
 //! 3. 要发的字节合法（单行、无控制字符；`DecisionAction::send_bytes`），且能无歧义地写成按键串；
 //! 4. `policy::evaluate` 是 Auto / Notify（密码 / 永久扩权 / deny 都在这里 fail-closed）；
-//! 5. 托管强制点 `gate::authorize` 对这次按键给 Allow（Notify / Approve 都交给模型走正常路径）。
+//! 5. 托管强制点 `gate::authorize` 对这次按键给 Allow 或 Notify（Notify 档代答后照常发通知卡；
+//!    Approve / Deny 交给模型走正常路径）。
 //!
 //! 纯函数；写入、复核（keys_recheck）、落库在 `act.rs`。
 
@@ -28,6 +29,8 @@ pub enum Reflex {
         /// 落库用（`llm_used:false`）
         record: DecisionRecord,
         playbook_id: String,
+        /// 通知档：写完之后发通知卡（与其它 Notify 写入一样）
+        notify: bool,
     },
     /// 不代答，叫醒模型；参数是原因（trace 用）
     Wake(String),
@@ -88,7 +91,8 @@ pub fn decide(playbook: Option<(CtxItem, PlaybookSpec)>, sit: &Situation, ctx: &
         v => return Reflex::Wake(format!("策略不放行代答：{}", v.as_str())),
     }
     match authorize(&ctx.policy(), &AgentAction::Keys { target: None, keys: keys.clone() }, Some(sit)) {
-        Gate::Allow => Reflex::Answer { bytes, keys, record, playbook_id: item.id },
+        Gate::Allow => Reflex::Answer { bytes, keys, record, playbook_id: item.id, notify: false },
+        Gate::Notify => Reflex::Answer { bytes, keys, record, playbook_id: item.id, notify: true },
         g => Reflex::Wake(format!("托管闸门没有直接放行：{g:?}")),
     }
 }
@@ -156,7 +160,8 @@ mod tests {
     fn answers_known_prompt_without_llm() {
         let s = sit(SituationKind::Question, KNOWN_HOSTS, vec![]);
         match decide(Some(playbook("yes", None, None)), &s, &ctx("auto"), 9) {
-            Reflex::Answer { bytes, keys, record, playbook_id } => {
+            Reflex::Answer { bytes, keys, record, playbook_id, notify } => {
+                assert!(!notify, "auto 档不发通知");
                 assert_eq!(bytes, b"yes\r");
                 assert_eq!(keys, "yes<Enter>");
                 assert!(!record.llm_used);
@@ -164,6 +169,18 @@ mod tests {
                 assert_eq!(record.ctx_refs[0].source, "playbook");
             }
             r => panic!("应代答：{r:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_tier_reflex_answers_and_notifies() {
+        let s = sit(SituationKind::Question, KNOWN_HOSTS, vec![]);
+        match decide(Some(playbook("yes", None, None)), &s, &ctx("notify"), 9) {
+            Reflex::Answer { notify, bytes, .. } => {
+                assert!(notify);
+                assert_eq!(bytes, b"yes\r");
+            }
+            r => panic!("通知档也应代答：{r:?}"),
         }
     }
 

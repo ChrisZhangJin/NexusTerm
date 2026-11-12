@@ -174,7 +174,7 @@ fn e2e_a_question_answered_by_reflex_inside_host_task() {
     let pb = brain.match_playbook(&sit, &ctx.contract.host_key);
     assert!(pb.is_some(), "剧本命中");
     match decide(pb.clone(), &sit, &ctx, NOW + 200) {
-        Reflex::Answer { bytes, keys, record, playbook_id } => {
+        Reflex::Answer { bytes, keys, record, playbook_id, .. } => {
             assert_eq!(playbook_id, "pb-remember");
             assert!(bytes.starts_with(b"2"), "选编号而不是整段文本：{bytes:?}");
             assert!(!bytes.contains(&b'\n'), "单行");

@@ -25,6 +25,9 @@ use super::gate::{HardRule, HostPolicy};
 use super::phase::{step, Effect, HostEvent, HostPhase, Invalid};
 use super::{BudgetGrant, CardKind, Check, HostHandle, HumanCard, SuspendReason};
 
+/// 挂起等人期间多久看一眼 console 还在不在。
+pub const LIVENESS_POLL: Duration = Duration::from_secs(3);
+
 /// 挂起期间多久看一眼取消标记。不是超时：等多久都行，只是取消要及时生效。
 pub const CANCEL_POLL: Duration = Duration::from_millis(200);
 
@@ -48,6 +51,10 @@ pub trait HostIo: Send + Sync {
     fn note_watchdog(&self, _w: &super::watchdog::WatchdogState) {}
     /// 给人看的提示变了（随状态推给面板）。默认不记。
     fn note_notice(&self, _notice: Option<&str>) {}
+    /// 被托管的 console 还在不在（tab 没关、连接没断）。挂起等人期间据此发现「tab 关了」。默认在。
+    fn console_alive(&self) -> bool {
+        true
+    }
     /// 待落盘的现场（接驳时从它恢复）。默认没有。
     fn snapshot(&self) -> Option<super::checkpoint::HostCheckpoint> {
         None
@@ -173,6 +180,8 @@ pub struct HostShared {
     progress: Mutex<(Option<std::time::Instant>, (usize, usize, usize))>,
     /// 看门狗（随 checkpoint 持久化）
     watchdog: Mutex<super::watchdog::WatchdogState>,
+    /// 意向期限到了、用户已经点过「继续」：不再因为同一个期限反复暂停
+    deadline_acked: AtomicBool,
     /// 计划清单（nx_todo，随 checkpoint 持久化）
     todo: Mutex<Vec<super::super::todo::TodoItem>>,
 }
@@ -213,6 +222,7 @@ impl HostShared {
             ended_at: Mutex::new(None),
             progress: Mutex::new((None, (0, 0, 0))),
             watchdog: Mutex::new(super::watchdog::WatchdogState::default()),
+            deadline_acked: AtomicBool::new(false),
             todo: Mutex::new(Vec::new()),
         })
     }
@@ -229,6 +239,26 @@ impl HostShared {
             self.io.note_todo(&items, &self.phase());
         }
         *self.todo.lock() = items;
+    }
+
+    // ——— 期限 ———
+
+    /// 契约的意向期限（墙钟毫秒）；没设为 None。`timebox_ms` 是从签约起算的时长。
+    pub fn deadline_ms(&self) -> Option<i64> {
+        let c = self.ctx();
+        let span = if c.contract.timebox_ms > 0 { c.contract.timebox_ms } else { c.authority.timebox_ms };
+        (span > 0 && c.contract.created_at > 0).then(|| c.contract.created_at + span as i64)
+    }
+
+    /// 期限到了且还没被用户「继续」确认过：进 Paused{Deadline}。返回是否刚暂停。
+    pub fn check_deadline(&self, now_wall_ms: i64) -> bool {
+        if self.deadline_acked.load(Ordering::Relaxed) || self.phase() != HostPhase::Running {
+            return false;
+        }
+        match self.deadline_ms() {
+            Some(d) if now_wall_ms >= d => self.apply(HostEvent::DeadlineReached).is_ok(),
+            _ => false,
+        }
     }
 
     // ——— 看门狗 ———
@@ -561,6 +591,12 @@ impl HostShared {
 
     /// 收件箱来的事件：记下「从暂停恢复」，运行循环据此换预算。
     fn apply_inbox(&self, ev: HostEvent) {
+        // 期限暂停后用户点了「继续」：这一次期限算确认过了，不再一恢复就又停
+        if matches!(ev, HostEvent::Resume { .. })
+            && matches!(self.phase().base(), HostPhase::Paused { cause: super::PauseCause::Deadline })
+        {
+            self.deadline_acked.store(true, Ordering::Relaxed);
+        }
         let was_paused = matches!(self.phase(), HostPhase::Paused { .. });
         let resume = matches!(ev, HostEvent::Resume { .. });
         if self.apply(ev).is_ok() && resume && was_paused {
@@ -585,6 +621,14 @@ impl HostShared {
             let ev = tokio::select! {
                 ev = rx.recv() => ev,
                 _ = wait_cancel(&self.cancel) => None,
+                // 等人期间（问题卡 / 人在驾驶 / 暂停）tab 被关掉：转成挂起（ConsoleGone），面板出「待重新接驳」，
+                // 而不是让一个没有终端的任务无声地占着租约
+                _ = tokio::time::sleep(LIVENESS_POLL) => {
+                    if !self.io.console_alive() {
+                        self.console_gone();
+                    }
+                    None
+                }
             };
             if let Some(ev) = ev {
                 self.apply_inbox(ev);
@@ -594,6 +638,10 @@ impl HostShared {
 
     /// 写 pty 之前的闸：先处理收件箱；`user_paused` 为真（用户在终端里动了键）而相位还是 Running 时
     /// 补一个 UserKey；然后不在 Running 就无限期挂起。返回 true = 可以写；false = 取消 / 已结束。
+    ///
+    /// 已知窄缝（复审 L2）：闸口放行到真正写 pty 之间还有几毫秒（写本身是异步的），用户恰好在这几毫秒里
+    /// 按键不会被这次写入看到 —— 他的按键照常进终端，下一次写入前的闸口会接住（转 UserDriving）。
+    /// 要彻底堵上得把「查控制权 + 写 pty」放进同一把锁，改动面太大，先记在这里。
     pub async fn gate(&self, user_paused: impl Fn() -> bool, console_alive: impl Fn() -> bool) -> bool {
         if self.cancelled() {
             return false;
@@ -683,6 +731,8 @@ pub(crate) mod tests {
         pub emits: Mutex<Vec<String>>,
         pub released: Mutex<u32>,
         pub control: Mutex<Vec<String>>,
+        /// console 没了（tab 关了）
+        pub dead: Mutex<bool>,
     }
 
     impl HostIo for Arc<FakeIo> {
@@ -697,6 +747,9 @@ pub(crate) mod tests {
         }
         fn sync_control(&self, p: &HostPhase) {
             self.control.lock().push(p.label().into());
+        }
+        fn console_alive(&self) -> bool {
+            !*self.dead.lock()
         }
     }
 
@@ -951,6 +1004,48 @@ pub(crate) mod tests {
         let more = vec![msgs[0].clone(), super::super::super::llm::ChatMessage::assistant("b".to_string())];
         h.flush_progress(&more, 2);
         assert_eq!(io.saves.lock().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tab_closed_while_parked_becomes_console_gone() {
+        let io = Arc::new(FakeIo::default());
+        *io.dead.lock() = false;
+        let h = HostShared::new(HostHandle::new("c1"), "t1", "目标", Arc::new(AtomicBool::new(false)), Box::new(io.clone()));
+        h.apply(HostEvent::Ask(HumanCard::ask("k1", "q", 0))).unwrap();
+        let h2 = h.clone();
+        let task = tokio::spawn(async move { h2.park().await });
+        settle().await;
+        // tab 关了
+        *io.dead.lock() = true;
+        tokio::time::advance(LIVENESS_POLL * 2).await;
+        settle().await;
+        match h.phase() {
+            HostPhase::Suspended { reason: SuspendReason::ConsoleGone, resume_to } => {
+                assert!(matches!(*resume_to, HostPhase::WaitingHuman { .. }), "接驳后卡片还在");
+            }
+            p => panic!("应挂起待接驳：{p:?}"),
+        }
+        assert!(!task.is_finished(), "挂起后接着等（接驳 / 停止）");
+        assert_eq!(*io.released.lock(), 0, "租约不放");
+        h.send(HostEvent::Stop);
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn deadline_pauses_once_then_resume_is_honored() {
+        let (h, _io) = shared();
+        let mut c = h.ctx();
+        c.contract.created_at = 1_000;
+        c.contract.timebox_ms = 60_000;
+        h.set_ctx(c, None);
+        assert_eq!(h.deadline_ms(), Some(61_000));
+        assert!(!h.check_deadline(30_000));
+        assert!(h.check_deadline(61_000));
+        assert_eq!(h.phase(), HostPhase::Paused { cause: PauseCause::Deadline });
+        h.send(HostEvent::Resume { new_budget: None });
+        h.drain();
+        assert_eq!(h.phase(), HostPhase::Running);
+        assert!(!h.check_deadline(99_000), "继续过了就不再因同一期限暂停");
     }
 
     #[tokio::test(start_paused = true)]

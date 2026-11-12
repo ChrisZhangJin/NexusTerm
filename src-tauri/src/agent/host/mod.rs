@@ -267,6 +267,20 @@ fn prune_ended(map: &mut HashMap<String, Arc<HostShared>>) {
 #[derive(Default)]
 pub struct HostSupervisor {
     runs: Mutex<HashMap<String, Arc<HostShared>>>,
+    /// 正在接驳中的契约（防并发接驳）
+    reattaching: Mutex<std::collections::HashSet<String>>,
+}
+
+/// 接驳进行中的登记：drop 时摘掉。
+pub struct ReattachGuard<'a> {
+    sup: &'a HostSupervisor,
+    id: String,
+}
+
+impl Drop for ReattachGuard<'_> {
+    fn drop(&mut self) {
+        self.sup.reattaching.lock().remove(&self.id);
+    }
 }
 
 impl HostSupervisor {
@@ -281,6 +295,14 @@ impl HostSupervisor {
         map.retain(|_, h| !(h.console_id == shared.console_id && h.is_terminal()));
         map.insert(shared.contract_id().to_string(), shared);
         prune_ended(&mut map);
+    }
+
+    /// 开始接驳：同一契约已在接驳中返回 None。
+    pub fn begin_reattach(&self, contract_id: &str) -> Option<ReattachGuard<'_>> {
+        if !self.reattaching.lock().insert(contract_id.to_string()) {
+            return None;
+        }
+        Some(ReattachGuard { sup: self, id: contract_id.to_string() })
     }
 
     pub fn get(&self, contract_id: &str) -> Option<Arc<HostShared>> {
@@ -410,6 +432,29 @@ mod tests {
         // 留下的是最近结束的
         assert!(s.get(&format!("e{:02}", ENDED_MAX + 4)).is_some());
         assert!(s.get("e00").is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_reattach_only_one_wins() {
+        let s = std::sync::Arc::new(HostSupervisor::new());
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let (s, b) = (s.clone(), barrier.clone());
+            tasks.push(tokio::spawn(async move {
+                let g = s.begin_reattach("c1");
+                let won = g.is_some();
+                b.wait().await; // 两边都已经尝试过、赢家还拿着登记
+                drop(g);
+                won
+            }));
+        }
+        let mut wins = 0;
+        for t in tasks {
+            wins += usize::from(t.await.unwrap());
+        }
+        assert_eq!(wins, 1, "双击只放行一次接驳");
+        assert!(s.begin_reattach("c1").is_some(), "接驳结束后登记摘掉");
     }
 
     #[test]
