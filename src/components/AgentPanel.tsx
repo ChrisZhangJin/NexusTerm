@@ -4,6 +4,7 @@ import SkillManager from "./SkillManager";
 import { HostMemoryDialog } from "./HostMemory";
 import Timeline from "./Timeline";
 import StewardPanel, { type StewardRunBridge } from "./StewardPanel";
+import HostCard from "./HostCard";
 import { RecordingBadge } from "./RecorderBar";
 import { RunCard, isRunCard } from "./RunFeed";
 import { api } from "../api";
@@ -20,6 +21,8 @@ import { enterVerdict, ImeGuard, isImeKey, keyInfoFrom } from "../lib/ime";
 import { matchSessions, scanMention } from "../lib/mention";
 import { useAgentHistory } from "../lib/useAgentHistory";
 import { useAgentRun } from "../lib/useAgentRun";
+import { useHostRuns } from "../lib/useHostRuns";
+import { basePhase, hostDetail, hostPauseKind, isTerminal } from "../lib/host";
 import { stewardApi, stewardConsoleIds } from "../lib/steward";
 import { setStewardConsoles } from "../lib/termRegistry";
 import type { AgentMessage, AgentTarget, Skill, SkillInput } from "../types";
@@ -115,6 +118,23 @@ export function AgentPanel({
    */
   const [err, setErr] = useState<string | null>(null);
   const run = useAgentRun({ sessionId, onError: setErr });
+  // 托管任务总表（每个 console 的胶囊 / 卡片）。任务结束时后端已停契约，这里顺手撤掉屏幕帧采集
+  const hostRuns = useHostRuns(() => {
+    void stewardApi
+      .status()
+      .then((l) => setStewardConsoles(stewardConsoleIds(l)))
+      .catch(() => {});
+  });
+  /** 托管动作（停止 / 继续 / 接管 / 交还）：失败落一行错误 */
+  const hostAct = async (f: () => Promise<unknown>) => {
+    try {
+      await f();
+    } catch (e) {
+      setErr(toFriendlyError(e).message);
+    }
+  };
+  /** 当前终端上的托管（对话页也显示它的胶囊与卡片） */
+  const hostedHere = hostRuns.forConsole(sessionId);
   const { conv, setConv, patch, runSession, setRunSession, pausedIds, drivingIds } = run;
   const [input, setInput] = useState("");
   /** 输入框。`@` 联想要在选中一项之后把光标放回原处，所以得拿得到它 */
@@ -348,49 +368,46 @@ export function AgentPanel({
   };
 
   /**
-   * 托管页点「开始托管」：在指定终端上起一轮 steward 模式的 Agent（LLM 是手和脑，
-   * 屏幕识别是眼睛）。与 runAgentic 同一条链路 —— 同一份订阅、同一份对话状态；
-   * 契约（让前端开始采集该终端屏幕帧）由调用方先签好。
-   * 和 runAgentic 一样：`await` 到的是整轮跑完，失败已发过 error 事件。
+   * 托管页点「开始托管」：后端 `host_start` 先拿终端租约、再签契约，起一个常驻的托管任务后**立即返回**。
+   * 之后的步骤仍走这个终端的 `nx://agent/step` 频道（同一份订阅、同一份对话状态），
+   * 相位与卡片走 `nx://host/{id}`（`useHostRuns`）。任务只有完成 / 失败 / 停止才结束：
+   * 模型问人、你接管、预算用尽都只是挂起，所以这里不再在 `finally` 里停契约。
    */
-  const runSteward = async (sid: string, goal: string, budget?: StewardBudgetPref): Promise<void> => {
+  const runSteward = async (
+    sid: string,
+    goal: string,
+    budget?: StewardBudgetPref,
+    tier?: string
+  ): Promise<void> => {
     if (run.conv.busy) return;
     setRunSession(sid);
     setStewardFromId(startRun(`托管目标：${goal}`, "steward"));
     const snap = onGetConsole?.(sid) ?? null;
     const label = sessions.find((x) => x.id === sid)?.label ?? "当前会话";
     try {
-      await api.agentRun({
-        sessionId: sid,
-        question: goal,
-        targets: [{ id: sid, label }],
+      await api.hostStart({
+        consoleId: sid,
+        goal,
+        authorityTier: tier,
+        label,
         consoleText: snap?.text,
         consoleAlt: snap?.alt,
-        mode: "steward",
         budget: budget ? { maxSteps: budget.maxSteps, maxMinutes: budget.maxMinutes } : undefined,
       });
+      // 契约已签：马上让前端开始为这个终端上报屏幕帧（不等托管页的轮询）
+      void reconcileStewardConsoles();
     } catch (e) {
       patch((c) => withError(c, toFriendlyError(e).message));
     } finally {
-      patch((c) => (c.busy ? finishWithoutAnswer(c) : c));
-      // 这一轮结束（跑完 / 出错 / 被取消）：契约一并停掉，否则零 LLM 的 Steward 会按旧档位
-      // 在该终端上接着动手，而界面早已不显示「托管中」。放在这里（常驻的 AgentPanel）而不是
-      // StewardPanel：切到「对话」页时 StewardPanel 会卸载，它的 effect 就收不到这个时刻了。
-      // 手动「停止」已经停过契约时这里是幂等空操作（后端返回 false）。
-      void stopContractFor(sid);
+      // 转圈只代表「正在发起」；托管中的状态看胶囊（HostCard），不占着对话输入框
+      patch((c) => (c.busy ? { ...c, busy: false } : c));
     }
   };
 
-  /** 停掉某终端上的托管契约（没有 / 已停就什么都不做；失败静默 —— 面板 1.5s 轮询会对账） */
-  const stopContractFor = async (sid: string) => {
+  /** 按后端契约表对一次屏幕帧采集门控（托管结束后后端已停契约，这里撤掉采集） */
+  const reconcileStewardConsoles = async () => {
     try {
-      const list = await stewardApi.status();
-      const c = list.find((x) => x.consoleId === sid);
-      if (c) {
-        await stewardApi.stop(c.id);
-        // 托管页若已卸载就没人轮询去撤采集门控了，这里顺手对一次
-        setStewardConsoles(stewardConsoleIds(await stewardApi.status()));
-      }
+      setStewardConsoles(stewardConsoleIds(await stewardApi.status()));
     } catch {
       /* 对账由 StewardPanel 的轮询负责 */
     }
@@ -443,24 +460,43 @@ export function AgentPanel({
 
   /** 托管页看到的这一轮：只含托管那一轮的消息，动作全部转给同一份 `useAgentRun` */
   const stewardOwned = runMode === "steward";
+  /** 托管页那一轮对应的托管任务（未结束的优先） */
+  const hosted = stewardOwned ? hostRuns.forConsole(runSession) : null;
+  const hostedLive = !!hosted && !isTerminal(hosted.phase);
+  const hostedBase = hosted ? basePhase(hosted.phase) : null;
   const stewardBridge: StewardRunBridge = {
     session: stewardOwned ? runSession : null,
-    active: busy && stewardOwned,
+    active: hostedLive,
     otherBusy: busy && !stewardOwned,
     messages: sliceFromMessage(messages, stewardFromId),
-    paused: !!conv.paused,
-    pauseText: conv.paused ? pauseBannerText(conv.paused) : undefined,
-    pauseKind: conv.paused,
-    userPaused: pausedIds.length > 0,
-    driving: drivingIds.length > 0,
+    paused: hostedLive && hostedBase?.kind === "paused",
+    pauseText: hosted ? (hostDetail(hosted.phase) ?? undefined) : undefined,
+    pauseKind: hosted ? hostPauseKind(hosted.phase) : undefined,
+    userPaused: hostedLive && hosted?.phase.kind === "userDriving",
+    driving: hostedLive && (hosted?.phase.kind === "running" || hosted?.phase.kind === "waitingHuman"),
+    host: hosted,
+    hostFor: hostRuns.forConsole,
     stopCtrlC: run.stopCtrlC,
     toggleStopCtrlC: run.toggleStopCtrlC,
     start: runSteward,
-    cancel: run.cancel,
-    pause: run.pauseRun,
-    resume: run.resumeRun,
-    takeover: run.takeover,
-    handback: run.handback,
+    cancel: async () => {
+      if (hosted) await hostAct(() => api.hostStop(hosted.contractId, run.stopCtrlC));
+    },
+    pause: async () => {
+      if (hosted) await hostAct(() => api.hostPause(hosted.contractId));
+    },
+    resume: async (b?: StewardBudgetPref) => {
+      if (hosted)
+        await hostAct(() =>
+          api.hostResume(hosted.contractId, b ? { maxSteps: b.maxSteps, maxMinutes: b.maxMinutes } : undefined)
+        );
+    },
+    takeover: () => {
+      if (hosted) void hostAct(() => api.hostTakeover(hosted.contractId));
+    },
+    handback: () => {
+      if (hosted) void hostAct(() => api.hostHandback(hosted.contractId));
+    },
     decide: run.decide,
     answerSecret: run.answerSecret,
     ready: ready.ok,
@@ -557,6 +593,14 @@ export function AgentPanel({
       </div>
 
       {err && <div className="ap-err">{err}</div>}
+
+      {view === "chat" && hostedHere && !isTerminal(hostedHere.phase) && (
+        <HostCard
+          status={hostedHere}
+          label={sessions.find((s) => s.id === hostedHere.consoleId)?.label}
+          stopCtrlC={run.stopCtrlC}
+        />
+      )}
 
       {ready.ok ? (
         <>

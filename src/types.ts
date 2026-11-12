@@ -805,3 +805,86 @@ export interface ConnImportSummary {
   keys: number;
   warnings: string[];
 }
+
+// ——— 统一托管（host_*，设计见 docs/nexus-host-unified-design.md §2） ———
+
+/** 卡片上的一个选项：按钮文字 + 点了之后作为用户答复送回模型的话 */
+export interface HostCardOption {
+  label: string;
+  reply: string;
+}
+
+export interface HostCheckResult {
+  check: { kind: string; [k: string]: unknown };
+  passed: boolean;
+  detail: string;
+}
+
+/** 卡片来源：ask = nx_ask_user / 无动作回复；approve = 写入审批；watchdog / manualCheck 留给 PR7 */
+export type HostCardKind =
+  | { kind: "ask" }
+  | { kind: "approve" }
+  | { kind: "watchdog" }
+  | { kind: "manualCheck"; summary: string; checks: HostCheckResult[] };
+
+/** 一张等人处理的卡片：永远等下去，没有倒计时、没有默认动作 */
+export interface HostHumanCard {
+  id: string;
+  kind: HostCardKind;
+  question: string;
+  options: HostCardOption[];
+  recommendation?: string | null;
+  reasons: string[];
+  createdWallMs: number;
+}
+
+export interface HostCardReply {
+  cardId: string;
+  text: string;
+  /** 只对审批 / 人工确认卡有意义 */
+  approved?: boolean;
+}
+
+export type HostPauseCause =
+  | { kind: "budget"; reason: string }
+  | { kind: "deadline" }
+  | { kind: "user" }
+  | { kind: "llmDown"; error: string };
+
+/** 后端 `HostPhase`（serde tag = kind；变体内字段保持 snake_case） */
+export type HostPhase =
+  | { kind: "running" }
+  | { kind: "waitingHuman"; card: HostHumanCard }
+  | { kind: "userDriving"; resume_to: HostPhase }
+  | { kind: "paused"; cause: HostPauseCause }
+  | { kind: "suspended"; reason: "appRestart" | "consoleGone" | "llmDown"; resume_to: HostPhase }
+  | { kind: "completed"; summary: string; checks: HostCheckResult[] }
+  | { kind: "failed"; error: string }
+  | { kind: "stopped" };
+
+/** `nx://host/{contractId}` / `nx://host/all` 的载荷，也是 host_status / host_list 的返回 */
+export interface HostStatus {
+  contractId: string;
+  runId: string;
+  consoleId: string;
+  goal: string;
+  state: string;
+  phase: HostPhase;
+}
+
+/** 「加预算继续」的新上限；不给的字段不变 */
+export interface HostBudgetGrant {
+  maxSteps?: number;
+  maxMinutes?: number;
+  maxOutputChars?: number;
+}
+
+export interface HostStartRequest {
+  consoleId: string;
+  goal: string;
+  authorityTier?: string;
+  label?: string;
+  budget?: { maxSteps?: number; maxMinutes?: number };
+  consoleText?: string;
+  consoleAlt?: boolean;
+}
