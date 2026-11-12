@@ -2428,6 +2428,16 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .ap-diff-del { color: #e06c75; }
 .ap-diff-hunk { color: #61afef; }
 .ap-diff-meta { color: var(--text-dim); }
+.ap-diff-note { color: #e5c07b; font-style: italic; }
+.ap-diff-hunk:not(:first-child) { margin-top: 6px; }
+.ap-diff-incomplete {
+  margin: 4px 0;
+  padding: 4px 8px;
+  border-left: 3px solid #e5c07b;
+  background: rgba(229, 192, 123, 0.12);
+  color: #e5c07b;
+  font-weight: 600;
+}
 
 /* ——— 计划清单（nx_todo） ——— */
 .ap-todo { list-style: none; margin: 4px 0 0; padding: 0; font-size: 12px; }
