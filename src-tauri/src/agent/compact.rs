@@ -5,10 +5,10 @@
 //! - 第 0 条（任务本身 + 上一轮摘要 + 初始屏幕）；
 //! - 最近一段原样历史（模型接着干活需要的现场）。
 //!
-//! 历史是**纯文本的 user/assistant 交替**（工具调用在入历史时已渲染成文字，没有原生
-//! tool_call / tool_result 配对），所以不存在拆散配对的问题；但必须保持严格交替 ——
-//! 不少网关会拒绝连续两条同角色的消息。做法：笔记用 assistant 角色（插在第 0 条 user 之后），
-//! 尾段从 user 消息开始，交替自然成立。
+//! 历史是 user/assistant 交替，assistant 可能带原生工具调用（`tool_calls`），紧随的 user 带回执
+//! （`tool_results`）。必须保持严格交替（不少网关拒绝连续两条同角色），也不能拆散配对：
+//! 笔记用 assistant 角色（插在第 0 条 user 之后），尾段从 user 消息开始；若尾段第一条 user 的回执
+//! 对应的调用被折进了笔记，压缩后跑一遍 `llm::repair_tool_pairing` 把这些孤儿回执压成文本。
 
 use super::llm::ChatMessage;
 
@@ -86,7 +86,7 @@ pub fn estimate_tokens(s: &str) -> usize {
 }
 
 pub fn total_tokens(messages: &[ChatMessage]) -> usize {
-    messages.iter().map(|m| estimate_tokens(&m.content)).sum()
+    messages.iter().map(|m| estimate_tokens(&m.flat_text())).sum()
 }
 
 /// 压缩后原样保留的最近消息条数（取奇数，保证尾段以 user 开头）。
@@ -129,7 +129,7 @@ fn summarize(m: &ChatMessage) -> String {
     if m.role == "assistant" && m.content.starts_with(NOTE_PREFIX) {
         return squeeze(&m.content, 2_000);
     }
-    let flat: String = m.content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat: String = m.flat_text().split_whitespace().collect::<Vec<_>>().join(" ");
     let who = if m.role == "assistant" { "我" } else { "反馈" };
     format!("- {who}：{}", head_chars(&flat, NOTE_LINE_CHARS))
 }
@@ -166,12 +166,21 @@ pub fn compact(messages: &mut Vec<ChatMessage>, budget_tokens: usize) -> bool {
             changed = true;
         }
     }
-    // 兜底：单条过大的（通常是整屏输出）压成首尾
+    // 兜底：单条过大的（通常是整屏输出）压成首尾；工具回执同理
     for m in messages.iter_mut().skip(1) {
         if m.content.chars().count() > TAIL_MSG_MAX_CHARS {
             m.content = squeeze(&m.content, TAIL_MSG_MAX_CHARS);
             changed = true;
         }
+        for r in m.tool_results.iter_mut() {
+            if r.content.chars().count() > TAIL_MSG_MAX_CHARS {
+                r.content = squeeze(&r.content, TAIL_MSG_MAX_CHARS);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        super::llm::repair_tool_pairing(messages);
     }
     changed
 }
@@ -187,6 +196,47 @@ mod tests {
             v.push(ChatMessage::user(format!("输出{i} {}", "x".repeat(fb_len))));
         }
         v
+    }
+
+    /// 带原生工具调用的长对话：每一轮 assistant 调一个工具、user 回执
+    fn tool_convo(rounds: usize, fb_len: usize) -> Vec<ChatMessage> {
+        use super::super::llm::{ToolResult, ToolUse};
+        let mut v = vec![ChatMessage::user("任务：把服务装好")];
+        for i in 0..rounds {
+            let id = format!("call_{i}");
+            v.push(ChatMessage::assistant_calls(
+                format!("第 {i} 步"),
+                vec![ToolUse { id: id.clone(), name: "nx_exec".into(), arguments: format!("{{\"command\":\"cmd{i}\"}}") }],
+            ));
+            v.push(ChatMessage::results("", vec![ToolResult { id, content: format!("输出{i} {}", "x".repeat(fb_len)), is_error: false }]));
+        }
+        v
+    }
+
+    fn paired(v: &[ChatMessage]) -> bool {
+        v.iter().enumerate().all(|(i, m)| {
+            if !m.tool_results.is_empty() {
+                let Some(prev) = i.checked_sub(1).map(|p| &v[p]) else { return false };
+                return m.tool_results.len() == prev.tool_calls.len()
+                    && m.tool_results.iter().zip(&prev.tool_calls).all(|(r, c)| r.id == c.id);
+            }
+            if !m.tool_calls.is_empty() {
+                return v.get(i + 1).is_some_and(|n| n.tool_results.len() == m.tool_calls.len());
+            }
+            true
+        })
+    }
+
+    #[test]
+    fn compaction_keeps_tool_pairing_valid() {
+        for rounds in [8, 9, 20, 41] {
+            let mut v = tool_convo(rounds, 3_000);
+            assert!(paired(&v));
+            assert!(compact(&mut v, 3_000));
+            assert!(paired(&v), "压缩后配对仍成立（rounds={rounds}）");
+            assert!(alternates(&v));
+            assert!(v[1].content.starts_with(NOTE_PREFIX));
+        }
     }
 
     fn alternates(v: &[ChatMessage]) -> bool {

@@ -195,27 +195,229 @@ pub fn build_user_message(context: Option<&str>, question: &str) -> String {
     format!("{body}\n我的问题：{question}")
 }
 
-/// 一条聊天消息。两种方言的形状一致（`role` + `content`），故共用。
+/// 一条聊天消息（内部形状，落盘 / checkpoint 用的也是它）。
+///
+/// - 文本在 `content`；
+/// - assistant 发起的原生工具调用在 `tool_calls`（带 id）；
+/// - 紧随其后的 user 消息在 `tool_results` 里逐个回执（id 一一对应，被拒 / 失败的 `is_error`）。
+///
+/// 发请求时由 [`wire_messages`] 翻译成各家形状（Anthropic `tool_use` / `tool_result` 块；
+/// OpenAI `tool_calls` + `role:"tool"`）。旧数据只有 `role` + `content`，两个新字段缺省为空，照常读回。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolUse>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_results: Vec<ToolResult>,
 }
+
+/// assistant 消息里的一次原生工具调用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolUse {
+    pub id: String,
+    pub name: String,
+    /// 原始参数 JSON 文本
+    #[serde(default)]
+    pub arguments: String,
+}
+
+/// user 消息里对某次工具调用的回执。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub id: String,
+    #[serde(default)]
+    pub content: String,
+    /// 被拒 / 失败 / 没执行
+    #[serde(default)]
+    pub is_error: bool,
+}
+
+/// 补出来的回执：调用没有得到执行（取消 / 被拒 / 中途收场）。
+pub const UNRUN_RESULT: &str = "（这次调用没有执行：本轮在它之前被中断、拒绝或改道。）";
 
 impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into() }
+        Self { role: "user".into(), content: content.into(), tool_calls: Vec::new(), tool_results: Vec::new() }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into() }
+        Self { role: "assistant".into(), content: content.into(), tool_calls: Vec::new(), tool_results: Vec::new() }
     }
+    /// 带原生工具调用的 assistant 消息。
+    pub fn assistant_calls(content: impl Into<String>, calls: Vec<ToolUse>) -> Self {
+        Self { role: "assistant".into(), content: content.into(), tool_calls: calls, tool_results: Vec::new() }
+    }
+    /// 带工具回执的 user 消息。
+    pub fn results(content: impl Into<String>, results: Vec<ToolResult>) -> Self {
+        Self { role: "user".into(), content: content.into(), tool_calls: Vec::new(), tool_results: results }
+    }
+
+    /// 压平成纯文本（压缩笔记 / token 估算 / 不带 tools 的请求用）。
+    pub fn flat_text(&self) -> String {
+        let mut s = String::new();
+        for r in &self.tool_results {
+            s.push_str(&format!("（工具结果{}）{}\n", if r.is_error { "·未成功" } else { "" }, r.content));
+        }
+        s.push_str(&self.content);
+        for c in &self.tool_calls {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&format!("（调用工具 {}：{}）", c.name, c.arguments));
+        }
+        s
+    }
+
+    /// 压掉结构，只留文本。
+    pub fn flattened(&self) -> Self {
+        Self { role: self.role.clone(), content: self.flat_text(), tool_calls: Vec::new(), tool_results: Vec::new() }
+    }
+}
+
+/// 修复工具调用配对（每次请求前调用；压缩 / 截断 / 取消之后都可能出现孤儿）：
+/// - assistant 的每个 tool_use 在紧随其后的 user 消息里**恰好**有一个 tool_result；缺的补上
+///   [`UNRUN_RESULT`]（is_error），没有 user 消息就插一条；多余 / 重复的回执丢弃；
+/// - 前面没有对应 tool_use 的回执（比如它的调用被压缩折掉了）压成那条 user 消息里的文本；
+/// - 没有 id 的调用补一个稳定的 id。
+/// 返回是否改动。
+pub fn repair_tool_pairing(messages: &mut Vec<ChatMessage>) -> bool {
+    let mut changed = false;
+    let mut seq = 0usize;
+    let mut i = 0usize;
+    while i < messages.len() {
+        if messages[i].role == "assistant" && !messages[i].tool_calls.is_empty() {
+            for c in messages[i].tool_calls.iter_mut() {
+                if c.id.trim().is_empty() {
+                    seq += 1;
+                    c.id = format!("call_fix_{i}_{seq}");
+                    changed = true;
+                }
+            }
+            let ids: Vec<String> = messages[i].tool_calls.iter().map(|c| c.id.clone()).collect();
+            let next_is_user = messages.get(i + 1).is_some_and(|m| m.role == "user");
+            if !next_is_user {
+                messages.insert(i + 1, ChatMessage::results("", Vec::new()));
+                changed = true;
+            }
+            let next = &mut messages[i + 1];
+            let mut fixed: Vec<ToolResult> = Vec::with_capacity(ids.len());
+            for id in &ids {
+                match next.tool_results.iter().find(|r| &r.id == id) {
+                    Some(r) => fixed.push(r.clone()),
+                    None => {
+                        fixed.push(ToolResult { id: id.clone(), content: UNRUN_RESULT.to_string(), is_error: true });
+                        changed = true;
+                    }
+                }
+            }
+            // 不属于这一轮的回执：压成文本，不丢信息
+            let strays: Vec<ToolResult> = next.tool_results.iter().filter(|r| !ids.contains(&r.id)).cloned().collect();
+            if !strays.is_empty() {
+                changed = true;
+                let mut text: String = strays.iter().map(|r| format!("（工具结果）{}\n", r.content)).collect();
+                text.push_str(&next.content);
+                next.content = text;
+            }
+            if next.tool_results != fixed {
+                changed = true;
+            }
+            next.tool_results = fixed;
+            i += 2;
+            continue;
+        }
+        if !messages[i].tool_results.is_empty() {
+            // 前面没有对应的 tool_use：孤儿回执压成文本
+            let m = &mut messages[i];
+            m.content = m.flat_text();
+            m.tool_results.clear();
+            changed = true;
+        }
+        if messages[i].role != "assistant" && !messages[i].tool_calls.is_empty() {
+            messages[i].tool_calls.clear();
+            changed = true;
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// 内部消息 → 某家的 wire 形状。`native = false`（服务方不认 tools）时把结构压成文本。
+pub fn wire_messages(provider: Provider, system: &str, messages: &[ChatMessage], native: bool) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    let mut msgs = messages.to_vec();
+    if native {
+        repair_tool_pairing(&mut msgs);
+    } else {
+        msgs = msgs.iter().map(ChatMessage::flattened).collect();
+    }
+    let mut out = Vec::with_capacity(msgs.len() + 1);
+    match provider {
+        Provider::OpenAI => {
+            // OpenAI 方言的 system 是 messages 里的第一条 system 消息（Anthropic 才是顶层字段）
+            if !system.trim().is_empty() {
+                out.push(json!({ "role": "system", "content": system }));
+            }
+            for m in &msgs {
+                if !m.tool_calls.is_empty() {
+                    let calls: Vec<_> = m
+                        .tool_calls
+                        .iter()
+                        .map(|c| json!({ "id": c.id, "type": "function", "function": { "name": c.name, "arguments": if c.arguments.trim().is_empty() { "{}" } else { &c.arguments } } }))
+                        .collect();
+                    let content = if m.content.is_empty() { serde_json::Value::Null } else { json!(m.content) };
+                    out.push(json!({ "role": "assistant", "content": content, "tool_calls": calls }));
+                    continue;
+                }
+                for r in &m.tool_results {
+                    let content = if r.is_error { format!("[未成功] {}", r.content) } else { r.content.clone() };
+                    out.push(json!({ "role": "tool", "tool_call_id": r.id, "content": content }));
+                }
+                if !m.content.is_empty() || m.tool_results.is_empty() {
+                    out.push(json!({ "role": m.role, "content": m.content }));
+                }
+            }
+        }
+        Provider::Anthropic => {
+            for m in &msgs {
+                if !m.tool_calls.is_empty() {
+                    let mut blocks = Vec::new();
+                    if !m.content.trim().is_empty() {
+                        blocks.push(json!({ "type": "text", "text": m.content }));
+                    }
+                    for c in &m.tool_calls {
+                        let input = serde_json::from_str::<serde_json::Value>(&c.arguments)
+                            .ok()
+                            .filter(|v| v.is_object())
+                            .unwrap_or_else(|| json!({}));
+                        blocks.push(json!({ "type": "tool_use", "id": c.id, "name": c.name, "input": input }));
+                    }
+                    out.push(json!({ "role": "assistant", "content": blocks }));
+                } else if !m.tool_results.is_empty() {
+                    // tool_result 块必须排在这条 user 消息的最前面
+                    let mut blocks: Vec<_> = m
+                        .tool_results
+                        .iter()
+                        .map(|r| json!({ "type": "tool_result", "tool_use_id": r.id, "content": r.content, "is_error": r.is_error }))
+                        .collect();
+                    if !m.content.trim().is_empty() {
+                        blocks.push(json!({ "type": "text", "text": m.content }));
+                    }
+                    out.push(json!({ "role": "user", "content": blocks }));
+                } else {
+                    out.push(json!({ "role": m.role, "content": m.content }));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// OpenAI 兼容：`POST {base}/chat/completions`
 #[derive(Debug, Serialize)]
 struct OpenAiRequest {
     model: String,
-    messages: Vec<ChatMessage>,
+    messages: Vec<serde_json::Value>,
     stream: bool,
     /// 空则不出现：不支持 tools 的兼容层收到空数组也可能报错，干脆不声明。
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -232,7 +434,7 @@ struct AnthropicRequest {
     /// 空则整个字段不出现（部分兼容层不接受空字符串）。
     #[serde(skip_serializing_if = "is_blank")]
     system: String,
-    messages: Vec<ChatMessage>,
+    messages: Vec<serde_json::Value>,
     /// Anthropic 没有默认值，必须显式给
     max_tokens: u32,
     stream: bool,
@@ -295,6 +497,8 @@ struct AnthropicToolChoice {
 /// 模型要求调用的一个工具。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
+    /// 服务方给的调用 id（回执要按它配对）；兼容层没给时为空，入历史前补一个
+    pub id: String,
     pub name: String,
     /// 原始参数 JSON 文本。
     ///
@@ -433,7 +637,7 @@ pub fn build_messages_with_tools(
             push_accept_sse(&mut headers, stream);
             let req = OpenAiRequest {
                 model: model.to_string(),
-                messages: messages.to_vec(),
+                messages: wire_messages(provider, system, messages, !tools.is_empty()),
                 stream,
                 tools: openai_tools(tools),
                 tool_choice: if tools.is_empty() {
@@ -455,7 +659,7 @@ pub fn build_messages_with_tools(
             let req = AnthropicRequest {
                 model: model.to_string(),
                 system: system.to_string(),
-                messages: messages.to_vec(),
+                messages: wire_messages(provider, system, messages, !tools.is_empty()),
                 max_tokens: ANTHROPIC_MAX_TOKENS,
                 stream,
                 tools: anthropic_tools(tools),
@@ -1438,7 +1642,8 @@ pub fn extract_reply(provider: Provider, body: &str) -> Option<LlmReply> {
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "{}".to_string()),
                     };
-                    reply.tool_calls.push(ToolCall { name: name.to_string(), arguments });
+                    let id = c.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    reply.tool_calls.push(ToolCall { id, name: name.to_string(), arguments });
                 }
             }
         }
@@ -1469,7 +1674,8 @@ pub fn extract_reply(provider: Provider, body: &str) -> Option<LlmReply> {
                                 .filter(|v| !v.is_null())
                                 .map(|v| v.to_string())
                                 .unwrap_or_else(|| "{}".to_string());
-                            reply.tool_calls.push(ToolCall { name: name.to_string(), arguments });
+                            let id = b.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                            reply.tool_calls.push(ToolCall { id, name: name.to_string(), arguments });
                         }
                         _ => {}
                     }
@@ -2369,9 +2575,11 @@ mod tests {
         let body = body_of(&req);
         assert_eq!(body["model"], "gpt-4o-mini");
         assert_eq!(body["stream"], true);
-        assert_eq!(body["messages"][0]["role"], "user");
-        assert_eq!(body["messages"][0]["content"], "USER");
-        // OpenAI 方言的 system 走 messages，body 里不该有顶层 system
+        // OpenAI 方言的 system 走 messages 的第一条（以前这里被整个丢掉了），body 里不该有顶层 system
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "SYS");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "USER");
         assert!(body.get("system").is_none());
     }
 
@@ -2474,6 +2682,116 @@ mod tests {
         for key in ["终端会话", "不要臆测", "不确定", "风险"] {
             assert!(s.contains(key), "兜底提示词缺少要点：{key}");
         }
+    }
+
+    // ——— 原生工具回执配对 ———
+
+    fn tu(id: &str, name: &str) -> ToolUse {
+        ToolUse { id: id.into(), name: name.into(), arguments: "{\"command\":\"ls\"}".into() }
+    }
+    fn tr(id: &str, content: &str, is_error: bool) -> ToolResult {
+        ToolResult { id: id.into(), content: content.into(), is_error }
+    }
+    fn exec_spec() -> ToolSpec {
+        ToolSpec { name: "nx_exec", description: "exec".into(), schema: serde_json::json!({"type":"object"}) }
+    }
+
+    /// 一轮三个调用：第一个执行了，第二个被拒，第三个因取消没轮到（回执里没有它）
+    fn multi_call_history() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::user("清理一下 /tmp"),
+            ChatMessage::assistant_calls("我分三步做", vec![tu("a1", "nx_exec"), tu("a2", "nx_exec"), tu("a3", "nx_exec")]),
+            ChatMessage::results("用户点了停止", vec![tr("a1", "ok", false), tr("a2", "「rm -rf /tmp/x」没有执行：契约禁止", true)]),
+        ]
+    }
+
+    #[test]
+    fn anthropic_body_pairs_tool_use_with_tool_result() {
+        let req = build_messages_with_tools(&acct(), Provider::Anthropic, "SYS", &multi_call_history(), false, &[exec_spec()]).unwrap();
+        let body = body_of(&req);
+        let m = body["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 3);
+        let uses: Vec<&str> = m[1]["content"].as_array().unwrap().iter().filter(|b| b["type"] == "tool_use").map(|b| b["id"].as_str().unwrap()).collect();
+        assert_eq!(uses, vec!["a1", "a2", "a3"]);
+        assert_eq!(m[1]["content"][1]["input"]["command"], "ls", "input 是对象不是字符串");
+        let results = m[2]["content"].as_array().unwrap();
+        let ids: Vec<&str> = results.iter().filter(|b| b["type"] == "tool_result").map(|b| b["tool_use_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["a1", "a2", "a3"], "每个 tool_use 恰好一个 tool_result，且排在最前");
+        assert_eq!(results[0]["is_error"], false);
+        assert_eq!(results[1]["is_error"], true, "被拒");
+        assert_eq!(results[2]["is_error"], true, "取消没执行，补回执");
+        assert_eq!(results[2]["content"], UNRUN_RESULT);
+        assert_eq!(results.last().unwrap()["type"], "text");
+    }
+
+    #[test]
+    fn openai_body_pairs_tool_calls_with_tool_messages() {
+        let req = build_messages_with_tools(&acct(), Provider::OpenAI, "SYS", &multi_call_history(), false, &[exec_spec()]).unwrap();
+        let body = body_of(&req);
+        let m = body["messages"].as_array().unwrap();
+        assert_eq!(m[0]["role"], "system");
+        assert_eq!(m[2]["role"], "assistant");
+        let ids: Vec<&str> = m[2]["tool_calls"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["a1", "a2", "a3"]);
+        assert_eq!(m[2]["tool_calls"][0]["function"]["arguments"], "{\"command\":\"ls\"}");
+        let tools: Vec<&str> = m.iter().filter(|x| x["role"] == "tool").map(|x| x["tool_call_id"].as_str().unwrap()).collect();
+        assert_eq!(tools, vec!["a1", "a2", "a3"]);
+        assert!(m[4]["content"].as_str().unwrap().starts_with("[未成功]"));
+        assert_eq!(m.last().unwrap()["role"], "user");
+        assert_eq!(m.last().unwrap()["content"], "用户点了停止");
+    }
+
+    #[test]
+    fn without_tools_history_is_flattened() {
+        let req = build_messages_with_tools(&acct(), Provider::Anthropic, "SYS", &multi_call_history(), false, &[]).unwrap();
+        let body = body_of(&req);
+        for m in body["messages"].as_array().unwrap() {
+            assert!(m["content"].is_string(), "不带 tools 时不能出现 tool_use / tool_result 块：{m}");
+        }
+        assert!(body["messages"][1]["content"].as_str().unwrap().contains("调用工具 nx_exec"));
+    }
+
+    #[test]
+    fn sanitizer_repairs_orphans() {
+        // assistant 的调用后面直接又是 assistant（中途出错）：补一条带回执的 user
+        let mut v = vec![
+            ChatMessage::user("u"),
+            ChatMessage::assistant_calls("", vec![tu("x1", "nx_exec"), tu("", "nx_screen")]),
+            ChatMessage::assistant("后来又说了一句"),
+        ];
+        assert!(repair_tool_pairing(&mut v));
+        assert_eq!(v[2].role, "user");
+        assert_eq!(v[2].tool_results.len(), 2);
+        assert!(v[2].tool_results.iter().all(|r| r.is_error));
+        assert!(!v[1].tool_calls[1].id.is_empty(), "缺 id 的调用补上 id");
+        assert_eq!(v[2].tool_results[1].id, v[1].tool_calls[1].id);
+        // 前面没有调用的回执：压成文本；重复的回执去掉
+        let mut w = vec![
+            ChatMessage::user("u"),
+            ChatMessage::results("尾巴", vec![tr("gone", "旧结果", false)]),
+        ];
+        assert!(repair_tool_pairing(&mut w));
+        assert!(w[1].tool_results.is_empty() && w[1].content.contains("旧结果"));
+        let mut d = vec![
+            ChatMessage::user("u"),
+            ChatMessage::assistant_calls("", vec![tu("k", "nx_exec")]),
+            ChatMessage::results("", vec![tr("k", "1", false), tr("k", "2", false), tr("zz", "?", false)]),
+        ];
+        repair_tool_pairing(&mut d);
+        assert_eq!(d[2].tool_results, vec![tr("k", "1", false)]);
+        assert!(d[2].content.contains("?"));
+        // 已经正确的不动
+        let mut ok = multi_call_history();
+        repair_tool_pairing(&mut ok);
+        assert!(!repair_tool_pairing(&mut ok));
+    }
+
+    #[test]
+    fn old_flat_messages_still_deserialize() {
+        let v: Vec<ChatMessage> = serde_json::from_str(r#"[{"role":"user","content":"hi"},{"role":"assistant","content":"（调用工具 nx_exec：{}）"}]"#).unwrap();
+        assert_eq!(v[1], ChatMessage::assistant("（调用工具 nx_exec：{}）"));
+        // 新字段为空时不出现在 JSON 里（旧版本读得回来）
+        assert_eq!(serde_json::to_string(&ChatMessage::user("x")).unwrap(), r#"{"role":"user","content":"x"}"#);
     }
 
     #[test]

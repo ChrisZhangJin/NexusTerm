@@ -42,6 +42,8 @@ pub trait HostIo: Send + Sync {
     fn note_progress(&self, _messages: &[super::super::llm::ChatMessage], _step: usize, _spent: &Spent) {}
     /// 契约 / 授权变了（签约、`host_amend`、判据确认），下一次 `save` 一并落盘。默认不记。
     fn note_contract(&self, _contract: &StewardContract, _authority: &Authority) {}
+    /// 计划清单变了：记进快照并推一次状态（面板的托管卡显示它）。默认不记。
+    fn note_todo(&self, _todo: &[super::super::todo::TodoItem], _phase: &HostPhase) {}
     /// 看门狗状态变了，下一次 `save` 一并落盘。默认不记。
     fn note_watchdog(&self, _w: &super::watchdog::WatchdogState) {}
     /// 给人看的提示变了（随状态推给面板）。默认不记。
@@ -171,6 +173,8 @@ pub struct HostShared {
     progress: Mutex<(Option<std::time::Instant>, (usize, usize, usize))>,
     /// 看门狗（随 checkpoint 持久化）
     watchdog: Mutex<super::watchdog::WatchdogState>,
+    /// 计划清单（nx_todo，随 checkpoint 持久化）
+    todo: Mutex<Vec<super::super::todo::TodoItem>>,
 }
 
 /// 进程内单调时钟（毫秒）。看门狗只认它；重启后基准变了，恢复时要 `rebase`。
@@ -209,7 +213,22 @@ impl HostShared {
             ended_at: Mutex::new(None),
             progress: Mutex::new((None, (0, 0, 0))),
             watchdog: Mutex::new(super::watchdog::WatchdogState::default()),
+            todo: Mutex::new(Vec::new()),
         })
+    }
+
+    // ——— 计划清单 ———
+
+    pub fn todo(&self) -> Vec<super::super::todo::TodoItem> {
+        self.todo.lock().clone()
+    }
+
+    /// 换上新的计划清单（整表替换）：记进快照、推一次状态。
+    pub fn set_todo(&self, items: Vec<super::super::todo::TodoItem>) {
+        if !self.is_superseded() {
+            self.io.note_todo(&items, &self.phase());
+        }
+        *self.todo.lock() = items;
     }
 
     // ——— 看门狗 ———

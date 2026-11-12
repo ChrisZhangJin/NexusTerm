@@ -19,6 +19,8 @@ use crate::agent::history::{RunSummary, MAX_SUMMARIES_KEPT};
 
 /// 对话的唯一 scope。
 pub const GLOBAL_SCOPE: &str = "global";
+/// 对话模式下发给模型的消息历史（结构化 ChatMessage，跨轮续用；「新对话」清掉）。
+pub const LLM_SCOPE: &str = "llm";
 
 /// 建表（幂等）。由 `Store::open` 在 `migrate` 之后调用。
 pub(super) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -44,12 +46,33 @@ pub(super) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 impl Store {
     /// 覆盖保存全局对话。`messages` 必须已经过 `agent::history::sanitize_messages`。
     pub fn agent_conv_save(&self, messages: &[Value]) -> Result<(), String> {
+        self.scope_save(GLOBAL_SCOPE, messages)
+    }
+
+    /// 覆盖保存对话模式的模型消息历史（调用方保证已脱敏、已压缩）。
+    pub fn agent_llm_save(&self, messages: &[Value]) -> Result<(), String> {
+        self.scope_save(LLM_SCOPE, messages)
+    }
+
+    pub fn agent_llm_load(&self) -> Vec<Value> {
+        self.scope_load(LLM_SCOPE)
+    }
+
+    /// 「新对话」：只清模型消息历史，面板上的记录与运行摘要不动。
+    pub fn agent_llm_clear(&self) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM agent_conversations WHERE scope = ?1", params![LLM_SCOPE])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn scope_save(&self, scope: &str, messages: &[Value]) -> Result<(), String> {
         let json = serde_json::to_string(messages).map_err(|e| e.to_string())?;
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO agent_conversations (scope, messages, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(scope) DO UPDATE SET messages = excluded.messages, updated_at = excluded.updated_at",
-            params![GLOBAL_SCOPE, json, now_secs()],
+            params![scope, json, now_secs()],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -57,13 +80,17 @@ impl Store {
 
     /// 读全局对话。没有 / 数据损坏都当空：坏数据不该让面板打不开。
     pub fn agent_conv_load(&self) -> Vec<Value> {
+        self.scope_load(GLOBAL_SCOPE)
+    }
+
+    fn scope_load(&self, scope: &str) -> Vec<Value> {
         let Ok(conn) = self.conn.lock() else {
             return Vec::new();
         };
         let raw: Option<String> = conn
             .query_row(
                 "SELECT messages FROM agent_conversations WHERE scope = ?1",
-                params![GLOBAL_SCOPE],
+                params![scope],
                 |r| r.get(0),
             )
             .ok();

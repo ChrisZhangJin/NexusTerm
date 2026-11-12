@@ -61,6 +61,7 @@ pub mod steward_core;
 #[cfg(test)]
 mod steward_e2e;
 pub mod timeline;
+pub mod todo;
 pub mod trace;
 pub mod usercmd;
 pub mod watch;
