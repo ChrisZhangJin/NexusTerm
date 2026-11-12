@@ -41,7 +41,7 @@ fn has_history_nav(bytes: &[u8]) -> bool {
 }
 
 /// 按键里的可见文本（去掉控制字符与 ESC 序列），按回车分行。
-fn typed_lines(bytes: &[u8]) -> Vec<String> {
+pub(crate) fn typed_lines(bytes: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(bytes);
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -83,7 +83,7 @@ fn typed_lines(bytes: &[u8]) -> Vec<String> {
     out
 }
 
-fn strip_esc(s: &str) -> String {
+pub(crate) fn strip_esc(s: &str) -> String {
     let mut out = String::new();
     let mut it = s.chars().peekable();
     while let Some(c) = it.next() {
@@ -295,7 +295,7 @@ fn is_ambiguous(s: &Situation) -> bool {
 }
 
 /// 这次按键是否在授权对话框里选了「永久授权」类选项。选中则给出拒绝理由。
-fn permanent_pick(bytes: &[u8], visible: &str, s: &Situation) -> Option<String> {
+pub(crate) fn permanent_pick(bytes: &[u8], visible: &str, s: &Situation) -> Option<String> {
     let first = visible.trim().chars().next();
     // 光按回车 = 选光标停着的那项，默认是第一项：第一项若是永久授权（计划批准的「Yes, and auto-accept edits」）
     if first.is_none()
