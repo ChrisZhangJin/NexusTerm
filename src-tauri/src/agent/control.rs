@@ -129,6 +129,24 @@ impl ControlTable {
         changed
     }
 
+    /// 运行 `run` 只撤下 `session` 这一处（接驳换 console 时撤旧 console）。最后一个驾驶者走了就清掉登记、
+    /// 还给用户；返回变化后的状态（没变 / 本就不是它在驾驶返回 `None`）。
+    pub fn release_session(&self, session: &str, run: &str) -> Option<ControlState> {
+        let mut map = self.inner.lock();
+        let e = map.get_mut(session)?;
+        let before = e.holders.len();
+        e.holders.retain(|h| h != run);
+        if e.holders.len() == before {
+            return None;
+        }
+        if e.holders.is_empty() {
+            let st = next(e.state, ControlEvent::RunEnded);
+            map.remove(session);
+            return Some(st);
+        }
+        None
+    }
+
     /// 运行 `run` 当前驾驶着哪些会话（停止时给它们补发 Ctrl-C 用）。
     pub fn sessions_of(&self, run: &str) -> Vec<String> {
         self.inner

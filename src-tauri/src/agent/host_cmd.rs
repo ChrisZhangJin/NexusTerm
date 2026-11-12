@@ -353,8 +353,10 @@ pub fn host_start(
 /// 托管任务退出：还没进终态就按出口补一个（取消 → Stopped；出错 → Failed），
 /// 再兜底放租约、收掉守护进程那边的契约。
 fn finish_hosted(app: &AppHandle, h: &HostShared, res: Result<(), AgentError>) {
+    h.mark_exited();
     // 被接驳的新任务顶替：租约、契约、这一行都归新任务了，旧任务什么都不收
-    if h.is_superseded() {
+    // （不迁终态 → 没有 ReleaseLease；不放 `host:{id}` 租约；不停契约）
+    if !should_finalize(h) {
         return;
     }
     if !h.is_terminal() {
@@ -830,13 +832,17 @@ pub async fn host_reattach(
     cp.authority = live.authority.clone();
     let (next, effects, drifted) = reattach_plan(&cp, console, current.as_deref(), now_ms())?;
 
-    // 同一会话里 tab 关掉（ConsoleGone）时旧任务还挂在 park 上：让位给新任务
-    if state.act.is_running(old.run_id()) {
-        old.supersede();
+    // 租约换到新 console：拿不到（别的运行占着）就不接驳、不写；拿到后撤掉旧 console 上的。
+    // 这一步在契约对守护进程可见之前完成（与 host_start 同一顺序），确认的那一刻 control_owned(新) 即为真
+    let old_console = old.console_id.clone();
+    let changes = move_lease(&state.act.control, old.run_id(), &old_console, &console_id)?;
+    for (session, st) in changes {
+        act::emit_control(&app, &session, &state.act.control.holders_of(&session), st);
     }
-    // 先拿新 console 的租约，再让契约对守护进程可见（与 host_start 同一顺序）
-    if let Some(st) = state.act.control.acquire(&console_id, old.run_id()) {
-        act::emit_control(&app, &console_id, &[old.run_id().to_string()], st);
+    // 同一会话里 tab 关掉（ConsoleGone）时旧任务还挂在 park 上：让位给新任务
+    let had_task = state.act.is_running(old.run_id());
+    if had_task {
+        old.supersede();
     }
     registry.restore(next.contract.clone());
     core.set_authority(&contract_id, next.authority.clone());
@@ -854,8 +860,38 @@ pub async fn host_reattach(
     h.set_ctx(build_ctx(&app, &state, c.contract, c.authority, &c.label), None);
     state.act.host.register(Arc::clone(&h));
     h.announce();
-    spawn_resumed(app.clone(), h, Arc::clone(&old));
+    spawn_resumed(app.clone(), h, had_task.then(|| Arc::clone(&old)));
     Ok(())
+}
+
+/// 托管任务退出时要不要收尾（迁终态 / 放租约 / 停契约）。被接驳顶替的旧任务一律不收。
+pub(crate) fn should_finalize(h: &HostShared) -> bool {
+    !h.is_superseded()
+}
+
+/// 接驳时把 `host:{id}` 的租约从旧 console 挪到新 console（ControlTable 按 console 记）。
+/// - 新 console 已被别的运行占着 → Err，不接驳；
+/// - 先拿新的，再撤旧的（旧 tab 还在就还给用户，不在了就清掉登记）。
+/// 返回需要推事件的变化。
+pub(crate) fn move_lease(
+    control: &ControlTable,
+    run_id: &str,
+    old_console: &str,
+    new_console: &str,
+) -> Result<Vec<(String, ControlState)>, String> {
+    if control.holders_of(new_console).iter().any(|h| h != run_id) {
+        return Err("这个终端正被另一轮运行驾驶着（对话 / 技能 / 另一份托管），先停掉它再接驳".to_string());
+    }
+    let mut changes = Vec::new();
+    if let Some(st) = control.acquire(new_console, run_id) {
+        changes.push((new_console.to_string(), st));
+    }
+    if old_console != new_console {
+        if let Some(st) = control.release_session(old_console, run_id) {
+            changes.push((old_console.to_string(), st));
+        }
+    }
+    Ok(changes)
 }
 
 /// 新开连接后要恢复的工作目录 / tmux：交给模型经 nx_exec 去做（走 gate::authorize，cd / tmux attach 这类
@@ -886,16 +922,21 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// 起接驳后的运行任务：等旧任务（若有）退出、腾出运行登记，再接着跑。
-fn spawn_resumed(app: AppHandle, h: Arc<HostShared>, old: Arc<HostShared>) {
+fn spawn_resumed(app: AppHandle, h: Arc<HostShared>, old: Option<Arc<HostShared>>) {
     tauri::async_runtime::spawn(async move {
         let st = app.state::<AppState>();
-        for _ in 0..100 {
-            if !st.act.is_running(h.run_id()) {
-                break;
+        // 等被顶替的旧任务彻底退出（守卫都 drop 了）再起，免得它的收尾摘掉新任务的登记
+        if let Some(old) = old {
+            for _ in 0..300 {
+                if old.has_exited() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !old.has_exited() {
+                tracing::warn!("托管 {} 的旧任务 30 秒没退出，仍按新现场接着跑", h.contract_id());
+            }
         }
-        drop(old);
         // 重启前停在判据草稿卡上：先等它确认，再开跑
         if matches!(h.phase().base(), HostPhase::WaitingHuman { card } if matches!(card.kind, CardKind::CriteriaDraft { .. })) {
             if !matches!(h.park().await, super::host::ParkEnd::Running) {
@@ -1108,6 +1149,46 @@ mod tests {
         let (next, fx, _) = reattach_plan(&cp, saved_console("t2"), Some("h-before"), 2_000).unwrap();
         assert_eq!(next.phase, HostPhase::Running);
         assert!(fx.iter().any(|e| matches!(e, super::super::host::phase::Effect::Feedback(t) if t.contains("nx_secret"))));
+    }
+
+    #[test]
+    fn reattach_moves_lease_from_a_to_b_and_keeps_contract_live() {
+        use super::super::steward_loop::control_owned;
+        let table = ControlTable::new();
+        let registry = StewardRegistry::new();
+        let run = "host:c1";
+        // 原来托管在 A 上：租约 + 契约 + 一个挂在 ConsoleGone 上的旧任务
+        table.acquire("tab-A", run);
+        registry.start_with_id("c1", "tab-A", "local", "升级依赖", "auto");
+        let (old, old_io) = super::super::host::driver::tests::shared_as("c1", "tab-A");
+        old.apply(HostEvent::Suspend(SuspendReason::ConsoleGone)).unwrap();
+
+        // 确认接驳到 B：先挪租约（此刻守护进程就看到 B 有主），再顶替旧任务、恢复契约
+        let changes = move_lease(&table, run, "tab-A", "tab-B").unwrap();
+        assert!(control_owned(&table, "tab-B"), "确认的那一刻 B 就归托管");
+        assert!(!control_owned(&table, "tab-A"), "A 上的租约撤掉、登记清掉");
+        assert_eq!(table.holders_of("tab-B"), vec![run.to_string()]);
+        assert!(changes.iter().any(|(s, st)| s == "tab-B" && *st == ControlState::AgentDriving));
+        assert!(changes.iter().any(|(s, st)| s == "tab-A" && *st == ControlState::UserDriving));
+        old.supersede();
+        let mut c = registry.get("c1").unwrap();
+        c.console_id = "tab-B".into();
+        registry.restore(c);
+
+        // 旧任务退出：不收尾 —— 不迁终态（没有 ReleaseLease）、不停契约
+        assert!(!should_finalize(&old));
+        assert!(!old.is_terminal());
+        assert_eq!(*old_io.released.lock(), 0);
+        assert!(control_owned(&table, "tab-B"));
+        assert_eq!(registry.get("c1").map(|c| c.console_id), Some("tab-B".to_string()), "契约仍在");
+
+        // B 已被别的运行占着 → 不接驳、不写，A 的租约也不动
+        let t2 = ControlTable::new();
+        t2.acquire("tab-A", run);
+        t2.acquire("tab-B", "tab-B"); // 对话运行（运行 id = 发起会话）
+        assert!(move_lease(&t2, run, "tab-A", "tab-B").is_err());
+        assert_eq!(t2.holders_of("tab-B"), vec!["tab-B".to_string()]);
+        assert_eq!(t2.holders_of("tab-A"), vec![run.to_string()]);
     }
 
     #[test]

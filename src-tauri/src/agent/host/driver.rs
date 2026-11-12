@@ -156,6 +156,8 @@ pub struct HostShared {
     spent: Mutex<Spent>,
     /// 接驳时被新任务顶替：旧任务退出时不收尾（不停契约、不放租约）
     superseded: AtomicBool,
+    /// 运行任务已经彻底退出（`act::run` 的各个守卫都已 drop）
+    exited: AtomicBool,
     /// 接驳 / 重启后接着跑的现场
     seed: Mutex<Option<Seed>>,
     /// 给人看的一句提示（例如「接驳时屏幕和重启前不一样，已降为确认档」），随状态推给面板
@@ -190,6 +192,7 @@ impl HostShared {
             amend_notes: Mutex::new(Vec::new()),
             spent: Mutex::new(Spent::default()),
             superseded: AtomicBool::new(false),
+            exited: AtomicBool::new(false),
             seed: Mutex::new(None),
             notice: Mutex::new(None),
             ended_at: Mutex::new(None),
@@ -271,6 +274,16 @@ impl HostShared {
 
     pub fn is_superseded(&self) -> bool {
         self.superseded.load(Ordering::Relaxed)
+    }
+
+    /// 运行任务退出时调用（`finish_hosted` 第一行）。接驳的新任务要等到它，
+    /// 否则旧任务稍后 drop 的相位 / 托管登记守卫会把新任务的登记摘掉。
+    pub fn mark_exited(&self) {
+        self.exited.store(true, Ordering::Release);
+    }
+
+    pub fn has_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
     }
 
     /// 测试用：假装已经结束了 `ago` 这么久。
