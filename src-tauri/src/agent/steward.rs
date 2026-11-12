@@ -96,6 +96,9 @@ pub struct ScreenDelta {
     pub alt: bool,
     pub cursor_x: u16,
     pub cursor_y: u16,
+    /// 终端处于应用光标键模式（DECCKM）：方向键要发 SS3（`\eOA`）而不是 CSI（`\e[A`）
+    #[serde(default)]
+    pub app_cursor: bool,
     pub hash: String,
     /// 全量帧（首帧 / 重连 / 窗口滑动）；此时 `lines` 覆盖窗口内每一行
     pub full: bool,
@@ -126,6 +129,9 @@ pub struct ScreenSnapshot {
     pub rows: u16,
     pub cursor_x: u16,
     pub cursor_y: u16,
+    /// 应用光标键模式（DECCKM），见 `ScreenDelta::app_cursor`
+    #[serde(default)]
+    pub app_cursor: bool,
     pub lines: Vec<String>,
     pub updated_at: i64,
     /// 连续多少帧内容没变。P1 的 Watchdog 用它做空转判定，不必自己再数一遍
@@ -251,6 +257,7 @@ impl ScreenStore {
             rows: d.rows,
             cursor_x: d.cursor_x,
             cursor_y: d.cursor_y,
+            app_cursor: d.app_cursor,
             lines,
             updated_at: if d.ts_ms > 0 { d.ts_ms } else { now_ms() },
             idle_frames,
@@ -767,7 +774,7 @@ mod tests {
             rows: 24,
             alt: false,
             cursor_x: 0,
-            cursor_y: 0,
+            cursor_y: 0, app_cursor: false,
             hash,
             full: true,
             lines: lines

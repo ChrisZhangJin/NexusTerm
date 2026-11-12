@@ -581,7 +581,8 @@ pub fn tool_specs() -> Vec<llm::ToolSpec> {
                                         转义：\\r 回车、\\n 换行、\\t 制表、\\e ESC、\\\\ 反斜杠、\\xNN 任意字节（\\x03 = Ctrl-C）；\
                                         具名键：<Enter> <Tab> <Esc> <Space> <BS> <Del> <Up> <Down> <Left> <Right> \
                                         <Home> <End> <PgUp> <PgDn> <F1>…<F12>、<C-a>…<C-z>（Ctrl 组合，如 <C-c> <C-d>）、\
-                                        <M-x>（Alt + 字符）、<lt>（字面的 <）。\
+                                        <M-x>（Alt + 字符）、<lt>（字面的 <）；重复：<Down*3> = 连按三次（1–50）。\
+                                        方向键菜单（无编号、回车提交光标项）用 <Down*k><Enter> 挪过去再提交。\
                                         例：\"<C-c>\" 打断；\"y<Enter>\" 回答 y 并回车；\"<Esc>:wq<Enter>\" 保存退出 vim。"
                     }
                 },
@@ -1611,12 +1612,13 @@ pub const ACTION_PROTOCOL: &str = concat!(
     "【手和眼：按键 / 等待 / 读屏】nx_exec 是「敲一行命令、等它跑完」；",
     "终端里**正停在一个交互程序上**时它不适用，改用下面三个（围栏写法分别是 ",
     "`{\"action\":\"keys\",\"keys\":\"…\"}` / `{\"action\":\"wait\",\"pattern\":\"…\"}` / `{\"action\":\"screen\"}`，同样可带 target）：\n",
-    "· **nx_send_keys{keys}**：写入原始按键，**不追加回车、不等命令结束**，约 0.3 秒后回一段新输出。",
+    "· **nx_send_keys{keys}**：写入原始按键，**不追加回车、不等命令结束**；等输出静默 1 秒（最多约 2.5 秒）后回一段新输出，",
+    "停在交互提示上会说明 prompt_kind。发的是答复（带回车）时会核对提示是否真的过去了，「按键已发送但提示仍在」就是没答上。",
     "用于 vim（`<Esc>:wq<Enter>`）、`[Y/n]` 之类的确认（`y<Enter>`）、`python` / `mysql` 等 REPL 里输入、",
     "方向键与 Tab 补全，以及 **Ctrl-C 打断卡住的进程（`<C-c>`）**、Ctrl-D 退出 REPL（`<C-d>`）。",
     "按键串语法：普通字符原样发；转义 `\\r` 回车 `\\n` 换行 `\\t` 制表 `\\e` ESC `\\\\` 反斜杠 `\\xNN` 任意字节；",
     "具名键 `<Enter> <Tab> <Esc> <Space> <BS> <Del> <Up> <Down> <Left> <Right> <Home> <End> <PgUp> <PgDn> <F1>…<F12>`、",
-    "`<C-a>`…`<C-z>`、`<M-x>`、`<lt>`（字面 `<`）。解码后最长 4096 字节，超了请拆开。**给 Claude Code 等 TUI 输入文字时，先发文字（不带回车），再单独发一次 `<Enter>` 提交**（一次连发容易被当成粘贴而没提交）。",
+    "`<C-a>`…`<C-z>`、`<M-x>`、`<lt>`（字面 `<`）、重复 `<Down*3>`（终端处于应用光标键模式时方向键自动发 SS3）。解码后最长 4096 字节，超了请拆开。**给 Claude Code 等 TUI 输入文字时，先发文字（不带回车），再单独发一次 `<Enter>` 提交**（一次连发容易被当成粘贴而没提交）。",
     "要跑一条普通命令并拿它的输出，仍用 nx_exec —— 它会替你等命令结束；send_keys 不会。\n",
     "· **nx_wait{pattern?, timeoutMs?, quietMs?}**：等新输出里出现某段文字（直接写是子串，`/正则/` 加 i 可忽略大小写），",
     "或等输出静止；不往终端写任何东西。发完按键、启动了长任务后用它等一个提示 / 结束标志，",
@@ -1949,13 +1951,49 @@ fn push_guess(s: &mut String, guess: Option<&PromptGuess>) {
 }
 
 /// 对一个会话此刻的缓冲尾部分类。旁路缓冲没开 / 没内容时按空串分类（得到 Unknown）。
-pub(super) fn classify_session(state: &AppState, id: &str, alt: bool) -> PromptGuess {
-    let tail = state.agent.context(id, CLASSIFY_TAIL_BYTES).unwrap_or_default();
-    prompt::classify(&tail, alt)
+pub(super) fn classify_session(app: &AppHandle, state: &AppState, id: &str, alt: bool) -> PromptGuess {
+    let t = render_tail(app, state, id, alt);
+    prompt::classify(&t.text, t.alt)
 }
 
-/// 前端屏幕帧多新才算「还在流」（毫秒）。超过就退回旁路缓冲。
-const FRAME_FRESH_MS: i64 = 10_000;
+/// 前端屏幕帧多新才算「还在流」（毫秒）。前端心跳 2s 一帧，超过 3s 没新帧就退回旁路缓冲。
+const FRAME_FRESH_MS: i64 = 3_000;
+
+/// 新鲜的前端渲染帧（≤ [`FRAME_FRESH_MS`]）。对话模式下 Agent 驾驶某个终端期间前端也会采帧。
+pub(super) fn fresh_frame(app: &AppHandle, id: &str) -> Option<super::steward::ScreenSnapshot> {
+    let snap = app.try_state::<super::steward::ScreenStore>()?.get(id)?;
+    frame_is_fresh(&snap, super::steward::now_ms()).then_some(snap)
+}
+
+fn frame_is_fresh(snap: &super::steward::ScreenSnapshot, now_ms: i64) -> bool {
+    snap.updated_at > 0 && now_ms - snap.updated_at <= FRAME_FRESH_MS
+}
+
+/// 给提示分类器的终端尾部：有新鲜的渲染帧就用它（到光标行为止、alt 是真的）；没有就退回旁路字节流。
+pub(super) fn render_tail(app: &AppHandle, state: &AppState, id: &str, alt: bool) -> super::executor::Tail {
+    let raw = || state.agent.context(id, CLASSIFY_TAIL_BYTES).unwrap_or_default();
+    tail_from(fresh_frame(app, id).as_ref(), raw, alt)
+}
+
+/// `render_tail` 的纯逻辑（便于单测）。
+pub(super) fn tail_from(
+    frame: Option<&super::steward::ScreenSnapshot>,
+    raw: impl FnOnce() -> String,
+    alt: bool,
+) -> super::executor::Tail {
+    match frame {
+        Some(f) => {
+            let (text, alt) = super::situation::frame_text(f);
+            super::executor::Tail { text, alt }
+        }
+        None => super::executor::Tail { text: raw(), alt },
+    }
+}
+
+/// 终端是否处于应用光标键模式（DECCKM）。只有渲染帧知道；没有帧按普通模式。
+fn app_cursor_mode(app: &AppHandle, id: &str) -> bool {
+    fresh_frame(app, id).is_some_and(|f| f.app_cursor)
+}
 
 /// 此刻目标会话的局面：优先用前端采的屏幕帧（`ScreenStore` + `situation::classify`），
 /// 帧不存在 / 断流了就退回旁路缓冲的启发式分类。**总有一个结果**，调用方不必处理缺失。
@@ -1969,10 +2007,8 @@ pub(super) fn situation_now(
 ) -> super::situation::Situation {
     use super::situation::{self, Program, SituationKind};
     let now = super::steward::now_ms();
-    if let Some(snap) = app.try_state::<super::steward::ScreenStore>().and_then(|s| s.get(id)) {
-        if snap.updated_at > 0 && now - snap.updated_at <= FRAME_FRESH_MS {
-            return situation::classify(&snap, now, FRAME_FRESH_MS);
-        }
+    if let Some(snap) = fresh_frame(app, id) {
+        return situation::classify(&snap, now, FRAME_FRESH_MS);
     }
     let tail = state.agent.context(id, CLASSIFY_TAIL_BYTES).unwrap_or_default();
     let guess = prompt::classify(&tail, alt);
@@ -2182,7 +2218,7 @@ pub async fn run_one(
         prompt.as_deref(),
         || state.agent.pushed(session_id).unwrap_or_default(),
         || state.agent.last_line(session_id).unwrap_or_default(),
-        || state.agent.context(session_id, CLASSIFY_TAIL_BYTES).unwrap_or_default(),
+        || render_tail(app, state, session_id, false),
         || state.agent.since(session_id, mark).unwrap_or_default(),
         || cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false),
     ));
@@ -2310,7 +2346,7 @@ fn keys_feedback(label: &str, shown: &str, tail: &str, guess: Option<&PromptGues
     let tail = tail.trim();
     let mut s = format!(
         "已向会话「{label}」发送按键：`{shown}`（只写入，不等命令结束，也不保证对方已处理）。\n\
-         约 300ms 后的新输出：\n{}\n",
+         发送后的新输出（等到输出静默 1 秒，最多约 2.5 秒）：\n{}\n",
         if tail.is_empty() { "（暂无新输出）".to_string() } else { tail_chars(tail, KEYS_TAIL_BYTES) }
     );
     push_guess(&mut s, guess);
@@ -2873,6 +2909,14 @@ impl Default for ActRuntime {
     }
 }
 
+/// `nx://agent/capture` 的载荷：这个终端要不要采屏幕帧。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CapturePayload {
+    session: String,
+    on: bool,
+}
+
 /// `nx://agent/control/{session}` 的载荷。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2884,6 +2928,12 @@ struct ControlPayload {
 /// 推控制权变化。同时发给会话自己的频道（终端据此开关键盘闸）和每个驾驶它的运行的频道
 /// （面板据此出「接管 / 交还」横幅 —— 面板订阅的是发起会话，不一定是被驾驶的那个）。
 pub(super) fn emit_control(app: &AppHandle, session: &str, runs: &[String], state: ControlState) {
+    // 前端据此开 / 关这个终端的屏幕帧采集：只在有 Agent 运行驾驶它的期间采（对话模式也一样），
+    // 运行结束（还给用户）就停 —— 平时零采集
+    let _ = app.emit(
+        "nx://agent/capture",
+        CapturePayload { session: session.to_string(), on: state != ControlState::UserDriving },
+    );
     let payload = ControlPayload { session: session.to_string(), state };
     let _ = app.emit(&format!("nx://agent/control/{session}"), payload.clone());
     for run in runs.iter().filter(|r| r.as_str() != session) {
@@ -4749,23 +4799,56 @@ pub async fn run(
                             continue;
                         }
                     }
+                    // 终端在应用光标键模式（DECCKM）时方向键要发 SS3：按目标终端此刻的模式重新解码
+                    let bytes = if app_cursor_mode(app, &target_id) {
+                        interact::parse_keys_mode(&keys, true).unwrap_or(bytes)
+                    } else {
+                        bytes
+                    };
+                    // 回执要对照的「发之前」：被答的那个提示
+                    let before_sit = judged.clone().unwrap_or_else(|| situation_now(app, state, &target_id, false));
                     emit_interact(app, &session, "keys", step, &target_id, &label, Some(&shown), None, None, None);
                     let tl_seq = timeline::begin(app, &state.agent, &target_id, TlKind::Keys, &shown, None);
-                    match send_keys(state, &target_id, &bytes).await {
-                        Ok(tail) => {
+                    match send_keys_marked(state, &target_id, &bytes).await {
+                        Ok((_, mark)) => {
+                            // 等结果：输出静默 1s 就收（停在交互提示上时以 awaiting_input 提前返回，见 todo 1.6）；
+                            // 发的是「提交」类按键时同时核对回执：被答的提示必须过去了
+                            let submits = keys_submit(&bytes, &before_sit);
+                            let receipt = await_receipt(
+                                &before_sit,
+                                submits,
+                                || situation_now(app, state, &target_id, false),
+                                || state.agent.pushed(&target_id).unwrap_or_default(),
+                            )
+                            .await;
+                            let tail = state.agent.since(&target_id, mark).unwrap_or_default().trim().to_string();
                             if trace_on {
                                 trace::record(&session, step, "keys", &format!("{label}（{target_id}）← {shown}\n{tail}"));
                             }
                             marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
-                            let guess = classify_session(state, &target_id, false);
+                            let guess = classify_session(app, state, &target_id, false);
                             timeline::finish(app, &state.agent, &target_id, tl_seq, &tail, Some(&guess), false);
                             emit_interact(
                                 app, &session, "keys", step, &target_id, &label, Some(&shown),
-                                Some("已发送".into()), Some(tail.clone()), Some(&guess),
+                                Some(if receipt.answered { "已发送".into() } else { "已发送，但提示仍在".into() }),
+                                Some(tail.clone()), Some(&guess),
                             );
                             feedback.push_str(&keys_feedback(&label, &shown, &tail, Some(&guess)));
+                            if !receipt.answered {
+                                feedback.push_str(&format!(
+                                    "按键已发送但提示仍在：屏幕还停在同一个{}{}上，这次输入多半没有被接受（选项写错、要先移光标、\
+                                     或程序还没响应）。先 nx_screen 看清再决定怎么答，不要假设已经答复成功。\n",
+                                    before_sit.kind.as_str(),
+                                    before_sit.topic.as_deref().map(|t| format!("「{t}」")).unwrap_or_default()
+                                ));
+                            }
+                            if let Some(h) = super::situation::arrow_hint(&receipt.after) {
+                                feedback.push_str(&h);
+                            }
                             feedback.push('\n');
-                            host_did!();
+                            if receipt.answered {
+                                host_did!();
+                            }
                         }
                         Err(e) => {
                             emit_step(
@@ -4845,7 +4928,7 @@ pub async fn run(
                     )
                     .await;
                     marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
-                    let guess = classify_session(state, &target_id, false);
+                    let guess = classify_session(app, state, &target_id, false);
                     let fb = wait_feedback(&label, pattern.as_deref(), res.end, &res.output, Some(&guess));
                     if trace_on {
                         trace::record(&session, step, "wait", &format!("{label}（{target_id}）{:?} {shown}\n{}", res.end, res.output));
@@ -4995,14 +5078,23 @@ pub async fn run(
                             // 不叫醒模型（零 LLM 调用）。同一次盯梢最多代答几次，防止和程序来回打转
                             if let (Some(h), super::watch::Reason::NeedsAttention(_)) = (&host, r) {
                                 if reflexes < MAX_REFLEX_PER_WATCH {
-                                    if let Some(note) = try_reflex(app, state, runtime, h, &run_key, &target_id, &sit, &cancel).await {
-                                        reflexes += 1;
-                                        feedback.push_str(&note);
-                                        feedback.push('\n');
-                                        emit_step(app, &session, StepPayload { text: Some(note), ..StepPayload::new("note", step) });
-                                        last_change = std::time::Instant::now();
-                                        tokio::time::sleep(Duration::from_millis(super::watch::POLL_MS)).await;
-                                        continue;
+                                    match try_reflex(app, state, runtime, h, &run_key, &target_id, &sit, &cancel).await {
+                                        Some(Reflexed::Answered(note)) => {
+                                            reflexes += 1;
+                                            feedback.push_str(&note);
+                                            feedback.push('\n');
+                                            emit_step(app, &session, StepPayload { text: Some(note), ..StepPayload::new("note", step) });
+                                            last_change = std::time::Instant::now();
+                                            tokio::time::sleep(Duration::from_millis(super::watch::POLL_MS)).await;
+                                            continue;
+                                        }
+                                        // 发了但提示仍在：不再自己盯，叫醒模型（照常带上这一屏）
+                                        Some(Reflexed::Unanswered(note)) => {
+                                            feedback.push_str(&note);
+                                            feedback.push('\n');
+                                            emit_step(app, &session, StepPayload { text: Some(note), ..StepPayload::new("note", step) });
+                                        }
+                                        None => {}
                                     }
                                 }
                             }
@@ -5020,7 +5112,7 @@ pub async fn run(
                     }
                     let elapsed_ms = started.elapsed().saturating_sub(paused_for).as_millis() as u64;
                     marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
-                    let guess = classify_session(state, &target_id, false);
+                    let guess = classify_session(app, state, &target_id, false);
                     if let Some((super::watch::Reason::NeedsAttention(super::situation::SituationKind::AwaitingInput), s)) = &stop {
                         if s.frame_id != 0 {
                             woke_hash.insert(target_id.clone(), s.screen_hash.clone());
@@ -5122,6 +5214,10 @@ pub async fn run(
                         Some(&guess),
                     );
                     feedback.push_str(&screen_feedback(&label, &text, alt, rendered, Some(&guess)));
+                    // 方向键菜单：告诉模型光标在哪一项、怎么挪过去
+                    if let Some(h) = super::situation::arrow_hint(&situation_now(app, state, &target_id, false)) {
+                        feedback.push_str(&h);
+                    }
                     feedback.push('\n');
                 }
 
@@ -5187,7 +5283,7 @@ pub async fn run(
                     }
 
                     // 卡片上提示终端是否真的在要密码：不是时输入可能被回显。
-                    let guess = classify_session(state, &target_id, false);
+                    let guess = classify_session(app, state, &target_id, false);
                     let request_id = uuid::Uuid::new_v4().simple().to_string();
                     let rx = runtime.register_secret(&request_id);
                     // 托管：密码卡**不设超时**，相位挂到 WaitingHuman（Secret 卡）让胶囊显示「等你回答」；
@@ -5256,7 +5352,7 @@ pub async fn run(
                         }
                     };
                     marks.insert(target_id.clone(), state.agent.pushed(&target_id).unwrap_or_default());
-                    let after = classify_session(state, &target_id, false);
+                    let after = classify_session(app, state, &target_id, false);
                     // 时间线只记占位 + 原因 + 结局码，没有密码，也不记其后的输出尾部
                     let tl_seq = timeline::begin(
                         app, &state.agent, &target_id, TlKind::Secret, "",
@@ -5891,6 +5987,64 @@ fn keys_recheck(judged: &super::situation::Situation, now: &super::situation::Si
     super::situation::materially_changed(judged, now).map(|why| format!("等待期间屏幕局面变了：{why}"))
 }
 
+/// 反射代答的结局。
+enum Reflexed {
+    /// 代答了、回执也对：接着盯
+    Answered(String),
+    /// 发了，但被答的提示还在：叫醒模型
+    Unanswered(String),
+}
+
+/// 回执：发了答复按键之后，被答的提示过去了没有。
+#[derive(Debug, Clone)]
+pub(super) struct Receipt {
+    pub answered: bool,
+    /// 收尾时的局面
+    pub after: super::situation::Situation,
+}
+
+/// 回执窗口：最多等这么久看提示过去没有
+pub(super) const RECEIPT_WINDOW: Duration = Duration::from_millis(2_500);
+/// 输出静默这么久就收（停在交互提示上时提前返回，见 todo 1.6）
+pub(super) const KEYS_QUIET: Duration = Duration::from_millis(1_000);
+const RECEIPT_POLL: Duration = Duration::from_millis(150);
+
+/// 这串按键是不是在「提交答复」：含回车，或按编号即提交的菜单上发了数字。只移光标（<Down>）不算。
+pub(super) fn keys_submit(bytes: &[u8], before: &super::situation::Situation) -> bool {
+    interact::contains_enter(bytes)
+        || (super::situation::submit_style(before) == super::situation::SubmitStyle::DigitSubmits
+            && !bytes.is_empty()
+            && bytes.iter().all(u8::is_ascii_digit))
+}
+
+/// 发键之后等结果：`submits` 时轮询局面，被答的提示过去了（`situation::prompt_answered`）且输出
+/// 静默 [`KEYS_QUIET`] 就收；不是提交（只是移光标 / 打字）时只等输出静默。最多 [`RECEIPT_WINDOW`]。
+/// 只有转圈 / 计时在跳不算过去（签名不变）。
+pub(super) async fn await_receipt(
+    before: &super::situation::Situation,
+    submits: bool,
+    mut now: impl FnMut() -> super::situation::Situation,
+    mut pushed: impl FnMut() -> u64,
+) -> Receipt {
+    let start = tokio::time::Instant::now();
+    let mut last = pushed();
+    let mut quiet_since = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(RECEIPT_POLL).await;
+        let p = pushed();
+        if p != last {
+            last = p;
+            quiet_since = tokio::time::Instant::now();
+        }
+        let after = now();
+        let answered = !submits || super::situation::prompt_answered(before, &after);
+        let quiet = quiet_since.elapsed() >= KEYS_QUIET;
+        if (answered && quiet) || start.elapsed() >= RECEIPT_WINDOW {
+            return Receipt { answered, after };
+        }
+    }
+}
+
 /// 一次盯梢里反射代答的上限：超过就叫醒模型（多半是剧本和程序在来回打转）。
 const MAX_REFLEX_PER_WATCH: usize = 3;
 
@@ -6024,7 +6178,7 @@ async fn try_reflex(
     target: &str,
     sit: &super::situation::Situation,
     cancel: &AtomicBool,
-) -> Option<String> {
+) -> Option<Reflexed> {
     let brain = app.try_state::<super::profile::StewardBrain>()?;
     let ctx = h.ctx();
     let playbook = brain.match_playbook(sit, &ctx.contract.host_key);
@@ -6044,9 +6198,30 @@ async fn try_reflex(
         tracing::warn!("反射代答写入失败：{e}");
         return None;
     }
+    // 回执：被答的提示必须过去了，否则别再盯着假装成功 —— 叫醒模型
+    let receipt = await_receipt(
+        sit,
+        true,
+        || situation_now(app, state, target, false),
+        || state.agent.pushed(target).unwrap_or_default(),
+    )
+    .await;
+    if !receipt.answered {
+        let mut rec = record;
+        rec.outcome = "no_receipt".to_string();
+        let seq = super::host::record::persist(app, &rec);
+        brain.remember_decision(seq, &rec);
+        return Some(Reflexed::Unanswered(format!(
+            "[reflex] 按剧本 [P:{playbook_id}] 发了「{keys}」，但提示仍在（{}），请你看一下现场再决定",
+            sit.kind.as_str()
+        )));
+    }
     let seq = super::host::record::persist(app, &record);
     brain.remember_decision(seq, &record);
-    Some(format!("[reflex] 按剧本 [P:{playbook_id}] 回答了「{keys}」（局面：{}），没有叫醒模型；继续盯着", sit.kind.as_str()))
+    Some(Reflexed::Answered(format!(
+        "[reflex] 按剧本 [P:{playbook_id}] 回答了「{keys}」（局面：{}），没有叫醒模型；继续盯着",
+        sit.kind.as_str()
+    )))
 }
 
 /// 接驳后强制读屏的结果（喂给模型）。屏幕尾部已脱敏（出网前还会再过一遍闸门）。
@@ -6877,6 +7052,97 @@ mod tests {
         store.agent_conv_save(&[serde_json::json!({"id": "m1"})]).unwrap();
         store.agent_llm_clear().unwrap();
         assert_eq!(store.agent_conv_load().len(), 1);
+    }
+
+    // ——— 渲染屏幕 / 回执 ———
+
+    fn frame_at(updated_at: i64, alt: bool, lines: &[&str]) -> super::super::steward::ScreenSnapshot {
+        super::super::steward::ScreenSnapshot {
+            console_id: "t".into(),
+            frame_id: 1,
+            window_start: 0,
+            hash: "h".into(),
+            alt,
+            cols: 80,
+            rows: 24,
+            cursor_x: 0,
+            cursor_y: 0,
+            app_cursor: false,
+            lines: lines.iter().map(|x| x.to_string()).collect(),
+            updated_at,
+            idle_frames: 0,
+        }
+    }
+
+    #[test]
+    fn chat_mode_uses_fresh_rendered_frame_else_raw_stream() {
+        let raw = || "\x1b[2J\x1b[H garbage ink redraw ⠙".to_string();
+        let now = 100_000;
+        let fresh = frame_at(now - 1_000, true, &["  Select a model", "❯ Sonnet", "  Opus"]);
+        assert!(frame_is_fresh(&fresh, now));
+        let t = tail_from(frame_is_fresh(&fresh, now).then_some(&fresh), raw, false);
+        assert!(t.alt, "alt 用帧里真实的值");
+        assert!(t.text.contains("❯ Sonnet") && !t.text.contains("garbage"));
+        // 超过 3 秒没新帧：退回旁路字节流
+        let stale = frame_at(now - 3_500, true, &["old"]);
+        assert!(!frame_is_fresh(&stale, now));
+        let t = tail_from(frame_is_fresh(&stale, now).then_some(&stale), raw, false);
+        assert!(!t.alt && t.text.contains("garbage"));
+        assert_eq!(tail_from(None, raw, false).text, raw());
+    }
+
+    fn q(topic: &str) -> super::super::situation::Situation {
+        use super::super::situation::{Program, Situation, SituationKind};
+        Situation {
+            frame_id: 1,
+            screen_hash: "h".into(),
+            program: Program::Unknown,
+            kind: SituationKind::Question,
+            topic: Some(topic.into()),
+            options: vec![],
+            confidence: 0.9,
+            tail: String::new(),
+            evidence: vec![],
+            stale_ms: 0,
+            signature: Situation::signature_of(Program::Unknown, SituationKind::Question, Some(topic), &[]),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_fails_when_the_same_prompt_remains_even_if_a_spinner_ticks() {
+        let before = q("Continue? [y/N]");
+        let n = std::cell::Cell::new(0u64);
+        let r = await_receipt(
+            &before,
+            true,
+            || {
+                let mut s = before.clone();
+                s.screen_hash = format!("h{}", n.get()); // 转圈：每帧都变
+                s
+            },
+            || {
+                n.set(n.get() + 1); // 一直有输出
+                n.get()
+            },
+        )
+        .await;
+        assert!(!r.answered, "同一个提示还在，转圈不算答上");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_passes_when_prompt_changes_and_output_settles() {
+        let before = q("Continue? [y/N]");
+        let t0 = tokio::time::Instant::now();
+        let r = await_receipt(&before, true, || q("Overwrite config? [y/N]"), || 7).await;
+        assert!(r.answered);
+        assert!(t0.elapsed() < RECEIPT_WINDOW, "静默 1s 就提前收，不等满窗口");
+        assert_eq!(r.after.topic.as_deref(), Some("Overwrite config? [y/N]"));
+        // 只移光标（不是提交）：不要求提示过去
+        let r = await_receipt(&before, false, || before.clone(), || 7).await;
+        assert!(r.answered);
+        // 提交判定：回车 / 按编号即提交的菜单上发数字算；<Down> 不算
+        assert!(keys_submit(b"y\r", &before));
+        assert!(!keys_submit(b"\x1b[B", &before));
     }
 
     #[test]

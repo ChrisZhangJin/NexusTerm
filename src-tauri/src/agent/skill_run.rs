@@ -1655,7 +1655,7 @@ impl SkillIo for TauriIo<'_> {
         let tl = timeline::begin(self.app, &self.state.agent, &self.target, TlKind::Keys, shown, Some(&self.tl_note()));
         let (tail, mark) = send_keys_marked(self.state, &self.target, bytes).await?;
         self.mark = mark;
-        let guess = classify_session(self.state, &self.target, false);
+        let guess = classify_session(self.app, self.state, &self.target, false);
         timeline::finish(self.app, &self.state.agent, &self.target, tl, &tail, Some(&guess), false);
         emit_interact(
             self.app, &self.run, "keys", self.step, &self.target, &self.label, Some(shown),
@@ -1714,7 +1714,7 @@ impl SkillIo for TauriIo<'_> {
         }
         self.state.agent.set_enabled(&self.target, true);
         // 卡片上提示终端是否真的在要密码：不是时输入可能被回显
-        let guess = classify_session(self.state, &self.target, false);
+        let guess = classify_session(self.app, self.state, &self.target, false);
         let request_id = uuid::Uuid::new_v4().simple().to_string();
         let rx = self.runtime.register_secret(&request_id);
         emit_interact(
@@ -1758,7 +1758,7 @@ impl SkillIo for TauriIo<'_> {
         )
         .await;
         self.mark = self.pushed();
-        let after = classify_session(self.state, &self.target, false);
+        let after = classify_session(self.app, self.state, &self.target, false);
         // 时间线只记占位 + 原因 + 结局码，没有密码，也不记其后的输出尾部
         let tl = timeline::begin(
             self.app, &self.state.agent, &self.target, TlKind::Secret, "",

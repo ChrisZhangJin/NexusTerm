@@ -179,7 +179,9 @@ pub fn render_feedback(
             // 选中之后怎么提交：多发一个回车会落到下一屏（可能是下一张权限卡）
             match situation::submit_style(x) {
                 SubmitStyle::DigitSubmits => s.push_str("提交方式：按编号即选中并提交，只发数字，不要再加 <Enter>。\n"),
-                SubmitStyle::ArrowSelect => s.push_str("提交方式：方向键菜单，输入编号无效；用 <Up>/<Down> 移到目标项再 <Enter>。\n"),
+                SubmitStyle::ArrowSelect => s.push_str(&situation::arrow_hint(x).unwrap_or_else(|| {
+                    "提交方式：方向键菜单，输入编号无效；用 <Down*k> / <Up*k> 移到目标项再 <Enter>。\n".to_string()
+                })),
                 SubmitStyle::NeedsEnter => {}
             }
         }

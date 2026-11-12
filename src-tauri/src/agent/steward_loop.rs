@@ -774,7 +774,7 @@ mod tests {
             rows: 24,
             alt: false,
             cursor_x: 0,
-            cursor_y: 0,
+            cursor_y: 0, app_cursor: false,
             hash: frame_hash(&v, false, 80, 24, 0, 0),
             full: true,
             lines: v

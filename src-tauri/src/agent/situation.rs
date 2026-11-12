@@ -178,6 +178,83 @@ pub enum SubmitStyle {
 /// `SubmitStyle` 记在 `evidence` 里（不进 signature，也不改 `Situation` 的结构）。
 pub const SUBMIT_DIGIT: &str = "submit:digit-only";
 pub const SUBMIT_ARROW: &str = "submit:arrow-select";
+/// 方向键菜单的光标位置（证据形如 `menu:cursor=2`，0 起）
+pub const MENU_CURSOR: &str = "menu:cursor=";
+
+/// 方向键菜单此刻光标停在第几项（0 起）。
+pub fn menu_cursor(sit: &Situation) -> Option<usize> {
+    sit.evidence.iter().find_map(|e| e.strip_prefix(MENU_CURSOR)?.parse().ok())
+}
+
+/// 方向键菜单时给模型的操作提示：光标在哪、怎么移过去。不是方向键菜单返回 None。
+pub fn arrow_hint(sit: &Situation) -> Option<String> {
+    if submit_style(sit) != SubmitStyle::ArrowSelect || sit.options.is_empty() {
+        return None;
+    }
+    let mut s = String::from("提交方式：方向键菜单，输入编号 / 文字都无效，回车提交光标所在项。\n");
+    match menu_cursor(sit) {
+        Some(c) => {
+            s.push_str(&format!(
+                "光标在第 {} 项「{}」。要选第 N 项：用 nx_send_keys 发 <Down*k><Enter>（k = N - {}，往上用 <Up*k>）；\
+                 选当前项直接发 <Enter>。\n",
+                c + 1,
+                sit.options[c].text,
+                c + 1
+            ));
+        }
+        None => s.push_str("看不出光标在哪一项：先 nx_screen 确认，再用 <Down*k> / <Up*k> 移过去后 <Enter>。\n"),
+    }
+    Some(s)
+}
+
+/// 光标所在行在 `snap.lines` 里的下标。光标在 (0,0) 视为「帧没带光标」（真实终端里几乎不会停在左上角）。
+pub fn cursor_index(snap: &ScreenSnapshot) -> Option<usize> {
+    if snap.cursor_x == 0 && snap.cursor_y == 0 {
+        return None;
+    }
+    let total = snap.lines.len();
+    let top = total.saturating_sub(snap.rows as usize);
+    let idx = top + snap.cursor_y as usize;
+    (idx < total).then_some(idx)
+}
+
+/// 「当前行」为止的窗口终点：光标下面还画着东西时取到光标行（含它上面最后一个非空行），否则就是 `end`。
+fn current_end(snap: &ScreenSnapshot, start: usize, end: usize) -> usize {
+    cursor_index(snap)
+        .filter(|ci| ci + 1 < end)
+        .and_then(|ci| snap.lines[..=ci].iter().rposition(|l| !strip_ansi(l).trim().is_empty()).map(|i| i + 1))
+        .filter(|e| *e > start)
+        .unwrap_or(end)
+}
+
+/// 渲染帧里到「当前行」为止的文本（给提示分类器用）与真实的 alt 标志。
+pub fn frame_text(snap: &ScreenSnapshot) -> (String, bool) {
+    let end = snap.lines.iter().rposition(|l| !strip_ansi(l).trim().is_empty()).map_or(0, |i| i + 1);
+    let start = end.saturating_sub(TAIL_LINES);
+    let cur_end = current_end(snap, start, end);
+    let text = snap.lines[start..cur_end].iter().map(|l| strip_ansi(l).trim_end().to_string()).collect::<Vec<_>>().join("\n");
+    (text, snap.alt)
+}
+
+/// 发了答复按键之后，被答的那个提示是不是真的过去了（回执）。
+/// - 之前不是在等人回答（不是提问 / 授权 / 菜单 / 密码 / 等输入）：无从核对，算过去了；
+/// - 局面种类变了：过去了；
+/// - 种类没变：要求局面签名变了、且**不是同一个**提问（主题也变了）。只有转圈 / 计时在跳不算——
+///   签名里没有屏幕原文，转圈改不了它；
+/// - 没有签名可比（退回旁路缓冲的分类）、种类又没变：按「提示仍在」处理。
+pub fn prompt_answered(before: &Situation, after: &Situation) -> bool {
+    use SituationKind as K;
+    if !matches!(before.kind, K::Question | K::Permission | K::Menu | K::Password | K::AwaitingInput | K::Pager) {
+        return true;
+    }
+    if after.kind != before.kind {
+        return true;
+    }
+    if before.signature.is_empty() || after.signature.is_empty() {
+        return false;
+    }
+    after.signature != before.signature && after.topic != before.topic
+}
 
 /// 这个局面里选中选项的提交方式。没有标记 = 行式提示，编号后要回车。
 pub fn submit_style(sit: &Situation) -> SubmitStyle {
@@ -523,7 +600,8 @@ fn arrow_cue(lower: &str) -> bool {
 /// 当前项前面是 `❯` / `›` / `>`。返回各选项（`index` 为空：输入编号无效，只能方向键 + 回车）。
 ///
 /// 要求同时有选中光标行和方向键提示；带编号的选择器归 `parse_options` / `DigitSubmits`。
-fn parse_arrow_menu(raw: &[String]) -> Option<Vec<Choice>> {
+/// 方向键菜单：选项 + 光标（❯）当前停在第几项（0 起）。
+fn parse_arrow_menu_at(raw: &[String]) -> Option<(Vec<Choice>, usize)> {
     let from = raw.len().saturating_sub(16);
     let window = &raw[from..];
     let lower = window.join("\n").to_lowercase();
@@ -572,7 +650,12 @@ fn parse_arrow_menu(raw: &[String]) -> Option<Vec<Choice>> {
             }
         })
         .collect();
-    (!opts.is_empty()).then_some(opts)
+    (!opts.is_empty()).then_some((opts, cursor_at - lo))
+}
+
+#[cfg(test)]
+fn parse_arrow_menu(raw: &[String]) -> Option<Vec<Choice>> {
+    parse_arrow_menu_at(raw).map(|x| x.0)
 }
 
 /// npm init 一类「冒号 / 问号后面括号里给默认值」的提示：`package name: (myapp) ` /
@@ -1129,8 +1212,17 @@ pub fn classify(snap: &ScreenSnapshot, now_ms: i64, stale_limit_ms: i64) -> Situ
         .collect();
     let text = cleaned.join("\n");
     let lower = text.to_lowercase();
-    let mut guess = prompt::classify(&text, snap.alt);
+    // 「当前行」= 光标所在行（帧带了光标、且光标下面还画着东西时）：TUI 常在输入行下面画状态栏 /
+    // 快捷键提示，拿最后一个非空行当提示行会认错。程序识别、输入框、选项仍看整个窗口
+    let cur_end = current_end(snap, start, end);
+    let cur_text = snap.lines[start..cur_end].iter().map(|l| clean_line(&strip_ansi(l))).collect::<Vec<_>>().join("\n");
+    let mut guess = prompt::classify(&cur_text, snap.alt);
     let raw: Vec<String> = snap.lines[start..end]
+        .iter()
+        .map(|l| strip_ansi(l).trim_end().to_string())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let raw_cur: Vec<String> = snap.lines[start..cur_end]
         .iter()
         .map(|l| strip_ansi(l).trim_end().to_string())
         .filter(|l| !l.trim().is_empty())
@@ -1139,7 +1231,7 @@ pub fn classify(snap: &ScreenSnapshot, now_ms: i64, stale_limit_ms: i64) -> Situ
     // `clean_line` 会把行尾的 `>` 当框线抹掉，PowerShell `PS C:\> ` / cmd `C:\>` / fish `u@h ~> `
     // 就认不出来了：清洗没认出提示符时，拿原始末行再认一次
     if guess.kind == PromptKind::Unknown && !input_box {
-        if let Some(l) = raw.last() {
+        if let Some(l) = raw_cur.last() {
             let g = prompt::classify(l, snap.alt);
             if g.kind == PromptKind::ShellPrompt {
                 guess = g;
@@ -1148,14 +1240,14 @@ pub fn classify(snap: &ScreenSnapshot, now_ms: i64, stale_limit_ms: i64) -> Situ
     }
     // git 用 `LESS=FRX`：less 跑在主屏幕上，最后一行只剩一个 `:`。屏幕静止了一阵、上面是一屏内容时才认
     if guess.kind == PromptKind::Unknown && !snap.alt {
-        if let Some((last, before)) = raw.split_last() {
+        if let Some((last, before)) = raw_cur.split_last() {
             let before: Vec<&str> = before.iter().map(|s| s.as_str()).collect();
             if let Some(g) = prompt::normal_screen_pager(&before, last, snap.idle_frames >= STATIC_FRAMES) {
                 guess = g;
             }
         }
     }
-    let typed_prompt = !snap.alt && raw.last().map_or(false, |l| shell_prompt_with_text(l));
+    let typed_prompt = !snap.alt && raw_cur.last().map_or(false, |l| shell_prompt_with_text(l));
     let mut program = detect_program(&lower, snap.alt, guess.kind);
     let stale_cc = program == Program::ClaudeCode;
     // 光标行就是 shell 提示符（空的，或带着已敲的字）：上面残留的 Claude Code 画面已经是历史，
@@ -1169,11 +1261,14 @@ pub fn classify(snap: &ScreenSnapshot, now_ms: i64, stale_limit_ms: i64) -> Situ
     }
     let hints = Hints {
         input_box,
-        free_text: raw.last().map_or(false, |l| free_text_prompt(l)),
-        free_text_strong: raw.last().map_or(false, |l| free_text_strong(l)),
+        free_text: raw_cur.last().map_or(false, |l| free_text_prompt(l)),
+        free_text_strong: raw_cur.last().map_or(false, |l| free_text_strong(l)),
         selector: raw.iter().rev().take(RECENT_LINES.max(12)).any(|l| selector_line(l)),
     };
-    let arrow_opts = parse_arrow_menu(&raw);
+    let (arrow_opts, arrow_cursor) = match parse_arrow_menu_at(&raw) {
+        Some((o, c)) => (Some(o), Some(c)),
+        None => (None, None),
+    };
     let arrow = arrow_opts.is_some();
     let mut d = rule(&non_empty, snap.alt, guess, program, hints, arrow_opts);
     // 选中之后怎么提交（见 `SubmitStyle`）：带编号且有 `❯` 选中标记 / Claude Code 的选择卡按数字即提交；
@@ -1186,6 +1281,9 @@ pub fn classify(snap: &ScreenSnapshot, now_ms: i64, stale_limit_ms: i64) -> Situ
         if d.options.iter().all(|o| o.index.is_none()) {
             if arrow {
                 d.evidence.push(SUBMIT_ARROW.to_string());
+                if let Some(c) = arrow_cursor.filter(|c| *c < d.options.len()) {
+                    d.evidence.push(format!("{MENU_CURSOR}{c}"));
+                }
             }
         } else if hints.selector || program == Program::ClaudeCode {
             d.evidence.push(SUBMIT_DIGIT.to_string());
@@ -1289,7 +1387,7 @@ pub(crate) mod frames {
             cols: 100,
             rows: 40,
             cursor_x: 0,
-            cursor_y: 0,
+            cursor_y: 0, app_cursor: false,
             lines: lines.iter().map(|x| x.to_string()).collect(),
             updated_at: 1_000,
             idle_frames: 0,
@@ -1343,7 +1441,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor_x: 0,
-            cursor_y: 0,
+            cursor_y: 0, app_cursor: false,
             lines: v,
             updated_at: 1_000,
             idle_frames: 0,
@@ -1709,6 +1807,94 @@ mod tests {
         // 没有方向键提示的 `> 文字`（引用、REPL 回显）不是方向键菜单
         let y = cs(&["> some quoted text", "  more text", "  even more"], false);
         assert_ne!(submit_style(&y), SubmitStyle::ArrowSelect);
+    }
+
+    #[test]
+    fn inquirer_cursor_index_and_arrow_hint() {
+        let x = cs(
+            &[
+                "? Pick a framework: (Use arrow keys)",
+                "  React",
+                "  Vue",
+                "❯ Svelte",
+                "  Solid",
+            ],
+            false,
+        );
+        assert_eq!(submit_style(&x), SubmitStyle::ArrowSelect);
+        assert_eq!(menu_cursor(&x), Some(2), "{:?}", x.evidence);
+        let h = arrow_hint(&x).unwrap();
+        assert!(h.contains("光标在第 3 项「Svelte」") && h.contains("<Down*k><Enter>"), "{h}");
+        // 不是方向键菜单就没有提示
+        let y = cs(&["$ ls", "a b", "$ "], false);
+        assert!(arrow_hint(&y).is_none());
+    }
+
+    #[test]
+    fn cursor_row_is_the_current_line() {
+        let lines = ["$ ./setup", "Project name: ", "", "  esc cancel · enter submit · ctrl+c quit"];
+        let mut snap = ScreenSnapshot {
+            console_id: "t".into(),
+            frame_id: 1,
+            window_start: 0,
+            hash: "h".into(),
+            alt: false,
+            cols: 80,
+            rows: 4,
+            cursor_x: 14,
+            cursor_y: 1,
+            app_cursor: false,
+            lines: lines.iter().map(|x| x.to_string()).collect(),
+            updated_at: 1_000,
+            idle_frames: 0,
+        };
+        assert_eq!(cursor_index(&snap), Some(1));
+        let (text, alt) = frame_text(&snap);
+        assert!(text.ends_with("Project name: ") || text.ends_with("Project name:"), "{text:?}");
+        assert!(!alt);
+        let with_cursor = classify(&snap, 1_100, 6_000);
+        assert_eq!(with_cursor.kind, SituationKind::AwaitingInput, "{:?}", with_cursor.evidence);
+        // 帧没带光标（0,0）：按最后一个非空行（状态栏）认，退回原来的行为
+        snap.cursor_x = 0;
+        snap.cursor_y = 0;
+        assert_eq!(cursor_index(&snap), None);
+        assert!(frame_text(&snap).0.ends_with("ctrl+c quit"));
+    }
+
+    fn sig_sit(kind: SituationKind, topic: &str) -> Situation {
+        Situation {
+            frame_id: 1,
+            screen_hash: "h".into(),
+            program: Program::Unknown,
+            kind,
+            topic: Some(topic.into()),
+            options: vec![],
+            confidence: 0.9,
+            tail: String::new(),
+            evidence: vec![],
+            stale_ms: 0,
+            signature: Situation::signature_of(Program::Unknown, kind, Some(topic), &[]),
+        }
+    }
+
+    #[test]
+    fn prompt_answered_needs_a_different_prompt_not_a_spinner() {
+        let q = sig_sit(SituationKind::Question, "Continue? [y/N]");
+        // 同一提问还在（只是屏幕别处的转圈在跳：签名不变）
+        let mut spinner = q.clone();
+        spinner.screen_hash = "h2".into();
+        spinner.tail = "⠙ working".into();
+        assert!(!prompt_answered(&q, &spinner));
+        // 进到了下一个提问
+        assert!(prompt_answered(&q, &sig_sit(SituationKind::Question, "Overwrite config? [y/N]")));
+        // 回到 shell / 开始跑了
+        assert!(prompt_answered(&q, &sig_sit(SituationKind::Progress, "")));
+        // 没有签名可比（旁路分类）且种类没变：当作提示仍在
+        let mut raw = q.clone();
+        raw.signature.clear();
+        assert!(!prompt_answered(&raw, &raw.clone()));
+        // 本来就不是提示：无从核对，算过去了
+        assert!(prompt_answered(&sig_sit(SituationKind::Idle, ""), &sig_sit(SituationKind::Idle, "")));
     }
 
     // ───────────── 误判修正 ─────────────

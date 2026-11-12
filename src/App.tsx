@@ -42,6 +42,7 @@ import {
   setScreenCaptureEnabled,
   setScreenDeltaSink,
   setStewardConsoles,
+  setAgentCapture,
   snapshotConsole,
   waitForPrompt,
 } from "./lib/termRegistry";
@@ -1240,6 +1241,17 @@ export default function App() {
    * 这里在 App 层兜底：契约开始 / 停止的事件到来时立刻对一次账，另每 5s 慢轮询
    * 一次（整个 app 一次 IPC，与终端数无关）—— 重新接驳后签回的契约也能接上。
    */
+  // Agent 运行（对话模式也算）驾驶某个终端期间也采屏幕帧：分类按渲染后的画面认（全屏 / Ink TUI），
+  // 运行结束就停。后端在控制权变化时推 `nx://agent/capture`
+  useEffect(() => {
+    const un = listen<{ session: string; on: boolean }>("nx://agent/capture", (e) => {
+      if (e.payload?.session) setAgentCapture(e.payload.session, !!e.payload.on);
+    });
+    return () => {
+      void un.then((f) => f()).catch(() => undefined);
+    };
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     const sync = () => {

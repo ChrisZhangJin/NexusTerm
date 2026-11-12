@@ -17,8 +17,11 @@
 //!   `<Up>` `<Down>` `<Left>` `<Right>` `<Home>` `<End>` `<PgUp>` `<PgDn>` `<S-Tab>`
 //!   `<F1>`…`<F12>`，`<C-a>`…`<C-z>`（Ctrl 组合，另有 `<C-[>` `<C-\>` `<C-]>` `<C-@>`），
 //!   `<M-x>`（Alt/Meta + 单个字符，即 ESC 前缀），`<lt>` 字面的 `<`。
+//! - 重复：`<Down*3>` = 连按三次（1–50 次），任何具名键都可以，方向键菜单靠它挪到目标项。
 //! - 形如 `<名字>` 但名字不认识会**报错**而不是当字面量发送（避免 `<C-cc>` 这类笔误悄悄敲进终端）；
 //!   不成对的 `<`（`a < b`、`<<EOF`）照常当字面字符。
+//! - 终端处于应用光标键模式（DECCKM，vim / less / 不少 TUI 会打开）时，方向键与 Home / End 发 SS3
+//!   （`\eOA`…）而不是 CSI（`\e[A`…），见 [`parse_keys_mode`]。模式来自前端屏幕帧；没有帧时按普通模式发。
 
 use std::time::Duration;
 
@@ -31,8 +34,16 @@ use tokio::time::{sleep, Instant};
 /// 再长的内容（粘贴一整个文件）不该走这条路，也不该让一次工具调用无声地倾倒进终端。
 pub const MAX_KEYS_BYTES: usize = 4096;
 
-/// 解析按键串。成功返回要写入的字节，失败返回给模型看的原因。
+/// 具名键最多重复几次（`<Down*50>`）
+pub const MAX_KEY_REPEAT: usize = 50;
+
+/// 解析按键串（普通光标键模式）。成功返回要写入的字节，失败返回给模型看的原因。
 pub fn parse_keys(src: &str) -> Result<Vec<u8>, String> {
+    parse_keys_mode(src, false)
+}
+
+/// 同 [`parse_keys`]；`app_cursor` = 终端处于应用光标键模式（DECCKM），方向键 / Home / End 发 SS3。
+pub fn parse_keys_mode(src: &str, app_cursor: bool) -> Result<Vec<u8>, String> {
     let chars: Vec<char> = src.chars().collect();
     let mut out: Vec<u8> = Vec::new();
     let mut i = 0usize;
@@ -66,7 +77,7 @@ pub fn parse_keys(src: &str) -> Result<Vec<u8>, String> {
                 }
                 i += 2;
             }
-            '<' => match named_key_at(&chars, i)? {
+            '<' => match named_key_at(&chars, i, app_cursor)? {
                 Some((bytes, consumed)) => {
                     out.extend_from_slice(&bytes);
                     i += consumed;
@@ -97,16 +108,16 @@ pub fn parse_keys(src: &str) -> Result<Vec<u8>, String> {
 /// - `Ok(Some((字节, 吃掉的字符数)))`：读到了；
 /// - `Ok(None)`：这个 `<` 不是具名键的开头，当字面字符；
 /// - `Err`：形如 `<名字>` 但名字不认识。
-fn named_key_at(chars: &[char], at: usize) -> Result<Option<(Vec<u8>, usize)>, String> {
-    // 向后找 `>`，名字最长 12 个字符（`<Backspace>` 之类也够用）。
+fn named_key_at(chars: &[char], at: usize, app_cursor: bool) -> Result<Option<(Vec<u8>, usize)>, String> {
+    // 向后找 `>`，名字最长 15 个字符（`<Backspace>`、`<PgDn*50>` 之类也够用）。
     let mut end = None;
-    for (off, &c) in chars.iter().enumerate().skip(at + 1).take(12) {
+    for (off, &c) in chars.iter().enumerate().skip(at + 1).take(15) {
         if c == '>' {
             end = Some(off);
             break;
         }
         // 名字里只能有字母数字与 `-`、`[`、`\`、`]`、`@`
-        if !(c.is_ascii_alphanumeric() || matches!(c, '-' | '[' | '\\' | ']' | '@')) {
+        if !(c.is_ascii_alphanumeric() || matches!(c, '-' | '[' | '\\' | ']' | '@' | '*')) {
             return Ok(None);
         }
     }
@@ -115,16 +126,39 @@ fn named_key_at(chars: &[char], at: usize) -> Result<Option<(Vec<u8>, usize)>, S
     if name.is_empty() {
         return Ok(None);
     }
-    match key_bytes(&name) {
-        Some(b) => Ok(Some((b, end - at + 1))),
+    // `<名字*N>`：重复 N 次
+    let (base, times) = match name.rsplit_once('*') {
+        Some((b, n)) if !b.is_empty() => match n.parse::<usize>() {
+            Ok(t) if (1..=MAX_KEY_REPEAT).contains(&t) => (b.to_string(), t),
+            _ => return Err(format!("`<{name}>` 的重复次数要在 1–{MAX_KEY_REPEAT} 之间")),
+        },
+        _ => (name.clone(), 1),
+    };
+    match key_bytes(&base, app_cursor) {
+        Some(b) => Ok(Some((b.repeat(times), end - at + 1))),
         None => Err(format!(
             "不认识的按键 `<{name}>`（要发字面 `<` 请写 <lt>；支持的键见 nx_send_keys 的说明）"
         )),
     }
 }
 
-fn key_bytes(name: &str) -> Option<Vec<u8>> {
+fn key_bytes(name: &str, app_cursor: bool) -> Option<Vec<u8>> {
     let lower = name.to_ascii_lowercase();
+    // 应用光标键模式（DECCKM）：方向键 / Home / End 走 SS3
+    if app_cursor {
+        let ss3: Option<&[u8]> = match lower.as_str() {
+            "up" => Some(b"\x1bOA"),
+            "down" => Some(b"\x1bOB"),
+            "right" => Some(b"\x1bOC"),
+            "left" => Some(b"\x1bOD"),
+            "home" => Some(b"\x1bOH"),
+            "end" => Some(b"\x1bOF"),
+            _ => None,
+        };
+        if let Some(b) = ss3 {
+            return Some(b.to_vec());
+        }
+    }
     // Ctrl 组合
     if let Some(rest) = lower.strip_prefix("c-") {
         let mut it = rest.chars();
@@ -360,6 +394,29 @@ pub async fn wait_for_pattern(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn repeat_syntax() {
+        assert_eq!(parse_keys("<Down*3><Enter>").unwrap(), b"\x1b[B\x1b[B\x1b[B\r".to_vec());
+        assert_eq!(parse_keys("<up*1>").unwrap(), b"\x1b[A".to_vec());
+        assert_eq!(parse_keys("<C-c*2>").unwrap(), vec![3, 3]);
+        assert!(parse_keys("<Down*0>").is_err());
+        assert!(parse_keys("<Down*51>").is_err());
+        assert!(parse_keys("<Down*x>").is_err());
+        // 不成对的照旧当字面量
+        assert_eq!(parse_keys("a*b").unwrap(), b"a*b".to_vec());
+    }
+
+    #[test]
+    fn ss3_arrows_in_application_cursor_mode() {
+        assert_eq!(parse_keys_mode("<Up><Down><Right><Left>", true).unwrap(), b"\x1bOA\x1bOB\x1bOC\x1bOD".to_vec());
+        assert_eq!(parse_keys_mode("<Home><End>", true).unwrap(), b"\x1bOH\x1bOF".to_vec());
+        assert_eq!(parse_keys_mode("<Down*2><Enter>", true).unwrap(), b"\x1bOB\x1bOB\r".to_vec());
+        // 其余键不受影响；普通模式仍是 CSI
+        assert_eq!(parse_keys_mode("<PgDn><F5>", true).unwrap(), parse_keys("<PgDn><F5>").unwrap());
+        assert_eq!(parse_keys_mode("<Up>", false).unwrap(), b"\x1b[A".to_vec());
+    }
+
     use super::*;
 
     #[test]

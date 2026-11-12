@@ -53,7 +53,7 @@ fn frame(console: &str, frame_id: u64, lines: &[&str], alt: bool, ts: i64) -> Sc
         rows: 24,
         alt,
         cursor_x: 0,
-        cursor_y: 0,
+        cursor_y: 0, app_cursor: false,
         hash,
         full: true,
         lines: full

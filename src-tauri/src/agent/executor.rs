@@ -162,8 +162,24 @@ fn common_affix(a: impl Iterator<Item = u8>, b: impl Iterator<Item = u8>) -> usi
 /// - `cancelled()`：返回 true 时立即以 `Cancelled` 收场。
 ///
 /// 纯逻辑、不碰 Tauri，便于单测。计时用 `tokio::time`，测试里暂停时钟即可瞬间跑完。
+/// 给提示分类器的「终端尾部」：文本 + 是否 alt screen。
+///
+/// 有新鲜的前端渲染帧时由它给（全屏 / Ink 一类 TUI 只有渲染后的画面才看得懂，alt 也是真的）；
+/// 没有就退回旁路缓冲的原始字节流，alt 只能当 false。`String` 自动转成后者，单测照旧传字符串。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tail {
+    pub text: String,
+    pub alt: bool,
+}
+
+impl From<String> for Tail {
+    fn from(text: String) -> Self {
+        Self { text, alt: false }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub async fn wait_for_end<P, T, L, O, C>(
+pub async fn wait_for_end<P, T, L, O, C, R>(
     cfg: WaitConfig,
     prompt: Option<&str>,
     mut progress: P,
@@ -175,10 +191,12 @@ pub async fn wait_for_end<P, T, L, O, C>(
 where
     P: FnMut() -> u64,
     T: FnMut() -> String,
-    L: FnMut() -> String,
+    L: FnMut() -> R,
+    R: Into<Tail>,
     O: FnMut() -> String,
     C: FnMut() -> bool,
 {
+    let classify_tail = |t: Tail| prompt::classify(&t.text, t.alt);
     let silence = Duration::from_millis(cfg.silence_ms);
     // 不短于静默窗口：否则「提示符回来」这条更可信的收尾还没轮到判，就先被「在等输入」抢走了
     let input_quiet = Duration::from_millis(cfg.input_quiet_ms.max(cfg.silence_ms));
@@ -192,7 +210,7 @@ where
         prompt: match (reason, guess) {
             (ExecEnd::Cancelled, _) => None,
             (_, Some(g)) => Some(g),
-            (_, None) => Some(prompt::classify(&tail(), false)),
+            (_, None) => Some(classify_tail(tail().into())),
         },
     };
 
@@ -221,7 +239,7 @@ where
                 }
                 // 没有基线可比：先看是不是停在交互提示上，否则静默就是唯一线索
                 None => {
-                    let g = prompt::classify(&tail(), false);
+                    let g = classify_tail(tail().into());
                     if is_awaiting_input(&g) {
                         return finish(&mut output, &mut tail, ExecEnd::AwaitingInput, Some(g));
                     }
@@ -232,7 +250,7 @@ where
                 Some(_) => {
                     if quiet_for >= input_quiet && classified_at != Some(last) {
                         classified_at = Some(last);
-                        let g = prompt::classify(&tail(), false);
+                        let g = classify_tail(tail().into());
                         if is_awaiting_input(&g) {
                             return finish(&mut output, &mut tail, ExecEnd::AwaitingInput, Some(g));
                         }
