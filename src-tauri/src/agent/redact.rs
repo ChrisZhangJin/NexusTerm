@@ -72,12 +72,22 @@ fn rules() -> &'static [Rule] {
             (r#"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@'"]*:(?P<v>[^\s/@'"]+)@"#.into(), true),
             // `mysql -pSecret` / `-p'Secret'`（-p 后紧跟口令；单独的 `-p` 是交互输入，不动）
             (r#"(?:^|[\s;|&(])(?:mysql|mysqldump|mysqladmin|mariadb|mariadb-dump)\b[^\n]*?[ \t]-p(?P<v>'[^'\n]*'|"[^"\n]*"|[^\s'"\-][^\s]*)"#.into(), true),
+            // `sshpass -p 口令`
+            (r#"\bsshpass\b[^\n]*?[ \t]-p[ \t]*(?P<v>'[^'\n]*'|"[^"\n]*"|[^\s'"\-][^\s]*)"#.into(), true),
+            // `docker login -p 口令` / `--password 口令` / `--password=口令`
+            (r#"\bdocker\b[^\n]*?\blogin\b[^\n]*?[ \t](?:-p|--password)(?:[ \t]+|=)(?P<v>'[^'\n]*'|"[^"\n]*"|[^\s'"\-][^\s]*)"#.into(), true),
+            // openssl `-passin pass:口令` / `-passout pass:口令`
+            (r#"-pass(?:in|out)[ \t]+pass:(?P<v>'[^'\n]*'|"[^"\n]*"|[^\s'"]+)"#.into(), true),
+            // XML / HTML：`<password>口令</password>`、`<secret>`、`<token>`、`<apiKey>`
+            (r#"(?i)<(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)>(?P<v>[^<\n]{1,256})</"#.into(), true),
             // `curl -u user:pw` / `--user user:pw` / `--user=user:pw`
             (r#"\bcurl\b[^\n]*?[ \t](?:-u|--user)(?:[ \t]+|=)["']?[^\s:'"]*:(?P<v>[^\s'"]+)"#.into(), true),
             // Authorization 头里的 Bearer token（只吃空格 / Tab，不跨行）
             (r#"(?i)bearer[ \t]+[A-Za-z0-9._~+/=\-]{8,}"#.into(), false),
             // OpenAI / Anthropic 风格的前缀 key；前面要是词边界，`task-xxxx` 不算
             (r#"\bsk-[A-Za-z0-9_\-]{16,}"#.into(), false),
+            // Stripe 密钥 / 受限密钥（pk_ 是公开的可发布密钥，不算）
+            (r#"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{10,}"#.into(), false),
             // GitHub token：ghp_ / gho_ / ghu_ / ghs_ / ghr_ 与细粒度 PAT
             (r#"\bgh[pousr]_[A-Za-z0-9]{30,}"#.into(), false),
             (r#"\bgithub_pat_[A-Za-z0-9_]{22,}"#.into(), false),
@@ -150,6 +160,12 @@ fn keep_value(raw: &str, key: &str) -> bool {
         return true;
     }
     let name = key.rsplit(|c: char| matches!(c, '.' | '>' | ' ' | '\t')).next().unwrap_or(key);
+    // `PWD` / `OLDPWD` 是 shell 的当前 / 上一个目录，值是路径，不是口令
+    if (name.eq_ignore_ascii_case("PWD") || name.eq_ignore_ascii_case("OLDPWD"))
+        && (t.starts_with('/') || t.starts_with('~') || t.starts_with("\"/") || t.starts_with("'/"))
+    {
+        return true;
+    }
     if !name.is_empty() && t.eq_ignore_ascii_case(name) {
         return true;
     }
@@ -651,6 +667,20 @@ mod tests {
             ("token=tkn_123", "tkn_123"),
             ("--api_key=secretvalue", "secretvalue"),
             ("db.password = s3cret", "s3cret"),
+            (concat!("sk_", "live_51Habcdefghijklmnop"), "51Habcdefghijklmnop"),
+            (concat!("STRIPE=sk_", "test_FAKEfakeFAKEfake00000000"), "FAKEfakeFAKEfake00000000"),
+            (concat!("rk_", "live_abcdefghijklmn"), "abcdefghijklmn"),
+            ("sshpass -p 'Ssh Pw1' ssh root@h", "Ssh Pw1"),
+            ("sshpass -pSshPw2 ssh h", "SshPw2"),
+            ("docker login -u bob -p DockPw1 registry.io", "DockPw1"),
+            ("docker login --username bob --password DockPw2 r.io", "DockPw2"),
+            ("docker login --password=DockPw3 r.io", "DockPw3"),
+            ("openssl pkcs12 -export -passout pass:SslOut1 -out a.p12", "SslOut1"),
+            ("openssl rsa -in k.pem -passin pass:SslIn2", "SslIn2"),
+            ("<password>XmlPw1</password>", "XmlPw1"),
+            ("<Secret>XmlSec2</Secret>", "XmlSec2"),
+            ("<token>XmlTok3</token>", "XmlTok3"),
+            ("export PWD=hunterpwd", "hunterpwd"),
         ];
         for (raw, leak) in positives {
             let out = redact(raw);
@@ -678,6 +708,14 @@ mod tests {
             "mysql -h db -P 3306 -u root -p",
             r#"curl -u "$USER:$PASS" https://x"#,
             "password = password",
+            "export PWD=/home/me",
+            "OLDPWD=/var/www",
+            "PWD=~/src",
+            "pk_live_abcdefghijklmnop",
+            "docker login registry.io",
+            "sshpass -f /run/secret.txt ssh h",
+            "openssl rsa -in k.pem -passin env:KEY_PASS",
+            "<password></password>",
         ];
         for raw in negatives {
             assert_eq!(redact(raw), *raw, "不该脱敏");
