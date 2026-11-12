@@ -160,6 +160,10 @@ impl HostIo for AppHostIo {
         self.snap.lock().watchdog = w.clone();
     }
 
+    fn note_deadline_ack(&self, acked: bool) {
+        self.snap.lock().deadline_acked = acked;
+    }
+
     fn console_alive(&self) -> bool {
         self.app.try_state::<AppState>().map_or(true, |st| act::session_alive(&st, &self.console_id))
     }
@@ -719,6 +723,7 @@ fn shared_from_checkpoint(app: &AppHandle, cp: &HostCheckpoint) -> Arc<HostShare
     h.set_spent(cp.spent);
     h.restore_watchdog(cp.watchdog.clone());
     h.set_todo(cp.todo.clone());
+    h.set_deadline_acked(cp.deadline_acked);
     h
 }
 
@@ -842,8 +847,15 @@ pub async fn host_reattach(
     if !act::session_alive(&state, &console_id) {
         return Err(format!("没有 id 为「{console_id}」的终端"));
     }
-    // 打开新连接要等一阵：回来后再确认一遍还是那份挂起的任务（没被停掉 / 没被别处接走）
-    still_reattachable(&state.act.host, &contract_id, &old)?;
+    // 打开新连接要等一阵：回来后再确认一遍还是那份挂起的任务（没被停掉 / 没被别处接走）。
+    // 新开的标签页不替用户关（里面可能已经有他要的现场 / 正在登录），只在报错里说明
+    if let Err(e) = still_reattachable(&state.act.host, &contract_id, &old) {
+        return Err(if open_new.unwrap_or(false) {
+            format!("{e}。刚为接驳新开的标签页「{}」保留着，不需要的话可以手动关掉。", saved.label)
+        } else {
+            e
+        });
+    }
     if state.act.host.live_on_console(&console_id).is_some_and(|h| h.contract_id() != contract_id) {
         return Err("这个终端正被另一份托管占着".to_string());
     }

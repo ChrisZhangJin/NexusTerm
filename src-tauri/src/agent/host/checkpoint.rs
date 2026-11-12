@@ -46,6 +46,9 @@ pub struct HostCheckpoint {
     /// 计划清单（nx_todo）；旧现场没有该字段 → 空
     #[serde(default)]
     pub todo: Vec<super::super::todo::TodoItem>,
+    /// 意向期限到了、用户已经「继续」过（接驳后不再因同一期限暂停）
+    #[serde(default)]
+    pub deadline_acked: bool,
     pub created_wall_ms: i64,
     pub saved_wall_ms: i64,
 }
@@ -89,6 +92,7 @@ impl HostCheckpoint {
             last_screen_hash: String::new(),
             watchdog: WatchdogState::default(),
             todo: Vec::new(),
+            deadline_acked: false,
             created_wall_ms: now_wall_ms,
             saved_wall_ms: now_wall_ms,
         }
@@ -112,6 +116,8 @@ impl HostCheckpoint {
         c.v = HOST_CHECKPOINT_V;
         c.saved_wall_ms = now_wall_ms;
         c.messages = Self::prepare_messages(c.messages);
+        // 写文件审批卡上的 diff 给人看的是原文；落盘前脱敏（库里不躺凭据）
+        c.phase = scrub_phase(c.phase);
         serde_json::to_string(&c).map_err(|e| e.to_string())
     }
 
@@ -178,6 +184,21 @@ impl HostCheckpoint {
     }
 }
 
+/// 相位里（含 UserDriving / Suspended 嵌套的）等人卡片的 diff 脱敏。
+fn scrub_phase(p: HostPhase) -> HostPhase {
+    match p {
+        HostPhase::WaitingHuman { mut card } => {
+            card.diff = card.diff.map(|d| super::super::redact::redact(&d));
+            HostPhase::WaitingHuman { card }
+        }
+        HostPhase::UserDriving { resume_to } => HostPhase::UserDriving { resume_to: Box::new(scrub_phase(*resume_to)) },
+        HostPhase::Suspended { reason, resume_to } => {
+            HostPhase::Suspended { reason, resume_to: Box::new(scrub_phase(*resume_to)) }
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::checkpoint::CHECKPOINT_TTL_MS;
@@ -220,6 +241,17 @@ mod tests {
         c.woke_hash.insert("t1".into(), "abc".into());
         c.last_screen_hash = "h1".into();
         c
+    }
+
+    #[test]
+    fn card_diff_is_redacted_on_save_but_kept_in_memory() {
+        let mut card = super::super::HumanCard::ask("a1", "批准写入", 1);
+        card.diff = Some("-key=sk-proj-abcdefghijklmnopqrstuvwxyz1234\n+key=x".into());
+        let mut c = cp();
+        c.phase = HostPhase::UserDriving { resume_to: Box::new(HostPhase::WaitingHuman { card: card.clone() }) };
+        let j = c.to_json(5).unwrap();
+        assert!(!j.contains("abcdefghijklmnopqrstuvwxyz1234"), "落盘的 checkpoint 里不能有原文");
+        assert_eq!(c.phase, HostPhase::UserDriving { resume_to: Box::new(HostPhase::WaitingHuman { card }) }, "内存里不动");
     }
 
     #[test]
