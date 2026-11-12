@@ -42,6 +42,12 @@ pub trait HostIo: Send + Sync {
     fn note_progress(&self, _messages: &[super::super::llm::ChatMessage], _step: usize, _spent: &Spent) {}
     /// 契约 / 授权变了（签约、`host_amend`、判据确认），下一次 `save` 一并落盘。默认不记。
     fn note_contract(&self, _contract: &StewardContract, _authority: &Authority) {}
+    /// 给人看的提示变了（随状态推给面板）。默认不记。
+    fn note_notice(&self, _notice: Option<&str>) {}
+    /// 待落盘的现场（接驳时从它恢复）。默认没有。
+    fn snapshot(&self) -> Option<super::checkpoint::HostCheckpoint> {
+        None
+    }
 }
 
 /// 托管任务眼里的契约：强制用的授权与 Hard 规则、系统提示里的 `## 托管契约` 一节及其依据。
@@ -106,7 +112,19 @@ struct Pending {
     grant: Option<BudgetGrant>,
     /// 收到过 Resume：运行循环要换一份新预算
     resumed: bool,
+    /// 接驳后第一步前强制读屏（`Effect::ForceScreen`）
+    force_screen: bool,
 }
+
+/// 接驳 / 重启后接着跑的现场：对话历史与步数（运行循环开头取走）。
+#[derive(Debug, Clone, Default)]
+pub struct Seed {
+    pub messages: Vec<super::super::llm::ChatMessage>,
+    pub step: usize,
+}
+
+/// 运行进度多久落一次盘（Running 期间的周期快照；相位迁移另外即时落）。
+pub const PROGRESS_TICK: Duration = Duration::from_secs(30);
 
 /// 挂起结束的方式。
 #[derive(Debug, Clone, PartialEq)]
@@ -136,6 +154,16 @@ pub struct HostShared {
     amend_notes: Mutex<Vec<String>>,
     /// 契约级花费（随 checkpoint 持久化，暂停 / 继续不清零）
     spent: Mutex<Spent>,
+    /// 接驳时被新任务顶替：旧任务退出时不收尾（不停契约、不放租约）
+    superseded: AtomicBool,
+    /// 接驳 / 重启后接着跑的现场
+    seed: Mutex<Option<Seed>>,
+    /// 给人看的一句提示（例如「接驳时屏幕和重启前不一样，已降为确认档」），随状态推给面板
+    notice: Mutex<Option<String>>,
+    /// 进入终态的时刻（登记表按它清理旧记录）
+    ended_at: Mutex<Option<std::time::Instant>>,
+    /// 上一次周期快照的时刻与对话指纹（没变就不再克隆整段历史）
+    progress: Mutex<(Option<std::time::Instant>, (usize, usize, usize))>,
 }
 
 impl HostShared {
@@ -161,7 +189,129 @@ impl HostShared {
             ctx: Mutex::new((HostCtx::bare(&handle_cid, console_id, goal), 0)),
             amend_notes: Mutex::new(Vec::new()),
             spent: Mutex::new(Spent::default()),
+            superseded: AtomicBool::new(false),
+            seed: Mutex::new(None),
+            notice: Mutex::new(None),
+            ended_at: Mutex::new(None),
+            progress: Mutex::new((None, (0, 0, 0))),
         })
+    }
+
+    // ——— 重启 / 接驳 ———
+
+    /// 直接设定相位（启动扫描恢复的挂起任务、接驳后回到的状态），并执行接驳带来的副作用
+    /// （追加「先读屏」的话、强制读屏）。不落盘、不推事件：调用方随后 `announce`。
+    pub fn restore(&self, phase: HostPhase, effects: Vec<Effect>) {
+        if phase.is_terminal() {
+            *self.ended_at.lock() = Some(std::time::Instant::now());
+        }
+        *self.phase.lock() = phase.clone();
+        for e in effects {
+            match e {
+                Effect::SaveCheckpoint | Effect::EmitPhase | Effect::ReleaseLease => {}
+                other => self.run_effect(other, &phase),
+            }
+        }
+    }
+
+    /// 当前现场：快照 + 内存里最新的相位 / 契约 / 授权 / 花费。
+    pub fn checkpoint(&self) -> Option<super::checkpoint::HostCheckpoint> {
+        let mut c = self.io.snapshot()?;
+        let ctx = self.ctx();
+        c.phase = self.phase();
+        c.contract = ctx.contract;
+        c.authority = ctx.authority;
+        c.spent = self.spent();
+        Some(c)
+    }
+
+    /// 重启前被托管的那个 console 的描述。
+    pub fn saved_console(&self) -> Option<super::ConsoleRef> {
+        self.io.snapshot().map(|c| c.console)
+    }
+
+    /// 追加一条给模型的用户消息（下一步前并进对话）。
+    pub fn send_user_note(&self, text: String) {
+        self.pending.lock().user.push(text);
+    }
+
+    pub fn set_seed(&self, seed: Seed) {
+        *self.seed.lock() = Some(seed);
+    }
+
+    pub fn take_seed(&self) -> Option<Seed> {
+        self.seed.lock().take()
+    }
+
+    pub fn take_force_screen(&self) -> bool {
+        std::mem::take(&mut self.pending.lock().force_screen)
+    }
+
+    /// 重启前挂着的审批卡在这边被答了：等它的那次写入已经不在了，结论只能告诉模型让它重发。
+    pub fn take_stale_approvals(&self) -> Vec<(String, bool)> {
+        self.pending.lock().approvals.drain().collect()
+    }
+
+    pub fn set_notice(&self, n: Option<String>) {
+        self.io.note_notice(n.as_deref());
+        *self.notice.lock() = n;
+    }
+
+    pub fn notice(&self) -> Option<String> {
+        self.notice.lock().clone()
+    }
+
+    /// 被接驳的新任务顶替：旧任务随后被取消，退出时什么都不收。
+    pub fn supersede(&self) {
+        self.superseded.store(true, Ordering::Relaxed);
+        // 只置取消旗：挂起中的 park 最多 CANCEL_POLL 后醒来退出。**不能**投 Stop —— 那会把旧任务
+        // 迁到终态，副作用里放掉的是新旧任务共用的 `host:{id}` 租约，还会把这一行落成 stopped
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_superseded(&self) -> bool {
+        self.superseded.load(Ordering::Relaxed)
+    }
+
+    /// 测试用：假装已经结束了 `ago` 这么久。
+    #[cfg(test)]
+    pub(crate) fn mark_ended_ago(&self, ago: Duration) {
+        *self.ended_at.lock() = std::time::Instant::now().checked_sub(ago);
+    }
+
+    /// 进入终态多久了；没结束为 `None`。
+    pub fn ended_for(&self) -> Option<Duration> {
+        self.ended_at.lock().map(|t| t.elapsed())
+    }
+
+    /// Running 期间的周期快照：距上次超过 `PROGRESS_TICK` 且对话有变化时才克隆历史、落盘。
+    /// 相位迁移（问人 / 审批 / 暂停 / 完成）另外即时落盘，用的是最近一次快照。
+    pub fn tick_progress(&self, messages: &[super::super::llm::ChatMessage], step: usize) -> bool {
+        let fp = (messages.len(), messages.last().map_or(0, |m| m.content.len()), step);
+        {
+            let mut g = self.progress.lock();
+            let due = g.0.map_or(true, |t| t.elapsed() >= PROGRESS_TICK);
+            if !due || g.1 == fp {
+                return false;
+            }
+            *g = (Some(std::time::Instant::now()), fp);
+        }
+        self.note_progress(messages, step);
+        self.checkpoint_now();
+        true
+    }
+
+    /// 马上把进度记进快照（要挂起等人之前用，保证落盘的是最新对话）。不落盘。
+    pub fn flush_progress(&self, messages: &[super::super::llm::ChatMessage], step: usize) {
+        let fp = (messages.len(), messages.last().map_or(0, |m| m.content.len()), step);
+        {
+            let mut g = self.progress.lock();
+            if g.1 == fp {
+                return;
+            }
+            g.1 = fp;
+        }
+        self.note_progress(messages, step);
     }
 
     // ——— 契约 / 上下文 ———
@@ -285,6 +435,10 @@ impl HostShared {
         };
         match res {
             Ok((next, fx)) => {
+                if next.is_terminal() {
+                    let mut e = self.ended_at.lock();
+                    e.get_or_insert_with(std::time::Instant::now);
+                }
                 for e in fx {
                     self.run_effect(e, &next);
                 }
@@ -313,8 +467,9 @@ impl HostShared {
                 let mut p = self.pending.lock();
                 p.grant = Some(g);
             }
-            // TODO(PR6)：接驳到新 console、强制先读屏
-            Effect::Reattach(_) | Effect::ForceScreen => {}
+            // 换 console 由接驳命令重建任务时完成，这里只记「先读屏」
+            Effect::Reattach(_) => {}
+            Effect::ForceScreen => self.pending.lock().force_screen = true,
         }
     }
 
@@ -465,10 +620,14 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn shared() -> (Arc<HostShared>, Arc<FakeIo>) {
+        shared_as("c1", "t1")
+    }
+
+    pub(crate) fn shared_as(cid: &str, console: &str) -> (Arc<HostShared>, Arc<FakeIo>) {
         let io = Arc::new(FakeIo::default());
         let h = HostShared::new(
-            HostHandle::new("c1"),
-            "t1",
+            HostHandle::new(cid),
+            console,
             "目标",
             Arc::new(AtomicBool::new(false)),
             Box::new(io.clone()),
@@ -664,6 +823,19 @@ pub(crate) mod tests {
         h.send(HostEvent::Answer(CardReply { card_id: "cd1".into(), text: String::new(), approved: Some(true) }));
         assert_eq!(task.await.unwrap(), Some(edited));
         assert!(!h.ctx().contract.yolo);
+    }
+
+    #[test]
+    fn progress_snapshot_only_when_due_and_changed() {
+        let (h, io) = shared();
+        let msgs = vec![super::super::super::llm::ChatMessage::user("a".to_string())];
+        assert!(h.tick_progress(&msgs, 1), "第一次就落");
+        assert!(!h.tick_progress(&msgs, 2), "不到 30 秒不落（也不克隆历史）");
+        assert_eq!(io.saves.lock().len(), 1);
+        // 要挂起前的 flush：对话变了才记，不落盘
+        let more = vec![msgs[0].clone(), super::super::super::llm::ChatMessage::assistant("b".to_string())];
+        h.flush_progress(&more, 2);
+        assert_eq!(io.saves.lock().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]

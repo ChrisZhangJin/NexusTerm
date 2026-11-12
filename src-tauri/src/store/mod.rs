@@ -867,7 +867,7 @@ mod legacy_keyring {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(super) fn temp_store(tag: &str) -> Store {
@@ -875,7 +875,7 @@ mod tests {
     }
 
     /// 连 db 文件路径一起返回，给需要直接翻字节的用例。
-    pub(super) fn temp_store_at(tag: &str) -> (Store, PathBuf) {
+    pub(crate) fn temp_store_at(tag: &str) -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "nexus-store-{tag}-{}",
             uuid::Uuid::new_v4()

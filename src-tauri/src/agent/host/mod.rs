@@ -234,6 +234,25 @@ pub struct BudgetGrant {
     pub max_output_chars: Option<u64>,
 }
 
+/// 结束的托管记录留多久给面板看结局。
+pub const ENDED_KEEP: std::time::Duration = std::time::Duration::from_secs(3600);
+/// 结束的托管记录最多留几条（新的优先）。
+pub const ENDED_MAX: usize = 20;
+
+/// 清理结局：结束超过 `ENDED_KEEP` 的丢掉；剩下的只留最近 `ENDED_MAX` 条。未结束的一律不动。
+fn prune_ended(map: &mut HashMap<String, Arc<HostShared>>) {
+    map.retain(|_, h| h.ended_for().map_or(true, |d| d < ENDED_KEEP));
+    let mut ended: Vec<(String, std::time::Duration)> =
+        map.iter().filter_map(|(k, h)| h.ended_for().map(|d| (k.clone(), d))).collect();
+    if ended.len() <= ENDED_MAX {
+        return;
+    }
+    ended.sort_by_key(|(_, d)| *d); // 最近结束的在前
+    for (k, _) in ended.into_iter().skip(ENDED_MAX) {
+        map.remove(&k);
+    }
+}
+
 /// 托管任务登记表（挂在 `ActRuntime.host` 上）：契约 id → 运行中的托管任务。
 ///
 /// 命令层经它找到任务投事件；`gate_drive` / `request_approval` / `user_control` 经它判断
@@ -249,11 +268,13 @@ impl HostSupervisor {
         Self::default()
     }
 
-    /// 登记一个新任务。同一 console 上已结束的旧任务一并清掉。
+    /// 登记一个任务（新开、启动扫描恢复、接驳重建都走这里；同一契约 id 直接顶替）。
+    /// 同一 console 上已结束的旧任务一并清掉，再按 `prune` 清理过旧的结局。
     pub fn register(&self, shared: Arc<HostShared>) {
         let mut map = self.runs.lock();
         map.retain(|_, h| !(h.console_id == shared.console_id && h.is_terminal()));
         map.insert(shared.contract_id().to_string(), shared);
+        prune_ended(&mut map);
     }
 
     pub fn get(&self, contract_id: &str) -> Option<Arc<HostShared>> {
@@ -269,7 +290,10 @@ impl HostSupervisor {
     }
 
     pub fn all(&self) -> Vec<Arc<HostShared>> {
-        let mut v: Vec<_> = self.runs.lock().values().cloned().collect();
+        let mut map = self.runs.lock();
+        prune_ended(&mut map);
+        let mut v: Vec<_> = map.values().cloned().collect();
+        drop(map);
         v.sort_by(|a, b| a.contract_id().cmp(b.contract_id()));
         v
     }
@@ -356,6 +380,30 @@ mod tests {
         let (h2, _io) = driver::tests::shared();
         s.register(h2);
         assert_eq!(s.all().len(), 1);
+    }
+
+    #[test]
+    fn supervisor_prunes_old_and_excess_endings_but_keeps_live() {
+        let s = HostSupervisor::new();
+        let (live, _io) = driver::tests::shared_as("live", "tl");
+        s.register(live);
+        let (old, _io) = driver::tests::shared_as("old", "t-old");
+        old.apply(HostEvent::Stop).unwrap();
+        old.mark_ended_ago(ENDED_KEEP + std::time::Duration::from_secs(1));
+        s.register(old);
+        assert!(s.get("old").is_none(), "结束超过一小时的清掉");
+        for i in 0..(ENDED_MAX + 5) {
+            let (h, _io) = driver::tests::shared_as(&format!("e{i:02}"), &format!("t{i}"));
+            h.apply(HostEvent::Stop).unwrap();
+            h.mark_ended_ago(std::time::Duration::from_secs(1000 - i as u64));
+            s.register(h);
+        }
+        let all = s.all();
+        assert_eq!(all.iter().filter(|h| h.is_terminal()).count(), ENDED_MAX);
+        assert!(s.get("live").is_some(), "未结束的一律保留");
+        // 留下的是最近结束的
+        assert!(s.get(&format!("e{:02}", ENDED_MAX + 4)).is_some());
+        assert!(s.get("e00").is_none());
     }
 
     #[test]
