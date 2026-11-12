@@ -2402,3 +2402,14 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   display: flex; flex-direction: column; gap: 6px; margin-top: 6px;
   padding: 7px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-panel);
 }
+
+/* ——— 统一托管：状态胶囊 + 问题 / 审批卡（HostCard） ——— */
+.host-card { margin: 6px 0; }
+.host-pill { border-radius: 999px; padding: 0 8px; }
+.host-pill.active { color: var(--accent); border-color: var(--accent); }
+.host-pill.warn { color: #e5c07b; border-color: color-mix(in srgb, #e5c07b 55%, transparent); }
+.host-pill.done { color: var(--accent); }
+.host-pill.bad { color: var(--danger); border-color: var(--danger); }
+.host-pill.idle { color: var(--text-dim); }
+.host-goal { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+.host-question { white-space: pre-wrap; word-break: break-word; margin-bottom: 6px; }

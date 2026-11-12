@@ -7,6 +7,7 @@
 //!
 //! 本模块不碰 Tauri / pty / 时钟，只做判定与反馈文本，便于脱离运行时单测。
 
+use super::act::head_tail_chars;
 use super::situation::{self, Program, Situation, SituationKind, SubmitStyle};
 
 /// 默认最长盯多久（毫秒）。
@@ -128,14 +129,6 @@ pub fn watch_verdict(
 }
 
 /// 保留尾部的截断（长任务的结局在屏幕最下面）。
-fn keep_tail(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        return s.to_string();
-    }
-    format!("（前略）{}", s.chars().skip(n - max).collect::<String>())
-}
-
 fn head(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -198,11 +191,12 @@ pub fn render_feedback(
     // 表头已占的长度之外，剩下的给尾部与 extra（至少留一点，免得头太长时什么都不剩）
     let room = max_chars.saturating_sub(s.chars().count() + 40).max(200);
     let (tail_room, extra_room) = if extra.is_empty() { (room, 0) } else { (room / 2, room - room / 2) };
-    s.push_str(&keep_tail(&tail, tail_room));
+    // 首尾都留（报错常在开头、结论在结尾），中间省略并标明字数
+    s.push_str(&head_tail_chars(&tail, tail_room));
     s.push('\n');
     if !extra.is_empty() {
         s.push_str("命中期间的新输出（尾部）：\n");
-        s.push_str(&keep_tail(extra, extra_room.saturating_sub(20).max(100)));
+        s.push_str(&head_tail_chars(extra, extra_room.saturating_sub(60).max(100)));
         s.push('\n');
     }
     s
@@ -327,9 +321,10 @@ mod tests {
         let tail: String = (0..5000).map(|i| format!("line{i}\n")).collect();
         let fb = render_feedback("s1", Reason::Timeout, 61_000, None, &tail, "", 500);
         assert!(fb.contains("line4999"));
-        assert!(!fb.contains("line0\n"));
+        assert!(fb.contains("line0\n"), "开头也保留");
+        assert!(!fb.contains("line2500\n"));
         assert!(fb.chars().count() < 1_000);
-        assert!(fb.contains("前略"));
+        assert!(fb.contains("中间省略"));
     }
 
     #[test]

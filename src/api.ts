@@ -7,6 +7,10 @@ import type {
   AgentDonePayload,
   AgentExecResult,
   AgentRunRequest,
+  HostBudgetGrant,
+  HostCardReply,
+  HostStartRequest,
+  HostStatus,
   AgentScreenRequest,
   AgentSecretRequest,
   AgentStep,
@@ -321,6 +325,26 @@ export const api = {
    * 与 `agentAsk` 的分工：这条会真在终端里跑命令。
    */
   agentRun: (request: AgentRunRequest) => invoke<void>("agent_run", { request }),
+
+  // ——— 统一托管：任务在后端常驻，命令立即返回，相位走 `onHost` / `onHostAll` ———
+
+  /** 开始托管：先拿终端租约再签契约，起任务后立即返回 contractId */
+  hostStart: (req: HostStartRequest) => invoke<string>("host_start", { ...req }),
+  /** 停止托管（进入「已停止」并释放终端）；返回是否确实停了一个在跑的 */
+  hostStop: (contractId: string, sendCtrlC?: boolean) =>
+    invoke<boolean>("host_stop", { contractId, sendCtrlC: sendCtrlC ?? false }),
+  /** 答复卡片（问题 / 审批）。卡片已处理过会 reject */
+  hostAnswer: (contractId: string, reply: HostCardReply) =>
+    invoke<void>("host_answer", { contractId, reply }),
+  hostTakeover: (contractId: string) => invoke<void>("host_takeover", { contractId }),
+  hostHandback: (contractId: string) => invoke<void>("host_handback", { contractId }),
+  hostPause: (contractId: string) => invoke<void>("host_pause", { contractId }),
+  /** 加预算继续：只有暂停时有效 */
+  hostResume: (contractId: string, budget?: HostBudgetGrant) =>
+    invoke<void>("host_resume", { contractId, budget: budget ?? null }),
+  hostStatus: (contractId: string) => invoke<HostStatus | null>("host_status", { contractId }),
+  hostList: () => invoke<HostStatus[]>("host_list"),
+
   /**
    * 中止该会话正在进行的一轮。幂等。
    * `sendCtrlC` 为真时同时给被驾驶的会话发 Ctrl-C（打断前台进程）；停止后控制权回到用户。
@@ -619,6 +643,19 @@ export async function onAgentError(
  * Agentic 一轮里发生的每一步：下令 / 执行结果 / 被跳过 / 提示 / 最终结论。
  * 与 token/done 是两条并行的线：这里送过程，那边送说了什么话。
  */
+/** 某个托管任务的相位变化（含卡片） */
+export async function onHost(
+  contractId: string,
+  handler: (st: HostStatus) => void
+): Promise<UnlistenFn> {
+  return listen<HostStatus>(`nx://host/${contractId}`, (ev) => handler(ev.payload));
+}
+
+/** 所有托管任务的相位变化（面板的总表） */
+export async function onHostAll(handler: (st: HostStatus) => void): Promise<UnlistenFn> {
+  return listen<HostStatus>("nx://host/all", (ev) => handler(ev.payload));
+}
+
 export async function onAgentStep(
   id: string,
   handler: (step: AgentStep) => void

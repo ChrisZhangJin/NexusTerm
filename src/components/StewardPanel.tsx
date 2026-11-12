@@ -26,7 +26,10 @@ import type {
   AgentMessage,
   AgentSecretRequest,
   AgentTarget,
+  HostStatus,
 } from "../types";
+import HostCard from "./HostCard";
+import { hostPill, isTerminal } from "../lib/host";
 import { pendingPrompts } from "../lib/agentRun";
 import {
   BUDGET_EXHAUSTED_BANNER,
@@ -84,6 +87,10 @@ import StewardContext from "./StewardContext";
  * 本页不自己订阅任何 agent 事件，也不自己调 agent_approve / agent_secret_ack。
  */
 export interface StewardRunBridge {
+  /** 托管那一轮对应的托管任务（相位 / 卡片），没有为 null */
+  host: HostStatus | null;
+  /** 任意终端上的托管任务（终端列表里的胶囊用） */
+  hostFor: (consoleId: string) => HostStatus | null;
   /** 托管那一轮发起在哪个终端（最近一次托管；非托管起手的一轮为 null） */
   session: string | null;
   /** 托管那一轮此刻正在跑 */
@@ -103,11 +110,12 @@ export interface StewardRunBridge {
   driving: boolean;
   stopCtrlC: boolean;
   toggleStopCtrlC: (on: boolean) => void;
-  /** 起一轮托管；整轮跑完才 resolve（调用方不要 await 它） */
-  start: (sessionId: string, goal: string, budget?: StewardBudgetPref) => Promise<void>;
+  /** 开始托管（`host_start`）：后端起好任务就 resolve，失败会作为错误消息出现在实况里 */
+  start: (sessionId: string, goal: string, budget?: StewardBudgetPref, tier?: string) => Promise<void>;
   cancel: () => Promise<void>;
   pause: () => Promise<void>;
-  resume: () => Promise<void>;
+  /** 加预算继续：给了预算偏好就按它换一份新上限 */
+  resume: (budget?: StewardBudgetPref) => Promise<void>;
   takeover: () => void;
   handback: () => void;
   decide: (req: AgentApproveRequest, approved: boolean) => Promise<void>;
@@ -470,24 +478,19 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
   });
 
   /**
-   * 开始托管 = ① 契约（让前端开始为这个终端上报屏幕帧 —— 眼睛）+ ② 起一轮 steward 模式的 Agent（手和脑）。
-   * 已有契约就沿用（目标 / 档位改过则热更新），不重签：重签会丢掉你调过的授权。
+   * 开始托管 = 后端 `host_start`：先拿这个终端的租约，再签契约（前端据此开始上报屏幕帧 —— 眼睛），
+   * 最后起常驻的托管任务（手和脑）。顺序在后端保证：契约出现时守护进程已经看得到租约，只会观察。
+   * 托管任务只有完成 / 失败 / 停止才结束；问你问题、你接管、预算用尽都只是挂起。
    */
   const startHosting = async () => {
     if (!selected || !goal.trim() || busy || run.active || run.otherBusy || !run.ready) return;
     setBusy(true);
     try {
-      if (!contract) await stewardApi.start(selected, goal.trim(), tier);
-      else if (formDirty) await stewardApi.amend(contract.id, goal.trim(), tier);
+      await run.start(selected, goal.trim(), budgetPref, tier);
       await refresh();
-    } catch (e) {
-      setErr(`开始托管失败：${String(e)}`);
+    } finally {
       setBusy(false);
-      return;
     }
-    setBusy(false);
-    // 整轮跑完才 resolve：不 await，实况由 run.messages 推过来；失败会作为错误消息出现在实况里
-    void run.start(selected, goal.trim(), budgetPref);
   };
 
   /** 停止托管：先停这一轮 Agent（幂等），再把契约一并停掉 —— 否则零 LLM 的 Steward 会接着在该终端上动手 */
@@ -618,6 +621,8 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
   /** 托管那一轮发起在当前选中的终端上：实况与控制键才在这里显示 */
   const runHere = run.session !== null && run.session === selected;
   const promptsPending = runHere ? pendingPrompts(run.messages) : 0;
+  /** 选中终端上的托管任务（含刚结束的结局） */
+  const selectedHost = selected ? run.hostFor(selected) : null;
   /** 状态行：AI 托管在跑时说「它现在在干什么」，否则回落到规则式 Steward 的状态 */
   const runStatus: { text: string; tone: "idle" | "active" | "warn" } =
     run.active && !runHere
@@ -784,8 +789,8 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
           ) : (
             <>
               {run.paused ? (
-                <button className="st-btn primary" onClick={() => void run.resume()} title="同一段上下文、换一份新预算接着做">
-                  继续
+                <button className="st-btn primary" onClick={() => void run.resume(budgetPref)} title="同一段上下文、换一份新预算接着做">
+                  加预算继续
                 </button>
               ) : run.userPaused ? (
                 <button className="st-btn primary" onClick={run.handback} title="把终端交还给 AI，它从暂停处继续">
@@ -816,8 +821,8 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
         {runHere && run.active && run.paused && isBudgetPause(run.pauseKind) && (
           <div className="st-budget-banner" role="alert">
             <span>{BUDGET_EXHAUSTED_BANNER}</span>
-            <button className="st-btn primary" onClick={() => void run.resume()} title="同一段上下文、换一份新预算接着做">
-              继续
+            <button className="st-btn primary" onClick={() => void run.resume(budgetPref)} title="同一段上下文、换一份新预算接着做">
+              加预算继续
             </button>
             <button className="st-btn danger" disabled={busy} onClick={() => void stopHosting()}>
               停止
@@ -851,6 +856,16 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
       </div>
 
       {(err || run.error) && <div className="st-err">{err ?? run.error}</div>}
+
+      {/* 选中终端上的托管：胶囊 + 等你回答 / 批准的卡片（永远等下去，没有倒计时） */}
+      {selectedHost && (
+        <HostCard
+          status={selectedHost}
+          label={label(selectedHost.consoleId)}
+          grant={{ maxSteps: budgetPref.maxSteps, maxMinutes: budgetPref.maxMinutes }}
+          stopCtrlC={run.stopCtrlC}
+        />
+      )}
 
       {runHere && (run.active || run.messages.length > 0) && (
         <div className="st-run">
@@ -890,6 +905,8 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
         {consoles.length === 0 && <div className="st-empty">还没有检测到终端</div>}
         {consoles.map((c) => {
           const cs = runtime?.consoles.find((x) => x.consoleId === c.id);
+          const h = run.hostFor(c.id);
+          const pill = h && !isTerminal(h.phase) ? hostPill(h.phase) : null;
           return (
             <button
               key={c.id}
@@ -902,6 +919,7 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
             >
               <span className={`st-dot${c.alive ? " live" : ""}`} />
               <span className="st-name">{label(c.id)}</span>
+              {pill && <span className={`st-badge host-pill ${pill.tone}`}>{pill.label}</span>}
               <span className="st-badge">{c.kind}</span>
               {c.alt && <span className="st-badge alt">全屏</span>}
               {c.status !== "none" && (

@@ -1,22 +1,25 @@
 //! 统一托管引擎（设计见 `docs/nexus-host-unified-design.md`）。
 //!
-//! 本目录目前只有**纯逻辑**：生命周期状态机（`phase`）、授权闸门（`gate`）、看门狗（`watchdog`）、
-//! 契约上下文渲染（`context`）、可落盘现场（`checkpoint`）。它们都不碰 Tauri / PTY / SQLite，
-//! 由后续 PR 接进 `act::run(RunMode::Hosted)`。`HostSupervisor` 现在只是登记表骨架，不起任务。
+//! 纯逻辑：生命周期状态机（`phase`）、授权闸门（`gate`）、看门狗（`watchdog`）、
+//! 契约上下文渲染（`context`）、可落盘现场（`checkpoint`）；控制流（`driver`：收件箱 + 挂起 + 副作用）
+//! 也不碰 Tauri，副作用经 `HostIo` 落地。接线在 `act::run(RunMode::Hosted)` 与 `host_cmd.rs`。
 #![allow(dead_code)]
 
 pub mod checkpoint;
 pub mod context;
+pub mod driver;
 pub mod gate;
 pub mod phase;
 pub mod watchdog;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-pub use phase::{step, Effect, HostEvent, HostPhase};
+pub use driver::{HostIo, HostShared, ParkEnd};
+pub use phase::{HostEvent, HostPhase};
 
 /// 托管运行的 id 前缀：`host:{contract_id}`，避免和同一 tab 上的对话运行在 `begin()` 处冲突。
 pub const RUN_ID_PREFIX: &str = "host:";
@@ -209,6 +212,8 @@ pub enum PauseCause {
     Budget { reason: String },
     Deadline,
     User,
+    /// 模型服务重试用尽（限流 / 5xx / 超时）。和预算暂停一样只能由用户「继续」离开
+    LlmDown { error: String },
 }
 
 /// 用户「加预算继续」时给的新上限；`None` 字段 = 不变。
@@ -223,11 +228,14 @@ pub struct BudgetGrant {
     pub max_output_chars: Option<u64>,
 }
 
-/// 托管任务登记表骨架。PR4 起由它 `app.manage()`、按契约起 tokio task；
-/// 现在只登记相位、按 `phase::step` 迁移，不 spawn 任何东西。
+/// 托管任务登记表（挂在 `ActRuntime.host` 上）：契约 id → 运行中的托管任务。
+///
+/// 命令层经它找到任务投事件；`gate_drive` / `request_approval` / `user_control` 经它判断
+/// 某个运行 id（`host:{contract_id}`）或 console 是否在托管下。终态的任务留在表里给 UI 看结局，
+/// 同一 console 再开托管时清掉。
 #[derive(Default)]
 pub struct HostSupervisor {
-    phases: Mutex<HashMap<String, HostPhase>>,
+    runs: Mutex<HashMap<String, Arc<HostShared>>>,
 }
 
 impl HostSupervisor {
@@ -235,25 +243,53 @@ impl HostSupervisor {
         Self::default()
     }
 
-    pub fn register(&self, contract_id: &str, phase: HostPhase) {
-        self.phases.lock().insert(contract_id.to_string(), phase);
+    /// 登记一个新任务。同一 console 上已结束的旧任务一并清掉。
+    pub fn register(&self, shared: Arc<HostShared>) {
+        let mut map = self.runs.lock();
+        map.retain(|_, h| !(h.console_id == shared.console_id && h.is_terminal()));
+        map.insert(shared.contract_id().to_string(), shared);
+    }
+
+    pub fn get(&self, contract_id: &str) -> Option<Arc<HostShared>> {
+        self.runs.lock().get(contract_id).cloned()
     }
 
     pub fn phase(&self, contract_id: &str) -> Option<HostPhase> {
-        self.phases.lock().get(contract_id).cloned()
+        self.get(contract_id).map(|h| h.phase())
     }
 
-    pub fn remove(&self, contract_id: &str) -> Option<HostPhase> {
-        self.phases.lock().remove(contract_id)
+    pub fn remove(&self, contract_id: &str) -> Option<Arc<HostShared>> {
+        self.runs.lock().remove(contract_id)
     }
 
-    /// 迁移一个契约的相位；非法事件不改状态。
-    pub fn apply(&self, contract_id: &str, ev: HostEvent) -> Result<Vec<Effect>, String> {
-        let mut map = self.phases.lock();
-        let cur = map.get(contract_id).ok_or_else(|| format!("没有托管契约 {contract_id}"))?;
-        let (next, effects) = step(cur, ev).map_err(|e| e.to_string())?;
-        map.insert(contract_id.to_string(), next);
-        Ok(effects)
+    pub fn all(&self) -> Vec<Arc<HostShared>> {
+        let mut v: Vec<_> = self.runs.lock().values().cloned().collect();
+        v.sort_by(|a, b| a.contract_id().cmp(b.contract_id()));
+        v
+    }
+
+    /// 按运行 id（`host:…`）或 console id 找**未结束**的托管任务。
+    pub fn live(&self, id: &str) -> Option<Arc<HostShared>> {
+        self.runs
+            .lock()
+            .values()
+            .find(|h| !h.is_terminal() && (h.run_id() == id || h.console_id == id))
+            .cloned()
+    }
+
+    /// 这个 console 上有没有未结束的托管。
+    pub fn live_on_console(&self, console_id: &str) -> Option<Arc<HostShared>> {
+        self.runs
+            .lock()
+            .values()
+            .find(|h| !h.is_terminal() && h.console_id == console_id)
+            .cloned()
+    }
+
+    /// 立即迁移一个契约的相位（命令层用，比如「停止」要马上生效）；非法事件不改状态。
+    pub fn apply(&self, contract_id: &str, ev: HostEvent) -> Result<HostPhase, String> {
+        let h = self.get(contract_id).ok_or_else(|| format!("没有托管契约 {contract_id}"))?;
+        h.apply(ev).map_err(|e| e.to_string())
     }
 }
 
@@ -301,12 +337,19 @@ mod tests {
     #[test]
     fn supervisor_applies_and_rejects() {
         let s = HostSupervisor::new();
-        s.register("c", HostPhase::Running);
-        assert!(s.apply("c", HostEvent::Handback).is_err());
-        assert_eq!(s.phase("c"), Some(HostPhase::Running));
-        s.apply("c", HostEvent::Stop).unwrap();
-        assert_eq!(s.phase("c"), Some(HostPhase::Stopped));
+        let (h, _io) = driver::tests::shared();
+        s.register(h);
+        assert!(s.apply("c1", HostEvent::Handback).is_err());
+        assert_eq!(s.phase("c1"), Some(HostPhase::Running));
+        assert!(s.live("host:c1").is_some() && s.live("t1").is_some());
+        s.apply("c1", HostEvent::Stop).unwrap();
+        assert_eq!(s.phase("c1"), Some(HostPhase::Stopped));
+        assert!(s.live("host:c1").is_none(), "终态不算在托管");
         assert!(s.apply("nope", HostEvent::Stop).is_err());
+        // 同一 console 再开：旧的终态记录被清掉
+        let (h2, _io) = driver::tests::shared();
+        s.register(h2);
+        assert_eq!(s.all().len(), 1);
     }
 
     #[test]

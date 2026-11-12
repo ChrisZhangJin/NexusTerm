@@ -75,6 +75,8 @@ pub enum HostEvent {
     BudgetExhausted(String),
     /// 意向 deadline 到了
     DeadlineReached,
+    /// 模型服务重试用尽；参数是给人看的错误摘要
+    LlmDown(String),
     /// 用户点了「暂停」
     Pause,
     /// 只能由用户触发：「加预算继续」/「继续」
@@ -103,6 +105,7 @@ impl HostEvent {
             Self::Answer(_) => "answer",
             Self::BudgetExhausted(_) => "budget_exhausted",
             Self::DeadlineReached => "deadline_reached",
+            Self::LlmDown(_) => "llm_down",
             Self::Pause => "pause",
             Self::Resume { .. } => "resume",
             Self::Restart => "restart",
@@ -220,6 +223,9 @@ pub fn step(phase: &HostPhase, ev: HostEvent) -> Result<(HostPhase, Vec<Effect>)
             moved(P::Paused { cause: PauseCause::Budget { reason: r.clone() } }, vec![])
         }
         (P::Running, E::DeadlineReached) => moved(P::Paused { cause: PauseCause::Deadline }, vec![]),
+        (P::Running, E::LlmDown(e)) => {
+            moved(P::Paused { cause: PauseCause::LlmDown { error: e.clone() } }, vec![])
+        }
         (P::Running, E::Pause) => moved(P::Paused { cause: PauseCause::User }, vec![]),
         (P::Paused { .. }, E::Resume { new_budget }) => {
             let fx = new_budget.map(Effect::ApplyBudget).into_iter().collect();
@@ -333,6 +339,7 @@ mod tests {
             HostEvent::Answer(reply("k1", "好", None)),
             HostEvent::BudgetExhausted("步数".into()),
             HostEvent::DeadlineReached,
+            HostEvent::LlmDown("429".into()),
             HostEvent::Pause,
             HostEvent::Resume { new_budget: None },
             HostEvent::Restart,
@@ -412,6 +419,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn llm_down_pauses_and_only_resume_leaves() {
+        let (p, fx) = step(&HostPhase::Running, HostEvent::LlmDown("429".into())).unwrap();
+        assert_eq!(p, HostPhase::Paused { cause: PauseCause::LlmDown { error: "429".into() } });
+        assert!(!fx.contains(&Effect::ReleaseLease));
+        assert!(step(&p, HostEvent::Handback).is_err());
+        assert!(step(&p, HostEvent::Answer(reply("k1", "x", None))).is_err());
+        assert_eq!(next(&p, HostEvent::Resume { new_budget: None }), HostPhase::Running);
     }
 
     #[test]
