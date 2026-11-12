@@ -10,6 +10,8 @@ import type {
   HostBudgetGrant,
   HostCardReply,
   HostCheck,
+  HostConsoleHint,
+  HostReattachCandidate,
   HostNotice,
   HostStartRequest,
   HostStatus,
@@ -349,6 +351,12 @@ export const api = {
   /** 接受（编辑后的）完成判据草稿，托管随即开跑 */
   hostConfirmCriteria: (contractId: string, cardId: string, checks: HostCheck[]) =>
     invoke<void>("host_confirm_criteria", { contractId, cardId, checks }),
+  /** 「待重新接驳」卡的候选 tab（按相似度排好） */
+  hostReattachCandidates: (contractId: string, candidates: HostConsoleHint[]) =>
+    invoke<HostReattachCandidate[]>("host_reattach_candidates", { contractId, candidates }),
+  /** 确认接驳：接到某个 tab，或按保存的记录新开连接 */
+  hostReattach: (contractId: string, consoleId: string | null, openNew = false) =>
+    invoke<void>("host_reattach", { contractId, consoleId, openNew }),
   /** 改契约（目标 / 档位），不重启运行 */
   hostAmend: (contractId: string, goal?: string, authorityTier?: string) =>
     invoke<void>("host_amend", { contractId, goal: goal ?? null, authorityTier: authorityTier ?? null }),

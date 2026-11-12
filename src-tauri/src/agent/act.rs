@@ -3462,6 +3462,13 @@ pub async fn run(
         trace::record(&session, 0, "question", &req.question);
     }
     let mut step = 0usize;
+    // 重启 / 换 console 接驳：接着重启前的对话与步数跑（「先读屏」的话和强制读屏由接驳副作用带进来）
+    if let Some(seed) = host.as_ref().and_then(|h| h.take_seed()) {
+        if !seed.messages.is_empty() {
+            messages = seed.messages;
+            step = seed.step;
+        }
+    }
     let mut feedback = String::new();
     // 运行预算（4.6）：自本轮开始 / 最近一次「继续」起累计；用尽即暂停等用户，不是收场。
     let mut limits = effective_budget(cfg.budget, req);
@@ -3525,15 +3532,33 @@ pub async fn run(
         // 托管：先处理收件箱（运行期间用户按的键 / 点的「暂停」），不在 Running 就挂起到回来
         if let Some(h) = &host {
             h.set_spent(meter.contract_spent());
-            h.note_progress(&messages, step);
             h.drain();
+            // 要挂起了（人在驾驶 / 暂停 / 等人）：先把最新对话记进快照，迁移时落盘的才是它
+            if h.phase() != super::host::HostPhase::Running {
+                h.flush_progress(&messages, step);
+            }
             match h.park().await {
                 ParkEnd::Running => {}
                 _ => break,
             }
             absorb_host_pending(h, &mut messages, &mut feedback, &mut meter, &mut limits);
+            // 重启 / 换 console 接驳后的第一步：先读屏核对现场（结果并进这一步的反馈）
+            if h.take_force_screen() {
+                feedback.push_str(&reattach_screen_feedback(&situation_now(app, state, &h.console_id, false)));
+            }
+            // 重启前挂着的审批卡在重启后被答了：等它的那次写入已经不在了，告诉模型结论让它重发
+            for (_, ok) in h.take_stale_approvals() {
+                feedback.push_str(if ok {
+                    "（重启前等你批准的那个动作已获批准，但它没有执行；如仍需要请重新发起。）\n"
+                } else {
+                    "（重启前等批准的那个动作被拒绝了，没有执行。）\n"
+                });
+            }
             // 托管的 console 没了（tab 关了）：挂起（ConsoleGone），不再请模型往一个不存在的终端写
-            if !session_alive(state, &h.console_id) && h.console_gone() {
+            if !session_alive(state, &h.console_id) && {
+                h.flush_progress(&messages, step);
+                h.console_gone()
+            } {
                 emit_step(
                     app,
                     &session,
@@ -3586,6 +3611,7 @@ pub async fn run(
                     HostEvent::BudgetExhausted(r) => r.clone(),
                     _ => String::new(),
                 };
+                h.flush_progress(&messages, step);
                 let _ = h.apply(ev);
                 emit_step(
                     app,
@@ -3864,6 +3890,7 @@ pub async fn run(
             }
             // 托管：没有动作的回复不是结束，按 nx_ask_user(text) 处理 —— 挂起等用户答复
             if let Some(h) = &host {
+                h.flush_progress(&messages, step);
                 if !park_on_no_action(h, &text, &mut messages, &mut feedback).await {
                     break;
                 }
@@ -3933,7 +3960,8 @@ pub async fn run(
                         }
                         _ => None,
                     };
-                    let (verdict, refused) = hosted_authorize(h, &ctx, &action, &text, sit.as_ref()).await;
+                    let (verdict, refused) =
+                        hosted_authorize(h, &ctx, &action, &text, sit.as_ref(), || h.flush_progress(&messages, step)).await;
                     for u in h.take_user() {
                         push_user(&mut messages, u);
                     }
@@ -3965,6 +3993,7 @@ pub async fn run(
                         finished = true;
                         break;
                     };
+                    h.flush_progress(&messages, step);
                     if !host_ask(h, hosted_card(&question, options, recommendation), &mut messages).await {
                         finished = true;
                     }
@@ -5282,8 +5311,8 @@ pub async fn run(
             // 每个「动作 + 反馈」周期之后落一次现场（含契约级花费）
             meter.tick();
             h.set_spent(meter.contract_spent());
-            h.note_progress(&messages, step);
-            h.checkpoint_now();
+            // 周期快照：距上次 ≥30s 且对话变了才克隆历史落盘（不是每步都克隆）
+            h.tick_progress(&messages, step);
         }
         if finished {
             break;
@@ -5450,6 +5479,16 @@ fn keys_recheck(judged: &super::situation::Situation, now: &super::situation::Si
     super::situation::materially_changed(judged, now).map(|why| format!("等待期间屏幕局面变了：{why}"))
 }
 
+/// 接驳后强制读屏的结果（喂给模型）。屏幕尾部已脱敏（出网前还会再过一遍闸门）。
+fn reattach_screen_feedback(sit: &super::situation::Situation) -> String {
+    format!(
+        "（接驳后读屏）当前局面：kind={} program={}\n屏幕尾部：\n{}\n请先核对这是不是重启前的现场，再决定下一步。\n",
+        sit.kind.as_str(),
+        sit.program.as_str(),
+        tail_chars(sit.tail.trim(), 3000)
+    )
+}
+
 /// 托管写入的强制点：`gate::authorize` 一次；Approve 就挂起等批准（不设超时）。
 /// 返回 (结论, 拒绝原因)：拒绝原因有值 = 不写，把它反馈给模型。
 async fn hosted_authorize(
@@ -5458,11 +5497,13 @@ async fn hosted_authorize(
     action: &AgentAction,
     text: &str,
     sit: Option<&super::situation::Situation>,
+    before_park: impl FnOnce(),
 ) -> (Gate, Option<String>) {
     let verdict = super::host::gate::authorize(&ctx.policy(), action, sit);
     let refused = match &verdict {
         Gate::Deny(why) => Some(why.clone()),
         Gate::Approve(reasons) => {
+            before_park();
             let ok = h.approve(hosted_approval_card(text, reasons)).await;
             (!ok).then(|| "用户没有批准，没有写入。换一个做法，或用 nx_ask_user 问清楚".to_string())
         }
@@ -5764,10 +5805,10 @@ mod tests {
         let (h, io) = super::super::host::driver::tests::shared();
         let mut ctx = ctx_with("auto");
         ctx.authority.deny = vec!["delete".into(), "shutdown".into()];
-        let (g, why) = hosted_authorize(&h, &ctx, &exec("rm -rf build"), "rm -rf build", None).await;
+        let (g, why) = hosted_authorize(&h, &ctx, &exec("rm -rf build"), "rm -rf build", None, || {}).await;
         assert!(matches!(g, Gate::Deny(_)) && why.is_some());
         let keys = AgentAction::Keys { target: None, keys: "sudo shutdown -h now<Enter>".into() };
-        let (g, why) = hosted_authorize(&h, &ctx, &keys, "keys", None).await;
+        let (g, why) = hosted_authorize(&h, &ctx, &keys, "keys", None, || {}).await;
         assert!(matches!(g, Gate::Deny(_)) && why.unwrap().contains("shutdown"));
         // 拒绝不出卡、不挂起：相位一直是 Running，也没有任何迁移
         assert_eq!(h.phase(), HostPhase::Running);
@@ -5782,7 +5823,7 @@ mod tests {
         let ctx = ctx_with("approve");
         let h2 = h.clone();
         let c2 = ctx.clone();
-        let task = tokio::spawn(async move { hosted_authorize(&h2, &c2, &exec("ls"), "ls", None).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h2, &c2, &exec("ls"), "ls", None, || {}).await });
         settle().await;
         let card_id = match h.phase() {
             HostPhase::WaitingHuman { card } => {
@@ -5801,7 +5842,7 @@ mod tests {
 
         // 拒绝 → 不写
         let h3 = h.clone();
-        let task = tokio::spawn(async move { hosted_authorize(&h3, &ctx, &exec("ls"), "ls", None).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h3, &ctx, &exec("ls"), "ls", None, || {}).await });
         settle().await;
         let card_id = match h.phase() {
             HostPhase::WaitingHuman { card } => card.id,
@@ -5831,9 +5872,9 @@ mod tests {
         };
         ctx.hard = super::super::host::gate::HardRule::from_prefs(&[pref]);
         assert_eq!(ctx.hard.len(), 1);
-        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout main"), "x", None).await;
+        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout main"), "x", None, || {}).await;
         assert!(matches!(g, Gate::Deny(ref w) if w.contains("p-main")), "{g:?}");
-        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout dev"), "x", None).await;
+        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout dev"), "x", None, || {}).await;
         assert_eq!(g, Gate::Allow);
     }
 
@@ -5843,12 +5884,12 @@ mod tests {
         let mut ctx = ctx_with("auto");
         ctx.authority.host_scope = vec!["ssh:prod-db".into()];
         // 被托管的是 local:t1，不在契约的主机范围里
-        let (g, why) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None).await;
+        let (g, why) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None, || {}).await;
         assert!(matches!(g, Gate::Deny(_)), "{g:?}");
         assert!(why.is_some());
         // 认不出主机（host_key 为空）同样拒
         ctx.contract.host_key = String::new();
-        let (g, _) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None).await;
+        let (g, _) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None, || {}).await;
         assert!(matches!(g, Gate::Deny(_)));
     }
 
@@ -5877,7 +5918,7 @@ mod tests {
         let judged = screen(K::AwaitingInput, "Input: ");
         let keys = AgentAction::Keys { target: None, keys: "ls<Enter>".into() };
         let (h2, j2, k2) = (h.clone(), judged.clone(), keys.clone());
-        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, &k2, "ls", Some(&j2)).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, &k2, "ls", Some(&j2), || {}).await });
         settle().await;
         let card_id = match h.phase() {
             HostPhase::WaitingHuman { card } => card.id,

@@ -9,7 +9,14 @@ import { useEffect, useState } from "react";
 import { api, onHostNotify } from "../api";
 import { toFriendlyError } from "../lib/errors";
 import { checksToText, hostButtons, hostDetail, hostPill, isTerminal, pendingCard, textToChecks } from "../lib/host";
-import type { HostBudgetGrant, HostCardReply, HostNotice, HostStatus } from "../types";
+import type {
+  AgentTarget,
+  HostBudgetGrant,
+  HostCardReply,
+  HostNotice,
+  HostReattachCandidate,
+  HostStatus,
+} from "../types";
 
 export interface HostCardProps {
   status: HostStatus;
@@ -19,9 +26,11 @@ export interface HostCardProps {
   grant?: HostBudgetGrant;
   /** 停止时同时发 Ctrl-C */
   stopCtrlC?: boolean;
+  /** 开着的 tab（待重新接驳时给候选排序用） */
+  tabs?: AgentTarget[];
 }
 
-export default function HostCard({ status, label, grant, stopCtrlC }: HostCardProps) {
+export default function HostCard({ status, label, grant, stopCtrlC, tabs = [] }: HostCardProps) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -31,6 +40,24 @@ export default function HostCard({ status, label, grant, stopCtrlC }: HostCardPr
   const btn = hostButtons(status.phase);
   const cid = status.contractId;
   const live = !isTerminal(status.phase);
+  // 待重新接驳：开着的 tab 交给后端按相似度排序（host_key → SSH 记录 → 标签 → cwd）
+  const [cands, setCands] = useState<HostReattachCandidate[]>([]);
+  const tabKey = tabs.map((t) => t.id).join("|");
+  useEffect(() => {
+    if (!btn.reattach) return;
+    let gone = false;
+    api
+      .hostReattachCandidates(
+        cid,
+        tabs.map((t) => t.hint ?? { consoleId: t.id, label: t.label })
+      )
+      .then((c) => !gone && setCands(c))
+      .catch(() => !gone && setCands([]));
+    return () => {
+      gone = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cid, btn.reattach, tabKey]);
   // 判据草稿：一行一条，可改；换了一张卡就重置
   const draft = card?.kind.kind === "criteriaDraft" ? card.kind.draft : null;
   const [criteria, setCriteria] = useState("");
@@ -98,6 +125,41 @@ export default function HostCard({ status, label, grant, stopCtrlC }: HostCardPr
         </span>
       </div>
       {detail && <div className="st-esc-why">{detail}</div>}
+      {status.notice && <div className="st-status warn">{status.notice}</div>}
+
+      {btn.reattach && (
+        <div className="st-esc host-ask">
+          <div className="st-esc-head">
+            {status.phase.kind === "suspended" && status.phase.reason === "consoleGone"
+              ? "被托管的终端已经关闭"
+              : "应用重启了，托管停在这里"}
+          </div>
+          <div className="st-esc-why">
+            选一个终端接回去（按和原来的相似度排序），或按保存的连接新开一个。接回后 AI 会先读屏核对现场；
+            屏幕和原来不一样时会降为「确认」档，每次写入都先问你。
+          </div>
+          {cands.length === 0 && <div className="st-esc-why">没有找到相似的终端。</div>}
+          <div className="st-form-row st-center">
+            {cands.map((c) => (
+              <button
+                key={c.consoleId}
+                className="st-btn"
+                disabled={busy}
+                onClick={() => void act(() => api.hostReattach(cid, c.consoleId))}
+                title={`相似度 ${c.score}`}
+              >
+                接到「{c.label}」
+              </button>
+            ))}
+            <button className="st-btn primary" disabled={busy} onClick={() => void act(() => api.hostReattach(cid, null, true))}>
+              打开新连接
+            </button>
+            <button className="st-btn danger" disabled={busy} onClick={() => void act(() => api.hostStop(cid, false))}>
+              放弃
+            </button>
+          </div>
+        </div>
+      )}
 
       {live && (
         <div className="st-form-row st-center">
@@ -258,7 +320,7 @@ export default function HostCard({ status, label, grant, stopCtrlC }: HostCardPr
               暂停
             </button>
           )}
-          {btn.stop && (
+          {btn.stop && !btn.reattach && (
             <button className="st-btn danger" disabled={busy} onClick={() => void act(() => api.hostStop(cid, stopCtrlC))}>
               停止
             </button>

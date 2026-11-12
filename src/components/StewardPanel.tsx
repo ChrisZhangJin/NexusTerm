@@ -29,7 +29,7 @@ import type {
   HostStatus,
 } from "../types";
 import HostCard from "./HostCard";
-import { hostPill, isTerminal } from "../lib/host";
+import { hostPill, isTerminal, needsReattach } from "../lib/host";
 import { pendingPrompts } from "../lib/agentRun";
 import {
   BUDGET_EXHAUSTED_BANNER,
@@ -91,6 +91,8 @@ export interface StewardRunBridge {
   host: HostStatus | null;
   /** 任意终端上的托管任务（终端列表里的胶囊用） */
   hostFor: (consoleId: string) => HostStatus | null;
+  /** 等重新接驳的托管（重启后 / 终端关了） */
+  awaitingReattach: HostStatus[];
   /** 托管那一轮发起在哪个终端（最近一次托管；非托管起手的一轮为 null） */
   session: string | null;
   /** 托管那一轮此刻正在跑 */
@@ -872,8 +874,13 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
 
       {(err || run.error) && <div className="st-err">{err ?? run.error}</div>}
 
+      {/* 待重新接驳：重启后 console id 都变了，不跟选中的终端走，全部列出；接驳要你确认 */}
+      {run.awaitingReattach.map((h) => (
+        <HostCard key={h.contractId} status={h} label={h.label} tabs={sessions} stopCtrlC={run.stopCtrlC} />
+      ))}
+
       {/* 选中终端上的托管：胶囊 + 等你回答 / 批准的卡片（永远等下去，没有倒计时） */}
-      {selectedHost && (
+      {selectedHost && !needsReattach(selectedHost.phase) && (
         <HostCard
           status={selectedHost}
           label={label(selectedHost.consoleId)}

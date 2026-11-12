@@ -732,6 +732,12 @@ pub(crate) fn restore_checkpoints(
     let mut seen: Vec<String> = Vec::new();
     let mut restored = Vec::new();
     for (contract_id, console_id, _state, raw) in store.steward_checkpoints() {
+        // 统一托管（host_start）签的契约由 host_sessions 的启动扫描接管（挂起 → 用户确认接驳），
+        // 旧的守护进程恢复不能再抢同一份契约，否则又是两个写者
+        if store.host_session_get(&contract_id).is_some() {
+            store.steward_checkpoint_state(&contract_id, "completed").ok();
+            continue;
+        }
         if seen.contains(&console_id) {
             store.steward_checkpoint_state(&contract_id, "completed").ok();
             continue;

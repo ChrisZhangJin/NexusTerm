@@ -372,6 +372,8 @@ export interface AgentMessage {
 export interface AgentTarget {
   id: string;
   label: string;
+  /** 重启后找回这个 console 用的线索（托管时传给后端存进 ConsoleRef） */
+  hint?: HostConsoleHint;
 }
 
 /** `agent_run` 的入参 */
@@ -881,6 +883,27 @@ export interface HostStatus {
   goal: string;
   state: string;
   phase: HostPhase;
+  /** 被托管终端的可读名字 */
+  label: string;
+  /** 给人看的提示（例如接驳后降为确认档的原因） */
+  notice?: string | null;
+}
+
+/** 前端给的 console 线索：后端据此存 ConsoleRef，重启后按它给候选 tab 排序 */
+export interface HostConsoleHint {
+  consoleId: string;
+  label?: string;
+  /** 保存的 SSH 连接记录 id；本地 shell 为空 */
+  sessionRecordId?: string | null;
+  cwd?: string | null;
+  tmux?: string | null;
+}
+
+/** 接驳候选：分数越高越像重启前那个 console */
+export interface HostReattachCandidate {
+  consoleId: string;
+  label: string;
+  score: number;
 }
 
 /** 「加预算继续」的新上限；不给的字段不变 */
@@ -900,6 +923,8 @@ export interface HostStartRequest {
   consoleAlt?: boolean;
   /** YOLO：直接采用模型起草的完成判据，不经确认就开始（不改档位与禁项） */
   yolo?: boolean;
+  /** 重启后找回这个 console 用的线索 */
+  consoleRef?: HostConsoleHint;
 }
 
 /** `nx://host/{contractId}/notify`：通知档写入后的通知卡 */

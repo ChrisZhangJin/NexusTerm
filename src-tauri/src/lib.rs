@@ -208,6 +208,8 @@ pub fn run() {
                 auth_prompts,
                 keys_dir,
             });
+            // 统一托管的启动扫描：未结束的托管一律挂起（AppRestart）待用户确认接驳，不写任何终端
+            agent::host_cmd::boot_scan(app.handle());
             // P1：一个常驻 Supervisor 管所有被托管 console 的状态槽，
             // 面板关闭 / 窗口最小化都不影响它按心跳观察。全程只读、零 LLM。
             agent::steward_loop::spawn_daemon(
@@ -382,6 +384,8 @@ pub fn run() {
             agent::host_cmd::host_confirm_criteria,
             agent::host_cmd::host_amend,
             agent::host_cmd::host_correct,
+            agent::host_cmd::host_reattach,
+            agent::host_cmd::host_reattach_candidates,
             agent::steward::steward_stop,
             agent::steward::steward_status,
             agent::steward::steward_amend,

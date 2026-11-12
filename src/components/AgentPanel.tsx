@@ -22,7 +22,7 @@ import { matchSessions, scanMention } from "../lib/mention";
 import { useAgentHistory } from "../lib/useAgentHistory";
 import { useAgentRun } from "../lib/useAgentRun";
 import { useHostRuns } from "../lib/useHostRuns";
-import { basePhase, hostDetail, hostPauseKind, isTerminal } from "../lib/host";
+import { basePhase, hostDetail, hostPauseKind, isTerminal, needsReattach } from "../lib/host";
 import { stewardApi, stewardConsoleIds } from "../lib/steward";
 import { setStewardConsoles } from "../lib/termRegistry";
 import type { AgentMessage, AgentTarget, Skill, SkillInput } from "../types";
@@ -397,6 +397,8 @@ export function AgentPanel({
         consoleText: snap?.text,
         consoleAlt: snap?.alt,
         budget: budget ? { maxSteps: budget.maxSteps, maxMinutes: budget.maxMinutes } : undefined,
+        // 重启后找回这个终端用（SSH 记录 / 标签 / cwd / tmux）
+        consoleRef: sessions.find((x) => x.id === sid)?.hint,
       });
       // 契约已签：马上让前端开始为这个终端上报屏幕帧（不等托管页的轮询）
       void reconcileStewardConsoles();
@@ -480,6 +482,7 @@ export function AgentPanel({
     driving: hostedLive && (hosted?.phase.kind === "running" || hosted?.phase.kind === "waitingHuman"),
     host: hosted,
     hostFor: hostRuns.forConsole,
+    awaitingReattach: hostRuns.awaitingReattach,
     stopCtrlC: run.stopCtrlC,
     toggleStopCtrlC: run.toggleStopCtrlC,
     start: runSteward,
@@ -598,13 +601,18 @@ export function AgentPanel({
 
       {err && <div className="ap-err">{err}</div>}
 
-      {view === "chat" && hostedHere && !isTerminal(hostedHere.phase) && (
+      {view === "chat" && hostedHere && !isTerminal(hostedHere.phase) && !needsReattach(hostedHere.phase) && (
         <HostCard
           status={hostedHere}
           label={sessions.find((s) => s.id === hostedHere.consoleId)?.label}
           stopCtrlC={run.stopCtrlC}
         />
       )}
+      {/* 等重新接驳的托管（重启后 / 终端关了）：不管在哪个 tab 都摆出来，接驳要你确认 */}
+      {view === "chat" &&
+        hostRuns.awaitingReattach.map((h) => (
+          <HostCard key={h.contractId} status={h} label={h.label} tabs={sessions} stopCtrlC={run.stopCtrlC} />
+        ))}
 
       {ready.ok ? (
         <>
