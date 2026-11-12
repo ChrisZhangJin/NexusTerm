@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::danger;
 use super::decision::{CtxRef, DecisionAction, DecisionRecord, EscalationCard};
 use super::situation::{Choice, Situation, SituationKind};
 
@@ -154,6 +155,86 @@ fn effective_payload(action: &DecisionAction, sit: &Situation) -> String {
     }
 }
 
+/// 这个回答是不是「不批准」：选了 No / 回了 n。拒绝一个危险命令本身不危险。
+fn declines(action: &DecisionAction, sit: &Situation) -> bool {
+    let t = effective_payload(action, sit);
+    let t = t.trim();
+    t == "n"
+        || t == "no"
+        || ["no,", "no ", "no.", "deny", "reject", "cancel", "abort", "否", "拒绝", "取消", "不"]
+            .iter()
+            .any(|p| t.starts_with(p))
+}
+
+/// 授权对话框里**真正被批准的东西**：命令 / 工具调用的原文。
+///
+/// - Claude Code：`Bash command` 标题下面一段（直到空行或 `Do you want…`）；旧版的 `Bash(rm -rf x)`；
+/// - coreutils 的逐个确认：`rm: remove regular file 'x'?` / `rm: descend into directory 'd'?`，
+///   折算成一条 `rm` 命令。
+///
+/// 只看屏幕上**最后**一个对话框：更早的是已经答过的历史。拿不到就返回 `None`，风险按选项文本算。
+pub fn approved_payload(tail: &str) -> Option<String> {
+    let lines: Vec<&str> = tail.lines().map(str::trim).collect();
+    // coreutils：确认句就在光标所在的末几行
+    for l in lines.iter().rev().filter(|l| !l.is_empty()).take(3) {
+        let low = l.to_lowercase();
+        for tool in ["rm", "rmdir"] {
+            let Some(rest) = low.strip_prefix(&format!("{tool}: ")) else {
+                continue;
+            };
+            if rest.starts_with("remove") || rest.starts_with("descend into") {
+                // 文件名在引号里：`'x'` / `‘x’`
+                let target = l.find(['\'', '‘']).and_then(|s| {
+                    let s = s + l[s..].chars().next()?.len_utf8();
+                    let e = l.rfind(['\'', '’'])?;
+                    (e > s).then(|| l[s..e].to_string())
+                });
+                return Some(format!("{tool} -- {}", target.unwrap_or_else(|| "<file>".into())));
+            }
+        }
+    }
+    // 旧版 Claude Code：`Bash(rm -rf build)`
+    if let Some(l) = lines.iter().rev().find(|l| l.starts_with("Bash(") && l.ends_with(')')) {
+        let inner = &l["Bash(".len()..l.len() - 1];
+        if !inner.trim().is_empty() {
+            return Some(inner.trim().to_string());
+        }
+    }
+    const HEADERS: [&str; 4] = ["bash command", "shell command", "run command", "command"];
+    let at = lines
+        .iter()
+        .rposition(|l| HEADERS.contains(&l.to_lowercase().trim_end_matches(':')))?;
+    let body: Vec<&str> = lines[at + 1..]
+        .iter()
+        .copied()
+        .skip_while(|l| l.is_empty())
+        .take_while(|l| {
+            let low = l.to_lowercase();
+            !l.is_empty()
+                && !low.starts_with("do you want")
+                && !low.starts_with("would you like")
+                && !l.starts_with(|c: char| c.is_ascii_digit())
+        })
+        .take(6)
+        .collect();
+    (!body.is_empty()).then(|| body.join("\n"))
+}
+
+/// 被批准的命令过一遍 `danger::assess`（与 Human Approval 模式同一套判据）：危险即 `Destructive`。
+fn approved_command_risk(action: &DecisionAction, sit: &Situation) -> Option<Risk> {
+    if declines(action, sit) {
+        return None;
+    }
+    let cmd = approved_payload(&sit.tail)?;
+    // `Bash command` 下面常跟着一行说明文字（`Remove build directory`）：逐行评估，取最大
+    let dangerous = cmd.lines().any(|l| danger::assess(l).dangerous) || danger::assess(&cmd).dangerous;
+    Some(if dangerous {
+        Risk::Destructive
+    } else {
+        Risk::Reversible
+    })
+}
+
 /// 从动作与局面推断风险。纯函数：同一条决策多次调用结果必须一致。
 /// 有结构化选项时以选项元数据（`grants_permanent`）为准，选项原文的永久特征也算（fail-closed）；
 /// 没有选项可依时才扫动作文本。
@@ -173,6 +254,11 @@ pub fn risk_of(action: &DecisionAction, sit: &Situation) -> Risk {
         return Risk::Permanent;
     }
     if DESTRUCTIVE_TERMS.iter().any(|t| payload.contains(t)) {
+        return Risk::Destructive;
+    }
+    // 批准的是屏幕上那条命令，不是「Yes」两个字：命令本身危险就按危险算（取两者最大）
+    let approved = approved_command_risk(action, sit);
+    if approved == Some(Risk::Destructive) {
         return Risk::Destructive;
     }
     // 权限提示的「本次允许」会改变会话状态，但作用域限于单会话，按可逆处理
@@ -456,7 +542,7 @@ mod tests {
             situation_hash: "abcd1234".into(),
             ctx_refs: Vec::new(),
             candidates: Vec::new(),
-            chosen: DecisionAction { kind: kind.into(), text: text.into(), option_index: idx.map(str::to_string), injectable },
+            chosen: DecisionAction { kind: kind.into(), text: text.into(), option_index: idx.map(str::to_string), injectable, submit: Default::default() },
             rationale: "依据意向".into(),
             confidence: 0.9,
             tier: "auto".into(),
@@ -601,5 +687,63 @@ mod tests {
         assert_eq!(a.max_output_chars, 1_000);
         assert!(a.timebox_ms < u64::MAX);
         assert_eq!(Authority::default().with_tier("???").tier, "notify");
+    }
+
+    // ───────────── 批准的是命令，不是「Yes」───────────────
+
+    fn bash_perm(cmd: &str) -> Situation {
+        let box_line = |t: &str| format!("│ {t:<52} │");
+        let lines = [
+            "╭──────────────────────────────────────────────────────╮".to_string(),
+            box_line("Bash command"),
+            box_line(""),
+            box_line(&format!("  {cmd}")),
+            box_line("  Run the command"),
+            box_line(""),
+            box_line("Do you want to proceed?"),
+            box_line("❯ 1. Yes"),
+            box_line("  2. Yes, and don't ask again for this command"),
+            box_line("  3. No, and tell Claude what to do differently (esc)"),
+            "╰──────────────────────────────────────────────────────╯".to_string(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        super::super::situation::frames::classify_lines(&refs)
+    }
+
+    #[test]
+    fn approving_dangerous_command_is_destructive_not_reversible() {
+        let rm = bash_perm("rm -rf build/");
+        let ls = bash_perm("ls -la");
+        assert_eq!(rm.kind, SituationKind::Permission);
+        assert_eq!(approved_payload(&rm.tail).as_deref().map(|p| p.lines().next().unwrap()), Some("rm -rf build/"));
+        let yes = rec("answer", "本次允许：Yes（不选择永久授权）", Some("1"), true);
+        assert_eq!(risk_of(&yes.chosen, &rm), Risk::Destructive);
+        assert_eq!(risk_of(&yes.chosen, &ls), Risk::Reversible);
+        assert_ne!(risk_of(&yes.chosen, &rm), risk_of(&yes.chosen, &ls));
+        // auto 档也得人确认危险命令；安全命令照常放行
+        let a = Authority::default().with_tier("auto");
+        assert!(matches!(evaluate(&a, &yes, &rm, true), PolicyVerdict::Approve { .. }));
+        assert_eq!(evaluate(&a, &yes, &ls, true), PolicyVerdict::Auto);
+        // 拒绝危险命令（选 No）不危险
+        let no = rec("answer", "No", Some("3"), true);
+        assert_eq!(risk_of(&no.chosen, &rm), Risk::Reversible);
+    }
+
+    #[test]
+    fn coreutils_rm_confirmation_is_destructive() {
+        let s = super::super::situation::frames::classify_lines(&["user@h:~/p$ rm -i notes.txt", "rm: remove regular file 'notes.txt'? "]);
+        assert_eq!(approved_payload(&s.tail).as_deref(), Some("rm -- notes.txt"));
+        let y = rec("answer", "y", None, true);
+        assert_eq!(risk_of(&y.chosen, &s), Risk::Destructive);
+        let n = rec("answer", "n", None, true);
+        assert_ne!(risk_of(&n.chosen, &s), Risk::Destructive);
+    }
+
+    #[test]
+    fn approved_payload_takes_last_dialog_and_old_bash_form() {
+        assert_eq!(approved_payload("Bash(git push origin main)\n❯ 1. Yes").as_deref(), Some("git push origin main"));
+        let two = "Bash command\nrm -rf /tmp/x\n\nDo you want to proceed?\n1. Yes\nBash command\nls\n\nDo you want to proceed?";
+        assert_eq!(approved_payload(two).as_deref(), Some("ls"));
+        assert!(approved_payload("just some output\nDo you want to proceed?").is_none());
     }
 }

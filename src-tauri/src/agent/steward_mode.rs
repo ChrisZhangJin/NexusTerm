@@ -203,6 +203,23 @@ pub fn assess_keys(bytes: &[u8], sit: Option<&Situation>) -> KeysVerdict {
                 return KeysVerdict::Refuse(why);
             }
         }
+        // 授权对话框批准的是屏幕上那条命令（`Bash command` 下的 `rm -rf build/`、`rm: remove … 'x'?`），
+        // 不是「1」这一个键：命令本身危险就要人点头，与 PolicyEngine 的 `approved_payload` 同一判据
+        let dialog = matches!(
+            s.kind,
+            SituationKind::Permission | SituationKind::Question | SituationKind::Menu | SituationKind::AwaitingInput
+        ) && !super::situation::shell_visible(s);
+        if let Some(cmd) = dialog.then(|| super::policy::approved_payload(&s.tail)).flatten() {
+            if !declines(bytes, &visible, s) {
+                let lines: Vec<String> = cmd.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                let reasons = danger_reasons(&lines);
+                if !reasons.is_empty() {
+                    return KeysVerdict::Approve(
+                        reasons.into_iter().map(|r| format!("批准对话框里的命令 {r}")).collect(),
+                    );
+                }
+            }
+        }
         // 没有新鲜屏幕帧：看不到选项，选择动作（数字 / 方向键 / 回车）交给人
         if s.frame_id == 0
             && matches!(s.kind, SituationKind::Permission | SituationKind::Menu)
@@ -325,6 +342,22 @@ fn permanent_pick(bytes: &[u8], visible: &str, s: &Situation) -> Option<String> 
         );
     }
     None
+}
+
+/// 这次按键是不是「不批准」：`n` / `no`、选了文字以 No 开头的编号、只按 Esc / Ctrl-C 之类不提交的键。
+fn declines(bytes: &[u8], visible: &str, s: &Situation) -> bool {
+    let t = visible.trim().to_lowercase();
+    let Some(first) = t.chars().next() else {
+        // 没有可见字符：有回车 = 提交光标所在项（当作批准，fail-closed）；没有回车 = Esc / Ctrl-C 取消
+        return !super::interact::contains_enter(bytes);
+    };
+    if t == "n" || t == "no" {
+        return true;
+    }
+    s.options.iter().any(|o| {
+        o.index.as_deref().map_or(false, |i| i.eq_ignore_ascii_case(&first.to_string()))
+            && o.text.trim().to_lowercase().starts_with("no")
+    })
 }
 
 fn refuse_permanent(text: &str) -> String {
@@ -575,7 +608,8 @@ mod tests {
     fn claude_code_bash_permission_blocks_the_permanent_option() {
         let x = classify_lines(&frames::CC_BASH_PERM);
         assert_eq!(wake(&x, 0), Some(Reason::NeedsAttention(SituationKind::Permission)));
-        assert_eq!(assess_keys(b"1\r", Some(&x)), KeysVerdict::Allow);
+        // 1 号是「本次允许」，但批准的是 `rm -rf build`：命令危险，要人点头（不是直接放行）
+        assert!(matches!(assess_keys(b"1\r", Some(&x)), KeysVerdict::Approve(_)));
         assert!(matches!(assess_keys(b"2\r", Some(&x)), KeysVerdict::Refuse(_)));
         assert!(matches!(assess_keys(b"\x1b[Z", Some(&x)), KeysVerdict::Refuse(_)));
         assert_eq!(assess_keys(b"3", Some(&x)), KeysVerdict::Allow);
@@ -745,5 +779,22 @@ mod tests {
         assert!(matches!(assess_keys(b"\r", Some(&p)), KeysVerdict::Refuse(_)), "默认高亮第一项 = 永久授权");
         assert_eq!(assess_keys(b"2\r", Some(&p)), KeysVerdict::Allow);
         assert_eq!(assess_keys(b"3", Some(&p)), KeysVerdict::Allow);
+    }
+
+    #[test]
+    fn approving_a_dangerous_command_in_a_permission_dialog_needs_a_human() {
+        use crate::agent::situation::frames;
+        // CC_BASH_PERM 批准的是 `rm -rf build`
+        let p = frames::classify_lines(&frames::CC_BASH_PERM);
+        assert!(matches!(assess_keys(b"1", Some(&p)), KeysVerdict::Approve(_)));
+        assert!(matches!(assess_keys(b"\r", Some(&p)), KeysVerdict::Approve(_)), "回车提交光标项（Yes）");
+        // 拒绝不需要人
+        assert_eq!(assess_keys(b"3", Some(&p)), KeysVerdict::Allow);
+        assert_eq!(assess_keys(b"\x1b", Some(&p)), KeysVerdict::Allow);
+        // 安全命令照常放行
+        let safe: Vec<String> = frames::CC_BASH_PERM.iter().map(|l| l.replace("rm -rf build ", "ls -la build ")).collect();
+        let refs: Vec<&str> = safe.iter().map(|s| s.as_str()).collect();
+        let q = frames::classify_lines(&refs);
+        assert_eq!(assess_keys(b"1", Some(&q)), KeysVerdict::Allow);
     }
 }
