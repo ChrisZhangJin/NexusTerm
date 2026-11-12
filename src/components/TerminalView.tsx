@@ -47,6 +47,7 @@ import {
 import { themeToXterm } from "../lib/theme";
 import { isMacOS } from "../lib/platform";
 import { installMacKeyboard, setInputTrace, traceSend } from "../lib/macInput";
+import { SHIFT_ENTER_SEQ, shouldSendMetaEnter, textBeforeCursor, wantsMetaEnter } from "../lib/shiftEnter";
 import { attachZmodem, type ZmodemGate } from "../lib/zmodem";
 import type { ClosedInfo, TerminalTab, Theme } from "../types";
 
@@ -82,6 +83,19 @@ const macLayerOn = (): boolean => localStorage.getItem(LS_MAC_INPUT) !== "0";
  * （`@tauri-apps/api/path` 依赖没装的 path 插件），这里只是给人看的说明。
  */
 const INPUT_LOG_HINT = "~/Library/Application Support/com.nexus-term.app/logs/input.log";
+
+/**
+ * 光标是否被程序关掉了（DECTCEM `CSI ?25l`）。公开 API 没有这个状态，只能读内部；
+ * 结构变了就当「没关」—— 对 Shift+Enter 判定来说那是退回只看提示符。
+ */
+function isCursorHidden(term: Terminal): boolean {
+  try {
+    const core = (term as unknown as { _core?: { coreService?: { isCursorHidden?: boolean } } })._core;
+    return core?.coreService?.isCursorHidden === true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * 让 macOS 也支持按住 Shift 拖选文本（绕过 tmux 等程序的鼠标捕获）。
@@ -871,6 +885,34 @@ export default function TerminalView({
     // 默认 Windows / Linux 用 Ctrl+Shift+C/V/F：Ctrl+C 必须留给中断信号（^C）。
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
+
+      // Shift+Enter → `ESC \r`（Meta+Enter），让 Claude Code / nanopi 这类 TUI 换行而不是提交；
+      // shell 提示符、vim / less 等备用屏程序里保持原样（当回车，含下面的灰字路径）。判定见 `lib/shiftEnter`。
+      // 必须排在灰字块之前：那里对 Shift+Enter 直接 `return true` 交还 xterm。
+      if (e.key === "Enter" && e.shiftKey) {
+        const imeBusy = imeRef.current.captures({
+          key: e.key,
+          shiftKey: e.shiftKey,
+          isComposing: e.isComposing,
+          keyCode: e.keyCode ?? 0,
+          timeStamp: e.timeStamp,
+        });
+        const metaEnter = shouldSendMetaEnter(
+          { key: e.key, shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, altKey: e.altKey, metaKey: e.metaKey, imeBusy },
+          () =>
+            wantsMetaEnter({
+              before: textBeforeCursor(term.buffer.active),
+              cursorHidden: isCursorHidden(term),
+              altScreen: term.buffer.active.type !== "normal",
+            })
+        );
+        if (metaEnter) {
+          e.preventDefault();
+          dismissHints();
+          handleInput(SHIFT_ENTER_SEQ);
+          return false;
+        }
+      }
 
       // 只在灰字**真的画着**时才接管 Tab / Enter / Esc：ghost 没显示（放不下、
       // 已收起、或在全屏程序里）就放行 —— 这几个键本来属于 shell 自己的补全与
