@@ -168,6 +168,9 @@ pub enum PauseCause {
     Budget { reason: ExhaustReason },
     /// 用户手动点了「暂停」
     User,
+    /// 模型服务连续出错（限流 / 5xx / 超时…），自动重试仍未恢复。
+    /// 对话历史原样保留，点「继续」就是重新请求模型。
+    LlmError,
 }
 
 /// 一轮运行的相位。
@@ -200,6 +203,8 @@ pub enum PhaseEvent {
     BudgetExhausted(ExhaustReason),
     /// 用户点了「暂停」。
     PauseRequested,
+    /// 模型请求重试用尽（运行循环上报），暂停等人决定。
+    LlmUnavailable,
     /// 运行循环走到一个步骤边界：若有待生效的手动暂停，此刻生效。
     Boundary,
     /// 用户点了「继续」。
@@ -217,6 +222,7 @@ pub fn next_phase(phase: RunPhase, ev: PhaseEvent) -> RunPhase {
         (_, Stop) => Finished,
         (Running { .. }, BudgetExhausted(reason)) => Paused(PauseCause::Budget { reason }),
         (Running { .. }, PauseRequested) => Running { pause_pending: true },
+        (Running { .. }, LlmUnavailable) => Paused(PauseCause::LlmError),
         (Running { pause_pending: true }, Boundary) => Paused(PauseCause::User),
         (Running { pause_pending: false }, Boundary) => phase,
         (Paused(_), Resume) => RunPhase::RUNNING,
@@ -296,6 +302,9 @@ pub fn paused_text(cause: &PauseCause, steps_done: u32, recent_actions: &[String
     let mut s = match cause {
         PauseCause::Budget { reason } => format!("本轮预算已用尽：{}。先暂停在这里。", reason.describe()),
         PauseCause::User => "已按你的要求在步骤边界暂停。".to_string(),
+        PauseCause::LlmError => {
+            "模型服务连续请求失败，自动重试后仍未恢复，先暂停在这里（对话进度都还在）。".to_string()
+        }
     };
     if recent_actions.is_empty() {
         s.push_str(&format!("\n已做：本段共 {steps_done} 步，尚无可列的动作。"));
@@ -307,7 +316,11 @@ pub fn paused_text(cause: &PauseCause, steps_done: u32, recent_actions: &[String
         }
     }
     s.push_str("\n还差：任务还没有给出结论，剩下的部分由助手接着做。");
-    s.push_str("\n点「继续」会在同一段对话上下文里换一份新预算接着跑；点「停止」则结束本轮。");
+    if matches!(cause, PauseCause::LlmError) {
+        s.push_str("\n稍后点「继续」会在同一段对话上下文里重新请求模型；点「停止」则结束本轮。");
+    } else {
+        s.push_str("\n点「继续」会在同一段对话上下文里换一份新预算接着跑；点「停止」则结束本轮。");
+    }
     s
 }
 
@@ -622,5 +635,19 @@ mod pause_requested_tests {
         assert!(RunPhase::Paused(PauseCause::User).pause_requested());
         assert!(!RunPhase::RUNNING.pause_requested());
         assert!(!RunPhase::Finished.pause_requested());
+    }
+
+    #[test]
+    fn llm_unavailable_pauses_and_resumes() {
+        let p = next_phase(RunPhase::RUNNING, PhaseEvent::LlmUnavailable);
+        assert_eq!(p, RunPhase::Paused(PauseCause::LlmError));
+        assert!(p.is_paused());
+        assert_eq!(next_phase(p, PhaseEvent::Resume), RunPhase::RUNNING);
+        // 已经暂停时不改原因；终态吸收
+        let user = RunPhase::Paused(PauseCause::User);
+        assert_eq!(next_phase(user, PhaseEvent::LlmUnavailable), user);
+        assert_eq!(next_phase(RunPhase::Finished, PhaseEvent::LlmUnavailable), RunPhase::Finished);
+        let t = paused_text(&PauseCause::LlmError, 3, &[]);
+        assert!(t.contains("模型服务") && t.contains("继续"), "{t}");
     }
 }
