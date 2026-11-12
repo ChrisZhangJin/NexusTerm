@@ -194,6 +194,7 @@ mod tests {
             created_at: 1,
             success_criteria: vec![Check::ScreenMatches { re: "nginx/1\\.2".into() }],
             yolo: true,
+            criteria_confirmed: false,
         }
     }
     fn console(id: &str) -> ConsoleRef {

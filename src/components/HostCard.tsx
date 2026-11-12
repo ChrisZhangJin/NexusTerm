@@ -229,7 +229,7 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [] }:
         <div className="st-esc host-ask">
           <div className="st-esc-head">确认完成判据</div>
           <div className="st-esc-why">
-            AI 按目标起草了下面的判据，一行一条（前缀：命令 / 文件 / 屏幕 / 人工）。改好后点「接受」，托管才开始。
+            AI 按目标起草了下面的判据，一行一条（前缀：命令 / 文件 / 屏幕 / 人工）。改好后点「接受」，托管才开始。接受后，「命令」类判据会在完成时按授权档位执行（危险的先问你）。
           </div>
           <textarea className="st-goal" rows={Math.max(3, criteria.split("\n").length)} value={criteria} disabled={busy} onChange={(e) => setCriteria(e.target.value)} />
           <div className="st-form-row st-center">

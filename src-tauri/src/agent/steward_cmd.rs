@@ -484,7 +484,7 @@ pub fn steward_resume(
             intent_ids: cp.intent_ids.clone(),
             timebox_ms: cp.authority.timebox_ms,
             created_at: cp.created_or_saved_wall_ms(),
-            success_criteria: Vec::new(), yolo: false,
+            success_criteria: Vec::new(), yolo: false, criteria_confirmed: false,
         };
         core.set_authority(&contract_id, cp.authority.clone());
         core.resume_contract(&contract_id, cp.spent.elapsed_secs as i64 * 1000);

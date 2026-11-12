@@ -82,6 +82,7 @@ impl HostCtx {
                 created_at: 0,
                 success_criteria: Vec::new(),
                 yolo: false,
+                criteria_confirmed: false,
             },
             authority: Authority::default(),
             hard: Vec::new(),
@@ -394,6 +395,8 @@ impl HostShared {
         let mut c = self.ctx();
         c.contract.success_criteria = checks;
         c.contract.yolo = yolo;
+        // 不是 YOLO 就是用户在草稿卡上确认（或编辑）过
+        c.contract.criteria_confirmed = !yolo;
         self.set_ctx(c, None);
     }
 
@@ -857,6 +860,7 @@ pub(crate) mod tests {
         let c = h.ctx().contract;
         assert!(c.yolo);
         assert_eq!(c.success_criteria, draft);
+        assert!(!c.criteria_confirmed, "YOLO 的判据没人确认过");
     }
 
     #[tokio::test(start_paused = true)]
@@ -882,6 +886,12 @@ pub(crate) mod tests {
         h.send(HostEvent::Answer(CardReply { card_id: "cd1".into(), text: String::new(), approved: Some(true) }));
         assert_eq!(task.await.unwrap(), Some(edited));
         assert!(!h.ctx().contract.yolo);
+        assert!(h.ctx().contract.criteria_confirmed, "草稿卡上接受 = 用户确认过");
+        // 随契约进 checkpoint，重启后仍在
+        let ctx = h.ctx();
+        let cp = super::super::checkpoint::HostCheckpoint::new(ctx.contract, ctx.authority, Default::default(), 1);
+        let back = super::super::checkpoint::HostCheckpoint::from_json(&cp.to_json(2).unwrap()).unwrap();
+        assert!(back.contract.criteria_confirmed);
     }
 
     #[tokio::test(start_paused = true)]

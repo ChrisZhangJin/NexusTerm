@@ -49,6 +49,8 @@ use super::prompt::{self, PromptGuess, PromptKind};
 const SILENCE_MS: u64 = 600;
 /// 单条命令的总等待上限。超过就强制结束，避免 `top` / `tail -f` 这类永不返回的命令卡死循环。
 const MAX_WAIT_MS: u64 = 120_000;
+/// 完成判据单条命令的时间上限：执行通道自己的上限再留一点收尾余量。
+pub const CHECK_CAP: std::time::Duration = std::time::Duration::from_millis(MAX_WAIT_MS + 10_000);
 /// 轮询缓冲的间隔。
 const POLL_MS: u64 = 120;
 /// 输出安静多久之后，才去判断「是不是停在交互提示上」。

@@ -321,6 +321,10 @@ pub struct StewardContract {
     /// YOLO：直接采用起草的判据、不经确认就开始托管。只跳过确认，不改授权档位与 deny
     #[serde(default)]
     pub yolo: bool,
+    /// 判据经用户确认过（草稿卡上接受 / 编辑过）。确认过的 CommandOk 按普通托管写入过
+    /// `gate::authorize` 执行；没确认过（YOLO）的只允许只读命令。旧数据没有该字段 → false（保守）
+    #[serde(default)]
+    pub criteria_confirmed: bool,
 }
 
 /// 新契约的 id。
@@ -369,7 +373,7 @@ impl StewardRegistry {
             intent_ids: Vec::new(),
             timebox_ms: 0,
             created_at: ts,
-            success_criteria: Vec::new(), yolo: false,
+            success_criteria: Vec::new(), yolo: false, criteria_confirmed: false,
         };
         map.insert(contract.id.clone(), contract.clone());
         contract
@@ -381,6 +385,7 @@ impl StewardRegistry {
             Some(c) => {
                 c.success_criteria = checks;
                 c.yolo = yolo;
+                c.criteria_confirmed = !yolo;
                 true
             }
             None => false,
@@ -756,7 +761,7 @@ pub(crate) fn restore_checkpoints(
             intent_ids: cp.intent_ids.clone(),
             timebox_ms: cp.authority.timebox_ms,
             created_at: cp.created_or_saved_wall_ms(),
-            success_criteria: Vec::new(), yolo: false,
+            success_criteria: Vec::new(), yolo: false, criteria_confirmed: false,
         });
         core.set_authority(&contract_id, cp.authority.clone());
         core.resume_contract(&contract_id, cp.spent.elapsed_secs as i64 * 1000);
