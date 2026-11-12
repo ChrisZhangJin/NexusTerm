@@ -9,6 +9,7 @@ import {
   DEFAULT_RUN_BUDGET,
   MAX_MINUTES_CEIL,
   MAX_STEPS_CEIL,
+  isBudgetPause,
   nextPause,
   normalizeBudget,
   parseBudgetInput,
@@ -59,6 +60,7 @@ test("paused 步骤进入暂停并记住原因，resumed 退出，其余步骤�
   assert.equal(nextPause(undefined, { kind: "paused", pauseKind: "time" }), "time");
   assert.equal(nextPause(undefined, { kind: "paused", pauseKind: "output" }), "output");
   assert.equal(nextPause(undefined, { kind: "paused", pauseKind: "user" }), "user");
+  assert.equal(nextPause(undefined, { kind: "paused", pauseKind: "llm" }), "llm");
   // 未知 / 缺失的原因按手动暂停处理，仍然是「暂停」
   assert.equal(nextPause(undefined, { kind: "paused", pauseKind: "???" }), "user");
   assert.equal(nextPause(undefined, { kind: "paused" }), "user");
@@ -69,10 +71,13 @@ test("paused 步骤进入暂停并记住原因，resumed 退出，其余步骤�
 });
 
 test("暂停横幅按原因给文案，且都提示「继续」与「停止」", () => {
-  for (const k of ["steps", "time", "output", "user"] as const) {
+  for (const k of ["steps", "time", "output", "user", "llm"] as const) {
     const t = pauseBannerText(k);
     assert.ok(t.includes("继续") && t.includes("停止"), t);
   }
   assert.ok(pauseBannerText("steps").includes("步数"));
   assert.ok(pauseBannerText("time").includes("时间"));
+  assert.ok(pauseBannerText("llm").includes("模型服务"));
+  // 模型出错不是预算用尽：托管页不该把它显示成「已达到预算上限」
+  assert.equal(isBudgetPause("llm"), false);
 });

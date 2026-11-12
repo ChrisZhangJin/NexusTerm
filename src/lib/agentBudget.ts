@@ -6,8 +6,8 @@
  * 其余步骤不改变它。一轮结束 / 出错 / 被停止时对话状态整体重建，暂停标记随之消失。
  */
 
-/** 为什么暂停：预算三项之一，或用户手动暂停。与后端 `StepPayload.pauseKind` 一致。 */
-export type PauseKind = "steps" | "time" | "output" | "user";
+/** 为什么暂停：预算三项之一、用户手动暂停，或模型服务连续出错（`llm`）。与后端 `StepPayload.pauseKind` 一致。 */
+export type PauseKind = "steps" | "time" | "output" | "user" | "llm";
 
 /** 与后端 `RunBudget`（camelCase）对应。0 的含义见各字段。 */
 export interface RunBudget {
@@ -60,7 +60,7 @@ export interface PauseStepLike {
   pauseKind?: string;
 }
 
-const PAUSE_KINDS: readonly string[] = ["steps", "time", "output", "user"];
+const PAUSE_KINDS: readonly string[] = ["steps", "time", "output", "user", "llm"];
 
 /**
  * 给定当前暂停状态与一个新到的步骤，返回新的暂停状态（`undefined` = 没在暂停）。
@@ -83,6 +83,8 @@ export function pauseBannerText(kind: PauseKind): string {
       return "已达到时间上限，本轮暂停。点「继续」换一份新预算接着做，或点「停止」结束。";
     case "output":
       return "已达到输出量上限，本轮暂停。点「继续」换一份新预算接着做，或点「停止」结束。";
+    case "llm":
+      return "模型服务连续请求失败，自动重试后仍未恢复，本轮暂停（进度都还在）。稍后点「继续」重新请求，或点「停止」结束。";
     default:
       return "本轮已暂停。点「继续」接着做，或点「停止」结束。";
   }

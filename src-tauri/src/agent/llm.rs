@@ -319,6 +319,10 @@ pub struct LlmReply {
     ///
     /// 降级重试（服务方不认 tools）后置 false，调用方据此改回围栏协议。
     pub tools_supported: bool,
+    /// 回复是否因输出长度上限被截断（OpenAI `finish_reason=length` / Anthropic `stop_reason=max_tokens`）。
+    ///
+    /// 截断的回复不能当成最终结论：调用方应请模型接着写（见 `act::run`）。
+    pub truncated: bool,
 }
 
 fn openai_tools(specs: &[ToolSpec]) -> Vec<OpenAiTool> {
@@ -1395,6 +1399,13 @@ pub fn extract_answer_text(provider: Provider, body: &str) -> Option<String> {
 pub fn extract_reply(provider: Provider, body: &str) -> Option<LlmReply> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let mut reply = LlmReply::default();
+    let stop = match provider {
+        Provider::OpenAI => value.pointer("/choices/0/finish_reason"),
+        Provider::Anthropic => value.pointer("/stop_reason"),
+    };
+    reply.truncated = stop
+        .and_then(|v| v.as_str())
+        .is_some_and(|r| finish_reason_from(r) == FinishReason::Length);
 
     match provider {
         Provider::OpenAI => {
@@ -1501,13 +1512,165 @@ async fn until_cancelled(cancel: &AtomicBool) {
     }
 }
 
-/// 带工具调用的 [`complete`]（**Agentic 循环专用**）。
+// ——————————————————————————————— 失败分类与重试 ———————————————————————————————
+
+/// 一次模型请求失败属于哪一类：决定 Agentic 循环是退避重试、暂停等人，还是直接报错收场。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// 等一会儿大概率会好：限流（429）、服务端 5xx、超时、连接失败、空回复。
+    Transient,
+    /// 重试也没用：Key 错（401/403）、请求不合法（400）、模型不存在（404）、欠费（402）……
+    Fatal,
+    /// 用户点了取消。
+    Cancelled,
+}
+
+/// [`complete_reply_once`] 的失败：带分类和服务方给的 `Retry-After`。
+#[derive(Debug)]
+pub struct LlmFailure {
+    pub error: AgentError,
+    pub kind: FailureKind,
+    pub retry_after: Option<Duration>,
+}
+
+impl LlmFailure {
+    fn new(kind: FailureKind, msg: String) -> Self {
+        Self { error: AgentError::Transport(msg), kind, retry_after: None }
+    }
+    fn cancelled() -> Self {
+        Self::new(FailureKind::Cancelled, "已取消".into())
+    }
+}
+
+impl From<LlmFailure> for AgentError {
+    fn from(f: LlmFailure) -> Self {
+        f.error
+    }
+}
+
+/// 按 HTTP 状态码 + 错误体给失败分类。
 ///
-/// 返回正文 + 模型要求调用的工具。`tools` 为空时等价 [`complete`]。
+/// 429 里有一种不是「太快了」而是「额度用完了」（OpenAI 的 `insufficient_quota`），
+/// 等多久都不会好，按 Fatal 处理，免得白等一分多钟才报错。
+pub fn classify_status(status: StatusCode, body: &str) -> FailureKind {
+    match status.as_u16() {
+        429 => {
+            let lower = body.to_ascii_lowercase();
+            if lower.contains("insufficient_quota") || lower.contains("billing") {
+                FailureKind::Fatal
+            } else {
+                FailureKind::Transient
+            }
+        }
+        408 | 409 | 425 => FailureKind::Transient,
+        // 501 Not Implemented / 505 版本不支持：重试不会改变结果
+        501 | 505 => FailureKind::Fatal,
+        500..=599 => FailureKind::Transient,
+        _ => FailureKind::Fatal,
+    }
+}
+
+/// `Retry-After` 的上限：服务方让等十分钟的话，宁可直接进入暂停让人决定。
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// 解析服务方给的重试等待：`retry-after-ms`（OpenAI 兼容层常见）优先，其次 `retry-after` 秒数。
+/// HTTP-date 形式不解析（少见，按退避算）。
+pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let get = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(str::trim);
+    if let Some(ms) = get("retry-after-ms").and_then(|v| v.parse::<f64>().ok()) {
+        if ms.is_finite() && ms >= 0.0 {
+            return Some(Duration::from_millis(ms as u64).min(MAX_RETRY_AFTER));
+        }
+    }
+    let secs = get("retry-after")?.parse::<f64>().ok()?;
+    // 先封顶再转换：`from_secs_f64` 遇到天文数字会 panic
+    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs.min(MAX_RETRY_AFTER.as_secs_f64())))
+}
+
+/// 重试策略。
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// 总共最多请求几次（含第一次）。
+    pub max_attempts: u32,
+    /// 第一次退避的基准时长；之后每次翻倍。
+    pub base: Duration,
+    /// 单次退避的上限。
+    pub cap: Duration,
+}
+
+/// Agentic 循环用的默认策略：最多 4 次，约 2s → 4s → 8s（各带抖动），总等待一般不到半分钟。
+pub const AGENT_RETRY: RetryPolicy =
+    RetryPolicy { max_attempts: 4, base: Duration::from_secs(2), cap: Duration::from_secs(30) };
+
+/// 第 `failures` 次失败后该等多久。`jitter ∈ [0,1)`。
 ///
-/// **服务方不认 tools 时自动降级**：拿掉 tools 重发一次并把 `tools_supported` 置回 false。
-/// 不少自建网关只转发 messages，没有这一步整个 Agentic 循环会被它们直接打死；
-/// 调用方据此改回围栏协议。
+/// 服务方给了 `Retry-After` 就照它来（已在解析时封顶）；否则指数退避 + 「一半固定一半随机」的抖动，
+/// 免得多个标签页的运行在同一时刻一起撞回去。
+pub fn backoff_delay(policy: &RetryPolicy, failures: u32, retry_after: Option<Duration>, jitter: f64) -> Duration {
+    if let Some(ra) = retry_after {
+        return ra.min(MAX_RETRY_AFTER);
+    }
+    let exp = policy.base.saturating_mul(1u32 << failures.saturating_sub(1).min(16)).min(policy.cap);
+    exp.mul_f64(0.5 + 0.5 * jitter.clamp(0.0, 1.0))
+}
+
+fn jitter() -> f64 {
+    use rand_core::RngCore;
+    f64::from(rand_core::OsRng.next_u32()) / (f64::from(u32::MAX) + 1.0)
+}
+
+/// 一次重试即将发生时交给调用方的信息（用来在面板上落一张提示卡）。
+#[derive(Debug, Clone)]
+pub struct RetryNotice {
+    /// 接下来是第几次请求（从 2 起）。
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub delay: Duration,
+    /// 刚才那次失败的中文说明。
+    pub error: String,
+}
+
+/// 带退避重试的 [`complete_reply_once`]（**Agentic 循环专用**）。
+///
+/// 只重试 [`FailureKind::Transient`]；Fatal / Cancelled 立即返回。退避期间可被 `cancel` 打断。
+/// 每次重试前回调 `on_retry`，调用方据此告诉用户「正在重试」。重试用尽返回最后一次的失败。
+pub async fn complete_reply_retrying(
+    acct: &AgentAccount,
+    system: &str,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+    cancel: &AtomicBool,
+    policy: &RetryPolicy,
+    mut on_retry: impl FnMut(&RetryNotice),
+) -> Result<LlmReply, LlmFailure> {
+    let mut attempt = 1u32;
+    loop {
+        let failure = match complete_reply_once(acct, system, messages, tools, Some(cancel)).await {
+            Ok(r) => return Ok(r),
+            Err(f) => f,
+        };
+        if failure.kind != FailureKind::Transient || attempt >= policy.max_attempts {
+            return Err(failure);
+        }
+        let delay = backoff_delay(policy, attempt, failure.retry_after, jitter());
+        tracing::warn!("模型请求失败（第 {attempt} 次），{:.1}s 后重试：{}", delay.as_secs_f64(), failure.error);
+        attempt += 1;
+        on_retry(&RetryNotice {
+            attempt,
+            max_attempts: policy.max_attempts,
+            delay,
+            error: failure.error.to_string(),
+        });
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = until_cancelled(cancel) => return Err(LlmFailure::cancelled()),
+        }
+    }
+}
+
+/// 带工具调用的 [`complete`]（不重试，失败只给中文错误）。
+///
+/// 技能精炼、托管摘要等一次性调用用它；Agentic 循环用 [`complete_reply_retrying`]。
 pub async fn complete_reply(
     acct: &AgentAccount,
     system: &str,
@@ -1515,30 +1678,50 @@ pub async fn complete_reply(
     tools: &[ToolSpec],
     cancel: Option<&AtomicBool>,
 ) -> Result<LlmReply, AgentError> {
+    complete_reply_once(acct, system, messages, tools, cancel).await.map_err(AgentError::from)
+}
+
+/// 单次带工具调用的请求，失败时带分类（见 [`FailureKind`]）。
+///
+/// 返回正文 + 模型要求调用的工具。`tools` 为空时等价 [`complete`]。
+///
+/// **服务方不认 tools 时自动降级**：拿掉 tools 重发一次并把 `tools_supported` 置回 false。
+/// 不少自建网关只转发 messages，没有这一步整个 Agentic 循环会被它们直接打死；
+/// 调用方据此改回围栏协议。
+pub async fn complete_reply_once(
+    acct: &AgentAccount,
+    system: &str,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+    cancel: Option<&AtomicBool>,
+) -> Result<LlmReply, LlmFailure> {
     // 首轮先按「支持 tools」发
     let first = post_chat(acct, system, messages, tools, cancel).await?;
     let provider = first.provider;
 
     let mut degraded = false;
-    let (status, body) = if !first.status.is_success()
-        && !tools.is_empty()
-        && is_tool_unsupported(&first.body)
-    {
+    let res = if !first.status.is_success() && !tools.is_empty() && is_tool_unsupported(&first.body) {
         tracing::warn!("服务方不接受 tools 声明（HTTP {}），本轮起改为纯文本协议", first.status.as_u16());
         degraded = true;
-        post_chat(acct, system, messages, &[], cancel).await?.into_parts()
+        post_chat(acct, system, messages, &[], cancel).await?
     } else {
-        first.into_parts()
+        first
     };
 
-    if !status.is_success() {
-        return Err(AgentError::Transport(http_status_message(status, &body)));
+    if !res.status.is_success() {
+        return Err(LlmFailure {
+            error: AgentError::Transport(http_status_message(res.status, &res.body)),
+            kind: classify_status(res.status, &res.body),
+            retry_after: res.retry_after,
+        });
     }
 
-    let mut reply = extract_reply(provider, &body).unwrap_or_default();
+    let mut reply = extract_reply(provider, &res.body).unwrap_or_default();
     reply.tools_supported = !tools.is_empty() && !degraded;
     if reply.text.trim().is_empty() && reply.tool_calls.is_empty() {
-        return Err(AgentError::Transport(
+        // 偶发的空回复（网关抖动、模型把 token 全花在推理上）重试往往就好
+        return Err(LlmFailure::new(
+            FailureKind::Transient,
             "模型返回了空回复：请确认该模型可用于对话接口".into(),
         ));
     }
@@ -1547,24 +1730,30 @@ pub async fn complete_reply(
 
 /// 发一次非流式请求。返回「状态码 + 响应体 + 解析出的 provider」。
 ///
-/// 三条出网路径（complete / complete_reply / 降级重试）共用，
-/// 免得取消判定与限长读取被复制三份。
+/// complete_reply 与它的降级重试共用，免得取消判定与限长读取被复制多份。
+/// 传输层错误（超时 / 连不上 / 读响应中断）一律算 Transient；构造请求失败算 Fatal。
 async fn post_chat(
     acct: &AgentAccount,
     system: &str,
     messages: &[ChatMessage],
     tools: &[ToolSpec],
     cancel: Option<&AtomicBool>,
-) -> Result<PostResult, AgentError> {
+) -> Result<PostResult, LlmFailure> {
     if let Some(flag) = cancel {
         if flag.load(Ordering::Relaxed) {
-            return Err(AgentError::Transport("已取消".into()));
+            return Err(LlmFailure::cancelled());
         }
     }
+    let fatal = |e: AgentError| LlmFailure { error: e, kind: FailureKind::Fatal, retry_after: None };
+    let net = |e: reqwest::Error| {
+        let kind = if e.is_builder() { FailureKind::Fatal } else { FailureKind::Transient };
+        LlmFailure::new(kind, transport_error(&e))
+    };
     let provider = resolve_provider(acct);
-    let prepared = build_messages_with_tools(acct, provider, system, messages, false, tools)?;
-    let client = http_client()?;
-    let headers = header_map(&prepared.headers)?;
+    let prepared =
+        build_messages_with_tools(acct, provider, system, messages, false, tools).map_err(fatal)?;
+    let client = http_client().map_err(fatal)?;
+    let headers = header_map(&prepared.headers).map_err(fatal)?;
 
     let request = client
         .post(&prepared.url)
@@ -1573,39 +1762,30 @@ async fn post_chat(
         .send();
 
     let resp = match cancel {
-        Some(flag) => match tokio::select! {
-            r = request => r,
-            _ = until_cancelled(flag) => return Err(AgentError::Transport("已取消".into())),
-        } {
-            Ok(r) => r,
-            Err(e) => return Err(AgentError::Transport(transport_error(&e))),
+        Some(flag) => tokio::select! {
+            r = request => r.map_err(net)?,
+            _ = until_cancelled(flag) => return Err(LlmFailure::cancelled()),
         },
-        None => request
-            .await
-            .map_err(|e| AgentError::Transport(transport_error(&e)))?,
+        None => request.await.map_err(net)?,
     };
 
     let status = resp.status();
+    let retry_after = parse_retry_after(resp.headers());
     // 成功响应也可以很大（模型可能一口气吐出几十 KB），统一限长
     let body = if status.is_success() {
         read_body_limited(resp, MAX_COMPLETE_BODY).await
     } else {
         read_error_body(resp).await
     };
-    Ok(PostResult { status, body, provider })
+    Ok(PostResult { status, body, provider, retry_after })
 }
 
-/// [`post_chat`] 的结果。小结构是为了让重试那行能直接 `.into_parts()`。
+/// [`post_chat`] 的结果。
 struct PostResult {
     status: StatusCode,
     body: String,
     provider: Provider,
-}
-
-impl PostResult {
-    fn into_parts(self) -> (reqwest::StatusCode, String) {
-        (self.status, self.body)
-    }
+    retry_after: Option<Duration>,
 }
 
 /// 用一条极短消息验证 Key / 地址 / 模型是否可用，供设置界面「测试连接」用。
@@ -2002,6 +2182,85 @@ mod tests {
             ),
             SseAction::Text("hi".to_string())
         );
+    }
+
+    #[test]
+    fn extract_reply_detects_truncation() {
+        let oa = r#"{"choices":[{"message":{"content":"写到一半"},"finish_reason":"length"}]}"#;
+        assert!(extract_reply(Provider::OpenAI, oa).unwrap().truncated);
+        let oa_ok = r#"{"choices":[{"message":{"content":"完"},"finish_reason":"stop"}]}"#;
+        assert!(!extract_reply(Provider::OpenAI, oa_ok).unwrap().truncated);
+        let an = r#"{"content":[{"type":"text","text":"写到一半"}],"stop_reason":"max_tokens"}"#;
+        assert!(extract_reply(Provider::Anthropic, an).unwrap().truncated);
+        let an_ok = r#"{"content":[{"type":"text","text":"完"}],"stop_reason":"end_turn"}"#;
+        assert!(!extract_reply(Provider::Anthropic, an_ok).unwrap().truncated);
+        // 没有 finish_reason 的兼容层：不当成截断
+        let bare = r#"{"choices":[{"message":{"content":"完"}}]}"#;
+        assert!(!extract_reply(Provider::OpenAI, bare).unwrap().truncated);
+    }
+
+    #[test]
+    fn status_classification_retries_only_transient() {
+        let c = |code: u16, body: &str| classify_status(StatusCode::from_u16(code).unwrap(), body);
+        for code in [408, 409, 425, 429, 500, 502, 503, 504, 529] {
+            assert_eq!(c(code, ""), FailureKind::Transient, "{code}");
+        }
+        for code in [400, 401, 402, 403, 404, 422, 501] {
+            assert_eq!(c(code, ""), FailureKind::Fatal, "{code}");
+        }
+        // 额度耗尽的 429 等多久都不会好
+        assert_eq!(
+            c(429, r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#),
+            FailureKind::Fatal
+        );
+    }
+
+    #[test]
+    fn retry_after_header_is_honored_and_capped() {
+        let mut h = HeaderMap::new();
+        assert_eq!(parse_retry_after(&h), None);
+        h.insert("retry-after", HeaderValue::from_static("7"));
+        assert_eq!(parse_retry_after(&h), Some(Duration::from_secs(7)));
+        h.insert("retry-after", HeaderValue::from_static("3600"));
+        assert_eq!(parse_retry_after(&h), Some(MAX_RETRY_AFTER));
+        h.insert("retry-after", HeaderValue::from_static("1e300"));
+        assert_eq!(parse_retry_after(&h), Some(MAX_RETRY_AFTER), "天文数字不能 panic");
+        h.insert("retry-after", HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        assert_eq!(parse_retry_after(&h), None);
+        h.insert("retry-after-ms", HeaderValue::from_static("1500"));
+        assert_eq!(parse_retry_after(&h), Some(Duration::from_millis(1500)));
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_with_bounded_jitter() {
+        let p = RetryPolicy { max_attempts: 5, base: Duration::from_secs(2), cap: Duration::from_secs(30) };
+        // jitter=1 → 满额；jitter=0 → 一半
+        assert_eq!(backoff_delay(&p, 1, None, 1.0), Duration::from_secs(2));
+        assert_eq!(backoff_delay(&p, 2, None, 1.0), Duration::from_secs(4));
+        assert_eq!(backoff_delay(&p, 3, None, 1.0), Duration::from_secs(8));
+        assert_eq!(backoff_delay(&p, 3, None, 0.0), Duration::from_secs(4));
+        assert_eq!(backoff_delay(&p, 10, None, 1.0), Duration::from_secs(30), "封顶");
+        assert_eq!(backoff_delay(&p, 40, None, 1.0), Duration::from_secs(30), "移位不溢出");
+        // 服务方给了 Retry-After 就照它来
+        assert_eq!(backoff_delay(&p, 1, Some(Duration::from_secs(9)), 0.3), Duration::from_secs(9));
+        for _ in 0..100 {
+            let j = jitter();
+            assert!((0.0..1.0).contains(&j));
+        }
+    }
+
+    /// 取消标记已置位时一次请求都不发，直接按 Cancelled 返回（不会被当成可重试的错误）。
+    #[tokio::test]
+    async fn retrying_returns_cancelled_without_sending() {
+        let acct = AgentAccount { api_key: "k".into(), ..AgentAccount::default() };
+        let cancel = AtomicBool::new(true);
+        let mut retries = 0;
+        let r = complete_reply_retrying(&acct, "", &[ChatMessage::user("hi")], &[], &cancel, &AGENT_RETRY, |_| {
+            retries += 1
+        })
+        .await;
+        assert_eq!(r.unwrap_err().kind, FailureKind::Cancelled);
+        assert_eq!(retries, 0);
     }
 
     #[test]
