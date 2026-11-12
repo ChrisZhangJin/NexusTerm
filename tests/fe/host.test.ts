@@ -147,3 +147,26 @@ test("挂起（重启 / 终端关了）只给接驳与放弃", () => {
   assert.equal(b.stop, true);
   assert.equal(needsReattach({ kind: "running" }), false);
 });
+
+import { checkLines } from "../../src/lib/host";
+
+test("完成卡逐条证据与新卡片胶囊", () => {
+  const lines = checkLines([
+    { check: { kind: "commandOk", cmd: "grep -q ok /tmp/r" }, passed: true, detail: "退出码 0" },
+    { check: { kind: "manual", text: "页面能打开" }, passed: true, detail: "用户确认" },
+  ]);
+  assert.deepEqual(lines, ["✓ 命令成功：`grep -q ok /tmp/r`：退出码 0", "✓ 人工确认：页面能打开：用户确认"]);
+  const mk = (kind: "manualCheck" | "watchdog"): HostPhase => ({
+    kind: "waitingHuman",
+    card: {
+      id: "x",
+      kind: kind === "watchdog" ? { kind } : { kind, summary: "s", checks: [] },
+      question: "q",
+      options: [],
+      reasons: [],
+      createdWallMs: 0,
+    },
+  });
+  assert.equal(hostPill(mk("manualCheck")).label, "等你确认完成");
+  assert.equal(hostPill(mk("watchdog")).label, "看门狗·等你看看");
+});

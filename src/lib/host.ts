@@ -4,7 +4,7 @@
  */
 
 import type { PauseKind } from "./agentBudget";
-import type { HostCheck, HostConsoleHint, HostHumanCard, HostPhase, HostStatus, TerminalTab } from "../types";
+import type { HostCheck, HostCheckResult, HostConsoleHint, HostHumanCard, HostPhase, HostStatus, TerminalTab } from "../types";
 
 export type HostPillTone = "active" | "warn" | "idle" | "done" | "bad";
 
@@ -35,6 +35,10 @@ export function hostPill(p: HostPhase): HostPill {
           return { label: "等你输入密码", tone: "warn" };
         case "criteriaDraft":
           return { label: "等你确认判据", tone: "warn" };
+        case "manualCheck":
+          return { label: "等你确认完成", tone: "warn" };
+        case "watchdog":
+          return { label: "看门狗·等你看看", tone: "warn" };
         default:
           return { label: "等你回答", tone: "warn" };
       }
@@ -222,4 +226,23 @@ export function textToChecks(text: string): HostCheck[] {
     }
   }
   return out;
+}
+
+/** 一条判据的人话（与后端 `Check::describe` 同口径） */
+export function describeCheck(c: HostCheck): string {
+  switch (c.kind) {
+    case "screenMatches":
+      return `屏幕匹配 /${c.re}/`;
+    case "commandOk":
+      return `命令成功：\`${c.cmd}\``;
+    case "fileExists":
+      return `文件存在：${c.path}`;
+    case "manual":
+      return `人工确认：${c.text}`;
+  }
+}
+
+/** 完成卡上的逐条证据（✓ / ✗ + 判据 + 证据） */
+export function checkLines(results: HostCheckResult[]): string[] {
+  return results.map((r) => `${r.passed ? "✓" : "✗"} ${describeCheck(r.check)}：${r.detail}`);
 }

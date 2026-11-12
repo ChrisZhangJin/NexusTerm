@@ -8,7 +8,7 @@
 import { useEffect, useState } from "react";
 import { api, onHostNotify } from "../api";
 import { toFriendlyError } from "../lib/errors";
-import { checksToText, hostButtons, hostDetail, hostPill, isTerminal, pendingCard, textToChecks } from "../lib/host";
+import { checkLines, checksToText, hostButtons, hostDetail, hostPill, isTerminal, pendingCard, textToChecks } from "../lib/host";
 import type {
   AgentTarget,
   HostBudgetGrant,
@@ -103,7 +103,9 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [] }:
       setText("");
     });
 
-  const approve = card?.kind.kind === "approve";
+  // 审批卡与「只剩人工项」的完成确认卡都是「批准 / 驳回」
+  const approve = card?.kind.kind === "approve" || card?.kind.kind === "manualCheck";
+  const manualCheck = card?.kind.kind === "manualCheck";
   const secret = card?.kind.kind === "secret";
 
   /** 通知卡的「撤销」：没有真回滚 —— 先接管（AI 立刻让路），再把纠正记成偏好 */
@@ -125,6 +127,15 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [] }:
         </span>
       </div>
       {detail && <div className="st-esc-why">{detail}</div>}
+      {status.phase.kind === "completed" && status.phase.checks.length > 0 && (
+        <ul className="host-checks">
+          {checkLines(status.phase.checks).map((l, i) => (
+            <li key={i} className={l.startsWith("✓") ? "ok" : "no"}>
+              {l}
+            </li>
+          ))}
+        </ul>
+      )}
       {status.notice && <div className="st-status warn">{status.notice}</div>}
 
       {btn.reattach && (
@@ -243,9 +254,20 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [] }:
 
       {card && !draft && !secret && (
         <div className="st-esc host-ask">
-          <div className="st-esc-head">{approve ? "等你批准" : "等你回答"}</div>
+          <div className="st-esc-head">
+            {manualCheck ? "等你确认完成" : approve ? "等你批准" : card.kind.kind === "watchdog" ? "看门狗：它好像卡住了" : "等你回答"}
+          </div>
           <div className="host-question">{card.question}</div>
-          {card.reasons.length > 0 && <div className="st-esc-why">原因：{card.reasons.join("；")}</div>}
+          {card.reasons.length > 0 &&
+            (manualCheck || card.kind.kind === "watchdog" ? (
+              <ul className="host-checks">
+                {card.reasons.map((r, i) => (
+                  <li key={i}>{r}</li>
+                ))}
+              </ul>
+            ) : (
+              <div className="st-esc-why">原因：{card.reasons.join("；")}</div>
+            ))}
           {card.recommendation && <div className="st-esc-why">建议：{card.recommendation}</div>}
           {card.options.length > 0 && (
             <div className="st-form-row st-center">
@@ -278,10 +300,10 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [] }:
             {approve ? (
               <>
                 <button className="st-btn primary" disabled={busy} onClick={() => void answer({ text: text.trim(), approved: true })}>
-                  批准
+                  {manualCheck ? "确认完成" : "批准"}
                 </button>
                 <button className="st-btn danger" disabled={busy} onClick={() => void answer({ text: text.trim(), approved: false })}>
-                  拒绝
+                  {manualCheck ? "还没完成" : "拒绝"}
                 </button>
               </>
             ) : (
