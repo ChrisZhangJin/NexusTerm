@@ -5705,7 +5705,7 @@ async fn try_reflex(
         tracing::warn!("反射代答写入失败：{e}");
         return None;
     }
-    let seq = super::steward_loop::persist_decision(app, &record);
+    let seq = super::host::record::persist(app, &record);
     brain.remember_decision(seq, &record);
     Some(format!("[reflex] 按剧本 [P:{playbook_id}] 回答了「{keys}」（局面：{}），没有叫醒模型；继续盯着", sit.kind.as_str()))
 }
@@ -5750,7 +5750,7 @@ fn hosted_applied(app: &AppHandle, h: &HostShared, session: &str, step: usize, w
     let rec = super::host::record::hosted_decision(
         &ctx, &h.console_id, w.kind, &w.text, &w.rationale, &w.gate, w.sit.as_ref(), now,
     );
-    let seq = super::steward_loop::persist_decision(app, &rec);
+    let seq = super::host::record::persist(app, &rec);
     if let Some(brain) = app.try_state::<super::profile::StewardBrain>() {
         brain.remember_decision(seq, &rec);
     }

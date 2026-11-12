@@ -24,7 +24,6 @@ use tauri::State;
 
 use crate::cmd::AppState;
 
-use super::checkpoint::StewardCheckpoint;
 use super::policy::Authority;
 use super::profile::{CtxInput, StewardBrain, KIND_INTENT};
 use super::steward_core::StewardCore;
@@ -294,8 +293,7 @@ pub struct ConsoleInfo {
     pub idle_frames: u32,
     pub updated_at: i64,
     pub contract_id: Option<String>,
-    /// 有契约时是真实所有权状态（agent_driving | observing_only | suspended），
-    /// 没有契约是 none
+    /// 有契约是 hosted，没有是 none。托管相位（运行中 / 等你回答 / 你在驾驶…）看 `host_list`
     pub status: String,
 }
 
@@ -511,11 +509,9 @@ fn console_info(
     alive: bool,
     screen: &ScreenStore,
     registry: &StewardRegistry,
-    core: &StewardCore,
 ) -> ConsoleInfo {
     let snap = screen.get(&id);
     let contract = registry.for_console(&id);
-    let info_id = id.clone();
     ConsoleInfo {
         id,
         kind: kind.to_string(),
@@ -527,10 +523,7 @@ fn console_info(
         idle_frames: snap.as_ref().map(|s| s.idle_frames).unwrap_or(0),
         updated_at: snap.as_ref().map(|s| s.updated_at).unwrap_or(0),
         contract_id: contract.as_ref().map(|c| c.id.clone()),
-        // 以前恒为 observing：用户夺权 / 暂停后列表上仍显示「在托管」，与真实所有权不符
-        status: contract
-            .map(|_| core.ownership().state(&info_id).as_str().to_string())
-            .unwrap_or_else(|| "none".to_string()),
+        status: if contract.is_some() { "hosted" } else { "none" }.to_string(),
     }
 }
 
@@ -541,7 +534,6 @@ pub fn steward_list_consoles(
     state: State<'_, AppState>,
     screen: State<'_, ScreenStore>,
     registry: State<'_, StewardRegistry>,
-    core: State<'_, StewardCore>,
 ) -> Vec<ConsoleInfo> {
     let mut ids: Vec<(String, &str)> = state
         .local
@@ -563,7 +555,7 @@ pub fn steward_list_consoles(
     }
     ids.sort_by(|a, b| a.0.cmp(&b.0));
     ids.into_iter()
-        .map(|(id, kind)| console_info(id, kind, kind != "stale", &screen, &registry, &core))
+        .map(|(id, kind)| console_info(id, kind, kind != "stale", &screen, &registry))
         .collect()
 }
 
@@ -588,22 +580,7 @@ pub fn steward_screen_get(
     screen.get(&console_id)
 }
 
-#[tauri::command]
-pub fn steward_start(
-    console_id: String,
-    goal: String,
-    authority_tier: String,
-    state: State<'_, AppState>,
-    registry: State<'_, StewardRegistry>,
-    brain: State<'_, StewardBrain>,
-    bus: State<'_, StewardBus>,
-    core: State<'_, StewardCore>,
-    screen: State<'_, ScreenStore>,
-) -> Result<StewardContract, String> {
-    sign_contract(None, &console_id, &goal, &authority_tier, &state, &registry, &brain, &bus, &core, &screen)
-}
-
-/// 签一份托管契约（`steward_start` 与 `host_start` 共用）。`id` 为 `None` 时现取一个。
+/// 签一份托管契约（`host_start` 用）。`id` 为 `None` 时现取一个。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sign_contract(
     id: Option<&str>,
@@ -615,7 +592,6 @@ pub(crate) fn sign_contract(
     brain: &StewardBrain,
     bus: &StewardBus,
     core: &StewardCore,
-    screen: &ScreenStore,
 ) -> Result<StewardContract, String> {
     let console_id = console_id.to_string();
     let goal = goal.trim().to_string();
@@ -629,9 +605,7 @@ pub(crate) fn sign_contract(
     } else {
         return Err(format!("没有 id 为「{console_id}」的终端"));
     };
-    // 一个 console 只有一份契约。旧契约不能只被 registry 顶掉：它的意向栈、Checkpoint、
-    // 所有权槽、时间盒、预算都得一起收尾，否则下次启动会把旧契约当未完成任务恢复，
-    // 新契约也会继承旧契约的空转计时与暂停状态。
+    // 一个 console 只有一份契约。旧契约不能只被 registry 顶掉：它的意向栈与授权都得一起收尾。
     if let Some(old) = registry.for_console(&console_id) {
         stop_contract(registry, brain, &state.store, core, &old.id);
     }
@@ -647,36 +621,12 @@ pub(crate) fn sign_contract(
             registry.attach_intent(&contract.id, &item.id);
         }
     }
-    // P3/P4：登记授权契约、起所有权与时间盒、落第一份 Checkpoint。
-    // 这样强杀 app 后启动扫描能重建契约并先读屏对齐。
-    core.ensure_console(&console_id);
-    core.reset_timebox(&console_id);
-    core.start_contract(&contract.id);
-    let auth = core.set_authority(
+    // 登记授权契约：托管任务起步时按契约 id 读它
+    core.set_authority(
         &contract.id,
         Authority::default().with_tier(&contract.authority_tier),
     );
     let live = registry.get(&contract.id).unwrap_or(contract);
-    let mut cp = StewardCheckpoint::new(&live.id, &console_id, &goal, &auth);
-    cp.intent_ids = live.intent_ids.clone();
-    cp.screen_hash = screen
-        .get(&console_id)
-        .map(|s| s.hash.clone())
-        .unwrap_or_default();
-    cp.frame_id = screen.get(&console_id).map(|s| s.frame_id).unwrap_or(0);
-    cp.saved_at = core.elapsed_ms();
-    cp.saved_wall_ms = now_ms();
-    cp.created_wall_ms = cp.saved_wall_ms;
-    cp.host_key = live.host_key.clone();
-    cp.state = "observing".to_string();
-    cp.note = "契约签下时的初始现场".to_string();
-    if let Ok(json) = serde_json::to_string(&cp) {
-        state
-            .store
-            .steward_checkpoint_save(&live.id, &console_id, &json, "observing", cp.saved_wall_ms)
-            .ok();
-    }
-    core.set_checkpoint(cp);
     bus.wake();
     Ok(live)
 }
@@ -695,10 +645,8 @@ pub(crate) fn stop_contract(
     // 意向栈跟着契约一起归档；决策记录留着做审计，不删。
     brain.drop_intents(contract_id);
     store.steward_ctx_delete_intents(contract_id).ok();
-    // P4：标记完成，避免下次启动误恢复；内存里的所有权 / 时间盒 / 预算一并释放。
-    store.steward_checkpoint_state(contract_id, "completed").ok();
-    if let Some(c) = old {
-        core.drop_contract(contract_id, &c.console_id);
+    if old.is_some() {
+        core.drop_contract(contract_id);
     }
     stopped
 }
@@ -716,58 +664,6 @@ pub(crate) fn release_console(
         Some(c) => stop_contract(registry, brain, store, core, &c.id),
         None => false,
     }
-}
-
-/// P4 启动扫描：从未完成的 Checkpoint 重建契约，交给常驻循环读屏对齐后再决定是否续跑。
-/// - 先裁掉已完成 / 超过 TTL 的行，表不会无限增长；
-/// - 行按 saved_wall_ms 降序，同一 console 只恢复最新一份，其余直接标记完成；
-/// - 用 Checkpoint 里的真实 host_key 与创建时刻重建；
-/// - 恢复的 console 先置 Suspended：首帧到达、现场核对通过之前不允许写。
-pub(crate) fn restore_checkpoints(
-    store: &crate::store::Store,
-    registry: &StewardRegistry,
-    core: &StewardCore,
-) -> Vec<String> {
-    store.steward_checkpoints_prune(now_ms(), super::checkpoint::CHECKPOINT_TTL_MS);
-    let mut seen: Vec<String> = Vec::new();
-    let mut restored = Vec::new();
-    for (contract_id, console_id, _state, raw) in store.steward_checkpoints() {
-        // 统一托管（host_start）签的契约由 host_sessions 的启动扫描接管（挂起 → 用户确认接驳），
-        // 旧的守护进程恢复不能再抢同一份契约，否则又是两个写者
-        if store.host_session_get(&contract_id).is_some() {
-            store.steward_checkpoint_state(&contract_id, "completed").ok();
-            continue;
-        }
-        if seen.contains(&console_id) {
-            store.steward_checkpoint_state(&contract_id, "completed").ok();
-            continue;
-        }
-        seen.push(console_id.clone());
-        let Ok(cp) = serde_json::from_str::<StewardCheckpoint>(&raw) else {
-            continue;
-        };
-        registry.restore(StewardContract {
-            id: contract_id.clone(),
-            console_id: console_id.clone(),
-            host_key: cp.restored_host_key(),
-            goal: cp.goal.clone(),
-            authority_tier: cp.authority.tier.clone(),
-            status: "observing".to_string(),
-            intent_ids: cp.intent_ids.clone(),
-            timebox_ms: cp.authority.timebox_ms,
-            created_at: cp.created_or_saved_wall_ms(),
-            success_criteria: Vec::new(), yolo: false,
-        });
-        core.set_authority(&contract_id, cp.authority.clone());
-        core.resume_contract(&contract_id, cp.spent.elapsed_secs as i64 * 1000);
-        core.ensure_console(&console_id);
-        core.ownership()
-            .suspend(&console_id, "等待首帧核对现场", core.elapsed_ms());
-        core.set_checkpoint(cp);
-        core.push_resume(&contract_id);
-        restored.push(contract_id);
-    }
-    restored
 }
 
 #[tauri::command]

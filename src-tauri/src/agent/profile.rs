@@ -13,7 +13,7 @@
 //! - `knowledge`：`{ "tags": ["keychain", "vault"] }`
 //! - `playbook`：`PlaybookSpec { matchProgram, matchKind, matchTopic, matchText, answer, optionIndex, tier, enabled }`
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -30,8 +30,6 @@ use crate::store::{CtxRow, Store};
 pub const MAX_TEXT_CHARS: usize = 2000;
 /// 每类条目上限，防止误操作把内存与面板撑爆。
 pub const MAX_ITEMS_PER_KIND: usize = 100;
-/// 常驻循环带进 DecisionContext 的历史决策摘要条数。
-const RECENT_DECISIONS: usize = 6;
 /// 内存里保留的完整 DecisionRecord 条数（升级卡一键确认要按 seq 找回）。
 const DECISION_CACHE: usize = 100;
 
@@ -141,7 +139,6 @@ pub struct KnowledgeHit {
 #[serde(rename_all = "camelCase")]
 pub struct BrainView {
     pub items: Vec<CtxItem>,
-    pub execution_enabled: bool,
     pub decision_count: usize,
 }
 
@@ -150,10 +147,6 @@ pub struct BrainView {
 #[derive(Default)]
 struct BrainInner {
     items: Vec<CtxItem>,
-    /// **默认 false**：P2 允许自动应答，但每次冷启动都必须由用户显式打开。
-    /// 不持久化，避免上次会话忘记关导致下次启动就直接往终端写。
-    execution_enabled: bool,
-    recent: VecDeque<String>,
     decisions: HashMap<i64, DecisionRecord>,
 }
 
@@ -194,18 +187,8 @@ impl StewardBrain {
         let inner = self.0.lock();
         BrainView {
             items: inner.items.clone(),
-            execution_enabled: inner.execution_enabled,
             decision_count: inner.decisions.len(),
         }
-    }
-
-    pub fn execution_enabled(&self) -> bool {
-        self.0.lock().execution_enabled
-    }
-
-    pub fn set_execution(&self, on: bool) -> bool {
-        self.0.lock().execution_enabled = on;
-        on
     }
 
     /// 新增 / 更新一条。校验在这里做，持久化由命令层接着调 `store.steward_ctx_upsert`。
@@ -250,24 +233,6 @@ impl StewardBrain {
             !hit
         });
         ids
-    }
-
-    /// 栈顶意向：position 最大且 status != done/archived。
-    pub fn top_intent(&self, contract_id: &str) -> Option<(CtxItem, IntentSpec)> {
-        let inner = self.0.lock();
-        inner
-            .items
-            .iter()
-            .filter(|x| x.kind == KIND_INTENT && x.contract_id == contract_id)
-            .filter(|x| {
-                let spec: IntentSpec = serde_json::from_value(x.extra.clone()).unwrap_or_default();
-                !matches!(spec.status.as_deref(), Some("done") | Some("archived"))
-            })
-            .max_by_key(|x| x.position)
-            .map(|x| {
-                let spec = serde_json::from_value(x.extra.clone()).unwrap_or_default();
-                (x.clone(), spec)
-            })
     }
 
     pub fn intent_stack(&self, contract_id: &str) -> Vec<CtxItem> {
@@ -411,22 +376,13 @@ impl StewardBrain {
             .next()
     }
 
-    /// 记住一条决策：完整记录用于升级卡一键确认，摘要用于下一轮的 `DecisionContext`。
+    /// 记住一条决策：解释链 / 纠正按 seq 找回它。
     pub fn remember_decision(&self, seq: i64, record: &DecisionRecord) {
         let mut inner = self.0.lock();
         inner.decisions.insert(seq, record.clone());
         if inner.decisions.len() > DECISION_CACHE {
             let oldest = *inner.decisions.keys().min().unwrap_or(&0);
             inner.decisions.remove(&oldest);
-        }
-        inner.recent.push_back(format!(
-            "#{seq} {} → {} ({})",
-            record.situation_signature,
-            record.chosen.label(),
-            record.outcome
-        ));
-        while inner.recent.len() > RECENT_DECISIONS {
-            inner.recent.pop_front();
         }
     }
 
@@ -440,10 +396,6 @@ impl StewardBrain {
         if let Some(r) = self.0.lock().decisions.get_mut(&seq) {
             r.outcome = outcome.to_string();
         }
-    }
-
-    pub fn recent_decisions(&self) -> Vec<String> {
-        self.0.lock().recent.iter().cloned().collect()
     }
 
     /// 闭环学习（§4.4）：用户否掉一条自动决策时，把纠正写成 `Learned` 软偏好，
@@ -879,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn top_intent_uses_position_and_skips_done() {
+    fn intent_stack_is_per_contract_and_dropped_with_it() {
         let b = brain();
         for (i, status) in [("active", 1), ("done", 9)].iter().enumerate() {
             b.upsert(CtxInput {
@@ -896,8 +848,6 @@ mod tests {
             })
             .unwrap();
         }
-        let (item, _) = b.top_intent("c1").unwrap();
-        assert_eq!(item.id, "i0", "done 的意向不该占栈顶");
         assert_eq!(b.intent_stack("c1").len(), 2);
         assert_eq!(b.drop_intents("c1").len(), 2);
     }

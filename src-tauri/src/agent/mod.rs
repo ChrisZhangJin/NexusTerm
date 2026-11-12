@@ -47,14 +47,12 @@ pub mod profile;
 pub mod steward_cmd;
 // P3 授权与协作
 pub mod policy;
-pub mod ownership;
 // P4 长运行与恢复
 pub mod checkpoint;
 pub mod host;
 pub mod host_cmd;
 // P5 学习闭环 / LLM 兜底
 pub mod learning;
-pub mod planner;
 // P3–P5 共享运行时状态
 pub mod steward_core;
 #[cfg(test)]

@@ -1,9 +1,8 @@
 //! P3 `PolicyEngine`：把「能不能自动写」从 `decision.rs` 里散落的硬编码收敛成一张授权契约。
 //!
-//! 设计见 `docs/nexus-agent-steward-design.md` §6.1 / §6.2。与 P2 的关系：
-//! - `decision::compile` 负责**生成**有依据的回复（意向 / 剧本 / KB）；
-//! - 本模块负责**授权**：按「风险 × 可逆性 × 作用域 × host」决定这条回复能不能自动注入，
-//!   以及要不要降级成升级卡、要不要给撤销窗口。
+//! 设计见 `docs/nexus-agent-steward-design.md` §6.1 / §6.2。统一托管之后的调用方是反射快路径
+//! （`host::reflex`）：剧本给出确定的回答后，由 `evaluate` 按「风险 × 可逆性 × 作用域 × host」
+//! 决定能不能不叫醒模型直接作答。
 //!
 //! 三条硬底线（任何档位都不可越过）：
 //! 1. `Authority.deny` 是硬禁，命中即 `Deny`，不写、不弹卡、只留审计；
@@ -15,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::danger;
-use super::decision::{CtxRef, DecisionAction, DecisionRecord, EscalationCard};
+use super::decision::{DecisionAction, DecisionRecord};
 use super::situation::{Choice, Situation, SituationKind};
 
 pub const TIER_AUTO: &str = "auto";
@@ -291,10 +290,6 @@ impl PolicyVerdict {
             Self::Deny { .. } => "deny",
         }
     }
-
-    pub fn allows_write(&self) -> bool {
-        matches!(self, Self::Auto | Self::Notify { .. })
-    }
 }
 
 /// 授权核心。**顺序即设计 §6.1**：硬禁 → 密码/永久 → host 作用域 → 档位 → 风险。
@@ -379,134 +374,6 @@ pub fn evaluate(
     PolicyVerdict::Auto
 }
 
-/// 把裁决写回决策记录：改档位 / 结果 / 升级卡，并补一条可审计的 policy 依据。
-///
-/// 返回裁决本身，调用方据此决定注入、开撤销窗口还是只记事件。
-pub fn authorize(
-    auth: &Authority,
-    rec: &mut DecisionRecord,
-    sit: &Situation,
-    host_in_scope: bool,
-) -> PolicyVerdict {
-    let verdict = evaluate(auth, rec, sit, host_in_scope);
-    let marker = format!("policy:{}", verdict.as_str());
-    rec.ctx_refs.push(CtxRef::of(
-        "policy",
-        &marker,
-        match &verdict {
-            PolicyVerdict::Auto => "PolicyEngine：授权档允许自主执行".to_string(),
-            PolicyVerdict::Notify { undo_ms } => {
-                format!("PolicyEngine：自主执行，{undo_ms}ms 内可撤销")
-            }
-            PolicyVerdict::Approve { reason } => {
-                format!("PolicyEngine 降为确认：{reason}")
-            }
-            PolicyVerdict::Deny { reason } => {
-                format!("PolicyEngine 硬禁：{reason}")
-            }
-        },
-    ));
-
-    match &verdict {
-        PolicyVerdict::Auto => {
-            rec.tier = TIER_AUTO.to_string();
-        }
-        PolicyVerdict::Notify { .. } => {
-            rec.tier = TIER_NOTIFY.to_string();
-        }
-        PolicyVerdict::Approve { reason } => {
-            rec.tier = TIER_APPROVE.to_string();
-            rec.outcome = "escalated".to_string();
-            rec.escalation = Some(EscalationCard::new(rec.chosen.clone(), rec.ctx_refs.clone(), rec.ts_ms));
-            rec.rationale = format!("{}；{}", rec.rationale, reason);
-        }
-        PolicyVerdict::Deny { reason } => {
-            // 硬禁不是「转述问题给用户」，而是明确不写、把原因留在审计里。
-            rec.tier = TIER_APPROVE.to_string();
-            rec.outcome = "rejected".to_string();
-            rec.chosen = DecisionAction::observe(reason.clone());
-            rec.escalation = None;
-            rec.rationale = format!("{}；PolicyEngine 硬禁：{}", rec.rationale, reason);
-        }
-    }
-    verdict
-}
-
-/// Notify 档的撤销窗口记录。真正「撤销」不是把已敲的键收回（做不到），
-/// 而是：立刻转观察态避免后续连发 + 把这条决策标为 rolled_back + 写一条 Learned 偏好。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UndoEntry {
-    pub seq: i64,
-    pub console_id: String,
-    pub action: DecisionAction,
-    pub expires_at: i64,
-    pub used: bool,
-}
-
-impl UndoEntry {
-    pub fn new(rec: &DecisionRecord, undo_ms: u64) -> Self {
-        Self {
-            seq: rec.seq,
-            console_id: rec.console_id.clone(),
-            action: rec.chosen.clone(),
-            expires_at: rec.ts_ms + undo_ms as i64,
-            used: false,
-        }
-    }
-
-    pub fn live(&self, now: i64) -> bool {
-        !self.used && now <= self.expires_at
-    }
-}
-
-/// host 作用域判据（fail-closed）。
-///
-/// `host_scope` 非空时必须命中列表；未显式限定时，仍要求这个 console 是后端
-/// 真实存在的本地 / SSH 会话——屏幕帧可以被伪造，会话注册表不能。
-/// 复用 `skill_run::check_scope` 的语义（无可比对名字一律拒绝），但不强依赖
-/// `HostIdentity`，让 Steward 循环在纯逻辑层就能调用。
-pub fn host_in_scope(auth: &Authority, host_key: &str, known_console: bool) -> bool {
-    if auth.host_scope.is_empty() {
-        return known_console;
-    }
-    auth.host_scope
-        .iter()
-        .any(|h| h == "*" || h == host_key || (!h.is_empty() && host_key.contains(h.as_str())))
-}
-
-/// 给前端看的策略说明（真值，不再是 P2 的静态数组）。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PolicyView {
-    pub authority: Authority,
-    pub verdicts: Vec<&'static str>,
-    pub risks: Vec<&'static str>,
-    pub hard_rules: Vec<String>,
-}
-
-pub fn policy_view(auth: &Authority) -> PolicyView {
-    PolicyView {
-        authority: auth.clone(),
-        verdicts: vec!["auto", "notify", "approve", "deny"],
-        risks: vec![
-            "read", "reversible", "irreversible", "destructive", "permanent", "secret",
-        ],
-        hard_rules: vec![
-            "Authority.deny 命中即拒绝，allow 不能覆盖".to_string(),
-            "密码 / 凭据永不代填，也不进模型上下文".to_string(),
-            if auth.allow_permanent_grant {
-                "⚠️ 已允许自动永久扩权（不建议）".to_string()
-            } else {
-                "「don't ask again」式永久扩权默认硬禁".to_string()
-            },
-            "host 不在作用域内一律降为确认档".to_string(),
-            "断流 / 低置信度 / 未知全屏只允许只读".to_string(),
-            "Notify 档执行后留 30s 撤销窗口".to_string(),
-        ],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,9 +433,6 @@ mod tests {
         let r = rec("answer", "ok", None, true);
         let v = evaluate(&a, &r, &sit(SituationKind::Question, false), true);
         assert_eq!(v, PolicyVerdict::Notify { undo_ms: DEFAULT_UNDO_WINDOW_MS });
-        let e = UndoEntry::new(&r, DEFAULT_UNDO_WINDOW_MS);
-        assert!(e.live(1_000 + 20_000));
-        assert!(!e.live(1_000 + 40_000));
     }
 
     #[test]
@@ -584,10 +448,6 @@ mod tests {
         let r = rec("answer", "Yes", Some("2"), true);
         let v = evaluate(&a, &r, &sit(SituationKind::Permission, true), true);
         assert!(matches!(v, PolicyVerdict::Deny { .. }), "got {v:?}");
-        let mut r2 = r.clone();
-        authorize(&a, &mut r2, &sit(SituationKind::Permission, true), true);
-        assert_eq!(r2.outcome, "rejected");
-        assert!(!r2.chosen.injectable);
     }
 
     #[test]
@@ -652,30 +512,6 @@ mod tests {
         a.allow.push("answer".into());
         let r = rec("answer", "ok", None, true);
         assert!(matches!(evaluate(&a, &r, &sit(SituationKind::Question, false), true), PolicyVerdict::Deny { .. }));
-    }
-
-    #[test]
-    fn authorize_writes_audit_ref_and_card() {
-        let a = Authority::default().with_tier("approve");
-        let mut r = rec("answer", "ok", None, true);
-        authorize(&a, &mut r, &sit(SituationKind::Question, false), true);
-        assert_eq!(r.outcome, "escalated");
-        assert!(r.escalation.is_some());
-        assert!(r.ctx_refs.iter().any(|x| x.source == "policy" && x.id == "policy:approve"));
-        assert!(r.rationale.contains("确认"));
-    }
-
-    #[test]
-    fn host_scope_is_fail_closed() {
-        let a = Authority::default();
-        assert!(host_in_scope(&a, "local:tab-1", true));
-        assert!(!host_in_scope(&a, "local:tab-1", false), "会话不存在就不该自动写");
-        let mut b = Authority::default();
-        b.host_scope = vec!["web1".into()];
-        assert!(host_in_scope(&b, "ssh:web1:22", true));
-        assert!(!host_in_scope(&b, "ssh:prod-db:22", true));
-        b.host_scope = vec!["*".into()];
-        assert!(host_in_scope(&b, "anything", true));
     }
 
     #[test]

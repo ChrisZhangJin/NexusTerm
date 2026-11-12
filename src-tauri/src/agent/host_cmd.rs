@@ -259,7 +259,6 @@ pub fn host_start(
     brain: State<'_, StewardBrain>,
     bus: State<'_, StewardBus>,
     core: State<'_, StewardCore>,
-    screen: State<'_, ScreenStore>,
 ) -> Result<String, String> {
     let goal = goal.trim().to_string();
     if goal.is_empty() {
@@ -293,7 +292,6 @@ pub fn host_start(
             &brain,
             &bus,
             &core,
-            &screen,
         )
     })?;
     if let Some(st) = changed {
@@ -581,7 +579,12 @@ pub fn host_correct(
     state.store.steward_decision_outcome(seq, "rejected").ok();
     brain.set_decision_outcome(seq, "rejected");
     let correction = correction.trim();
-    if !correction.is_empty() {
+    // 同类纠正不无限堆积：等价的 Learned 偏好已存在就跳过（原升级卡「我自己来」的去重口径）
+    let skip = matches!(
+        super::learning::should_learn(&brain.view().items, topic.trim(), correction),
+        super::learning::LearnDecision::Skip { .. }
+    );
+    if !correction.is_empty() && !skip {
         let item = brain.learn_correction(seq, topic.trim(), correction)?;
         state.store.steward_ctx_upsert(&item.to_row())?;
     }
@@ -702,10 +705,8 @@ fn shared_from_checkpoint(app: &AppHandle, cp: &HostCheckpoint) -> Arc<HostShare
 /// 让 host_list 看得见；过期的收掉契约。不写任何终端。
 pub fn boot_scan(app: &AppHandle) {
     let Some(state) = app.try_state::<AppState>() else { return };
+    // 过期的行由 scan_rows 在 host_sessions 里收掉，这里只记一笔
     let (restored, expired) = scan_rows(&state.store, now_ms());
-    for id in &expired {
-        state.store.steward_checkpoint_state(id, "completed").ok();
-    }
     for cp in restored {
         let h = shared_from_checkpoint(app, &cp);
         h.restore(cp.phase.clone(), Vec::new());
@@ -968,15 +969,20 @@ fn spawn_resumed(app: AppHandle, h: Arc<HostShared>, old: Option<Arc<HostShared>
 #[cfg(test)]
 mod tests {
     use super::super::host::PauseCause;
-    use super::super::steward_loop::control_owned;
     use super::*;
+
+    /// 这个 console 是否归托管：有租约持有者，或状态不是 UserDriving（暂停中的运行同样占着）。
+    fn control_owned(table: &ControlTable, console_id: &str) -> bool {
+        !table.holders_of(console_id).is_empty()
+            || table.state(console_id) != ControlState::UserDriving
+    }
 
     #[test]
     fn lease_is_held_before_contract_becomes_visible() {
         let table = ControlTable::new();
         let registry = StewardRegistry::new();
         let (c, changed) = claim_then_sign(&table, "t1", "host:c1", || {
-            // 签约这一刻：守护进程的判定（PR1 的 `control_owned`）已经为真，它只会观察
+            // 签约这一刻：租约已在托管手里
             assert!(control_owned(&table, "t1"));
             assert_eq!(table.holders_of("t1"), vec!["host:c1".to_string()]);
             assert!(registry.for_console("t1").is_none(), "租约在前、契约在后");
@@ -1158,7 +1164,6 @@ mod tests {
 
     #[test]
     fn reattach_moves_lease_from_a_to_b_and_keeps_contract_live() {
-        use super::super::steward_loop::control_owned;
         let table = ControlTable::new();
         let registry = StewardRegistry::new();
         let run = "host:c1";
@@ -1168,7 +1173,7 @@ mod tests {
         let (old, old_io) = super::super::host::driver::tests::shared_as("c1", "tab-A");
         old.apply(HostEvent::Suspend(SuspendReason::ConsoleGone)).unwrap();
 
-        // 确认接驳到 B：先挪租约（此刻守护进程就看到 B 有主），再顶替旧任务、恢复契约
+        // 确认接驳到 B：先挪租约，再顶替旧任务、恢复契约
         let changes = move_lease(&table, run, "tab-A", "tab-B").unwrap();
         assert!(control_owned(&table, "tab-B"), "确认的那一刻 B 就归托管");
         assert!(!control_owned(&table, "tab-A"), "A 上的租约撤掉、登记清掉");
@@ -1219,28 +1224,6 @@ mod tests {
         let ids: Vec<_> = got.iter().map(|c| c.console_id.as_str()).collect();
         assert_eq!(ids, vec!["t-host", "t-rec", "t-cwd"]);
         assert!(got[0].score > got[1].score);
-    }
-
-    #[test]
-    fn old_daemon_resume_skips_host_contracts() {
-        let (store, _) = temp_store_at("host-vs-daemon");
-        let auth = Authority::default();
-        for (id, console) in [("hosted", "t1"), ("plain", "t2")] {
-            let mut sc = super::super::checkpoint::StewardCheckpoint::new(id, console, "g", &auth);
-            sc.created_wall_ms = now_ms();
-            sc.saved_wall_ms = sc.created_wall_ms;
-            sc.state = "observing".into();
-            store
-                .steward_checkpoint_save(id, console, &serde_json::to_string(&sc).unwrap(), "observing", sc.saved_wall_ms)
-                .unwrap();
-        }
-        let cp = saved_cp(HostPhase::Running, now_ms());
-        store.host_session_upsert("hosted", "running", &cp.to_json(now_ms()).unwrap(), now_ms()).unwrap();
-        let registry = StewardRegistry::new();
-        let core = StewardCore::new();
-        let restored = steward::restore_checkpoints(&store, &registry, &core);
-        assert_eq!(restored, vec!["plain".to_string()], "托管契约归 host_sessions 的启动扫描");
-        assert!(registry.get("hosted").is_none());
     }
 
     #[test]
