@@ -2,13 +2,32 @@
 //! `DecisionRecord{llm_used:true, ctx_refs, chosen, rationale}`，进与守护进程同一张 `steward_decisions` 表，
 //! 面板的决策回放、「为什么」解释链、Notify 档的纠正（`learn_correction`）都按 seq 找回它。
 //!
-//! 纯函数：只拼记录，落库由调用方做。
+//! 拼记录是纯函数；落库走 `persist`。
 
 use super::super::act::{AgentAction, OpenKind, TabOp};
 use super::super::decision::{DecisionAction, DecisionRecord};
 use super::super::situation::Situation;
 use super::driver::HostCtx;
 use super::gate::Gate;
+
+/// 决策落 SQLite，返回自增 seq；失败时返回 0（内存里仍可展示，不因审计写失败卡住托管）。
+pub fn persist(app: &tauri::AppHandle, rec: &DecisionRecord) -> i64 {
+    use tauri::Manager;
+    let Some(st) = app.try_state::<crate::cmd::AppState>() else {
+        return 0;
+    };
+    let json = serde_json::to_string(rec).unwrap_or_default();
+    st.store
+        .steward_decision_insert(
+            rec.ts_ms,
+            &rec.contract_id,
+            &rec.console_id,
+            &rec.situation_signature,
+            &json,
+            &rec.outcome,
+        )
+        .unwrap_or(0)
+}
 
 /// 理由里最多留多少字（模型这一轮的说明）
 const RATIONALE_CAP: usize = 600;

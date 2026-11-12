@@ -1,231 +1,22 @@
-//! P5 学习闭环：KB 聚合、成功轨迹沉淀、纠正去重、解释链、跨会话复盘、统一审计。
+//! 学习闭环的只读一侧：纠正去重、解释链、跨会话复盘、统一审计。
 //!
-//! 设计见 `docs/nexus-agent-steward-design.md` §4.4 / §8。P2 已经把「器官」做齐
-//! （`learn_correction` / `CtxRef` / `DecisionRecord`），P5 补的是把它们串成闭环：
+//! 设计见 `docs/nexus-agent-steward-design.md` §4.4 / §8。
 //!
-//! 1. **KB 不再只有手填条目**：`aggregate_kb` 把主机记忆、技能、历史 RunSummary
-//!    一起纳入检索，全部标为不可信数据，只能当参考，不能改写 Profile / Authority。
-//! 2. **成功轨迹沉淀**：同一局面被同一条回复成功处理两次 → `distill` 产出 Playbook 候选，
-//!    下次同类提问直接命中确定性剧本，不再询问、也不调模型。
-//! 3. **纠正不无限堆积**：`should_learn` 做去重与冲突检测。
-//! 4. **可解释**：`explain` 把 `ctxRefs` 展开成「引用了哪条、为什么这次自动放行」。
-//! 5. **统一审计**：`merge_audit` 把观察事件与决策记录合成一条时间线。
+//! 1. **纠正不无限堆积**：`should_learn` 做去重与冲突检测（`host_correct` 用）。
+//! 2. **可解释**：`explain` 把 `ctxRefs` 展开成「引用了哪条、为什么这次自动放行」。
+//! 3. **跨会话复盘**：`review` 按契约汇总决策结局。
+//! 4. **统一审计**：`merge_audit` 把观察事件与决策记录合成一条时间线。
 //!
-//! 全部是纯函数；落库 / 写时间线 / LLM 调用放在 `steward_cmd.rs` 与 `planner.rs`。
+//! 守护进程时代的 KB 聚合（`aggregate_kb`）与成功轨迹蒸馏（`distill`）只服务于已删除的
+//! 零 LLM 决策编译器，PR8 一并删除。全部是纯函数；落库放在 `steward_cmd.rs` / `host_cmd.rs`。
 
 use std::collections::HashMap;
 
 use serde::Serialize;
 
 use super::decision::{CtxRef, DecisionRecord};
-use super::hostmem::HostNote;
-use super::history::RunSummary;
-use super::profile::{CtxInput, CtxItem, KnowledgeHit, PlaybookSpec, KIND_PLAYBOOK};
-use super::situation::Situation;
-use super::skill::Skill;
+use super::profile::CtxItem;
 use super::steward_loop::StewardEvent;
-
-/// 蒸馏一条成功轨迹至少需要重复几次。2 次是刻意保守：一次可能是碰巧。
-pub const DISTILL_MIN_OCCURRENCES: usize = 2;
-
-// ─────────────────────────── KB 聚合 ───────────────────────────
-
-fn keywords(sit: &Situation) -> Vec<String> {
-    let mut v = Vec::new();
-    if let Some(t) = &sit.topic {
-        v.extend(t.split([':', '-', '_', '/']).map(|s| s.to_lowercase()).filter(|s| s.len() >= 3));
-    }
-    for w in sit.tail.to_lowercase().split_whitespace() {
-        let w = w.trim_matches(|c: char| !c.is_alphanumeric());
-        if w.len() >= 5 && v.len() < 24 {
-            v.push(w.to_string());
-        }
-    }
-    v
-}
-
-fn score_text(text: &str, kws: &[String]) -> i32 {
-    let t = text.to_lowercase();
-    kws.iter().filter(|k| t.contains(k.as_str())).count() as i32
-}
-
-/// 把三类既有资产聚进 KB。`base` 是 `StewardBrain::retrieve_kb` 的结果（优先级最高）。
-/// 所有新增条目 `untrusted=true`，id 带来源前缀，点开可回溯。
-pub fn aggregate_kb(
-    base: Vec<KnowledgeHit>,
-    host_notes: &[HostNote],
-    skills: &[Skill],
-    summaries: &[RunSummary],
-    sit: &Situation,
-    limit: usize,
-) -> Vec<KnowledgeHit> {
-    let kws = keywords(sit);
-    let mut out = base;
-    for n in host_notes {
-        let s = score_text(&n.text, &kws);
-        if s > 0 {
-            out.push(KnowledgeHit {
-                id: format!("hostmem:{}", n.id),
-                text: format!("[主机记忆] {}", n.text),
-                score: s + 1,
-                untrusted: true,
-            });
-        }
-    }
-    for sk in skills {
-        let s = score_text(&format!("{} {}", sk.name, sk.description), &kws);
-        if s > 0 {
-            out.push(KnowledgeHit {
-                id: format!("skill:{}", sk.id),
-                text: format!("[技能] {} — {}", sk.name, sk.description),
-                score: s,
-                untrusted: true,
-            });
-        }
-    }
-    for (i, r) in summaries.iter().enumerate() {
-        let s = score_text(&format!("{} {} {}", r.goal, r.outcome, r.final_state), &kws);
-        if s > 0 {
-            out.push(KnowledgeHit {
-                id: format!("run:{i}:{}", r.ts),
-                text: format!("[历史运行] 目标「{}」结局「{}」", r.goal, r.outcome),
-                score: s,
-                untrusted: true,
-            });
-        }
-    }
-    out.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
-    out.truncate(limit.max(1).min(32));
-    out
-}
-
-// ─────────────────────── 成功轨迹 → 剧本 ───────────────────────
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlaybookCandidate {
-    pub id: String,
-    pub signature: String,
-    pub occurrences: usize,
-    pub answer: String,
-    pub option_index: Option<String>,
-    pub match_program: Option<String>,
-    pub match_kind: Option<String>,
-    pub match_topic: Option<String>,
-    pub input: CtxInput,
-}
-
-/// 决策当时所在的 host_key：编译时写进 authority 依据的「授权档位 X · host Y」。
-/// 拿不到就返回 None——宁可不蒸馏，也不能把一台主机上的答案升格成全局剧本。
-fn host_of(d: &DecisionRecord) -> Option<String> {
-    d.ctx_refs
-        .iter()
-        .filter(|r| r.source == "authority")
-        .find_map(|r| r.snippet.split_once("· host ").map(|(_, h)| h.trim().to_string()))
-        .filter(|h| !h.is_empty())
-}
-
-/// 从决策历史里蒸馏确定性剧本。只有 `applied`（有写后回执）且两次以上、
-/// 且回复文本完全一致才生成候选——避免把一次侥幸或互相矛盾的回答固化下来。
-///
-/// 候选按 (host, 签名) 分组，作用域收窄到那台主机，并且**默认停用**：
-/// 蒸馏是机器归纳，自动生效会让一次错误的成功在所有主机上被反复自动执行；
-/// 用户在剧本面板里看过、手动启用后才参与决策。
-pub fn distill(decisions: &[DecisionRecord]) -> Vec<PlaybookCandidate> {
-    #[derive(Default)]
-    struct Group {
-        n: usize,
-        text: String,
-        option_index: Option<String>,
-        sig_parts: Vec<String>,
-        evidence: String,
-        host: String,
-        sig: String,
-    }
-    let mut groups: HashMap<(String, String), Group> = HashMap::new();
-    for d in decisions {
-        if d.outcome != "applied" || d.llm_used || !d.chosen.injectable {
-            continue;
-        }
-        if matches!(d.chosen.kind.as_str(), "observe" | "wait" | "secret" | "handoff") {
-            continue;
-        }
-        let Some(host) = host_of(d) else {
-            continue;
-        };
-        let g = groups
-            .entry((host.clone(), d.situation_signature.clone()))
-            .or_default();
-        if g.n == 0 {
-            g.host = host;
-            g.sig = d.situation_signature.clone();
-            g.text = d.chosen.text.clone();
-            g.option_index = d.chosen.option_index.clone();
-            g.sig_parts = d
-                .situation_signature
-                .split('|')
-                .map(|s| s.to_string())
-                .collect();
-            g.evidence = format!("DecisionRecord #{}", d.seq);
-        }
-        // 同签名但回复不一致：这一组作废（用空 text 标记）
-        if g.text != d.chosen.text {
-            g.text.clear();
-        }
-        g.n += 1;
-    }
-    let mut out: Vec<PlaybookCandidate> = groups
-        .into_iter()
-        .filter(|(_, g)| g.n >= DISTILL_MIN_OCCURRENCES && !g.text.is_empty())
-        .map(|(_, g)| {
-            let sig = g.sig.clone();
-            let spec = PlaybookSpec {
-                match_program: g.sig_parts.first().cloned(),
-                match_kind: g.sig_parts.get(1).cloned(),
-                match_topic: g.sig_parts.get(2).cloned(),
-                match_text: None,
-                answer: g.text.clone(),
-                option_index: g.option_index.clone(),
-                tier: Some("auto".to_string()),
-                enabled: false,
-            };
-            let id = format!("distilled-{}", short_hash(&format!("{}|{}", g.host, sig)));
-            PlaybookCandidate {
-                id: id.clone(),
-                signature: sig.clone(),
-                occurrences: g.n,
-                answer: g.text.clone(),
-                option_index: g.option_index.clone(),
-                match_program: spec.match_program.clone(),
-                match_kind: spec.match_kind.clone(),
-                match_topic: spec.match_topic.clone(),
-                input: CtxInput {
-                    id: Some(id),
-                    kind: KIND_PLAYBOOK.to_string(),
-                    text: format!("自动沉淀：{} → {}", sig.split('|').take(2).collect::<Vec<_>>().join("/"), truncate(&g.text, 60)),
-                    strength: None,
-                    scope: Some(g.host.clone()),
-                    source: Some("distilled".to_string()),
-                    evidence: Some(g.evidence.clone()),
-                    extra: Some(serde_json::to_value(spec).unwrap_or_default()),
-                    contract_id: None,
-                    position: None,
-                },
-            }
-        })
-        .collect();
-    out.sort_by(|a, b| b.occurrences.cmp(&a.occurrences).then_with(|| a.id.cmp(&b.id)));
-    out
-}
-
-fn short_hash(s: &str) -> String {
-    let mut h: u32 = 0x811c_9dc5;
-    for b in s.as_bytes() {
-        h ^= *b as u32;
-        h = h.wrapping_mul(0x0100_0193);
-    }
-    format!("{h:08x}")
-}
 
 fn truncate(s: &str, n: usize) -> String {
     let mut v: String = s.chars().take(n).collect();
@@ -460,7 +251,7 @@ pub fn merge_audit(events: &[StewardEvent], decisions: &[DecisionRecord]) -> Vec
             kind: e.kind.as_str().to_string(),
             text: e.message.clone(),
             seq: format!("ev{}", e.seq),
-            decision_seq: e.decision.as_ref().map(|d| d.seq),
+            decision_seq: None,
         });
     }
     for d in decisions {
@@ -480,7 +271,6 @@ pub fn merge_audit(events: &[StewardEvent], decisions: &[DecisionRecord]) -> Vec
 mod tests {
     use super::*;
     use super::super::decision::DecisionAction;
-    use super::super::situation::{Program, SituationKind};
 
     fn rec(seq: i64, sig: &str, outcome: &str, text: &str) -> DecisionRecord {
         DecisionRecord {
@@ -506,89 +296,6 @@ mod tests {
             escalation: None,
             receipt: Some("applied".into()),
         }
-    }
-
-    fn sit() -> Situation {
-        Situation {
-            frame_id: 1,
-            screen_hash: "aabb".into(),
-            program: Program::ClaudeCode,
-            kind: SituationKind::Question,
-            topic: Some("settings:remember-check".into()),
-            options: vec![],
-            confidence: 0.93,
-            tail: "Do you want to change the setting remember check?".into(),
-            evidence: vec![],
-            stale_ms: 0,
-            signature: "claude_code|question|settings:remember-check".into(),
-        }
-    }
-
-    #[test]
-    fn kb_aggregates_three_sources_and_marks_untrusted() {
-        let notes = vec![HostNote {
-            id: "h1".into(), host_key: "local:tab-1".into(),
-            text: "remember-check 与钥匙串读取有关".into(),
-            kind: super::super::hostmem::Kind::Quirk,
-            source: super::super::hostmem::Source::User,
-            created_at: 0, updated_at: 0,
-        }];
-        let runs = vec![RunSummary {
-            ts: 1, goal: "修 remember-check 设置".into(),
-            actions: vec![], outcome: "已修好".into(), final_state: "shell".into(),
-        }];
-        let hits = aggregate_kb(vec![], &notes, &[], &runs, &sit(), 8);
-        assert!(hits.len() >= 2);
-        assert!(hits.iter().all(|h| h.untrusted));
-        assert!(hits.iter().any(|h| h.id.starts_with("hostmem:")));
-        assert!(hits.iter().any(|h| h.id.starts_with("run:")));
-    }
-
-    #[test]
-    fn distill_requires_two_identical_successes() {
-        let one = vec![rec(1, "claude_code|question|settings", "applied", "No — 不改设置")];
-        assert!(distill(&one).is_empty());
-        let two = vec![
-            rec(1, "claude_code|question|settings", "applied", "No — 不改设置"),
-            rec(2, "claude_code|question|settings", "applied", "No — 不改设置"),
-        ];
-        let c = distill(&two);
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].occurrences, 2);
-        assert_eq!(c[0].match_kind.as_deref(), Some("question"));
-        assert_eq!(c[0].input.kind, "playbook");
-        assert_eq!(c[0].input.source.as_deref(), Some("distilled"));
-    }
-
-    #[test]
-    fn distilled_playbook_is_disabled_and_host_scoped() {
-        let mut b = rec(2, "claude_code|question|settings", "applied", "No — 不改设置");
-        let a = rec(1, "claude_code|question|settings", "applied", "No — 不改设置");
-        let c = distill(&[a.clone(), b.clone()]);
-        assert_eq!(c[0].input.scope.as_deref(), Some("local:tab-1"));
-        let spec: PlaybookSpec =
-            serde_json::from_value(c[0].input.extra.clone().unwrap()).unwrap();
-        assert!(!spec.enabled, "蒸馏出来的剧本必须等用户启用");
-        // 同签名但分属两台主机：各自只有一次成功，不能拼成一条
-        for r in b.ctx_refs.iter_mut().filter(|r| r.source == "authority") {
-            r.snippet = "授权档位 auto · host ssh:root@b:22".into();
-        }
-        assert!(distill(&[a.clone(), b]).is_empty());
-        // 没有 host 信息的记录不参与蒸馏
-        let mut x = a.clone();
-        x.ctx_refs.retain(|r| r.source != "authority");
-        assert!(distill(&[x.clone(), x]).is_empty());
-    }
-
-    #[test]
-    fn distill_rejects_conflicting_or_unconfirmed() {
-        let v = vec![
-            rec(1, "sig", "applied", "A"),
-            rec(2, "sig", "applied", "B"),
-            rec(3, "other", "escalated", "C"),
-            rec(4, "other2", "no_receipt", "D"),
-        ];
-        assert!(distill(&v).is_empty());
     }
 
     #[test]
@@ -639,7 +346,7 @@ mod tests {
             seq: 1, ts_ms: 2_000, console_id: "tab-1".into(), contract_id: "c-1".into(),
             kind: super::super::steward_loop::StewardEventKind::SituationChanged,
             message: "局面变化".into(), suggestion: None, situation: None,
-            frame_id: 1, screen_hash: "h".into(), llm_calls: 0, decision: None,
+            frame_id: 1, screen_hash: "h".into(),
         }];
         let v = merge_audit(&e, &[rec(5, "sig", "applied", "x")]);
         assert_eq!(v.len(), 2);

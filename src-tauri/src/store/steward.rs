@@ -10,8 +10,9 @@
 //! 两张表都是 `CREATE TABLE IF NOT EXISTS`，对旧库纯增量；**不加密**，与 `host_memory` 同级
 //! （保险库只覆盖凭据列）。写入口统一过 `agent::profile::validate_*`，拒绝凭据类文本与控制字符。
 //!
-//! P4 再加第三张表 `steward_checkpoints`：整条 Checkpoint JSON 一行，启动时扫描未完成契约。
-//! 与决策表一样是纯增量迁移，旧库打开只多一张空表。
+//! P4 加过第三张表 `steward_checkpoints`（守护进程的恢复现场）与 `steward_tombstones`
+//!（蒸馏剧本的墓碑）。PR8 删掉守护进程的恢复 / 蒸馏后两张表都不再读写；建表语句保留，
+//! 不做迁移。托管现场改存 `host_sessions`（`store/host.rs`）。
 
 use rusqlite::{params, Connection, Row};
 
@@ -244,132 +245,5 @@ impl Store {
         conn.execute("DELETE FROM steward_decisions", [])
             .map_err(|e| e.to_string())?;
         Ok(())
-    }
-
-    // ───────────────── P4：Checkpoint ─────────────────
-
-    /// 一契约一行，重复保存走 UPSERT（长任务每 30s 写一次也不会堆积）。
-    pub fn steward_checkpoint_save(
-        &self,
-        contract_id: &str,
-        console_id: &str,
-        record_json: &str,
-        state: &str,
-        saved_wall_ms: i64,
-    ) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT INTO steward_checkpoints
-                (contract_id, console_id, record_json, state, saved_wall_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(contract_id) DO UPDATE SET
-                console_id = excluded.console_id,
-                record_json = excluded.record_json,
-                state = excluded.state,
-                saved_wall_ms = excluded.saved_wall_ms",
-            params![contract_id, console_id, record_json, state, saved_wall_ms],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    /// 启动时扫描未完成契约：`(contract_id, console_id, state, record_json)`。
-    pub fn steward_checkpoints(&self) -> Vec<(String, String, String, String)> {
-        let Ok(conn) = self.conn.lock() else {
-            return Vec::new();
-        };
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT contract_id, console_id, state, record_json
-             FROM steward_checkpoints WHERE state != 'completed'
-             ORDER BY saved_wall_ms DESC",
-        ) else {
-            return Vec::new();
-        };
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-            .map(|it| it.filter_map(Result::ok).collect())
-            .unwrap_or_default()
-    }
-
-    /// 清理不再可能恢复的 Checkpoint：已完成的，以及超过 TTL 的（恢复判定反正会拒）。
-    /// 一契约一行，但每次启动 / 重开 tab 都会产生新契约 id，不裁剪的话表会无限增长。
-    pub fn steward_checkpoints_prune(&self, now_wall_ms: i64, ttl_ms: i64) -> usize {
-        let Ok(conn) = self.conn.lock() else {
-            return 0;
-        };
-        conn.execute(
-            "DELETE FROM steward_checkpoints WHERE state = 'completed' OR saved_wall_ms < ?1",
-            params![now_wall_ms.saturating_sub(ttl_ms)],
-        )
-        .unwrap_or(0)
-    }
-
-    pub fn steward_tombstone_add(&self, id: &str, ts: i64) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT OR REPLACE INTO steward_tombstones (id, ts) VALUES (?1, ?2)",
-            params![id, ts],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    pub fn steward_tombstoned(&self, id: &str) -> bool {
-        let Ok(conn) = self.conn.lock() else {
-            // 读不到就当作已删除：宁可少蒸馏一条，也不复活用户删掉的剧本
-            return true;
-        };
-        conn.query_row(
-            "SELECT 1 FROM steward_tombstones WHERE id = ?1",
-            params![id],
-            |_| Ok(()),
-        )
-        .is_ok()
-    }
-
-    pub fn steward_checkpoint(&self, contract_id: &str) -> Option<String> {
-        let conn = self.conn.lock().ok()?;
-        conn.query_row(
-            "SELECT record_json FROM steward_checkpoints WHERE contract_id = ?1",
-            params![contract_id],
-            |r| r.get(0),
-        )
-        .ok()
-    }
-
-    /// 契约完成 / 用户停止后标记，避免下次启动误恢复。
-    pub fn steward_checkpoint_state(&self, contract_id: &str, state: &str) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        conn.execute(
-            "UPDATE steward_checkpoints SET state = ?1 WHERE contract_id = ?2",
-            params![state, contract_id],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::tests::temp_store_at;
-
-    #[test]
-    fn prune_drops_completed_and_expired_checkpoints() {
-        let (store, _) = temp_store_at("steward-cp-prune");
-        store.steward_checkpoint_save("c-old", "t1", "{}", "observing", 1_000).unwrap();
-        store.steward_checkpoint_save("c-done", "t2", "{}", "observing", 9_000).unwrap();
-        store.steward_checkpoint_state("c-done", "completed").unwrap();
-        store.steward_checkpoint_save("c-live", "t3", "{}", "observing", 9_500).unwrap();
-        assert_eq!(store.steward_checkpoints_prune(10_000, 5_000), 2);
-        let left: Vec<String> = store.steward_checkpoints().into_iter().map(|r| r.0).collect();
-        assert_eq!(left, vec!["c-live".to_string()]);
-        assert!(store.steward_checkpoint("c-old").is_none());
-    }
-
-    #[test]
-    fn tombstones_persist() {
-        let (store, _) = temp_store_at("steward-tomb");
-        assert!(!store.steward_tombstoned("distilled-1"));
-        store.steward_tombstone_add("distilled-1", 5).unwrap();
-        assert!(store.steward_tombstoned("distilled-1"));
     }
 }

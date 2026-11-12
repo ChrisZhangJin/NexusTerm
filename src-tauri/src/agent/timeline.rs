@@ -72,8 +72,6 @@ pub enum Kind {
     Wait,
     /// Agent 读了一次屏幕（`nx_screen`）。
     Screen,
-    /// P5 统一审计：托管 Steward 产出的一条 DecisionRecord（`text` 是 rationale 摘要）。
-    Decision,
     /// Agent 的文件工具（读 / 写 / 改 / 查找 / 搜索）。`text` 是一句摘要，写入时输出是差异预览。
     File,
 }
