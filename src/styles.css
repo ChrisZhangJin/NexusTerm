@@ -2413,3 +2413,5 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .host-pill.idle { color: var(--text-dim); }
 .host-goal { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
 .host-question { white-space: pre-wrap; word-break: break-word; margin-bottom: 6px; }
+.host-yolo.on { color: var(--danger); font-weight: 600; }
+.host-notice .st-esc-head { color: var(--accent); }

@@ -135,6 +135,8 @@ export function AgentPanel({
   };
   /** 当前终端上的托管（对话页也显示它的胶囊与卡片） */
   const hostedHere = hostRuns.forConsole(sessionId);
+  // 托管不占对话的 busy；但它的密码卡 / 审批卡在跑着的托管里要能答
+  const hostedHereLive = !!hostedHere && !isTerminal(hostedHere.phase);
   const { conv, setConv, patch, runSession, setRunSession, pausedIds, drivingIds } = run;
   const [input, setInput] = useState("");
   /** 输入框。`@` 联想要在选中一项之后把光标放回原处，所以得拿得到它 */
@@ -377,7 +379,8 @@ export function AgentPanel({
     sid: string,
     goal: string,
     budget?: StewardBudgetPref,
-    tier?: string
+    tier?: string,
+    yolo?: boolean
   ): Promise<void> => {
     if (run.conv.busy) return;
     setRunSession(sid);
@@ -389,6 +392,7 @@ export function AgentPanel({
         consoleId: sid,
         goal,
         authorityTier: tier,
+        yolo,
         label,
         consoleText: snap?.text,
         consoleAlt: snap?.alt,
@@ -620,7 +624,7 @@ export function AgentPanel({
                   <RunCard
                     key={m.id}
                     message={m}
-                    busy={busy}
+                    busy={busy || hostedHereLive}
                     onDecide={(req, ok) => void run.decide(req, ok)}
                     onAnswerSecret={run.answerSecret}
                   />

@@ -88,3 +88,35 @@ test("按 console 取托管：未结束优先，否则最新结局", () => {
   assert.equal(hostForConsole(m, "t1")?.contractId, "steward-t1-050");
   assert.equal(hostForConsole(m, "t2"), null);
 });
+
+import { checksToText, textToChecks } from "../../src/lib/host";
+
+test("判据草稿：一行一条，往返不变；认不出的当人工确认", () => {
+  const cs = [
+    { kind: "commandOk" as const, cmd: "cargo test" },
+    { kind: "fileExists" as const, path: "/srv/app/dist" },
+    { kind: "screenMatches" as const, re: "All \\d+ passed" },
+    { kind: "manual" as const, text: "由你确认完成" },
+  ];
+  assert.deepEqual(textToChecks(checksToText(cs)), cs);
+  assert.deepEqual(textToChecks("  \n页面能打开\n命令：  \n文件：/a "), [
+    { kind: "manual", text: "页面能打开" },
+    { kind: "fileExists", path: "/a" },
+  ]);
+});
+
+test("等密码 / 等确认判据有各自的胶囊", () => {
+  const mk = (kind: "secret" | "criteriaDraft"): HostPhase => ({
+    kind: "waitingHuman",
+    card: {
+      id: "x",
+      kind: kind === "secret" ? { kind } : { kind, draft: [] },
+      question: "q",
+      options: [],
+      reasons: [],
+      createdWallMs: 0,
+    },
+  });
+  assert.equal(hostPill(mk("secret")).label, "等你输入密码");
+  assert.equal(hostPill(mk("criteriaDraft")).label, "等你确认判据");
+});

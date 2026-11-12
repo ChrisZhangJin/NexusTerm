@@ -814,8 +814,15 @@ export interface HostCardOption {
   reply: string;
 }
 
+/** 完成判据（后端 `host::Check`） */
+export type HostCheck =
+  | { kind: "screenMatches"; re: string }
+  | { kind: "commandOk"; cmd: string }
+  | { kind: "fileExists"; path: string }
+  | { kind: "manual"; text: string };
+
 export interface HostCheckResult {
-  check: { kind: string; [k: string]: unknown };
+  check: HostCheck;
   passed: boolean;
   detail: string;
 }
@@ -825,7 +832,11 @@ export type HostCardKind =
   | { kind: "ask" }
   | { kind: "approve" }
   | { kind: "watchdog" }
-  | { kind: "manualCheck"; summary: string; checks: HostCheckResult[] };
+  | { kind: "manualCheck"; summary: string; checks: HostCheckResult[] }
+  /** nx_secret：密码在面板的密码卡片里输入，不经 host_answer */
+  | { kind: "secret" }
+  /** 开始托管时模型起草的完成判据，等你编辑 / 接受 */
+  | { kind: "criteriaDraft"; draft: HostCheck[] };
 
 /** 一张等人处理的卡片：永远等下去，没有倒计时、没有默认动作 */
 export interface HostHumanCard {
@@ -887,4 +898,17 @@ export interface HostStartRequest {
   budget?: { maxSteps?: number; maxMinutes?: number };
   consoleText?: string;
   consoleAlt?: boolean;
+  /** YOLO：直接采用模型起草的完成判据，不经确认就开始（不改档位与禁项） */
+  yolo?: boolean;
+}
+
+/** `nx://host/{contractId}/notify`：通知档写入后的通知卡 */
+export interface HostNotice {
+  contractId: string;
+  /** 对应的决策记录 seq（纠正按它找） */
+  seq: number;
+  kind: string;
+  text: string;
+  undoWindowMs: number;
+  tsMs: number;
 }
