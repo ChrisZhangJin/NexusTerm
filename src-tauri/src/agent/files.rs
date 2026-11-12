@@ -781,7 +781,7 @@ impl GrepResult {
 
 // ——————————————————————————————— 工具参数 ———————————————————————————————
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadArgs {
     pub target: Option<String>,
@@ -790,7 +790,7 @@ pub struct ReadArgs {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WriteArgs {
     pub target: Option<String>,
@@ -800,7 +800,7 @@ pub struct WriteArgs {
     pub create_dirs: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditArgs {
     pub target: Option<String>,
@@ -811,7 +811,7 @@ pub struct EditArgs {
     pub replace_all: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GlobArgs {
     pub target: Option<String>,
@@ -820,7 +820,7 @@ pub struct GlobArgs {
     pub max_results: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GrepArgs {
     pub target: Option<String>,

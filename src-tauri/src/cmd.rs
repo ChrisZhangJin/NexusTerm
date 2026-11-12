@@ -244,6 +244,7 @@ pub fn ssh_resize(
 #[tauri::command]
 pub fn ssh_close(
     id: String,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     screen: State<'_, ScreenStore>,
     registry: State<'_, StewardRegistry>,
@@ -252,6 +253,14 @@ pub fn ssh_close(
     bus: State<'_, StewardBus>,
 ) {
     state.sessions.close(&id);
+    // Agent 文件工具在这个标签的连接上开过 SFTP：一并关掉，否则它会替已关的连接续命
+    let sftp_id = crate::sftp::SftpManager::agent_sftp_id(&id);
+    tauri::async_runtime::spawn(async move {
+        use tauri::Manager;
+        if let Some(st) = app.try_state::<AppState>() {
+            st.sftp.close(&sftp_id).await;
+        }
+    });
     // 会话没了，旁路缓冲也要跟着放掉：AppState 活到应用退出，
     // 不清理的话每个关掉的标签都会留下最多 256KB 常驻内存
     state.agent.remove(&id);

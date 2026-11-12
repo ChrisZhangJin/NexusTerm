@@ -1607,6 +1607,7 @@ impl SkillIo for TauriIo<'_> {
             target: self.target.clone(),
             target_label: self.label.clone(),
             reasons: ask.reasons.clone(),
+            diff: None,
         };
         request_approval(self.app, self.runtime, &self.run, &payload).await
     }
@@ -1923,7 +1924,7 @@ pub async fn run_skill(
         run: target_session.to_string(),
         target: target_session.to_string(),
         label: if target_label.trim().is_empty() { "当前会话".into() } else { target_label.trim().to_string() },
-        targets: vec![AgentTarget { id: target_session.to_string(), label: target_label.trim().to_string() }],
+        targets: vec![AgentTarget { id: target_session.to_string(), label: target_label.trim().to_string(), cwd: None }],
         cancel,
         mark: 0,
         step: 0,
