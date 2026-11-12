@@ -632,6 +632,69 @@ impl SftpManager {
         Ok(())
     }
 
+    /// 新建远端文件（已存在则失败，`EXCLUDE`）并写入。`mode` 在 OPEN 请求里随属性一起下发，
+    /// 文件从诞生那一刻起就是这个权限 —— agent/files.rs 的原子写用它建临时文件，
+    /// 替换 0600 的秘密文件时不会出现一个按服务器 umask 建出来、全世界可读的临时文件。
+    pub async fn create_new_with_mode(
+        &self,
+        id: &str,
+        path: &str,
+        bytes: &[u8],
+        mode: Option<u32>,
+    ) -> Result<(), SftpError> {
+        use russh_sftp::protocol::{FileAttributes, OpenFlags};
+        let mut file = {
+            let map = self.inner.lock().await;
+            let s = map
+                .get(id)
+                .ok_or_else(|| SftpError::NotFound(id.to_string()))?;
+            let attrs = FileAttributes { permissions: mode, ..FileAttributes::empty() };
+            s.open_with_flags_and_attributes(
+                path.to_string(),
+                OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+                attrs,
+            )
+            .await
+            .map_err(|e| SftpError::Remote(e.to_string()))?
+        };
+        file.write_all(bytes)
+            .await
+            .map_err(|e| SftpError::Remote(e.to_string()))?;
+        file.shutdown()
+            .await
+            .map_err(|e| SftpError::Remote(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 流式计算远端文件的 SHA-256（十六进制），不受浏览读上限约束。
+    /// agent/files.rs 给过大、不生成差异的文件算 before_hash，落盘前据此复核「审批期间没被改过」。
+    pub async fn sha256(&self, id: &str, path: &str) -> Result<String, SftpError> {
+        use sha2::{Digest, Sha256};
+        let mut file = {
+            let map = self.inner.lock().await;
+            let s = map
+                .get(id)
+                .ok_or_else(|| SftpError::NotFound(id.to_string()))?;
+            s.open(path.to_string())
+                .await
+                .map_err(|e| SftpError::Remote(e.to_string()))?
+        };
+        let mut h = Sha256::new();
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| SftpError::Remote(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+        let _ = file.close().await;
+        Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    }
+
     /// 查询单个路径（跟随符号链接）。不存在返回 `Ok(None)`，其余错误照常上抛 ——
     /// 「没有这个文件」与「没权限看」对调用方是两回事。
     pub async fn stat(&self, id: &str, path: &str) -> Result<Option<RemoteEntry>, SftpError> {

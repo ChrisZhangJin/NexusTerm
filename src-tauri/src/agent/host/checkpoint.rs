@@ -286,6 +286,54 @@ mod tests {
         assert!(!back.messages.iter().any(|m| m.content.contains("hunter2secret")));
     }
 
+    /// 整个 checkpoint 落盘串里不能有任何凭据：正文、工具参数、工具回执（含整段私钥）都要过加强后的脱敏
+    #[test]
+    fn checkpoint_round_trip_holds_no_secret() {
+        use super::super::super::llm::{ToolResult, ToolUse};
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun\nVTLw7onLRnrq0/IzW7yWR7QkrmBL7jTKEn5u+qKhbwKfBstIs+bMY2Zkp18gnTxK\n-----END RSA PRIVATE KEY-----\n";
+        let numbered: String = pem.lines().enumerate().map(|(i, l)| format!("{:>6}\t{l}\n", i + 1)).collect();
+        let mut c = cp();
+        c.messages = vec![
+            ChatMessage::user("部署：DB_PASSWORD=Hunter2Hunter2 GITHUB_TOKEN=ghp_0123456789abcdefghijABCDEFGHIJ012345"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: "读一下配置".into(),
+                tool_calls: vec![ToolUse {
+                    id: "call_1".into(),
+                    name: "nx_write".into(),
+                    arguments: r#"{"path":"/srv/app.yml","content":"db:\n  password: S3cretYamlPw\n"}"#.into(),
+                }],
+                tool_results: vec![],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: String::new(),
+                tool_results: vec![ToolResult {
+                    id: "call_1".into(),
+                    content: format!("文件 /root/key：\n{numbered}root:$6$Zr8qBx1L$Qk4pU2c9dYJ0oF1vXxjv5w8m3eTq7Lr2sN6aH4bG9yK:19700:0:99999:7:::\n"),
+                    is_error: false,
+                }],
+                tool_calls: vec![],
+            },
+        ];
+        let json = c.to_json(0).unwrap();
+        for secret in [
+            "Hunter2Hunter2",
+            "0123456789abcdefghij",
+            "S3cretYamlPw",
+            "MIIEowIBAAKCAQEAu1SU1Lf",
+            "VTLw7onLRnrq0",
+            "Qk4pU2c9dYJ0",
+        ] {
+            assert!(!json.contains(secret), "落盘串里有 {secret}：{json}");
+        }
+        let back = HostCheckpoint::from_json(&json).unwrap();
+        assert_eq!(back.messages.len(), 3);
+        assert_eq!(back.messages[1].tool_calls[0].id, "call_1", "id 不脱敏，配对不断");
+        assert_eq!(back.messages[2].tool_results[0].id, "call_1");
+        assert!(back.messages[0].content.contains("DB_PASSWORD=[REDACTED]"));
+    }
+
     #[test]
     fn restart_suspends_non_terminal_only() {
         let mut c = cp();

