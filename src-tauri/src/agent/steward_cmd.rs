@@ -25,8 +25,8 @@ use super::situation;
 use super::steward::{now_ms, ScreenStore, StewardContract, StewardRegistry};
 use super::steward_core::{CoreView, StewardCore};
 use super::steward_loop::{
-    approval_gate, build_context, persist_decision, EventLog, StewardBus, StewardEvent,
-    StewardEventKind, StewardResolutions, StewardRuntime,
+    build_context, persist_decision, EventLog, StewardBus, StewardEvent,
+    StewardEventKind, StewardResolutions, StewardRuntime, OBSERVER_ONLY_NOTE,
 };
 
 /// 命令层直接往托管事件流补一条系统事件（循环下一 tick 也会看到同一份 log）。
@@ -209,47 +209,15 @@ pub fn steward_set_execution(
     on
 }
 
-/// 升级卡「按建议执行」：只投递 seq，注入由常驻循环执行。
-/// 投递前先跑与循环相同的 `approval_gate`（待确认、契约仍有效、屏幕未变、非 shell、
-/// 策略复核、总闸、所有权），不满足就直接把中文原因还给前端；循环注入前还会再跑一遍，
-/// 并在写入前消费掉这张卡，所以同一张卡连点两次也只会写一次。
+/// 升级卡「按建议执行」。PR1 起守护进程只观察、没有写路径：批准**不会**写终端，
+/// 直接把原因还给前端（卡片保持为建议，超时照常收敛，或点「我自己来」关掉）。
+/// 托管动手统一交给 LLM 运行（设计 §1）。
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub fn steward_approve(
-    seq: i64,
-    brain: State<'_, StewardBrain>,
-    resolutions: State<'_, StewardResolutions>,
-    bus: State<'_, StewardBus>,
-    core: State<'_, StewardCore>,
-    registry: State<'_, StewardRegistry>,
-    screen: State<'_, ScreenStore>,
-    state: State<'_, AppState>,
-) -> Result<bool, String> {
-    let rec = brain
+pub fn steward_approve(seq: i64, brain: State<'_, StewardBrain>) -> Result<bool, String> {
+    brain
         .decision(seq)
         .ok_or_else(|| format!("找不到决策 #{seq}（可能已过期）"))?;
-    let active = registry.for_console(&rec.console_id);
-    let auth = core.authority(&rec.contract_id);
-    let known =
-        state.local.contains(&rec.console_id) || state.sessions.contains(&rec.console_id);
-    let in_scope = active
-        .as_ref()
-        .map(|c| policy::host_in_scope(&auth, &c.host_key, known))
-        .unwrap_or(false);
-    approval_gate(
-        &rec,
-        core.is_consumed(seq),
-        active.as_ref(),
-        screen.get(&rec.console_id).as_ref(),
-        &auth,
-        in_scope,
-        brain.execution_enabled(),
-        core.ownership().can_write(&rec.console_id),
-        now_ms(),
-    )?;
-    resolutions.approve(seq);
-    bus.wake();
-    Ok(true)
+    Err(format!("决策 #{seq} 未执行：{OBSERVER_ONLY_NOTE}"))
 }
 
 /// 升级卡「我自己来」：撤销决策；给了纠正文本就写一条 Learned 偏好。

@@ -164,6 +164,23 @@ impl TimeboxState {
         self.raised.remove(&TimeboxHit::Receipt);
     }
 
+    /// deadline / grace 的**电平**判定（不去重）：`check` 只在第一次越线时报一次，
+    /// 之后用户按键→交还把所有权拨回 AgentDriving 时，循环靠这个重新核对，
+    /// 确保过了时限的托管仍被挡住，而不是因为「已经报过」就放行。
+    pub fn deadline_passed(&self, now: i64, cfg: &TimeboxConfig) -> Option<TimeboxHit> {
+        if cfg.deadline_ms <= 0 {
+            return None;
+        }
+        let elapsed = now - self.started_ms;
+        if elapsed >= cfg.deadline_ms + cfg.grace_ms {
+            Some(TimeboxHit::Grace)
+        } else if elapsed >= cfg.deadline_ms {
+            Some(TimeboxHit::Deadline)
+        } else {
+            None
+        }
+    }
+
     /// 返回本次新触发的档位（同一档只报一次，直到对应 mark_* 重置）。
     pub fn check(&mut self, now: i64, cfg: &TimeboxConfig) -> Vec<TimeboxHit> {
         let mut hits = Vec::new();
@@ -210,6 +227,7 @@ impl Spent {
     pub fn bump_step(&mut self) {
         self.steps = self.steps.saturating_add(1);
     }
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn bump_injection(&mut self, bytes: usize) {
         self.injections = self.injections.saturating_add(1);
         self.output_chars = self
@@ -440,6 +458,22 @@ mod tests {
         assert!(!st.check(9_999, &cfg).contains(&TimeboxHit::Deadline));
         assert!(st.check(10_000, &cfg).contains(&TimeboxHit::Deadline));
         assert!(st.check(11_000, &cfg).contains(&TimeboxHit::Grace));
+    }
+
+    #[test]
+    fn deadline_level_check_survives_edge_dedup() {
+        let mut cfg = TimeboxConfig::default();
+        cfg.deadline_ms = 10_000;
+        cfg.grace_ms = 1_000;
+        let mut st = TimeboxState::start(0);
+        assert_eq!(st.deadline_passed(9_999, &cfg), None);
+        assert!(st.check(10_000, &cfg).contains(&TimeboxHit::Deadline));
+        // 边沿只报一次，但电平判定始终成立：交还之后仍能据此重新挂起
+        assert!(!st.check(10_500, &cfg).contains(&TimeboxHit::Deadline));
+        assert_eq!(st.deadline_passed(10_500, &cfg), Some(TimeboxHit::Deadline));
+        assert_eq!(st.deadline_passed(11_000, &cfg), Some(TimeboxHit::Grace));
+        cfg.deadline_ms = 0;
+        assert_eq!(st.deadline_passed(99_999, &cfg), None, "没设时限就不判");
     }
 
     #[test]

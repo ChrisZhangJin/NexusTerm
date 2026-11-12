@@ -56,10 +56,25 @@ pub struct OwnershipSlot {
     pub takeover_latency_ms: i64,
     pub takeover_count: u32,
     pub suspension_reason: Option<String>,
+    /// 用户在 `Suspended` 期间敲键 / 接管时，把挂起原因寄存在这里：交还后回到
+    /// `Suspended` 而不是 `AgentDriving`。预算耗尽 / deadline 只能由显式的 `resume` 解除，
+    /// 不能被「按一下键再交还」绕过（设计 §2：UserDriving 交还回 `resume_to`）。
+    pub held_suspension: Option<String>,
     pub absence: Vec<AbsenceNote>,
 }
 
 impl OwnershipSlot {
+    /// 从 `Suspended` 转去观察态前寄存挂起原因（已在观察态的不覆盖）。
+    fn hold_suspension(&mut self) {
+        if self.state == OwnershipState::Suspended {
+            self.held_suspension = self
+                .suspension_reason
+                .take()
+                .or_else(|| Some("托管已挂起".to_string()));
+        }
+        self.suspension_reason = None;
+    }
+
     fn new(now: i64) -> Self {
         Self {
             state: OwnershipState::AgentDriving,
@@ -68,6 +83,7 @@ impl OwnershipSlot {
             takeover_latency_ms: 0,
             takeover_count: 0,
             suspension_reason: None,
+            held_suspension: None,
             absence: Vec::new(),
         }
     }
@@ -127,11 +143,11 @@ impl OwnershipTable {
         let latency = (now_wall - key_at_ms).max(0);
         slot.last_key_ms = key_at_ms;
         if slot.state != OwnershipState::ObservingOnly {
+            slot.hold_suspension();
             slot.state = OwnershipState::ObservingOnly;
             slot.since_ms = now_mono;
             slot.takeover_count += 1;
             slot.takeover_latency_ms = latency;
-            slot.suspension_reason = None;
         }
         let text = if latency > TAKEOVER_SLA_MS {
             format!("用户敲键，{latency}ms 夺权（超出 {TAKEOVER_SLA_MS}ms SLA），Steward 转观察态")
@@ -152,11 +168,11 @@ impl OwnershipTable {
         let Some(slot) = m.get_mut(console_id) else {
             return;
         };
+        slot.hold_suspension();
         slot.state = OwnershipState::ObservingOnly;
         slot.since_ms = now;
         slot.takeover_count += 1;
         slot.takeover_latency_ms = 0;
-        slot.suspension_reason = None;
     }
 
     /// 用户点「交还」。先由命令层读屏对齐，再把 `screen_aligned` 结果传进来；
@@ -197,7 +213,17 @@ impl OwnershipTable {
         }
         done.truncate(20);
         pending.truncate(10);
-        let next_step = if !screen_aligned {
+        // 接管期间又被挂起（例如用户开车时预算耗尽）：此刻就是 Suspended，交还也不解除
+        let held = slot.held_suspension.take().or_else(|| {
+            (slot.state == OwnershipState::Suspended).then(|| {
+                slot.suspension_reason
+                    .clone()
+                    .unwrap_or_else(|| "托管已挂起".to_string())
+            })
+        });
+        let next_step = if let Some(reason) = &held {
+            format!("托管仍处于挂起：{reason}；需显式恢复（补预算 / 延长时限）后才继续")
+        } else if !screen_aligned {
             "屏幕与 Checkpoint 不一致：已降为「确认」档，请先核对现场".to_string()
         } else if pending.is_empty() {
             "现场已对齐，从最后 Checkpoint 继续值守".to_string()
@@ -215,7 +241,13 @@ impl OwnershipTable {
             next_step,
             screen_aligned,
         };
-        slot.state = OwnershipState::AgentDriving;
+        // 交还回到接管前的状态：挂起中的仍挂起（原因原样恢复），否则才回 AgentDriving
+        slot.state = if held.is_some() {
+            OwnershipState::Suspended
+        } else {
+            OwnershipState::AgentDriving
+        };
+        slot.suspension_reason = held;
         slot.since_ms = now;
         slot.absence.clear();
         summary
@@ -245,6 +277,7 @@ impl OwnershipTable {
         slot.state = OwnershipState::AgentDriving;
         slot.since_ms = now;
         slot.suspension_reason = None;
+        slot.held_suspension = None;
     }
 
     /// 循环在每次注入前查这个。`Suspended` 与 `ObservingOnly` 都不写。
@@ -383,6 +416,45 @@ mod tests {
         assert!(!t.can_write("tab-1"));
         t.resume("tab-1", 900);
         assert!(t.can_write("tab-1"));
+    }
+
+    #[test]
+    fn suspension_survives_user_key_then_handback() {
+        let t = OwnershipTable::new();
+        t.ensure("tab-1", 0);
+        t.suspend("tab-1", "预算耗尽（步数）", 100);
+        // 用户按一下键再交还：不能借此绕过预算耗尽
+        t.user_key("tab-1", 1_000, 1_010, 200);
+        assert_eq!(t.state("tab-1"), OwnershipState::ObservingOnly);
+        let s = t.handback("tab-1", 300, true);
+        assert_eq!(t.state("tab-1"), OwnershipState::Suspended);
+        assert!(!t.can_write("tab-1"));
+        assert!(s.next_step.contains("挂起"), "{}", s.next_step);
+        assert_eq!(
+            t.view()[0].suspension_reason.as_deref(),
+            Some("预算耗尽（步数）"),
+            "原因原样恢复"
+        );
+        // 接管按钮同理
+        t.takeover("tab-1", 400);
+        t.handback("tab-1", 500, true);
+        assert_eq!(t.state("tab-1"), OwnershipState::Suspended);
+        // 只有显式 resume 才解除
+        t.resume("tab-1", 600);
+        assert!(t.can_write("tab-1"));
+        t.user_key("tab-1", 2_000, 2_010, 700);
+        t.handback("tab-1", 800, true);
+        assert!(t.can_write("tab-1"), "resume 之后不再残留寄存的挂起");
+    }
+
+    #[test]
+    fn suspended_while_user_drives_stays_suspended_on_handback() {
+        let t = OwnershipTable::new();
+        t.ensure("tab-1", 0);
+        t.user_key("tab-1", 10, 15, 10);
+        t.suspend("tab-1", "deadline 已到", 50);
+        t.handback("tab-1", 90, true);
+        assert_eq!(t.state("tab-1"), OwnershipState::Suspended);
     }
 
     #[test]

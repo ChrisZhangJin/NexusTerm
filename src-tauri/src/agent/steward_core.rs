@@ -19,6 +19,10 @@ use super::ownership::{OwnershipTable, OwnershipView};
 use super::planner::PlannerGate;
 use super::policy::{Authority, UndoEntry};
 
+/// 恢复项等 console 重新出现的上限：checkpoint 里的 tab id 重启后可能永远不会再出现，
+/// 过了这个时长就丢弃，而不是每个 tick 重新排队到天荒地老。
+pub const RESUME_TTL_MS: i64 = 10 * 60_000;
+
 /// 全局 LLM 并发上限（设计 §3.5 的 Supervisor 约束）。默认 2。
 pub const MAX_LLM_CONCURRENCY: usize = 2;
 
@@ -35,6 +39,8 @@ pub struct StewardCore {
     write_locks: Arc<Mutex<HashSet<String>>>,
     llm_inflight: Arc<AtomicUsize>,
     resume_queue: Arc<Mutex<Vec<String>>>,
+    /// 恢复项第一次入队的单调时刻；重新排队不刷新，用来判 `RESUME_TTL_MS`
+    resume_since: Arc<Mutex<HashMap<String, i64>>>,
     timebox_config: Arc<Mutex<TimeboxConfig>>,
     /// 每个契约自己的 Timebox 配置；没有单独设置的契约回落到全局 `timebox_config`
     timebox_configs: Arc<Mutex<HashMap<String, TimeboxConfig>>>,
@@ -76,6 +82,7 @@ impl StewardCore {
             write_locks: Arc::new(Mutex::new(HashSet::new())),
             llm_inflight: Arc::new(AtomicUsize::new(0)),
             resume_queue: Arc::new(Mutex::new(Vec::new())),
+            resume_since: Arc::new(Mutex::new(HashMap::new())),
             timebox_config: Arc::new(Mutex::new(TimeboxConfig::default())),
             timebox_configs: Arc::new(Mutex::new(HashMap::new())),
             injections: Arc::new(AtomicUsize::new(0)),
@@ -156,6 +163,7 @@ impl StewardCore {
             .lock()
             .unwrap()
             .retain(|id| id != contract_id);
+        self.resume_since.lock().unwrap().remove(contract_id);
     }
 
     // ── Timebox / 预算 ──
@@ -260,6 +268,12 @@ impl StewardCore {
         *s
     }
 
+    /// 是否已报过耗尽（电平）。交还后循环据此重新核对，不让耗尽状态被绕过。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_exhausted(&self, contract_id: &str) -> bool {
+        self.exhausted.lock().unwrap().contains(contract_id)
+    }
+
     /// 第一次标记耗尽返回 true；之后同一契约再标返回 false。
     pub fn mark_exhausted(&self, contract_id: &str) -> bool {
         self.exhausted
@@ -285,6 +299,8 @@ impl StewardCore {
         fresh
     }
 
+    // PR1：守护进程不再注入，只剩测试 / 后续托管任务（reflex）会用
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_consumed(&self, seq: i64) -> bool {
         self.consumed.lock().unwrap().contains(&seq)
     }
@@ -319,6 +335,8 @@ impl StewardCore {
         *s
     }
 
+    // PR1：守护进程不再注入，只剩测试 / 后续托管任务（reflex）会用
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn bump_injection(&self, contract_id: &str, bytes: usize) -> Spent {
         let mut m = self.spent.lock().unwrap();
         let s = m.entry(contract_id.to_string()).or_default();
@@ -327,6 +345,8 @@ impl StewardCore {
         *s
     }
 
+    // PR1：守护进程不再注入，只剩测试 / 后续托管任务（reflex）会用
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn mark_injection(&self) -> usize {
         self.injections.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -356,6 +376,8 @@ impl StewardCore {
 
     // ── 撤销窗口 ──
 
+    // PR1：守护进程不再注入，只剩测试 / 后续托管任务（reflex）会用
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn add_undo(&self, e: UndoEntry) {
         let mut m = self.undo.lock().unwrap();
         m.retain(|x| x.seq != e.seq);
@@ -420,10 +442,32 @@ impl StewardCore {
     // ── 恢复队列 ──
 
     pub fn push_resume(&self, contract_id: &str) {
+        let now = self.elapsed_ms();
+        self.resume_since
+            .lock()
+            .unwrap()
+            .entry(contract_id.to_string())
+            .or_insert(now);
         let mut q = self.resume_queue.lock().unwrap();
         if !q.iter().any(|x| x == contract_id) {
             q.push(contract_id.to_string());
         }
+    }
+
+    /// 恢复项从第一次入队到现在等了多久（没登记过返回 0）。
+    pub fn resume_waited_ms(&self, contract_id: &str) -> i64 {
+        let now = self.elapsed_ms();
+        self.resume_since
+            .lock()
+            .unwrap()
+            .get(contract_id)
+            .map(|t| (now - t).max(0))
+            .unwrap_or(0)
+    }
+
+    /// 恢复项已处理（对齐完成 / 过期丢弃）：清掉计时，之后再投递重新计。
+    pub fn forget_resume(&self, contract_id: &str) {
+        self.resume_since.lock().unwrap().remove(contract_id);
     }
 
     pub fn drain_resume(&self) -> Vec<String> {
@@ -630,5 +674,18 @@ mod tests {
         assert_eq!(v.resume_queue, vec!["c-9".to_string()]);
         assert!(!v.planner_enabled);
         assert_eq!(v.checkpoint_count, 0);
+    }
+
+    #[test]
+    fn exhausted_budget_survives_user_key_then_handback() {
+        let c = StewardCore::new();
+        c.ensure_console("tab-1");
+        assert!(c.mark_exhausted("c-1"));
+        c.ownership().suspend("tab-1", "预算耗尽（步数）", c.elapsed_ms());
+        c.ownership().user_key("tab-1", 0, 5, c.elapsed_ms());
+        c.ownership().handback("tab-1", c.elapsed_ms(), true);
+        assert!(!c.ownership().can_write("tab-1"), "按一下键再交还不能绕过预算耗尽");
+        assert!(c.is_exhausted("c-1"), "耗尽是电平，循环据此重新核对");
+        assert!(!c.mark_exhausted("c-1"), "通知仍只发一次");
     }
 }
