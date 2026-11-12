@@ -300,6 +300,9 @@ impl HostShared {
     /// Running 期间的周期快照：距上次超过 `PROGRESS_TICK` 且对话有变化时才克隆历史、落盘。
     /// 相位迁移（问人 / 审批 / 暂停 / 完成）另外即时落盘，用的是最近一次快照。
     pub fn tick_progress(&self, messages: &[super::super::llm::ChatMessage], step: usize) -> bool {
+        if self.is_superseded() {
+            return false;
+        }
         let fp = (messages.len(), messages.last().map_or(0, |m| m.content.len()), step);
         {
             let mut g = self.progress.lock();
@@ -426,6 +429,9 @@ impl HostShared {
 
     /// 开局：落第一份 checkpoint、推一次相位、同步控制权。
     pub fn announce(&self) {
+        if self.is_superseded() {
+            return;
+        }
         let p = self.phase();
         self.io.save(&p);
         self.io.emit(&p);
@@ -436,6 +442,11 @@ impl HostShared {
     /// 旧的「交还」按钮可能已经把 ControlTable 翻成 AgentDriving，而相位并不接受它）。
     pub fn apply(&self, ev: HostEvent) -> Result<HostPhase, Invalid> {
         let name = ev.name();
+        // 被接驳顶替的旧任务：相位冻结。它和新任务共用 `host:{id}`，任何迁移的副作用
+        // （落盘覆盖新行、ReleaseLease 放掉新 console 的租约、同步控制权）都会打到新任务身上
+        if self.is_superseded() {
+            return Err(Invalid { from: "superseded", event: name });
+        }
         let res = {
             let mut cur = self.phase.lock();
             match step(&cur, ev) {
@@ -593,6 +604,9 @@ impl HostShared {
 
     /// 周期快照：「动作 + 反馈」一轮之后落一次（相位不变）。
     pub fn checkpoint_now(&self) {
+        if self.is_superseded() {
+            return;
+        }
         self.io.save(&self.phase());
     }
 }
@@ -836,6 +850,33 @@ pub(crate) mod tests {
         h.send(HostEvent::Answer(CardReply { card_id: "cd1".into(), text: String::new(), approved: Some(true) }));
         assert_eq!(task.await.unwrap(), Some(edited));
         assert!(!h.ctx().contract.yolo);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn superseded_task_is_inert_on_every_exit_path() {
+        let (h, io) = shared();
+        h.apply(HostEvent::Suspend(SuspendReason::ConsoleGone)).unwrap();
+        let saves = io.saves.lock().len();
+        let controls = io.control.lock().len();
+        let h2 = h.clone();
+        let parked = tokio::spawn(async move { h2.park().await });
+        settle().await;
+        h.supersede();
+        tokio::time::advance(CANCEL_POLL * 2).await;
+        assert_eq!(parked.await.unwrap(), ParkEnd::Cancelled, "挂起中的旧任务被取消旗叫醒");
+        // 旧任务退出路径上可能碰到的一切：终态迁移、周期快照、即时落盘、开局广播
+        for ev in [HostEvent::Stop, HostEvent::Fatal("x".into()), HostEvent::CompleteVerified { summary: "s".into(), checks: vec![] }] {
+            assert!(h.apply(ev).is_err());
+        }
+        assert!(!h.tick_progress(&[super::super::super::llm::ChatMessage::user("x".to_string())], 99));
+        h.checkpoint_now();
+        h.announce();
+        assert!(!h.is_terminal());
+        assert_eq!(*io.released.lock(), 0, "不放共用的 host:{{id}} 租约");
+        assert_eq!(io.saves.lock().len(), saves, "不覆盖新任务那一行");
+        assert_eq!(io.control.lock().len(), controls, "不动控制权");
+        // 写到一半被取消：闸口直接返回不可写
+        assert!(!h.gate(|| false, || true).await);
     }
 
     #[test]
