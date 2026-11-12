@@ -503,13 +503,15 @@ export interface AgentApproveRequest {
    * skill：技能回放里的逐步确认（审批模式）/ 偏离后让用户选「继续 / 重试 / 中止」。
    * 缺省按 danger 处理（兼容旧载荷）。
    */
-  kind?: "danger" | "scope" | "skill" | "file" | "file_sensitive";
+  kind?: "danger" | "scope" | "skill" | "file" | "file_sensitive" | "file_read_sensitive";
   command: string;
   target: string;
   targetLabel: string;
   reasons: string[];
   /** kind=file：写 / 改文件的差异预览 */
   diff?: string;
+  /** kind=file*：差异预览是否完整（false = 卡上看不到全部修改） */
+  previewComplete?: boolean;
 }
 
 /**
@@ -862,6 +864,8 @@ export interface HostHumanCard {
   reasons: string[];
   /** 写文件审批卡上的差异预览 */
   diff?: string | null;
+  /** 写文件审批卡：差异预览是否完整 */
+  previewComplete?: boolean | null;
   createdWallMs: number;
 }
 

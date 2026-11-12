@@ -8,6 +8,7 @@
 import { useEffect, useState } from "react";
 import { api, onHostNotify } from "../api";
 import { DiffView } from "./DiffView";
+import { needsIncompleteBanner } from "../lib/diff";
 import { TodoList } from "./TodoList";
 import { toFriendlyError } from "../lib/errors";
 import { checkLines, checksToText, hostButtons, hostDetail, hostPill, isTerminal, pendingCard, textToChecks } from "../lib/host";
@@ -272,6 +273,11 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [] }:
               <div className="st-esc-why">原因：{card.reasons.join("；")}</div>
             ))}
           {card.recommendation && <div className="st-esc-why">建议：{card.recommendation}</div>}
+          {needsIncompleteBanner(card.previewComplete, card.diff) && (
+            <div className="ap-diff-incomplete" role="alert">
+              ⚠ 预览不完整：卡上看不到全部修改，批准写入的是完整内容
+            </div>
+          )}
           {card.diff && <DiffView diff={card.diff} open />}
           {card.options.length > 0 && (
             <div className="st-form-row st-center">

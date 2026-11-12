@@ -1690,6 +1690,7 @@ impl SkillIo for TauriIo<'_> {
             target_label: self.label.clone(),
             reasons: ask.reasons.clone(),
             diff: None,
+            preview_complete: None,
         };
         request_approval(self.app, self.runtime, &self.run, &payload).await
     }

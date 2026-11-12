@@ -140,6 +140,9 @@ pub struct HumanCard {
     /// 写文件审批卡上的差异预览（敏感时已脱敏）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    /// 写文件审批卡：差异预览是否完整（false = 卡上看不到全部修改，面板要醒目提示）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_complete: Option<bool>,
     pub created_wall_ms: i64,
 }
 
@@ -153,6 +156,7 @@ impl HumanCard {
             recommendation: None,
             reasons: Vec::new(),
             diff: None,
+            preview_complete: None,
             created_wall_ms: now_wall_ms,
         }
     }

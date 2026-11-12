@@ -1062,6 +1062,9 @@ pub struct ApprovePayload {
     /// `kind:"file"`：写 / 改文件的差异预览（敏感时已脱敏）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    /// `kind:"file*"`：差异预览是否完整（false 时卡片醒目提示「预览不完整」）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_complete: Option<bool>,
 }
 
 /// 给 UI 展示的单次执行结果（手动执行按钮也用它）。
@@ -3386,6 +3389,7 @@ async fn ask_beyond_scope(
         target_label: target_label.to_string(),
         reasons: reasons.clone(),
         diff: None,
+        preview_complete: None,
     };
     if request_approval(app, runtime, session, &payload).await {
         return true;
@@ -4512,6 +4516,7 @@ pub async fn run(
                             target_label: target_label.into(),
                             reasons: risk.reasons.clone(),
                             diff: None,
+                            preview_complete: None,
                         };
                         let approved = request_approval(app, runtime, &session, &req_payload).await;
                         if trace_on {
@@ -4845,6 +4850,7 @@ pub async fn run(
                             target_label: label.clone(),
                             reasons: reasons.clone(),
                             diff: None,
+                            preview_complete: None,
                         };
                         let approved = request_approval(app, runtime, &session, &req_payload).await;
                         if trace_on {
@@ -6509,29 +6515,44 @@ struct FileApprover<'a> {
 impl super::files_tool::Approver for FileApprover<'_> {
     fn approve(&mut self, req: &super::files_tool::WriteApproval) -> impl std::future::Future<Output = bool> + Send {
         let req = req.clone();
-        // 受保护路径的卡要把路径写在标题上：批准的就是「这一次写这个路径」
-        let title = if req.sensitive_path { format!("写入受保护路径 {}：{}", req.path, req.summary) } else { req.summary.clone() };
+        // 标题由 files_tool 统一拼：受保护路径（读 / 写）写明路径，预览不完整在标题里就说出来
+        let title = req.title();
         async move {
             match self.host {
                 Some(h) => {
                     let mut card = hosted_approval_card(&title, &req.reasons);
-                    card.diff = Some(req.diff.clone());
+                    if !req.read {
+                        card.diff = Some(req.diff.clone());
+                    }
+                    card.preview_complete = Some(req.preview_complete);
                     h.approve(card).await
                 }
                 None => {
                     let payload = ApprovePayload {
                         request_id: uuid::Uuid::new_v4().simple().to_string(),
-                        kind: if req.sensitive_path { "file_sensitive" } else { "file" },
+                        kind: file_approval_kind(&req),
                         command: title,
                         target: self.target.to_string(),
                         target_label: self.label.to_string(),
                         reasons: req.reasons.clone(),
-                        diff: Some(req.diff.clone()),
+                        diff: (!req.read).then(|| req.diff.clone()),
+                        preview_complete: Some(req.preview_complete),
                     };
                     request_approval(self.app, self.runtime, self.session, &payload).await
                 }
             }
         }
+    }
+}
+
+/// 文件审批卡的种类：读受保护路径 / 写受保护路径 / 普通写。
+fn file_approval_kind(req: &super::files_tool::WriteApproval) -> &'static str {
+    if req.read {
+        "file_read_sensitive"
+    } else if req.sensitive_path {
+        "file_sensitive"
+    } else {
+        "file"
     }
 }
 
@@ -7522,6 +7543,39 @@ mod tests {
         let mut ctx2 = ctx_with("auto");
         ctx2.authority.deny = vec!["~/.config/app".into()];
         assert!(matches!(hosted_file_gate(&ctx2.policy(), &call, Some("/home/me/.config/app/settings.toml")), Gate::Deny(_)));
+    }
+
+    #[test]
+    fn file_approval_kind_and_title_follow_the_request() {
+        let mut req = super::super::files_tool::WriteApproval {
+            path: "/home/me/.ssh/id_ed25519".into(),
+            summary: "读取 /home/me/.ssh/id_ed25519".into(),
+            diff: String::new(),
+            reasons: vec![],
+            sensitive_path: true,
+            read: true,
+            preview_complete: true,
+        };
+        assert_eq!(file_approval_kind(&req), "file_read_sensitive");
+        req.read = false;
+        assert_eq!(file_approval_kind(&req), "file_sensitive");
+        assert!(req.title().contains("写入受保护路径 /home/me/.ssh/id_ed25519"));
+        req.sensitive_path = false;
+        req.preview_complete = false;
+        assert_eq!(file_approval_kind(&req), "file");
+        assert!(req.title().contains("预览不完整"));
+        // 载荷里的字段名
+        let p = ApprovePayload {
+            request_id: "r".into(),
+            kind: "file",
+            command: req.title(),
+            target: "t".into(),
+            target_label: "l".into(),
+            reasons: vec![],
+            diff: None,
+            preview_complete: Some(false),
+        };
+        assert_eq!(serde_json::to_value(&p).unwrap()["previewComplete"], false);
     }
 
     #[test]
