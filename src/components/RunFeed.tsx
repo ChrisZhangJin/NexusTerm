@@ -7,6 +7,7 @@
  */
 
 import { DiffView } from "./DiffView";
+import { needsIncompleteBanner } from "../lib/diff";
 import { TodoList } from "./TodoList";
 import { useEffect, useRef, useState } from "react";
 import { MemoryStepCard } from "./HostMemory";
@@ -448,7 +449,7 @@ function ApproveCard({
   // skill：技能回放的逐步确认 / 偏离选择，按钮文案按语义写成「确认 / 拒绝」
   const skill = req.kind === "skill";
   // file：写 / 改文件，卡上带差异预览；file_sensitive：路径在受保护清单里
-  const file = req.kind === "file" || req.kind === "file_sensitive";
+  const file = req.kind === "file" || req.kind === "file_sensitive" || req.kind === "file_read_sensitive";
   return (
     <div className={`ap-approve${settled ? (result ? " ok" : " no") : ""}`}>
       <div className="ap-step-head">
@@ -459,7 +460,9 @@ function ApproveCard({
               ? "技能 · 需要确认"
               : req.kind === "file_sensitive"
                 ? "写受保护路径 · 需要批准"
-                : file
+                : req.kind === "file_read_sensitive"
+                  ? "读受保护路径 · 需要批准"
+                  : file
                   ? "写文件 · 需要批准"
                   : "需要批准"}
         </span>
@@ -468,6 +471,11 @@ function ApproveCard({
         </span>
       </div>
       <pre className="ap-code">{req.command}</pre>
+      {needsIncompleteBanner(req.previewComplete, req.diff) ? (
+        <div className="ap-diff-incomplete" role="alert">
+          ⚠ 预览不完整：卡上看不到全部修改，批准写入的是完整内容
+        </div>
+      ) : null}
       {req.diff ? <DiffView diff={req.diff} open /> : null}
       {req.reasons.length > 0 && (
         <div className="ap-step-why">

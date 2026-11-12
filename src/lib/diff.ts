@@ -38,6 +38,14 @@ export function parseDiff(diff: string): DiffLine[] {
   return out;
 }
 
+/**
+ * 审批卡上要不要另放「预览不完整」横幅：后端明说不完整、而 diff 里又没有自带那条说明
+ * （没有 diff，或 diff 被截短时标记丢了）。DiffView 自己会画 diff 里那条，避免重复。
+ */
+export function needsIncompleteBanner(previewComplete: boolean | null | undefined, diff: string | null | undefined): boolean {
+  return previewComplete === false && !(diff && incompleteNote(diff));
+}
+
 /** 预览是否不完整；是则返回那条说明（去掉标记前缀前的整行），否则 null */
 export function incompleteNote(diff: string): string | null {
   const first = diff.replace(/^\s+/, "").split("\n", 1)[0] ?? "";

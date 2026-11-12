@@ -180,7 +180,6 @@ pub struct WriteApproval {
 impl WriteApproval {
     /// 卡片标题：读 / 写受保护路径都把路径写在标题上，预览不完整要在标题里就说出来。
     /// act.rs 的 `FileApprover` 应当用它（而不是只看 `sensitive_path` 拼「写入受保护路径」）。
-    #[allow(dead_code)] // 待 act.rs 的 FileApprover 改用
     pub fn title(&self) -> String {
         let base = if self.read {
             self.summary.clone()

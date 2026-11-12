@@ -39,3 +39,13 @@ test("预览不完整：识别首行标记，省略说明归为 note", () => {
   assert.equal(kinds[kinds.length - 1], "note");
   assert.equal(incompleteNote("--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b"), null);
 });
+
+import { needsIncompleteBanner } from "../../src/lib/diff";
+
+test("审批卡的「预览不完整」横幅：后端说不完整且 diff 里没自带说明时才另放", () => {
+  assert.equal(needsIncompleteBanner(false, ""), true);
+  assert.equal(needsIncompleteBanner(false, undefined), true);
+  assert.equal(needsIncompleteBanner(false, `${INCOMPLETE_MARK}：差异过长，只显示前 3 处\n@@ -1 +1 @@\n-a\n+b`), false);
+  assert.equal(needsIncompleteBanner(true, ""), false);
+  assert.equal(needsIncompleteBanner(undefined, ""), false);
+});
