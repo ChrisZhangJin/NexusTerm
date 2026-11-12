@@ -323,6 +323,11 @@ pub struct StewardContract {
     pub yolo: bool,
 }
 
+/// 新契约的 id。
+pub fn new_contract_id(console_id: &str) -> String {
+    format!("steward-{console_id}-{}", now_ms())
+}
+
 #[derive(Clone, Default)]
 pub struct StewardRegistry(Arc<Mutex<HashMap<String, StewardContract>>>);
 
@@ -339,11 +344,23 @@ impl StewardRegistry {
         goal: &str,
         tier: &str,
     ) -> StewardContract {
+        self.start_with_id(&new_contract_id(console_id), console_id, kind, goal, tier)
+    }
+
+    /// 用事先定好的 id 签约：`host_start` 要先以 `host:{id}` 拿到租约，再让契约对守护进程可见。
+    pub fn start_with_id(
+        &self,
+        id: &str,
+        console_id: &str,
+        kind: &str,
+        goal: &str,
+        tier: &str,
+    ) -> StewardContract {
         let mut map = self.0.lock();
         map.retain(|_, c| c.console_id != console_id);
         let ts = now_ms();
         let contract = StewardContract {
-            id: format!("steward-{console_id}-{ts}"),
+            id: id.to_string(),
             console_id: console_id.to_string(),
             host_key: format!("{kind}:{console_id}"),
             goal: goal.to_string(),
@@ -571,6 +588,24 @@ pub fn steward_start(
     core: State<'_, StewardCore>,
     screen: State<'_, ScreenStore>,
 ) -> Result<StewardContract, String> {
+    sign_contract(None, &console_id, &goal, &authority_tier, &state, &registry, &brain, &bus, &core, &screen)
+}
+
+/// 签一份托管契约（`steward_start` 与 `host_start` 共用）。`id` 为 `None` 时现取一个。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sign_contract(
+    id: Option<&str>,
+    console_id: &str,
+    goal: &str,
+    authority_tier: &str,
+    state: &AppState,
+    registry: &StewardRegistry,
+    brain: &StewardBrain,
+    bus: &StewardBus,
+    core: &StewardCore,
+    screen: &ScreenStore,
+) -> Result<StewardContract, String> {
+    let console_id = console_id.to_string();
     let goal = goal.trim().to_string();
     if goal.is_empty() {
         return Err("托管目标不能为空".to_string());
@@ -586,9 +621,12 @@ pub fn steward_start(
     // 所有权槽、时间盒、预算都得一起收尾，否则下次启动会把旧契约当未完成任务恢复，
     // 新契约也会继承旧契约的空转计时与暂停状态。
     if let Some(old) = registry.for_console(&console_id) {
-        stop_contract(&registry, &brain, &state.store, &core, &old.id);
+        stop_contract(registry, brain, &state.store, core, &old.id);
     }
-    let contract = registry.start(&console_id, kind, &goal, &authority_tier);
+    let contract = match id {
+        Some(id) => registry.start_with_id(id, &console_id, kind, &goal, authority_tier),
+        None => registry.start(&console_id, kind, &goal, authority_tier),
+    };
     // P2：一句话目标 → 意向栈 I0，落库并挂到契约上。没有 I0 时决策编译器
     // 会 fail-closed 到「先补意向」，不会凭空编一个回复。
     let input = compile_intent_input(&goal, &contract.id, None);

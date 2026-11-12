@@ -245,7 +245,7 @@ pub async fn agent_run(
     app: AppHandle,
 ) -> Result<(), String> {
     let config = load_config(&state.store);
-    act::run(&app, &state, &state.act, &config, &request)
+    act::run(&app, &state, &state.act, &config, &request, act::RunMode::Chat)
         .await
         .map_err(err)
 }

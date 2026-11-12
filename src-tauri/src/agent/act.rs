@@ -61,6 +61,7 @@ use super::capture;
 use super::budget::{self, BudgetCheck, BudgetSpent, PauseCause, PhaseEvent, RunPhase};
 use super::control::{self, ControlState};
 use super::danger::assess;
+use super::host::{HostEvent, HostShared, ParkEnd};
 use super::hostmem::{self, MemoryCall};
 use super::skilltool::{self, SkillCall};
 use super::executor::{
@@ -232,6 +233,10 @@ pub enum AgentAction {
     /// 它照样占一个动作位、照样例行走反馈链路 —— 让模型看到自己错在哪，
     /// 而不是让这轮静悄悄什么都不发生。
     Reject { command: String, hint: String },
+    /// 托管专用（`nx_ask_user`）：问用户一个问题，挂起到有人答复（WaitingHuman，零 LLM 调用）。
+    AskUser { question: String, options: Vec<super::host::CardOption>, recommendation: Option<String> },
+    /// 托管专用（`nx_complete`）：宣告目标完成。唯一的完成途径。
+    Complete { summary: String, evidence: Vec<String> },
 }
 
 /// 对标签页能做些什么。
@@ -368,6 +373,98 @@ pub const TOOL_SCREEN: &str = "nx_screen";
 pub const TOOL_SECRET: &str = "nx_secret";
 pub const TOOL_MEMORY: &str = "nx_memory";
 pub const TOOL_SKILL: &str = "nx_skill";
+/// 托管专用：问人
+pub const TOOL_ASK_USER: &str = "nx_ask_user";
+/// 托管专用：宣告完成
+pub const TOOL_COMPLETE: &str = "nx_complete";
+
+/// 托管模式声明给模型的工具：对话模式的全部工具 + `nx_ask_user` / `nx_complete`。
+pub fn hosted_tool_specs() -> Vec<llm::ToolSpec> {
+    let mut v = tool_specs();
+    v.push(llm::ToolSpec {
+        name: TOOL_ASK_USER,
+        description: "托管模式下向用户提问并等待答复（用户可能很久之后才回来，期间任务挂起、不消耗预算）。\
+                      需要用户做决定、补充信息、或确认方向时用它；不要用纯文本回复来提问。".into(),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "question": { "type": "string", "description": "要问用户的问题，写清楚背景和需要他决定什么。" },
+                "options": {
+                    "type": "array",
+                    "description": "可选：给用户一键选择的选项。",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": { "type": "string", "description": "按钮上的文字" },
+                            "reply": { "type": "string", "description": "选中后作为用户答复交回给你的话" }
+                        },
+                        "required": ["label", "reply"]
+                    }
+                },
+                "recommendation": { "type": "string", "description": "可选：你推荐的做法及理由。" }
+            },
+            "required": ["question"]
+        }),
+    });
+    v.push(llm::ToolSpec {
+        name: TOOL_COMPLETE,
+        description: "托管模式下宣告目标已经完成。这是结束托管的唯一途径：没调用它之前任务不会结束。\
+                      只有在确认目标真的达成后才调用，并给出证据。".into(),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "summary": { "type": "string", "description": "做了什么、结果如何。" },
+                "evidence": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "证据：关键命令的输出、文件路径、屏幕上的提示等。"
+                }
+            },
+            "required": ["summary"]
+        }),
+    });
+    v
+}
+
+/// `nx_ask_user` / `nx_complete` 的参数（围栏协议同形：`{"action":"ask_user", ...}`）。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HostToolArgs {
+    #[serde(default)]
+    question: Option<String>,
+    #[serde(default)]
+    options: Vec<super::host::CardOption>,
+    #[serde(default)]
+    recommendation: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    evidence: Vec<String>,
+}
+
+/// 解析托管专用动作。缺了必填字段（问题 / 总结为空）就不产出动作。
+fn parse_host_action(action: &str, args: &serde_json::Value) -> Vec<AgentAction> {
+    let a: HostToolArgs = serde_json::from_value(args.clone()).unwrap_or_default();
+    let nonempty = |s: Option<String>| s.map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
+    match action {
+        "ask_user" => nonempty(a.question)
+            .map(|question| AgentAction::AskUser {
+                question,
+                options: a.options.into_iter().filter(|o| !o.label.trim().is_empty()).collect(),
+                recommendation: nonempty(a.recommendation),
+            })
+            .into_iter()
+            .collect(),
+        "complete" => nonempty(a.summary)
+            .map(|summary| AgentAction::Complete {
+                summary,
+                evidence: a.evidence.into_iter().filter(|e| !e.trim().is_empty()).collect(),
+            })
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
 /// 声明给模型的全部工具。
 ///
@@ -702,6 +799,8 @@ fn tool_action_name(name: &str) -> Option<&'static str> {
         TOOL_SECRET => Some("secret"),
         TOOL_MEMORY => Some("memory"),
         TOOL_SKILL => Some("skill"),
+        TOOL_ASK_USER => Some("ask_user"),
+        TOOL_COMPLETE => Some("complete"),
         _ => None,
     }
 }
@@ -748,6 +847,9 @@ pub fn actions_from_tool_call(call: &llm::ToolCall) -> Vec<AgentAction> {
         // 后面 parse_* 会因为缺必填字段自行丢弃。
         _ => serde_json::Value::Object(serde_json::Map::new()),
     };
+    if matches!(action, "ask_user" | "complete") {
+        return parse_host_action(action, &args);
+    }
     if let Some(obj) = args.as_object_mut() {
         obj.insert("action".into(), serde_json::Value::String(action.into()));
         promote_arrays(obj);
@@ -799,6 +901,8 @@ pub fn tool_label(name: &str, args: &str) -> &'static str {
         TOOL_SCREEN => "读取屏幕",
         TOOL_SECRET => "请求输入密码",
         TOOL_MEMORY => "主机备忘",
+        TOOL_ASK_USER => "向你提问",
+        TOOL_COMPLETE => "宣告完成",
         TOOL_SKILL => match serde_json::from_str::<serde_json::Value>(args)
             .ok()
             .and_then(|v| v.get("op").and_then(|o| o.as_str()).map(|s| s.to_string()))
@@ -1091,6 +1195,12 @@ pub fn extract_actions(text: &str) -> Vec<AgentAction> {
 /// 以前这里 JSON 一失败就返回空，结果是最糟的一种失败：围栏明明写着 `nx-exec`，
 /// 界面上却什么都没发生 —— 用户只看到模型自说自话，以为它卡住了。
 fn parse_block(raw: &str) -> Vec<AgentAction> {
+    // 托管专用动作字段与 ExecBlock 不同，先认出来
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim()) {
+        if let Some(a @ ("ask_user" | "complete")) = v.get("action").and_then(|a| a.as_str()) {
+            return parse_host_action(a, &v);
+        }
+    }
     match serde_json::from_str::<ExecBlock>(raw.trim()) {
         Ok(block) => match block.action.as_deref().unwrap_or("exec") {
             "export" => parse_export(block),
@@ -1893,7 +2003,7 @@ const HEAD_SHARE_PCT: usize = 35;
 
 /// 按**字符**截掉中间、保留首尾（约 35% 头 + 65% 尾），并在断处标出省略了多少。
 /// 按 `char` 而不是字节，否则中文会切出半个字。保留的正文总长恰好是 `max` 个字符。
-fn head_tail_chars(s: &str, max: usize) -> String {
+pub(crate) fn head_tail_chars(s: &str, max: usize) -> String {
     let total = s.chars().count();
     if total <= max {
         return s.to_string();
@@ -2495,6 +2605,8 @@ pub struct ActRuntime {
     pub phases: budget::PhaseTable,
     /// 正在跑的托管运行（run id）。只用来给审批选更长的等待上限。
     steward_runs: Mutex<std::collections::HashSet<String>>,
+    /// 统一托管的任务登记表（`host_start` 起的任务，运行 id 为 `host:{contract_id}`）
+    pub host: super::host::HostSupervisor,
 }
 
 impl ActRuntime {
@@ -2509,6 +2621,7 @@ impl ActRuntime {
             runlog: super::history::RunLogs::default(),
             phases: budget::PhaseTable::default(),
             steward_runs: Mutex::new(std::collections::HashSet::new()),
+            host: super::host::HostSupervisor::new(),
         }
     }
 
@@ -2539,6 +2652,25 @@ impl ActRuntime {
         if let Some(st) = changed {
             emit_control(app, session, &self.control.holders_of(session), st);
         }
+        self.forward_to_host(session, ev, changed);
+    }
+
+    /// 被托管的会话上的用户控制权操作，同时投进托管任务的收件箱：相位以托管任务为准
+    /// （UserDriving 记住 resume_to，交还回到它），ControlTable 只是它的投影。
+    fn forward_to_host(&self, session: &str, ev: control::ControlEvent, changed: Option<ControlState>) {
+        use control::ControlEvent::*;
+        let host_ev = match ev {
+            // 只在「Agent 正在驾驶 → 被打断」时算用户夺权；普通打字（本就是用户在驾驶）不算
+            UserInput if changed == Some(ControlState::Paused) => super::host::HostEvent::UserKey,
+            Takeover if changed == Some(ControlState::Paused) => super::host::HostEvent::Takeover,
+            Handback => super::host::HostEvent::Handback,
+            _ => return,
+        };
+        for run in self.control.holders_of(session) {
+            if let Some(h) = self.host.live(&run).filter(|h| h.run_id() == run) {
+                h.send(host_ev.clone());
+            }
+        }
     }
 
     /// 一轮运行结束 / 被停止：把它驾驶的会话全部还给用户并推事件。幂等。
@@ -2557,6 +2689,17 @@ impl ActRuntime {
         let flag = Arc::new(AtomicBool::new(false));
         guard.insert(session_id.to_string(), Arc::clone(&flag));
         Some(flag)
+    }
+
+    /// 用外面建好的取消旗登记一轮（托管任务：旗由 `host_start` 建、`host_stop` 置位）。
+    /// 返回 false 表示这个 id 已经有一轮在跑。
+    pub(super) fn begin_with(&self, run_id: &str, flag: Arc<AtomicBool>) -> bool {
+        let mut guard = self.inflight.lock();
+        if guard.contains_key(run_id) {
+            return false;
+        }
+        guard.insert(run_id.to_string(), flag);
+        true
     }
 
     pub(super) fn finish(&self, session_id: &str) {
@@ -2848,6 +2991,20 @@ pub(super) async fn gate_drive(
     if cancel.load(Ordering::Relaxed) {
         return control::PauseWait::Cancelled;
     }
+    // 托管：租约记在 `host:{contract_id}` 名下（技能回放传进来的可能是 console id）；
+    // 用户在驾驶 / 暂停 / 等人时无限期等收件箱，只有取消能打断 —— 没有 PAUSE_MAX_WAIT
+    if let Some(h) = runtime.host.live(run) {
+        let run = h.run_id().to_string();
+        if let Some(st) = runtime.control.acquire(target, &run) {
+            emit_control(app, target, &[run.clone()], st);
+        }
+        let ok = h.gate(|| runtime.control.state(target) == ControlState::Paused).await;
+        return if ok && !cancel.load(Ordering::Relaxed) {
+            control::PauseWait::Ready
+        } else {
+            control::PauseWait::Cancelled
+        };
+    }
     if let Some(st) = runtime.control.acquire(target, run) {
         emit_control(app, target, &[run.to_string()], st);
     }
@@ -2896,6 +3053,18 @@ pub(super) async fn request_approval(
     session_id: &str,
     payload: &ApprovePayload,
 ) -> bool {
+    // 托管：审批卡挂进 WaitingHuman，**不设超时**；答复经 `host_answer`
+    if let Some(h) = runtime.host.live(session_id) {
+        let mut card = super::host::HumanCard::ask(
+            &payload.request_id,
+            &format!("批准在「{}」上执行：{}", payload.target_label, payload.command),
+            super::steward::now_ms(),
+        );
+        card.reasons = payload.reasons.clone();
+        let approved = h.approve(card).await;
+        tracing::info!("托管审批 {}：{}", payload.request_id, if approved { "批准" } else { "拒绝" });
+        return approved;
+    }
     let rx = runtime.register(&payload.request_id);
     let _ = app.emit(&format!("nx://agent/approve/{session_id}"), payload.clone());
 
@@ -3185,6 +3354,7 @@ pub async fn run(
     runtime: &ActRuntime,
     cfg: &AgentConfig,
     req: &AgentRunRequest,
+    mode: RunMode,
 ) -> Result<(), AgentError> {
     if req.session_id.trim().is_empty() {
         return Err(AgentError::NoSession(req.session_id.clone()));
@@ -3194,19 +3364,43 @@ pub async fn run(
     }
     llm::validate(cfg)?;
 
-    let Some(cancel) = runtime.begin(&req.session_id) else {
-        return Err(AgentError::Busy);
+    let host = match mode {
+        RunMode::Hosted(h) => Some(h),
+        RunMode::Chat => {
+            // 被托管的终端只有一个写者：托管任务。对话运行不能在它上面再起一轮
+            if runtime.host.live_on_console(&req.session_id).is_some() {
+                return Err(AgentError::Busy);
+            }
+            None
+        }
     };
-    // 这一轮开始驾驶发起会话；任何出口（含出错 return）drop 时都会还给用户
-    let _lease = ControlLease { app, rt: runtime, run: req.session_id.clone() };
-    runtime.phases.start(&req.session_id);
-    let _phase = PhaseGuard { rt: runtime, run: req.session_id.clone() };
+    // 运行 id：对话 = 发起会话；托管 = `host:{contract_id}`（不和同一 tab 上的对话运行撞 `begin()`）。
+    // 步骤事件仍发在发起会话的频道上，面板的 RunFeed 照常渲染。
+    let run_key = host.as_ref().map(|h| h.run_id().to_string()).unwrap_or_else(|| req.session_id.clone());
+    let cancel = match &host {
+        // 托管任务的取消旗由 `host_start` 建好、`host_stop` 置位，这里登记同一面旗
+        Some(h) => {
+            if !runtime.begin_with(&run_key, Arc::clone(&h.cancel)) {
+                return Err(AgentError::Busy);
+            }
+            Arc::clone(&h.cancel)
+        }
+        None => match runtime.begin(&run_key) {
+            Some(c) => c,
+            None => return Err(AgentError::Busy),
+        },
+    };
+    // 对话：这一轮开始驾驶发起会话；任何出口（含出错 return）drop 时都会还给用户。
+    // 托管：租约由 `host_start` 先拿，只在进入终态（`Effect::ReleaseLease`）时放
+    let _lease = host.is_none().then(|| ControlLease { app, rt: runtime, run: run_key.clone() });
+    runtime.phases.start(&run_key);
+    let _phase = PhaseGuard { rt: runtime, run: run_key.clone() };
     // 托管：全自动跑，预算更大、审批等得更久；不看 exec_mode：危险命令一律走审批（Exec），按键按屏幕局面把关（见 `steward_mode`）
-    let is_steward = req.is_steward();
-    runtime.mark_steward(&req.session_id, is_steward);
-    let _steward = StewardGuard { rt: runtime, run: req.session_id.clone() };
-    if let Some(st) = runtime.control.acquire(&req.session_id, &req.session_id) {
-        emit_control(app, &req.session_id, &[req.session_id.clone()], st);
+    let is_steward = req.is_steward() || host.is_some();
+    runtime.mark_steward(&run_key, is_steward);
+    let _steward = StewardGuard { rt: runtime, run: run_key.clone() };
+    if let Some(st) = runtime.control.acquire(&req.session_id, &run_key) {
+        emit_control(app, &req.session_id, &[run_key.clone()], st);
     }
     // 此前几轮的摘要要在 `runlog.start` 之前取（本轮自己还没落库，但保持顺序更直观）
     let prior_runs = super::history::render_prior_runs(
@@ -3241,6 +3435,9 @@ pub async fn run(
     if is_steward {
         system.push_str(super::steward_mode::STEWARD_ADDENDUM);
     }
+    if host.is_some() {
+        system.push_str(HOSTED_ADDENDUM);
+    }
     // 上一轮摘要拼在第一条 user 消息前面（同一条消息，避免连续两条 user）；
     // 落盘时已脱敏，开关为真时出网前再过一遍闸门。
     let mut messages = vec![ChatMessage::user(format!(
@@ -3257,7 +3454,7 @@ pub async fn run(
     let mut step = 0usize;
     let mut feedback = String::new();
     // 运行预算（4.6）：自本轮开始 / 最近一次「继续」起累计；用尽即暂停等用户，不是收场。
-    let limits = effective_budget(cfg.budget, req);
+    let mut limits = effective_budget(cfg.budget, req);
     let mut spent = BudgetSpent::default();
     let mut seg_start = std::time::Instant::now();
     // 会话 id → 本轮里上一次动过它（exec / 按键 / 等待）之后缓冲的位置，供 `nx_wait` 当起点：
@@ -3274,18 +3471,20 @@ pub async fn run(
     let mut partial_answer = String::new();
     // 模型请求重试用尽：下一次循环顶直接进入暂停（`PauseCause::LlmError`），历史原样保留
     let mut llm_down = false;
+    // 最近一次重试用尽的错误摘要（托管暂停卡上给人看）
+    let mut last_llm_error = String::new();
     // 用户接管且等到超时的次数（见 `MAX_TOOK_OVER`）
     let mut took_over_times = 0usize;
     // 服务方不认 tools 时置 false：此后一律走围栏协议，不再每轮都白试一次。
     let mut use_tools = true;
-    let specs = tool_specs();
+    let specs = if host.is_some() { hosted_tool_specs() } else { tool_specs() };
     // 本轮动作里是否撞上了「用户接管且超时」：置位后跳出当前动作列表，别再逐个空等
     let mut took_over: bool;
     // 写 pty 之前的控制权闸（`gate_drive`）：Paused 就等用户交还；取消直接跳出动作列表
     // （外层循环顶会收尾），等满上限则标记 `took_over`。
     macro_rules! drive_gate {
         ($target:expr) => {
-            match gate_drive(app, runtime, &session, $target, &cancel).await {
+            match gate_drive(app, runtime, &run_key, $target, &cancel).await {
                 control::PauseWait::Ready => {}
                 control::PauseWait::Cancelled => break,
                 control::PauseWait::TookOver => {
@@ -3301,6 +3500,18 @@ pub async fn run(
             emit_step(app, &session, StepPayload { text: Some("已取消。".into()), ..StepPayload::new("note", step) });
             break;
         }
+        // 托管：先处理收件箱（运行期间用户按的键 / 点的「暂停」），不在 Running 就挂起到回来
+        if let Some(h) = &host {
+            h.note_progress(&messages, step);
+            h.drain();
+            match h.park().await {
+                ParkEnd::Running => {}
+                _ => break,
+            }
+            if absorb_host_pending(h, &mut messages, &mut feedback, &mut spent, &mut limits) {
+                seg_start = std::time::Instant::now();
+            }
+        }
         if took_over_times >= MAX_TOOK_OVER {
             emit_step(
                 app,
@@ -3315,16 +3526,57 @@ pub async fn run(
         // 步骤边界：预算用尽 / 用户点了「暂停」→ 暂停在这里，等「继续」或「停止」。
         // 对话历史（messages）、已做的动作、控制权等都留在本函数的局部变量里，继续 = 换新预算接着转。
         spent.elapsed_secs = seg_start.elapsed().as_secs();
-        let pause_cause = if std::mem::take(&mut llm_down) {
-            runtime.phases.apply(&session, PhaseEvent::LlmUnavailable);
+        // 托管：预算用尽 / 模型连不上 → Paused，只有 `host_resume` 能离开；挂起期间零 LLM 调用、租约不放
+        if let Some(h) = &host {
+            let ev = if std::mem::take(&mut llm_down) {
+                Some(HostEvent::LlmDown(last_llm_error.clone()))
+            } else {
+                match budget::check_budget(&spent, &limits) {
+                    BudgetCheck::Exhausted(reason) => Some(HostEvent::BudgetExhausted(reason.describe())),
+                    BudgetCheck::Continue => None,
+                }
+            };
+            if let Some(ev) = ev {
+                let why = match &ev {
+                    HostEvent::LlmDown(e) => format!("模型服务暂不可用（{e}）"),
+                    HostEvent::BudgetExhausted(r) => r.clone(),
+                    _ => String::new(),
+                };
+                let _ = h.apply(ev);
+                emit_step(
+                    app,
+                    &session,
+                    StepPayload {
+                        text: Some(format!("托管已暂停：{why}。点「加预算继续」恢复，或「停止」结束。")),
+                        ..StepPayload::new("note", step)
+                    },
+                );
+                match h.park().await {
+                    ParkEnd::Running => {
+                        absorb_host_pending(h, &mut messages, &mut feedback, &mut spent, &mut limits);
+                        seg_start = std::time::Instant::now();
+                        emit_step(
+                            app,
+                            &session,
+                            StepPayload { text: Some("继续托管。".into()), ..StepPayload::new("resumed", step) },
+                        );
+                    }
+                    _ => break,
+                }
+            }
+        }
+        let pause_cause = if host.is_some() {
+            None
+        } else if std::mem::take(&mut llm_down) {
+            runtime.phases.apply(&run_key, PhaseEvent::LlmUnavailable);
             Some(PauseCause::LlmError)
         } else {
             match budget::check_budget(&spent, &limits) {
                 BudgetCheck::Exhausted(reason) => {
-                    runtime.phases.apply(&session, PhaseEvent::BudgetExhausted(reason));
+                    runtime.phases.apply(&run_key, PhaseEvent::BudgetExhausted(reason));
                     Some(PauseCause::Budget { reason })
                 }
-                BudgetCheck::Continue => match runtime.phases.apply(&session, PhaseEvent::Boundary) {
+                BudgetCheck::Continue => match runtime.phases.apply(&run_key, PhaseEvent::Boundary) {
                     Some(RunPhase::Paused(cause)) => Some(cause),
                     _ => None,
                 },
@@ -3435,6 +3687,7 @@ pub async fn run(
                     },
                 );
                 llm_down = true;
+                last_llm_error = error_headline(&f.error.to_string()).to_string();
                 continue;
             }
             Err(f) => {
@@ -3444,7 +3697,7 @@ pub async fn run(
                 }
                 runtime.runlog.mark_error(&session);
                 // 先把自己这一轮从登记表里摘掉，再报错 —— 否则会话会被永久卡住「运行中」
-                runtime.finish(&session);
+                runtime.finish(&run_key);
                 let _ = app.emit(&format!("nx://agent/error/{session}"), e.to_string());
                 return Err(e);
             }
@@ -3565,7 +3818,14 @@ pub async fn run(
             let mut text = std::mem::take(&mut partial_answer);
             text.push_str(&strip_action_blocks(&reply.text));
             if !text.trim().is_empty() {
-                emit_step(app, &session, StepPayload { text: Some(text), ..StepPayload::new("answer", step) });
+                emit_step(app, &session, StepPayload { text: Some(text.clone()), ..StepPayload::new("answer", step) });
+            }
+            // 托管：没有动作的回复不是结束，按 nx_ask_user(text) 处理 —— 挂起等用户答复
+            if let Some(h) = &host {
+                if !park_on_no_action(h, &text, &mut messages, &mut feedback).await {
+                    break;
+                }
+                continue;
             }
             break;
         }
@@ -3593,6 +3853,8 @@ pub async fn run(
         partial_answer.clear();
 
         took_over = false;
+        // 本轮里模型调用了 nx_complete / 对话模式下的 nx_ask_user：做完这一步就收场
+        let mut finished = false;
         for action in actions {
             // 取消是**硬停**：余下动作不执行，循环顶随即收场，不再请模型写结论
             // （用户点取消就是不想再等它，也不想再花一次调用）。
@@ -3603,7 +3865,7 @@ pub async fn run(
             // 这一步本身要先算进去（做满 N 步就停，不多做第 N+1 步）。
             spent.elapsed_secs = seg_start.elapsed().as_secs();
             if matches!(budget::check_budget(&spent, &limits), BudgetCheck::Exhausted(_))
-                || runtime.phases.phase(&session) == Some(RunPhase::Running { pause_pending: true })
+                || runtime.phases.phase(&run_key) == Some(RunPhase::Running { pause_pending: true })
             {
                 feedback.push_str(
                     "（本轮运行被暂停（预算用尽或用户要求暂停），这一步及其后的动作都没有执行；\
@@ -3617,6 +3879,40 @@ pub async fn run(
             drive_gate!(&session);
             // 一轮内的多个动作共用同一个 step 号：UI 按 step 折叠，同一步归在一张卡里
             match action {
+                AgentAction::AskUser { question, options, recommendation } => {
+                    emit_step(
+                        app,
+                        &session,
+                        StepPayload { text: Some(ask_text(&question, &options, recommendation.as_deref())), ..StepPayload::new("answer", step) },
+                    );
+                    let Some(h) = &host else {
+                        // 对话模式：问题本身就是这一轮的结论，等用户下一条消息
+                        finished = true;
+                        break;
+                    };
+                    if !host_ask(h, hosted_card(&question, options, recommendation), &mut messages).await {
+                        finished = true;
+                    }
+                    // 问完之后的动作是在不知道答复时写的，不执行
+                    break;
+                }
+                AgentAction::Complete { summary, evidence } => {
+                    let mut text = summary.clone();
+                    if !evidence.is_empty() {
+                        text.push_str("\n\n证据：\n");
+                        for e in &evidence {
+                            text.push_str(&format!("- {e}\n"));
+                        }
+                    }
+                    emit_step(app, &session, StepPayload { text: Some(text), ..StepPayload::new("answer", step) });
+                    if let Some(h) = &host {
+                        // TODO(PR7)：在这里跑 `host::verify(success_criteria)`：有未满足项发 CompleteRejected
+                        // （反馈「未满足：…」、仍 Running），只剩 Manual 项出 ManualCheck 卡；现在直接视为全部通过
+                        let _ = h.apply(HostEvent::CompleteVerified { summary, checks: Vec::new() });
+                    }
+                    finished = true;
+                    break;
+                }
                 AgentAction::Reject { command, hint } => {
                     // 静默丢弃是最糟的：用户看到模型说「我要开个新标签页」，
                     // 终端里却只留下一行 command not found。这里把「为什么没下发」
@@ -4242,7 +4538,7 @@ pub async fn run(
                     let wcfg = super::watch::WatchCfg::from_args(timeout_ms, stall_ms);
                     state.agent.set_enabled(&target_id, true);
                     // 盯梢不写 pty，但也要先登记驾驶：零 LLM 托管循环据此对这个终端只看不写
-                    if let Some(st) = runtime.control.acquire(&target_id, &session) {
+                    if let Some(st) = runtime.control.acquire(&target_id, &run_key) {
                         emit_control(app, &target_id, &[session.clone()], st);
                     }
                     let mark = marks
@@ -4268,14 +4564,14 @@ pub async fn run(
                             break;
                         }
                         // 用户点了「暂停」：别一直挂着，交回主循环去 hold_paused
-                        if runtime.phases.pause_requested(&session) {
+                        if runtime.phases.pause_requested(&run_key) {
                             stop = Some((super::watch::Reason::Paused, situation_now(app, state, &target_id, false)));
                             break;
                         }
                         // 用户在终端里动了键盘（控制权 Paused）：等他交还；暂停的时间不算盯梢时长
                         if runtime.control.state(&target_id) == ControlState::Paused {
                             let t0 = std::time::Instant::now();
-                            match gate_drive(app, runtime, &session, &target_id, &cancel).await {
+                            match gate_drive(app, runtime, &run_key, &target_id, &cancel).await {
                                 control::PauseWait::Ready => {
                                     paused_for += t0.elapsed();
                                     last_change = std::time::Instant::now();
@@ -4874,6 +5170,14 @@ pub async fn run(
             }
         }
 
+        if let Some(h) = &host {
+            // 每个「动作 + 反馈」周期之后落一次现场
+            h.note_progress(&messages, step);
+            h.checkpoint_now();
+        }
+        if finished {
+            break;
+        }
         if took_over {
             took_over_times += 1;
             emit_step(
@@ -4888,8 +5192,137 @@ pub async fn run(
         }
     }
 
-    runtime.finish(&session);
+    runtime.finish(&run_key);
     Ok(())
+}
+
+/// `act::run` 的两种模式。
+pub enum RunMode {
+    /// 普通对话：一问一轮，模型给出结论即结束
+    Chat,
+    /// 统一托管：由 `host_start` 起的任务，只有 nx_complete / 停止 / 失败才结束（设计 §2）
+    Hosted(Arc<HostShared>),
+}
+
+/// 托管模式追加在系统提示词后面的约定。
+const HOSTED_ADDENDUM: &str = "\n\n## 托管运行\n\
+    这是一次托管运行：用户不在旁边逐步看着，任务一直持续到你调用 `nx_complete`。\n\
+    - 需要用户决定 / 补充信息时调用 `nx_ask_user`（可给选项和推荐），任务会挂起等他回来；\
+      不要用纯文本回复提问或收尾 —— 没有动作的回复会被当成向用户提问。\n\
+    - 目标确实达成后调用 `nx_complete`，附上总结和证据。没调用它之前任务不会结束。\n\
+    - 用户随时可能接管终端；交还后请先读屏核对现场再继续。\n";
+
+/// 模型回了一段空话（没有动作也没有文字）时卡片上的问题。
+const HOSTED_EMPTY_REPLY_QUESTION: &str = "（模型没有给出任何内容）要我怎么继续？";
+
+/// 无动作回复被当成提问、拿到答复之后提醒模型的话。
+const HOSTED_NO_ACTION_FEEDBACK: &str = "（你上一条回复没有任何动作，已作为问题交给用户，上面是他的答复。\
+    托管模式下提问请用 nx_ask_user，完成请用 nx_complete。）\n";
+
+/// 托管卡片：id 也是这张卡在 `host_answer` 里的凭据。
+fn hosted_card(
+    question: &str,
+    options: Vec<super::host::CardOption>,
+    recommendation: Option<String>,
+) -> super::host::HumanCard {
+    let mut card = super::host::HumanCard::ask(
+        &uuid::Uuid::new_v4().simple().to_string(),
+        question,
+        super::steward::now_ms(),
+    );
+    card.options = options;
+    card.recommendation = recommendation;
+    card
+}
+
+/// 托管：没有动作的回复按 `nx_ask_user(text)` 处理 —— 出卡、挂起（零 LLM 调用）到用户答复，
+/// 答复以用户消息追加。返回 true = 拿到答复、继续循环；false = 取消 / 已结束。**不会**当成结论收场。
+async fn park_on_no_action(
+    h: &HostShared,
+    text: &str,
+    messages: &mut Vec<ChatMessage>,
+    feedback: &mut String,
+) -> bool {
+    let q = if text.trim().is_empty() { HOSTED_EMPTY_REPLY_QUESTION } else { text };
+    if !host_ask(h, hosted_card(q, Vec::new(), None), messages).await {
+        return false;
+    }
+    feedback.push_str(HOSTED_NO_ACTION_FEEDBACK);
+    true
+}
+
+/// 问人并挂起到答复；答复以用户消息追加进对话。返回 false = 取消 / 已结束。
+async fn host_ask(h: &HostShared, card: super::host::HumanCard, messages: &mut Vec<ChatMessage>) -> bool {
+    if h.ask(card).await != ParkEnd::Running {
+        return false;
+    }
+    for u in h.take_user() {
+        push_user(messages, u);
+    }
+    true
+}
+
+/// 追加一条用户消息；上一条已经是用户消息就并进去（不少网关拒绝连续两条同角色）。
+fn push_user(messages: &mut Vec<ChatMessage>, text: String) {
+    match messages.last_mut() {
+        Some(last) if last.role == "user" => {
+            last.content.push('\n');
+            last.content.push_str(&text);
+        }
+        _ => messages.push(ChatMessage::user(text)),
+    }
+}
+
+/// 把托管任务攒下的副作用收进运行循环：卡片答复 → 用户消息；未满足判据 → 反馈；
+/// 从暂停恢复 → 换一份新预算（用户给了新上限就套上）。返回是否刚恢复。
+fn absorb_host_pending(
+    h: &HostShared,
+    messages: &mut Vec<ChatMessage>,
+    feedback: &mut String,
+    spent: &mut BudgetSpent,
+    limits: &mut budget::RunBudget,
+) -> bool {
+    for u in h.take_user() {
+        push_user(messages, u);
+    }
+    for f in h.take_feedback() {
+        feedback.push_str(&f);
+        feedback.push('\n');
+    }
+    let Some(grant) = h.take_resume() else { return false };
+    if let Some(g) = grant {
+        *limits = apply_grant(*limits, g);
+    }
+    *spent = BudgetSpent::default();
+    feedback.push_str(budget::RESUME_FEEDBACK);
+    true
+}
+
+/// 「加预算继续」：给了的字段覆盖，其余不变，最后夹紧。
+fn apply_grant(mut b: budget::RunBudget, g: super::host::BudgetGrant) -> budget::RunBudget {
+    if let Some(n) = g.max_steps {
+        b.max_steps = n;
+    }
+    if let Some(m) = g.max_minutes {
+        b.max_minutes = m;
+    }
+    if let Some(c) = g.max_output_chars {
+        b.max_output_chars = c;
+    }
+    b.clamped()
+}
+
+/// 问题卡在步骤流里的文字（选项 / 推荐一并列出）。
+fn ask_text(question: &str, options: &[super::host::CardOption], recommendation: Option<&str>) -> String {
+    let mut s = question.trim().to_string();
+    if !options.is_empty() {
+        s.push_str("\n\n可选：");
+        s.push_str(&options.iter().map(|o| o.label.trim()).collect::<Vec<_>>().join(" / "));
+    }
+    if let Some(r) = recommendation {
+        s.push_str(&format!("\n建议：{}", r.trim()));
+    }
+    s
 }
 
 /// 挑这一轮该用哪份系统提示词。
@@ -4947,6 +5380,125 @@ fn strip_action_blocks(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use super::super::host::HostPhase;
+
+    // ——— 托管（RunMode::Hosted）———
+    // `act::run` 离不开 AppHandle / PTY；托管专有的控制流抽成了 `park_on_no_action` / `host_ask` /
+    // `absorb_host_pending` 与 `host::driver`，这里用假 IO 驱动它们。
+
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hosted_reply_without_actions_parks_instead_of_ending() {
+        let (h, io) = super::super::host::driver::tests::shared();
+        let h2 = h.clone();
+        let task = tokio::spawn(async move {
+            let mut msgs = vec![ChatMessage::user("目标".to_string()), ChatMessage::assistant("要部署到 prod 还是 staging？".to_string())];
+            let mut fb = String::new();
+            let ok = park_on_no_action(&h2, "要部署到 prod 还是 staging？", &mut msgs, &mut fb).await;
+            (ok, msgs, fb)
+        });
+        settle().await;
+        match h.phase() {
+            HostPhase::WaitingHuman { card } => {
+                assert_eq!(card.question, "要部署到 prod 还是 staging？");
+                assert_eq!(card.kind, super::super::host::CardKind::Ask);
+            }
+            p => panic!("应挂起等人：{p:?}"),
+        }
+        // 挂一天也不结束、不放租约
+        tokio::time::advance(Duration::from_secs(24 * 3600)).await;
+        settle().await;
+        assert!(!task.is_finished());
+        assert_eq!(*io.released.lock(), 0);
+        let card_id = match h.phase() {
+            HostPhase::WaitingHuman { card } => card.id,
+            _ => unreachable!(),
+        };
+        h.send(HostEvent::Answer(super::super::host::CardReply { card_id, text: "staging".into(), approved: None }));
+        let (ok, msgs, fb) = task.await.unwrap();
+        assert!(ok, "答复后继续循环，而不是收场");
+        assert_eq!(msgs.last().unwrap().role, "user");
+        assert_eq!(msgs.last().unwrap().content, "用户答复：staging");
+        assert!(fb.contains("nx_ask_user"));
+        assert_eq!(h.phase(), HostPhase::Running);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hosted_empty_reply_still_asks_and_stop_ends_it() {
+        let (h, _io) = super::super::host::driver::tests::shared();
+        let h2 = h.clone();
+        let task = tokio::spawn(async move {
+            let mut msgs = Vec::new();
+            let mut fb = String::new();
+            park_on_no_action(&h2, "  ", &mut msgs, &mut fb).await
+        });
+        settle().await;
+        assert!(matches!(h.phase(), HostPhase::WaitingHuman { ref card } if card.question == HOSTED_EMPTY_REPLY_QUESTION));
+        h.send(HostEvent::Stop);
+        assert!(!task.await.unwrap());
+        assert_eq!(h.phase(), HostPhase::Stopped);
+    }
+
+    #[test]
+    fn resume_absorbs_grant_and_resets_spent() {
+        let (h, _io) = super::super::host::driver::tests::shared();
+        h.apply(HostEvent::BudgetExhausted("步数".into())).unwrap();
+        h.send(HostEvent::Resume {
+            new_budget: Some(super::super::host::BudgetGrant { max_steps: Some(77), ..Default::default() }),
+        });
+        h.drain();
+        let mut msgs = Vec::new();
+        let mut fb = String::new();
+        let mut spent = BudgetSpent { steps: 400, ..Default::default() };
+        let mut limits = budget::RunBudget::default();
+        assert!(absorb_host_pending(&h, &mut msgs, &mut fb, &mut spent, &mut limits));
+        assert_eq!(spent.steps, 0);
+        assert_eq!(limits.max_steps, 77);
+        assert!(fb.contains(budget::RESUME_FEEDBACK.trim()));
+        // 只吸收一次
+        assert!(!absorb_host_pending(&h, &mut msgs, &mut fb, &mut spent, &mut limits));
+    }
+
+    #[test]
+    fn hosted_tools_only_in_hosted_specs_and_parse() {
+        assert!(!tool_specs().iter().any(|s| s.name == TOOL_ASK_USER || s.name == TOOL_COMPLETE));
+        let hs = hosted_tool_specs();
+        assert!(hs.iter().any(|s| s.name == TOOL_ASK_USER) && hs.iter().any(|s| s.name == TOOL_COMPLETE));
+        let ask = llm::ToolCall {
+            name: TOOL_ASK_USER.into(),
+            arguments: r#"{"question":"删旧日志吗？","options":[{"label":"删","reply":"删掉"},{"label":"","reply":"x"}],"recommendation":"删"}"#.into(),
+        };
+        assert_eq!(
+            actions_from_tool_call(&ask),
+            vec![AgentAction::AskUser {
+                question: "删旧日志吗？".into(),
+                options: vec![super::super::host::CardOption { label: "删".into(), reply: "删掉".into() }],
+                recommendation: Some("删".into()),
+            }]
+        );
+        let empty = llm::ToolCall { name: TOOL_ASK_USER.into(), arguments: r#"{"question":"  "}"#.into() };
+        assert!(actions_from_tool_call(&empty).is_empty(), "空问题不产出动作");
+        let done = llm::ToolCall {
+            name: TOOL_COMPLETE.into(),
+            arguments: r#"{"summary":"测试全过","evidence":["cargo test: ok"]}"#.into(),
+        };
+        assert_eq!(
+            actions_from_tool_call(&done),
+            vec![AgentAction::Complete { summary: "测试全过".into(), evidence: vec!["cargo test: ok".into()] }]
+        );
+        // 围栏协议同形
+        assert_eq!(
+            extract_actions(&block(r#"{"action":"complete","summary":"好了"}"#)),
+            vec![AgentAction::Complete { summary: "好了".into(), evidence: vec![] }]
+        );
+        assert!(unknown_tool_names(&[ask, done]).is_empty());
+    }
 
     fn block(json: &str) -> String {
         format!("```nx-exec\n{json}\n```\n")
