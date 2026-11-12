@@ -9,6 +9,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -19,12 +20,18 @@ use crate::cmd::AppState;
 use super::act::{self, AgentRunRequest, AgentTarget, RunBudgetOverride, RunMode};
 use super::control::{ControlState, ControlTable};
 use super::host::checkpoint::HostCheckpoint;
+use super::checkpoint::Spent;
+use super::host::context::HostContext;
+use super::host::criteria;
+use super::host::gate::HardRule;
 use super::host::{
-    BudgetGrant, CardReply, ConsoleRef, HostEvent, HostHandle, HostIo, HostPhase, HostShared,
+    BudgetGrant, CardKind, CardReply, Check, ConsoleRef, HostCtx, HostEvent, HostHandle, HostIo, HostPhase,
+    HostShared,
 };
+use super::policy::Authority;
 use super::llm::ChatMessage;
 use super::profile::StewardBrain;
-use super::steward::{self, now_ms, ScreenStore, StewardRegistry};
+use super::steward::{self, now_ms, ScreenStore, StewardContract, StewardRegistry};
 use super::steward_core::StewardCore;
 use super::steward_loop::StewardBus;
 use super::AgentError;
@@ -120,11 +127,59 @@ impl HostIo for AppHostIo {
         }
     }
 
-    fn note_progress(&self, messages: &[ChatMessage], step: usize) {
-        let mut c = self.snap.lock();
-        c.messages = messages.to_vec();
-        c.step = step;
+    fn note_progress(&self, messages: &[ChatMessage], step: usize, spent: &Spent) {
+        record_progress(&mut self.snap.lock(), messages, step, spent);
     }
+
+    fn note_contract(&self, contract: &StewardContract, authority: &Authority) {
+        let mut c = self.snap.lock();
+        c.contract = contract.clone();
+        c.authority = authority.clone();
+    }
+}
+
+/// 把运行进度写进待落盘的现场（契约级花费随它持久化，重启不清零）。
+pub(crate) fn record_progress(c: &mut HostCheckpoint, messages: &[ChatMessage], step: usize, spent: &Spent) {
+    c.messages = messages.to_vec();
+    c.step = step;
+    c.spent = *spent;
+}
+
+/// 渲染托管契约上下文（设计 §3）：授权 + Hard / Soft 偏好 + 意向栈 + 主机备忘 + KB（≤2KB）。
+/// Hard 偏好里带 `denyPattern` 的同时编译成 `gate::authorize` 强制的规则。
+pub(crate) fn build_ctx(
+    app: &AppHandle,
+    state: &AppState,
+    contract: StewardContract,
+    authority: Authority,
+    label: &str,
+) -> HostCtx {
+    let sit = act::situation_now(app, state, &contract.console_id, false);
+    let redact = super::load_config(&state.store).active_account().redact;
+    let mem = super::hostmem::prompt_section(state, &contract.console_id, label, redact);
+    let (section, refs, hard) = match app.try_state::<StewardBrain>() {
+        Some(brain) => {
+            let kb = brain.retrieve_kb(&sit, 3);
+            let (section, refs) = HostContext::build(&contract, &authority, &brain, sit.program, &mem, &kb);
+            let (hard, _) = brain.applicable_preferences(sit.program, &contract.host_key);
+            (section, refs, HardRule::from_prefs(&hard))
+        }
+        None => (String::new(), Vec::new(), Vec::new()),
+    };
+    HostCtx { contract, authority, hard, section, refs, label: label.to_string() }
+}
+
+/// 开始托管前起草完成判据：一次 LLM 调用，60 秒拿不到就退回人工确认。
+async fn draft_criteria(cfg: &super::AgentConfig, goal: &str, cancel: &AtomicBool) -> Vec<Check> {
+    let acct = cfg.active_account();
+    let msgs = vec![ChatMessage::user(criteria::draft_prompt(goal))];
+    let call = super::llm::complete_reply(acct, criteria::DRAFT_SYSTEM, &msgs, &[], Some(cancel));
+    let reply = match tokio::time::timeout(Duration::from_secs(60), call).await {
+        Ok(Ok(r)) => Ok(r.text),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("起草超时".to_string()),
+    };
+    criteria::draft_or_fallback(reply)
 }
 
 /// 相位在 ControlTable 上的投影：人在驾驶 / 暂停 / 挂起 → Paused（租约不放，守护进程照样只看）；
@@ -168,6 +223,7 @@ pub fn host_start(
     budget: Option<RunBudgetOverride>,
     console_text: Option<String>,
     console_alt: Option<bool>,
+    yolo: Option<bool>,
     app: AppHandle,
     state: State<'_, AppState>,
     registry: State<'_, StewardRegistry>,
@@ -234,8 +290,11 @@ pub fn host_start(
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let shared = HostShared::new(handle, &console_id, &goal, cancel, Box::new(io));
+    let authority = core.authority(&contract_id);
+    shared.set_ctx(build_ctx(&app, &state, contract, authority, &label), None);
     rt.host.register(Arc::clone(&shared));
     shared.announce();
+    let yolo = yolo.unwrap_or(false);
 
     let req = AgentRunRequest {
         session_id: console_id.clone(),
@@ -250,7 +309,19 @@ pub fn host_start(
     let task_host = Arc::clone(&shared);
     tauri::async_runtime::spawn(async move {
         let st = task_app.state::<AppState>();
-        let res = act::run(&task_app, &st, &st.act, &cfg, &req, RunMode::Hosted(Arc::clone(&task_host))).await;
+        // 先定完成判据：YOLO 直接采用草稿；否则挂起等用户编辑 / 接受（这期间零 LLM 调用、不写终端）
+        let draft = draft_criteria(&cfg, &req.question, &task_host.cancel).await;
+        let card_id = uuid::Uuid::new_v4().simple().to_string();
+        let res = match task_host.settle_criteria(draft, yolo, &card_id, now_ms()).await {
+            Some(checks) => {
+                // 判据进了契约：重渲染一次上下文（目标 / 判据 / 授权都在这一节里）
+                let c = task_host.ctx();
+                task_host.set_ctx(build_ctx(&task_app, &st, c.contract, c.authority, &c.label), None);
+                tracing::info!("托管 {} 判据 {} 条（YOLO：{yolo}）", task_host.contract_id(), checks.len());
+                act::run(&task_app, &st, &st.act, &cfg, &req, RunMode::Hosted(Arc::clone(&task_host))).await
+            }
+            None => Ok(()),
+        };
         finish_hosted(&task_app, &task_host, res);
     });
     Ok(contract_id)
@@ -325,6 +396,10 @@ pub fn host_answer(
 ) -> Result<(), String> {
     let h = hosted(&state, &contract_id)?;
     match h.phase().base() {
+        // 密码卡的值只走密码通道；判据草稿走 host_confirm_criteria
+        HostPhase::WaitingHuman { card } if matches!(card.kind, CardKind::Secret | CardKind::CriteriaDraft { .. }) => {
+            return Err("这张卡片不能在这里答复".to_string())
+        }
         HostPhase::WaitingHuman { card } if card.id == reply.card_id => {}
         _ => return Err("这张卡片已经处理过了，或不是当前等你答复的那张".to_string()),
     }
@@ -380,6 +455,106 @@ pub fn host_resume(
     Ok(())
 }
 
+/// 确认完成判据（草稿卡上点「接受」）：编辑后的判据写进契约，再答复草稿卡让任务开跑。
+#[tauri::command]
+pub fn host_confirm_criteria(
+    contract_id: String,
+    card_id: String,
+    checks: Vec<Check>,
+    registry: State<'_, StewardRegistry>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let h = hosted(&state, &contract_id)?;
+    match h.phase().base() {
+        HostPhase::WaitingHuman { card } if card.id == card_id && matches!(card.kind, CardKind::CriteriaDraft { .. }) => {}
+        _ => return Err("没有等你确认的判据草稿".to_string()),
+    }
+    let checks = if checks.is_empty() { criteria::fallback() } else { checks };
+    registry.set_criteria(&contract_id, checks.clone(), false);
+    h.set_criteria(checks, false);
+    h.send(HostEvent::Answer(CardReply { card_id, text: String::new(), approved: Some(true) }));
+    Ok(())
+}
+
+/// 改契约（目标 / 档位）：不重启运行。重建 `## 托管契约` 一节，并在下一步前告诉模型「契约已更新：…」。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn host_amend(
+    contract_id: String,
+    goal: Option<String>,
+    authority_tier: Option<String>,
+    app: AppHandle,
+    registry: State<'_, StewardRegistry>,
+    brain: State<'_, StewardBrain>,
+    state: State<'_, AppState>,
+    bus: State<'_, StewardBus>,
+    core: State<'_, StewardCore>,
+) -> Result<(), String> {
+    let h = hosted(&state, &contract_id)?;
+    if h.is_terminal() {
+        return Err("托管已经结束，不能再改".to_string());
+    }
+    let goal = goal.map(|g| g.trim().to_string()).filter(|g| !g.is_empty());
+    let tier = authority_tier.filter(|t| !t.trim().is_empty());
+    if goal.is_none() && tier.is_none() {
+        return Ok(());
+    }
+    let amended = steward::steward_amend(
+        contract_id.clone(),
+        goal.clone(),
+        tier.clone(),
+        registry,
+        brain,
+        state.clone(),
+        bus,
+        core.clone(),
+    )
+    .ok_or_else(|| "契约不存在".to_string())?;
+    let prev = h.ctx();
+    let mut contract = amended;
+    // 判据 / YOLO 以托管任务这边为准（registry 那份可能是签约时的空表）
+    contract.success_criteria = prev.contract.success_criteria.clone();
+    contract.yolo = prev.contract.yolo;
+    let authority = core.authority(&contract_id);
+    let note = amend_note(goal.as_deref(), tier.as_deref());
+    h.set_ctx(build_ctx(&app, &state, contract, authority, &prev.label), Some(note));
+    Ok(())
+}
+
+/// 「契约已更新：…」那句话。
+pub(crate) fn amend_note(goal: Option<&str>, tier: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if let Some(g) = goal {
+        parts.push(format!("目标改为「{g}」"));
+    }
+    if let Some(t) = tier {
+        parts.push(format!("授权档位改为 {t}"));
+    }
+    format!("契约已更新：{}。系统提示里的「托管契约」一节已按新契约重建，后续请以它为准。", parts.join("；"))
+}
+
+/// Notify 档的「撤销」：没有真回滚 —— 前端先接管，这里把用户的纠正记成 Learned 偏好，
+/// 并把那条决策标成 rejected，下次同主题检索会命中它。
+#[tauri::command]
+pub fn host_correct(
+    contract_id: String,
+    seq: i64,
+    topic: String,
+    correction: String,
+    brain: State<'_, StewardBrain>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let _ = hosted(&state, &contract_id)?;
+    state.store.steward_decision_outcome(seq, "rejected").ok();
+    brain.set_decision_outcome(seq, "rejected");
+    let correction = correction.trim();
+    if !correction.is_empty() {
+        let item = brain.learn_correction(seq, topic.trim(), correction)?;
+        state.store.steward_ctx_upsert(&item.to_row())?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn host_status(contract_id: String, state: State<'_, AppState>) -> Option<HostStatus> {
     state.act.host.get(&contract_id).map(|h| HostStatus::of(&h, &h.phase()))
@@ -412,6 +587,24 @@ mod tests {
         assert_eq!(c.id, "c1");
         assert_eq!(changed, Some(ControlState::AgentDriving));
         assert!(registry.for_console("t1").is_some());
+    }
+
+    #[test]
+    fn contract_spent_survives_checkpoint_round_trip() {
+        let ctx = HostCtx::bare("c1", "t1", "目标");
+        let console = ConsoleRef { host_key: "local:t1".into(), console_id: "t1".into(), ..Default::default() };
+        let mut cp = HostCheckpoint::new(ctx.contract, ctx.authority, console, 1);
+        let spent = Spent { steps: 412, elapsed_secs: 3_600, output_chars: 90_000, injections: 0 };
+        record_progress(&mut cp, &[ChatMessage::user("目标".to_string())], 412, &spent);
+        let back = HostCheckpoint::from_json(&cp.to_json(2).unwrap()).unwrap();
+        assert_eq!(back.spent, spent);
+        assert_eq!(back.step, 412);
+    }
+
+    #[test]
+    fn amend_note_names_what_changed() {
+        let n = amend_note(Some("改成只升级 patch 版本"), Some("approve"));
+        assert!(n.starts_with("契约已更新：") && n.contains("patch") && n.contains("approve"));
     }
 
     #[test]

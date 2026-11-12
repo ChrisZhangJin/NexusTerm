@@ -274,6 +274,8 @@ fn answer(card: &HumanCard, reply: &CardReply) -> Result<(HostPhase, Vec<Effect>
                 vec![Effect::Feedback(format!("未满足：用户没有确认完成，{why}"))],
             )
         }
+        // 密码已经直写进 pty / 判据已经由确认命令放进契约：答复本身不进对话
+        CardKind::Secret | CardKind::CriteriaDraft { .. } => moved(HostPhase::Running, vec![]),
         CardKind::Ask | CardKind::Watchdog => moved(
             HostPhase::Running,
             vec![Effect::AppendUser(format!("用户答复：{}", reply.text.trim()))],
@@ -418,6 +420,16 @@ mod tests {
                     ),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn secret_and_criteria_cards_resume_without_user_text() {
+        for kind in [CardKind::Secret, CardKind::CriteriaDraft { draft: vec![] }] {
+            let w = HostPhase::WaitingHuman { card: card("s", kind) };
+            let (p, fx) = step(&w, HostEvent::Answer(reply("s", "不该出现", Some(true)))).unwrap();
+            assert_eq!(p, HostPhase::Running);
+            assert!(!fx.iter().any(|e| matches!(e, Effect::AppendUser(_))), "答复文字不进对话");
         }
     }
 

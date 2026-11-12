@@ -17,8 +17,13 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
+use super::super::checkpoint::Spent;
+use super::super::decision::CtxRef;
+use super::super::policy::Authority;
+use super::super::steward::StewardContract;
+use super::gate::{HardRule, HostPolicy};
 use super::phase::{step, Effect, HostEvent, HostPhase, Invalid};
-use super::{BudgetGrant, CardKind, HostHandle, HumanCard};
+use super::{BudgetGrant, CardKind, Check, HostHandle, HumanCard, SuspendReason};
 
 /// 挂起期间多久看一眼取消标记。不是超时：等多久都行，只是取消要及时生效。
 pub const CANCEL_POLL: Duration = Duration::from_millis(200);
@@ -33,8 +38,59 @@ pub trait HostIo: Send + Sync {
     fn release_lease(&self);
     /// 按相位同步 ControlTable：驾驶 / 暂停 / 挂起标 Paused（租约不放），运行 / 等人标 AgentDriving
     fn sync_control(&self, phase: &HostPhase);
-    /// 记下运行进度（对话历史、步数），下一次 `save` 一并落盘。默认不记。
-    fn note_progress(&self, _messages: &[super::super::llm::ChatMessage], _step: usize) {}
+    /// 记下运行进度（对话历史、步数、契约级花费），下一次 `save` 一并落盘。默认不记。
+    fn note_progress(&self, _messages: &[super::super::llm::ChatMessage], _step: usize, _spent: &Spent) {}
+    /// 契约 / 授权变了（签约、`host_amend`、判据确认），下一次 `save` 一并落盘。默认不记。
+    fn note_contract(&self, _contract: &StewardContract, _authority: &Authority) {}
+}
+
+/// 托管任务眼里的契约：强制用的授权与 Hard 规则、系统提示里的 `## 托管契约` 一节及其依据。
+#[derive(Debug, Clone)]
+pub struct HostCtx {
+    pub contract: StewardContract,
+    pub authority: Authority,
+    pub hard: Vec<HardRule>,
+    /// `HostContext::build` 渲染的一节（接在系统提示后面）
+    pub section: String,
+    /// 这一节引用的依据，写进 DecisionRecord.ctx_refs
+    pub refs: Vec<CtxRef>,
+    /// 被托管终端的可读名字（主机备忘按它找主机）
+    pub label: String,
+}
+
+impl HostCtx {
+    /// 还没取到 brain / 授权时的最小契约（测试与签约前的占位）。
+    pub fn bare(contract_id: &str, console_id: &str, goal: &str) -> Self {
+        Self {
+            contract: StewardContract {
+                id: contract_id.to_string(),
+                console_id: console_id.to_string(),
+                host_key: format!("local:{console_id}"),
+                goal: goal.to_string(),
+                authority_tier: Authority::default().tier,
+                status: "observing".to_string(),
+                intent_ids: Vec::new(),
+                timebox_ms: 0,
+                created_at: 0,
+                success_criteria: Vec::new(),
+                yolo: false,
+            },
+            authority: Authority::default(),
+            hard: Vec::new(),
+            section: String::new(),
+            refs: Vec::new(),
+            label: "当前会话".to_string(),
+        }
+    }
+
+    /// `gate::authorize` 的输入。
+    pub fn policy(&self) -> HostPolicy {
+        HostPolicy {
+            authority: self.authority.clone(),
+            hard: self.hard.clone(),
+            host_key: self.contract.host_key.clone(),
+        }
+    }
 }
 
 /// 迁移副作用里要交回运行循环的那部分。
@@ -74,6 +130,12 @@ pub struct HostShared {
     phase: Mutex<HostPhase>,
     pending: Mutex<Pending>,
     io: Box<dyn HostIo>,
+    /// 契约 + 渲染好的上下文；`version` 每次 `set_ctx` 加一，运行循环据此重建系统提示
+    ctx: Mutex<(HostCtx, u64)>,
+    /// `host_amend` 留给模型的一句「契约已更新：…」
+    amend_notes: Mutex<Vec<String>>,
+    /// 契约级花费（随 checkpoint 持久化，暂停 / 继续不清零）
+    spent: Mutex<Spent>,
 }
 
 impl HostShared {
@@ -85,6 +147,7 @@ impl HostShared {
         io: Box<dyn HostIo>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
+        let handle_cid = handle.contract_id.clone();
         Arc::new(Self {
             handle,
             console_id: console_id.to_string(),
@@ -95,7 +158,82 @@ impl HostShared {
             phase: Mutex::new(HostPhase::Running),
             pending: Mutex::new(Pending::default()),
             io,
+            ctx: Mutex::new((HostCtx::bare(&handle_cid, console_id, goal), 0)),
+            amend_notes: Mutex::new(Vec::new()),
+            spent: Mutex::new(Spent::default()),
         })
+    }
+
+    // ——— 契约 / 上下文 ———
+
+    pub fn ctx(&self) -> HostCtx {
+        self.ctx.lock().0.clone()
+    }
+
+    pub fn ctx_version(&self) -> u64 {
+        self.ctx.lock().1
+    }
+
+    /// 换上新的契约上下文；`note` 有值时作为「契约已更新：…」留给运行循环追加给模型。
+    pub fn set_ctx(&self, ctx: HostCtx, note: Option<String>) {
+        self.io.note_contract(&ctx.contract, &ctx.authority);
+        {
+            let mut g = self.ctx.lock();
+            g.0 = ctx;
+            g.1 += 1;
+        }
+        if let Some(n) = note {
+            self.amend_notes.lock().push(n);
+        }
+    }
+
+    pub fn take_amend_notes(&self) -> Vec<String> {
+        std::mem::take(&mut self.amend_notes.lock())
+    }
+
+    /// 用户确认（或 YOLO 直接采用）的完成判据写进契约。
+    pub fn set_criteria(&self, checks: Vec<Check>, yolo: bool) {
+        let mut c = self.ctx();
+        c.contract.success_criteria = checks;
+        c.contract.yolo = yolo;
+        self.set_ctx(c, None);
+    }
+
+    /// 开始托管前定判据：YOLO 直接采用草稿；否则出一张草稿卡挂起，等 `host_confirm_criteria`
+    /// 把编辑后的判据写进契约再答复。返回最终判据；取消 / 结束返回 `None`。
+    pub async fn settle_criteria(&self, draft: Vec<Check>, yolo: bool, card_id: &str, now_ms: i64) -> Option<Vec<Check>> {
+        if yolo {
+            self.set_criteria(draft.clone(), true);
+            return Some(draft);
+        }
+        let mut card = HumanCard::ask(card_id, "确认完成判据：编辑后点「接受」开始托管", now_ms);
+        card.kind = CardKind::CriteriaDraft { draft };
+        match self.ask(card).await {
+            ParkEnd::Running => Some(self.ctx().contract.success_criteria),
+            _ => None,
+        }
+    }
+
+    // ——— 契约级花费 ———
+
+    pub fn spent(&self) -> Spent {
+        self.spent.lock().clone()
+    }
+
+    pub fn set_spent(&self, s: Spent) {
+        *self.spent.lock() = s;
+    }
+
+    // ——— 现场 ———
+
+    /// 托管的 console 不在了（tab 关了 / 连接没了）：挂起（ConsoleGone），不再往一个不存在的终端写。
+    /// 接驳是 PR6 的事；挂起中只有停止能结束它。返回是否刚挂起。
+    pub fn console_gone(&self) -> bool {
+        let p = self.phase();
+        if p.is_terminal() || matches!(p, HostPhase::Suspended { .. }) {
+            return false;
+        }
+        self.apply(HostEvent::Suspend(SuspendReason::ConsoleGone)).is_ok()
     }
 
     pub fn contract_id(&self) -> &str {
@@ -223,11 +361,14 @@ impl HostShared {
 
     /// 写 pty 之前的闸：先处理收件箱；`user_paused` 为真（用户在终端里动了键）而相位还是 Running 时
     /// 补一个 UserKey；然后不在 Running 就无限期挂起。返回 true = 可以写；false = 取消 / 已结束。
-    pub async fn gate(&self, user_paused: impl Fn() -> bool) -> bool {
+    pub async fn gate(&self, user_paused: impl Fn() -> bool, console_alive: impl Fn() -> bool) -> bool {
         if self.cancelled() {
             return false;
         }
         self.drain();
+        if !console_alive() {
+            self.console_gone();
+        }
         if self.phase() == HostPhase::Running && user_paused() {
             let _ = self.apply(HostEvent::UserKey);
         }
@@ -278,7 +419,8 @@ impl HostShared {
 
     /// 让运行循环下一次落盘时带上最新进度。
     pub fn note_progress(&self, messages: &[super::super::llm::ChatMessage], step: usize) {
-        self.io.note_progress(messages, step);
+        let spent = self.spent();
+        self.io.note_progress(messages, step, &spent);
     }
 
     /// 周期快照：「动作 + 反馈」一轮之后落一次（相位不变）。
@@ -369,7 +511,7 @@ pub(crate) mod tests {
         let (h, _io) = shared();
         let h2 = h.clone();
         // 用户在终端里按了键：闸口补 UserKey，进 UserDriving{Running}
-        let task = tokio::spawn(async move { h2.gate(|| true).await });
+        let task = tokio::spawn(async move { h2.gate(|| true, || true).await });
         settle().await;
         assert_eq!(h.phase(), HostPhase::UserDriving { resume_to: Box::new(HostPhase::Running) });
         // 原来 300s（PAUSE_MAX_WAIT）就让模型收尾；现在多久都不动
@@ -463,6 +605,65 @@ pub(crate) mod tests {
         // 终态吸收：再停一次不再放租约
         let _ = h.apply(HostEvent::Stop);
         assert_eq!(*io.released.lock(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn console_gone_suspends_and_waits_without_writing() {
+        let (h, io) = shared();
+        let h2 = h.clone();
+        let task = tokio::spawn(async move { h2.gate(|| false, || false).await });
+        settle().await;
+        assert_eq!(
+            h.phase(),
+            HostPhase::Suspended { reason: SuspendReason::ConsoleGone, resume_to: Box::new(HostPhase::Running) }
+        );
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        settle().await;
+        assert!(!task.is_finished(), "挂起中不写、也不自己结束");
+        assert_eq!(*io.released.lock(), 0, "挂起不放租约");
+        assert!(io.control.lock().last().map(String::as_str) == Some("suspended"));
+        h.send(HostEvent::Stop);
+        assert!(!task.await.unwrap());
+        // 已挂起时再检测不重复迁移
+        assert!(!h.console_gone());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn yolo_takes_the_draft_without_asking() {
+        let (h, io) = shared();
+        let draft = vec![Check::FileExists { path: "/srv/app/dist".into() }];
+        let got = h.settle_criteria(draft.clone(), true, "cd1", 0).await;
+        assert_eq!(got, Some(draft.clone()));
+        assert_eq!(h.phase(), HostPhase::Running);
+        assert!(io.saves.lock().is_empty(), "没有出卡、没有相位迁移");
+        let c = h.ctx().contract;
+        assert!(c.yolo);
+        assert_eq!(c.success_criteria, draft);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_yolo_waits_for_confirmed_criteria() {
+        let (h, _io) = shared();
+        let draft = vec![Check::Manual { text: "由你确认完成".into() }];
+        let h2 = h.clone();
+        let d2 = draft.clone();
+        let task = tokio::spawn(async move { h2.settle_criteria(d2, false, "cd1", 0).await });
+        settle().await;
+        match h.phase() {
+            HostPhase::WaitingHuman { card } => {
+                assert_eq!(card.kind, CardKind::CriteriaDraft { draft: draft.clone() })
+            }
+            p => panic!("应等用户确认判据：{p:?}"),
+        }
+        tokio::time::advance(Duration::from_secs(24 * 3600)).await;
+        settle().await;
+        assert!(!task.is_finished());
+        // host_confirm_criteria：先把编辑后的判据写进契约，再答复
+        let edited = vec![Check::CommandOk { cmd: "cargo test".into() }];
+        h.set_criteria(edited.clone(), false);
+        h.send(HostEvent::Answer(CardReply { card_id: "cd1".into(), text: String::new(), approved: Some(true) }));
+        assert_eq!(task.await.unwrap(), Some(edited));
+        assert!(!h.ctx().contract.yolo);
     }
 
     #[tokio::test(start_paused = true)]

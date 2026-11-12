@@ -170,20 +170,30 @@ pub fn secret_payload(value: &str) -> Zeroizing<Vec<u8>> {
 /// 通道的发送端被丢掉（登记被清、窗口没了）按「跳过」处理——没人再能回答了，
 /// 与审批「UI 那一头先没了 = 拒绝」同一思路。
 pub async fn await_secret(
-    mut rx: oneshot::Receiver<SecretAnswer>,
+    rx: oneshot::Receiver<SecretAnswer>,
     timeout: Duration,
+    cancelled: impl FnMut() -> bool,
+) -> SecretOutcome {
+    await_secret_for(rx, Some(timeout), cancelled).await
+}
+
+/// 同 [`await_secret`]，`timeout = None` 表示一直等（托管：卡片永远等下去，只有取消能打断）。
+pub async fn await_secret_for(
+    mut rx: oneshot::Receiver<SecretAnswer>,
+    timeout: Option<Duration>,
     mut cancelled: impl FnMut() -> bool,
 ) -> SecretOutcome {
-    let deadline = Instant::now() + timeout;
+    let deadline = timeout.map(|t| Instant::now() + t);
     loop {
         if cancelled() {
             return SecretOutcome::Cancelled;
         }
         let now = Instant::now();
-        if now >= deadline {
-            return SecretOutcome::TimedOut;
-        }
-        let slice = CANCEL_POLL.min(deadline - now);
+        let slice = match deadline {
+            Some(d) if now >= d => return SecretOutcome::TimedOut,
+            Some(d) => CANCEL_POLL.min(d - now),
+            None => CANCEL_POLL,
+        };
         tokio::select! {
             got = &mut rx => {
                 return match got {
