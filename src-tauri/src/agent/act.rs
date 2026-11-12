@@ -4439,8 +4439,7 @@ pub async fn run(
                     // 提示符上敲的命令变了），对着旧局面批准的按键就不能再发
                     if let Some(before) = &judged {
                         let now_sit = situation_now(app, state, &target_id, false);
-                        if let Some(why) = super::situation::materially_changed(before, &now_sit) {
-                            let why = format!("等待期间屏幕局面变了：{why}");
+                        if let Some(why) = keys_recheck(before, &now_sit) {
                             emit_step(
                                 app,
                                 &session,
@@ -5445,6 +5444,12 @@ fn hosted_approval_card(text: &str, reasons: &[String]) -> super::host::HumanCar
     card
 }
 
+/// 发按键前的最后复核（托管与旧 steward 模式共用）：`judged` 是放行 / 批准时依据的局面
+/// （托管 = `gate::authorize` 当时抓的那份）。审批 / 交还控制权可能等了很久，屏幕换了局面就不发。
+fn keys_recheck(judged: &super::situation::Situation, now: &super::situation::Situation) -> Option<String> {
+    super::situation::materially_changed(judged, now).map(|why| format!("等待期间屏幕局面变了：{why}"))
+}
+
 /// 托管写入的强制点：`gate::authorize` 一次；Approve 就挂起等批准（不设超时）。
 /// 返回 (结论, 拒绝原因)：拒绝原因有值 = 不写，把它反馈给模型。
 async fn hosted_authorize(
@@ -5845,6 +5850,49 @@ mod tests {
         ctx.contract.host_key = String::new();
         let (g, _) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None).await;
         assert!(matches!(g, Gate::Deny(_)));
+    }
+
+    fn screen(kind: super::super::situation::SituationKind, tail: &str) -> super::super::situation::Situation {
+        super::super::situation::Situation {
+            frame_id: 1,
+            screen_hash: tail.into(),
+            program: super::super::situation::Program::Unknown,
+            kind,
+            topic: None,
+            options: Vec::new(),
+            confidence: 0.9,
+            tail: tail.into(),
+            evidence: Vec::new(),
+            stale_ms: 0,
+            signature: String::new(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn approved_hosted_keys_not_sent_when_screen_changed_during_wait() {
+        use super::super::situation::SituationKind as K;
+        let (h, _io) = super::super::host::driver::tests::shared();
+        let ctx = ctx_with("approve");
+        // 批准时依据的局面：shell 提示符上
+        let judged = screen(K::AwaitingInput, "Input: ");
+        let keys = AgentAction::Keys { target: None, keys: "ls<Enter>".into() };
+        let (h2, j2, k2) = (h.clone(), judged.clone(), keys.clone());
+        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, &k2, "ls", Some(&j2)).await });
+        settle().await;
+        let card_id = match h.phase() {
+            HostPhase::WaitingHuman { card } => card.id,
+            p => panic!("应等批准：{p:?}"),
+        };
+        // 等批准的这段时间里屏幕换成了密码提示
+        tokio::time::advance(Duration::from_secs(1800)).await;
+        h.send(HostEvent::Answer(super::super::host::CardReply { card_id, text: String::new(), approved: Some(true) }));
+        let (g, refused) = task.await.unwrap();
+        assert!(matches!(g, Gate::Approve(_)) && refused.is_none(), "批准了");
+        let now = screen(K::Password, "[sudo] password for user: ");
+        let why = keys_recheck(&judged, &now).expect("局面变了就不发");
+        assert!(why.contains("等待期间屏幕局面变了"));
+        // 局面没变则照发
+        assert!(keys_recheck(&judged, &judged.clone()).is_none());
     }
 
     #[test]
