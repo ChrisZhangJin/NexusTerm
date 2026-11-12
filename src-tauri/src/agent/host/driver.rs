@@ -51,6 +51,8 @@ pub trait HostIo: Send + Sync {
     fn note_watchdog(&self, _w: &super::watchdog::WatchdogState) {}
     /// 给人看的提示变了（随状态推给面板）。默认不记。
     fn note_notice(&self, _notice: Option<&str>) {}
+    /// 期限暂停后用户「继续」过了（随 checkpoint 落盘，接驳后不再因同一期限暂停）。默认不记。
+    fn note_deadline_ack(&self, _acked: bool) {}
     /// 被托管的 console 还在不在（tab 没关、连接没断）。挂起等人期间据此发现「tab 关了」。默认在。
     fn console_alive(&self) -> bool {
         true
@@ -248,6 +250,16 @@ impl HostShared {
         let c = self.ctx();
         let span = if c.contract.timebox_ms > 0 { c.contract.timebox_ms } else { c.authority.timebox_ms };
         (span > 0 && c.contract.created_at > 0).then(|| c.contract.created_at + span as i64)
+    }
+
+    /// 从 checkpoint 恢复「期限已确认」。
+    pub fn set_deadline_acked(&self, acked: bool) {
+        self.deadline_acked.store(acked, Ordering::Relaxed);
+        self.io.note_deadline_ack(acked);
+    }
+
+    pub fn deadline_acked(&self) -> bool {
+        self.deadline_acked.load(Ordering::Relaxed)
     }
 
     /// 期限到了且还没被用户「继续」确认过：进 Paused{Deadline}。返回是否刚暂停。
@@ -596,6 +608,7 @@ impl HostShared {
             && matches!(self.phase().base(), HostPhase::Paused { cause: super::PauseCause::Deadline })
         {
             self.deadline_acked.store(true, Ordering::Relaxed);
+            self.io.note_deadline_ack(true);
         }
         let was_paused = matches!(self.phase(), HostPhase::Paused { .. });
         let resume = matches!(ev, HostEvent::Resume { .. });
@@ -733,6 +746,7 @@ pub(crate) mod tests {
         pub control: Mutex<Vec<String>>,
         /// console 没了（tab 关了）
         pub dead: Mutex<bool>,
+        pub acked: Mutex<bool>,
     }
 
     impl HostIo for Arc<FakeIo> {
@@ -750,6 +764,9 @@ pub(crate) mod tests {
         }
         fn console_alive(&self) -> bool {
             !*self.dead.lock()
+        }
+        fn note_deadline_ack(&self, acked: bool) {
+            *self.acked.lock() = acked;
         }
     }
 
@@ -1033,7 +1050,7 @@ pub(crate) mod tests {
 
     #[test]
     fn deadline_pauses_once_then_resume_is_honored() {
-        let (h, _io) = shared();
+        let (h, io) = shared();
         let mut c = h.ctx();
         c.contract.created_at = 1_000;
         c.contract.timebox_ms = 60_000;
@@ -1046,6 +1063,15 @@ pub(crate) mod tests {
         h.drain();
         assert_eq!(h.phase(), HostPhase::Running);
         assert!(!h.check_deadline(99_000), "继续过了就不再因同一期限暂停");
+        assert!(*io.acked.lock(), "确认记进快照，随 checkpoint 落盘");
+        // 接驳后的新任务从 checkpoint 恢复确认：不再暂停
+        let (h2, _io2) = shared();
+        let mut c2 = h2.ctx();
+        c2.contract.created_at = 1_000;
+        c2.contract.timebox_ms = 60_000;
+        h2.set_ctx(c2, None);
+        h2.set_deadline_acked(true);
+        assert!(!h2.check_deadline(99_000));
     }
 
     #[tokio::test(start_paused = true)]

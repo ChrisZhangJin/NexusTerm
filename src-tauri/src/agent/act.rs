@@ -3663,7 +3663,10 @@ pub async fn run(
                 ParkEnd::Running => {}
                 _ => break,
             }
-            absorb_host_pending(h, &mut messages, &mut feedback, &mut meter, &mut limits);
+            // 用户「继续」了：上一次「超长就压缩重试」的额度重新给，不然恢复后一超长又直接暂停（死循环）
+            if absorb_host_pending(h, &mut messages, &mut feedback, &mut meter, &mut limits) {
+                context_retry_used = false;
+            }
             // 重启 / 换 console 接驳后的第一步：先读屏核对现场（结果并进这一步的反馈）
             if h.take_force_screen() {
                 feedback.push_str(&reattach_screen_feedback(&situation_now(app, state, &h.console_id, false)));
@@ -3761,7 +3764,9 @@ pub async fn run(
                 );
                 match h.park().await {
                     ParkEnd::Running => {
-                        absorb_host_pending(h, &mut messages, &mut feedback, &mut meter, &mut limits);
+                        if absorb_host_pending(h, &mut messages, &mut feedback, &mut meter, &mut limits) {
+                            context_retry_used = false;
+                        }
                         emit_step(
                             app,
                             &session,
@@ -3900,7 +3905,7 @@ pub async fn run(
                 let action = llm_failure_action(host.is_some(), &msg, context_retry_used);
                 if action == LlmFailAction::CompactRetry {
                     context_retry_used = true;
-                    force_compact(&mut messages);
+                    force_compact(&mut messages, super::compact::threshold_tokens(&acct.model));
                     emit_step(
                         app,
                         &session,
@@ -4250,7 +4255,13 @@ pub async fn run(
                             Some(p) => ops.resolve(p).await.ok(),
                             None => None,
                         };
-                        let gate = hosted_file_gate(&h.ctx().policy(), &call, resolved.as_deref());
+                        // 符号链接：写入会跟随链接落到真实路径（atomic_replace），真实路径也要过 deny
+                        let real = match resolved.as_deref() {
+                            Some(r) => ops.real_target(r).await,
+                            None => None,
+                        };
+                        let alts: Vec<&str> = resolved.iter().chain(real.iter()).map(String::as_str).collect();
+                        let gate = hosted_file_gate(&h.ctx().policy(), &call, &alts);
                         if let Gate::Deny(why) = &gate {
                             emit_step(app, &session, StepPayload { command: Some(call.summary()), reasons: Some(vec![why.clone()]), ..StepPayload::new("skip", step) });
                             feedback.push_str(&format!("「{}」没有执行：{why}\n", call.summary()));
@@ -4514,7 +4525,7 @@ pub async fn run(
                             command: command.trim().into(),
                             target: target_id.clone(),
                             target_label: target_label.into(),
-                            reasons: risk.reasons.clone(),
+                            reasons: with_cwd_note(risk.reasons.clone()),
                             diff: None,
                             preview_complete: None,
                         };
@@ -5126,6 +5137,11 @@ pub async fn run(
                     loop {
                         if cancel.load(Ordering::Relaxed) {
                             stop = Some((super::watch::Reason::Cancelled, situation_now(app, state, &target_id, false)));
+                            break;
+                        }
+                        // 托管：长时间盯梢期间意向期限到了 —— 停下来暂停（Paused{Deadline}），由主循环挂起
+                        if host.as_ref().is_some_and(|h| h.check_deadline(super::steward::now_ms())) {
+                            stop = Some((super::watch::Reason::Paused, situation_now(app, state, &target_id, false)));
                             break;
                         }
                         // 用户点了「暂停」：别一直挂着，交回主循环去 hold_paused
@@ -6152,6 +6168,14 @@ fn not_at_prompt_feedback(command: &str, label: &str, why: &str) -> String {
     )
 }
 
+/// 命令审批卡上的提醒：批准之后命令在 shell 那时所在的目录里跑（等待期间目录变了以那时为准）。
+pub(super) const CWD_NOTE: &str = "命令会在批准之后、shell 当时所在的目录里执行（等待期间若有人切换了目录，以那时为准）";
+
+fn with_cwd_note(mut reasons: Vec<String>) -> Vec<String> {
+    reasons.push(CWD_NOTE.to_string());
+    reasons
+}
+
 /// 不可重试的模型错误怎么办。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LlmFailAction {
@@ -6194,8 +6218,9 @@ pub(super) fn is_context_overflow(msg: &str) -> bool {
 }
 
 /// 狠狠压一次：预算取当前估算的一半。
-pub(super) fn force_compact(messages: &mut Vec<ChatMessage>) -> bool {
-    let budget = (super::compact::total_tokens(messages) / 2).max(1_000);
+pub(super) fn force_compact(messages: &mut Vec<ChatMessage>, threshold: usize) -> bool {
+    // 比平时的阈值狠：取「当前一半」与「阈值一半」里更小的那个
+    let budget = (super::compact::total_tokens(messages) / 2).min(threshold / 2).max(1_000);
     super::compact::compact(messages, budget)
 }
 
@@ -6204,7 +6229,7 @@ pub(super) fn force_compact(messages: &mut Vec<ChatMessage>) -> bool {
 pub(super) fn hosted_file_gate(
     policy: &super::host::gate::HostPolicy,
     call: &super::files_tool::FileCall,
-    resolved: Option<&str>,
+    alternates: &[&str],
 ) -> Gate {
     let rank = |g: &Gate| match g {
         Gate::Deny(_) => 3,
@@ -6213,7 +6238,7 @@ pub(super) fn hosted_file_gate(
         Gate::Allow => 0,
     };
     let mut best = super::host::gate::authorize(policy, &AgentAction::File(call.clone()), None);
-    if let Some(r) = resolved.filter(|r| Some(*r) != call.path()) {
+    for r in alternates.iter().filter(|r| Some(**r) != call.path()) {
         let c = with_path(call.clone(), r);
         let g = super::host::gate::authorize(policy, &AgentAction::File(c), None);
         if rank(&g) > rank(&best) {
@@ -6571,7 +6596,9 @@ async fn hosted_authorize(
         Gate::Deny(why) => Some(why.clone()),
         Gate::Approve(reasons) => {
             before_park();
-            let ok = h.approve(hosted_approval_card(text, reasons)).await;
+            let reasons =
+                if matches!(action, AgentAction::Exec { .. }) { with_cwd_note(reasons.clone()) } else { reasons.clone() };
+            let ok = h.approve(hosted_approval_card(text, &reasons)).await;
             (!ok).then(|| "用户没有批准，没有写入。换一个做法，或用 nx_ask_user 问清楚".to_string())
         }
         Gate::Allow | Gate::Notify => None,
@@ -7504,6 +7531,21 @@ mod tests {
         assert!(r.is_ok());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn exec_approval_card_says_where_it_runs() {
+        let (h, _io) = super::super::host::driver::tests::shared();
+        let ctx = ctx_with("approve");
+        let h2 = h.clone();
+        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, &exec("make install"), "make install", None, || {}).await });
+        settle().await;
+        match h.phase() {
+            HostPhase::WaitingHuman { card } => assert!(card.reasons.iter().any(|r| r == CWD_NOTE), "{:?}", card.reasons),
+            p => panic!("{p:?}"),
+        }
+        h.send(HostEvent::Stop);
+        task.await.unwrap();
+    }
+
     #[test]
     fn llm_failures_park_hosted_and_compact_on_overflow() {
         let e401 = "HTTP 401 Unauthorized: invalid api key";
@@ -7513,6 +7555,8 @@ mod tests {
         assert_eq!(llm_failure_action(false, long, false), LlmFailAction::CompactRetry);
         assert_eq!(llm_failure_action(true, long, true), LlmFailAction::Pause, "压过一次还超长：托管暂停");
         assert_eq!(llm_failure_action(false, long, true), LlmFailAction::Fail);
+        // 暂停 → 继续之后额度重给（主循环在 absorb_host_pending 报告恢复时把 retried 清零）：又能先压缩再试
+        assert_eq!(llm_failure_action(true, long, false), LlmFailAction::CompactRetry);
         assert!(is_context_overflow("prompt is too long: 210000 tokens > 200000 maximum"));
         // 狠压：长历史压到一半以内
         let mut msgs = vec![ChatMessage::user("任务")];
@@ -7521,8 +7565,34 @@ mod tests {
             msgs.push(ChatMessage::user("x".repeat(3_000)));
         }
         let before = super::super::compact::total_tokens(&msgs);
-        assert!(force_compact(&mut msgs));
+        assert!(force_compact(&mut msgs, 48_000));
         assert!(super::super::compact::total_tokens(&msgs) < before);
+    }
+
+    #[tokio::test]
+    async fn symlink_into_denied_dir_is_caught_by_realpath() {
+        use super::super::files::{fake::FakeTransport, FileOps, FileOpsConfig};
+        let t = FakeTransport::new("/home/me");
+        t.add_dir("/etc/nginx");
+        t.add_file("/etc/nginx/nginx.conf", b"x");
+        // ~/n.conf -> /etc/nginx/nginx.conf；新文件 ~/conf.d/new.conf，其中 ~/conf.d -> /etc/nginx
+        t.links.lock().insert("/home/me/n.conf".into(), "/etc/nginx/nginx.conf".into());
+        t.links.lock().insert("/home/me/conf.d".into(), "/etc/nginx".into());
+        let ops = FileOps::new(&t, FileOpsConfig::default());
+        let mut ctx = ctx_with("auto");
+        ctx.authority.deny = vec!["/etc/nginx".into()];
+        for p in ["/home/me/n.conf", "/home/me/conf.d/new.conf"] {
+            let call = super::super::files_tool::FileCall::Write(super::super::files::WriteArgs {
+                target: None,
+                path: p.into(),
+                content: "y".into(),
+                create_dirs: false,
+            });
+            assert_eq!(hosted_file_gate(&ctx.policy(), &call, &[]), Gate::Allow, "字面路径匹配不上");
+            let real = ops.real_target(p).await.unwrap();
+            assert!(real.starts_with("/etc/nginx/"), "{real}");
+            assert!(matches!(hosted_file_gate(&ctx.policy(), &call, &[&real]), Gate::Deny(_)), "{p}");
+        }
     }
 
     #[test]
@@ -7537,12 +7607,12 @@ mod tests {
         });
         // 原始写法 `~/…` 匹配不上 deny，解析后的真实路径匹配上：拦
         assert_eq!(super::super::host::gate::authorize(&ctx.policy(), &AgentAction::File(call.clone()), None), Gate::Allow);
-        let g = hosted_file_gate(&ctx.policy(), &call, Some("/home/me/.config/app/settings.toml"));
+        let g = hosted_file_gate(&ctx.policy(), &call, &["/home/me/.config/app/settings.toml"]);
         assert!(matches!(g, Gate::Deny(_)), "{g:?}");
         // 反过来：deny 写的是 ~ 形式，原始写法就能匹配
         let mut ctx2 = ctx_with("auto");
         ctx2.authority.deny = vec!["~/.config/app".into()];
-        assert!(matches!(hosted_file_gate(&ctx2.policy(), &call, Some("/home/me/.config/app/settings.toml")), Gate::Deny(_)));
+        assert!(matches!(hosted_file_gate(&ctx2.policy(), &call, &["/home/me/.config/app/settings.toml"]), Gate::Deny(_)));
     }
 
     #[test]

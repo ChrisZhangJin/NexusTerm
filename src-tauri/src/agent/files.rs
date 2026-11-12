@@ -1052,6 +1052,17 @@ impl<'a> FileOps<'a> {
         Ok(normalize(&expanded))
     }
 
+    /// 写入实际会落到哪里：已存在的路径取 realpath（跟随符号链接，与 `atomic_replace` 一致）；
+    /// 还不存在的新文件取父目录的 realpath + 文件名。拿不到返回 None。
+    pub async fn real_target(&self, path: &str) -> Option<String> {
+        if let Some(real) = self.t.realpath(path).await {
+            return Some(normalize(&to_slash(&real)));
+        }
+        let parent = parent_of(path)?;
+        let real = self.t.realpath(parent).await?;
+        Some(join(&normalize(&to_slash(&real)), file_name(path)))
+    }
+
     /// 路径是否命中禁写清单（字面路径与真实路径都查，防符号链接绕过）
     pub async fn is_denied(&self, path: &str) -> Result<bool, FileError> {
         let c = self.candidates(path).await;

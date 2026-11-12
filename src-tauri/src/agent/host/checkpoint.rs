@@ -46,6 +46,9 @@ pub struct HostCheckpoint {
     /// 计划清单（nx_todo）；旧现场没有该字段 → 空
     #[serde(default)]
     pub todo: Vec<super::super::todo::TodoItem>,
+    /// 意向期限到了、用户已经「继续」过（接驳后不再因同一期限暂停）
+    #[serde(default)]
+    pub deadline_acked: bool,
     pub created_wall_ms: i64,
     pub saved_wall_ms: i64,
 }
@@ -89,6 +92,7 @@ impl HostCheckpoint {
             last_screen_hash: String::new(),
             watchdog: WatchdogState::default(),
             todo: Vec::new(),
+            deadline_acked: false,
             created_wall_ms: now_wall_ms,
             saved_wall_ms: now_wall_ms,
         }
