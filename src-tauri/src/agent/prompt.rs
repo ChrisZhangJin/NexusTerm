@@ -387,6 +387,26 @@ fn check_pager(lower: &str, alt_screen: bool) -> Option<PromptGuess> {
     None
 }
 
+/// 主屏幕上的分页器：git 默认 `LESS=FRX`，less 不进备用屏幕，最后一行只剩一个 `:`。
+///
+/// 裸 `:` 在主屏幕上太常见（脚本输出、YAML 片段），所以要同时满足：
+/// - 屏幕已经静止一阵（`static_screen`，由调用方按帧计数判断）；
+/// - 上面至少 5 行内容，且紧挨着的那行不像一句等输入的提示（不以 `:` / `?` 结尾、不是 shell 提示符）。
+pub fn normal_screen_pager(before: &[&str], last: &str, static_screen: bool) -> Option<PromptGuess> {
+    if !static_screen || last.trim() != ":" {
+        return None;
+    }
+    let content: Vec<&str> = before.iter().copied().filter(|l| !l.trim().is_empty()).collect();
+    if content.len() < 5 {
+        return None;
+    }
+    let prev = content.last()?.trim_end();
+    if ends_colon(prev) || ends_question(prev) || check_shell(prev, false).is_some() {
+        return None;
+    }
+    Some(guess(PromptKind::Pager, 0.7, HINT_PAGER))
+}
+
 // ───────────────────────────── 菜单 ─────────────────────────────
 
 /// 形如 `1) foo` `2. bar` `[3] baz` `(4) qux` `5: x` `> 1 - y` 的编号项。
@@ -1339,5 +1359,28 @@ mod tests {
             let _ = classify(s, true);
             let _ = classify(s, false);
         }
+    }
+
+    #[test]
+    fn normal_screen_pager_needs_static_screen_and_paged_content() {
+        let log = [
+            "commit 3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a",
+            "Author: Dev <dev@example.com>",
+            "Date:   Mon Nov 9 10:00:00 2026 +0800",
+            "",
+            "    fix(agent): tighten prompt rules",
+            "",
+            "commit 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+        ];
+        let g = normal_screen_pager(&log, ":", true).expect("静止的一屏 git log + `:` 是分页器");
+        assert_eq!(g.kind, PromptKind::Pager);
+        // 屏幕还在动：不认
+        assert!(normal_screen_pager(&log, ":", false).is_none());
+        // 内容太少 / 上一行是提示 / 末行不是裸冒号：不认
+        assert!(normal_screen_pager(&log[..2], ":", true).is_none());
+        assert!(normal_screen_pager(&["a", "b", "c", "d", "Enter value:"], ":", true).is_none());
+        assert!(normal_screen_pager(&log, "key: value", true).is_none());
+        // 主屏幕上的裸 `:` 不经这条路径时仍是 Unknown（classify 本身不知道屏幕静没静止）
+        assert_eq!(classify(&format!("{}\n:", log.join("\n")), false).kind, PromptKind::Unknown);
     }
 }
