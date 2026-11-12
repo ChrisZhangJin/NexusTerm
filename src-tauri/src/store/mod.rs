@@ -28,6 +28,9 @@ mod host_memory;
 mod steward;
 pub use steward::CtxRow;
 
+/// 统一托管引擎：每份契约一行可接驳的现场。
+mod host;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
@@ -258,6 +261,7 @@ impl Store {
         macro_migration::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
         host_memory::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
         steward::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
+        host::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
 
         // 一次主键查找就能判定要不要弹解锁框。刻意不做 KDF、不碰系统凭据服务 ——
         // 这条路径在 `lib.rs` 的 setup 里是 `expect`，不能慢也不能阻塞。

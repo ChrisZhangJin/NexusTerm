@@ -315,6 +315,12 @@ pub struct StewardContract {
     pub intent_ids: Vec<String>,
     pub timebox_ms: u64,
     pub created_at: i64,
+    /// 完成判据：由模型起草、用户确认（统一托管 §5）。旧数据没有该字段时为空
+    #[serde(default)]
+    pub success_criteria: Vec<super::host::Check>,
+    /// YOLO：直接采用起草的判据、不经确认就开始托管。只跳过确认，不改授权档位与 deny
+    #[serde(default)]
+    pub yolo: bool,
 }
 
 #[derive(Clone, Default)]
@@ -346,6 +352,7 @@ impl StewardRegistry {
             intent_ids: Vec::new(),
             timebox_ms: 0,
             created_at: ts,
+            success_criteria: Vec::new(), yolo: false,
         };
         map.insert(contract.id.clone(), contract.clone());
         contract
@@ -693,6 +700,7 @@ pub(crate) fn restore_checkpoints(
             intent_ids: cp.intent_ids.clone(),
             timebox_ms: cp.authority.timebox_ms,
             created_at: cp.created_or_saved_wall_ms(),
+            success_criteria: Vec::new(), yolo: false,
         });
         core.set_authority(&contract_id, cp.authority.clone());
         core.resume_contract(&contract_id, cp.spent.elapsed_secs as i64 * 1000);

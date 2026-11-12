@@ -49,6 +49,7 @@ pub mod policy;
 pub mod ownership;
 // P4 长运行与恢复
 pub mod checkpoint;
+pub mod host;
 // P5 学习闭环 / LLM 兜底
 pub mod learning;
 pub mod planner;

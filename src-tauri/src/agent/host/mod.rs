@@ -1,0 +1,319 @@
+//! 统一托管引擎（设计见 `docs/nexus-host-unified-design.md`）。
+//!
+//! 本目录目前只有**纯逻辑**：生命周期状态机（`phase`）、授权闸门（`gate`）、看门狗（`watchdog`）、
+//! 契约上下文渲染（`context`）、可落盘现场（`checkpoint`）。它们都不碰 Tauri / PTY / SQLite，
+//! 由后续 PR 接进 `act::run(RunMode::Hosted)`。`HostSupervisor` 现在只是登记表骨架，不起任务。
+#![allow(dead_code)]
+
+pub mod checkpoint;
+pub mod context;
+pub mod gate;
+pub mod phase;
+pub mod watchdog;
+
+use std::collections::HashMap;
+
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+
+pub use phase::{step, Effect, HostEvent, HostPhase};
+
+/// 托管运行的 id 前缀：`host:{contract_id}`，避免和同一 tab 上的对话运行在 `begin()` 处冲突。
+pub const RUN_ID_PREFIX: &str = "host:";
+
+/// 托管任务的身份：交给 `act::run(RunMode::Hosted(HostHandle))`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostHandle {
+    pub contract_id: String,
+    pub run_id: String,
+}
+
+impl HostHandle {
+    pub fn new(contract_id: &str) -> Self {
+        Self { contract_id: contract_id.to_string(), run_id: run_id_for(contract_id) }
+    }
+}
+
+pub fn run_id_for(contract_id: &str) -> String {
+    format!("{RUN_ID_PREFIX}{contract_id}")
+}
+
+/// 被托管的那个 console 的稳定描述。`console_id` 是前端的易变 id，重启后**不作键**，
+/// 接驳时按 host_key → session_record_id → label → cwd 给候选 tab 排序。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsoleRef {
+    pub host_key: String,
+    #[serde(default)]
+    pub session_record_id: Option<String>,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub tmux: Option<String>,
+    pub console_id: String,
+}
+
+impl ConsoleRef {
+    /// 候选 tab 与保存的现场有多像：按位打分，高位优先（host_key 8 > 记录 id 4 > 标签 2 > cwd 1）。
+    /// 0 = 毫无关系。排序时分数高的在前。
+    pub fn match_score(&self, cand: &ConsoleRef) -> u8 {
+        let same = |a: &str, b: &str| !a.is_empty() && a == b;
+        let same_opt = |a: &Option<String>, b: &Option<String>| match (a, b) {
+            (Some(x), Some(y)) => same(x, y),
+            _ => false,
+        };
+        let mut s = 0;
+        if same(&self.host_key, &cand.host_key) {
+            s |= 8;
+        }
+        if same_opt(&self.session_record_id, &cand.session_record_id) {
+            s |= 4;
+        }
+        if same(self.label.trim(), cand.label.trim()) {
+            s |= 2;
+        }
+        if same_opt(&self.cwd, &cand.cwd) {
+            s |= 1;
+        }
+        s
+    }
+
+    /// 把候选按相似度降序排好，丢掉毫无关系的。分数相同保持原顺序。
+    pub fn rank<'a>(&self, cands: &'a [ConsoleRef]) -> Vec<&'a ConsoleRef> {
+        let mut v: Vec<(u8, &ConsoleRef)> =
+            cands.iter().map(|c| (self.match_score(c), c)).filter(|(s, _)| *s > 0).collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0));
+        v.into_iter().map(|(_, c)| c).collect()
+    }
+}
+
+/// 卡片上的一个选项：按钮文字 + 点了之后作为用户答复送回模型的话。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardOption {
+    pub label: String,
+    pub reply: String,
+}
+
+/// 卡片的来源。决定答复回到循环时走哪条路。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum CardKind {
+    /// `nx_ask_user`，或 Hosted 模式下没有动作的回复
+    Ask,
+    /// Approve 档 / 危险动作的写入审批
+    Approve,
+    /// 看门狗 L2：附最近几条决策记录
+    Watchdog,
+    /// 只剩人工确认项的完成判定：确认即 Completed
+    ManualCheck { summary: String, checks: Vec<CheckResult> },
+}
+
+/// 一张等人处理的卡片。**永远等下去**：没有倒计时，也没有默认动作。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanCard {
+    pub id: String,
+    pub kind: CardKind,
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<CardOption>,
+    #[serde(default)]
+    pub recommendation: Option<String>,
+    /// 审批原因 / 看门狗附带的最近决策摘要
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    pub created_wall_ms: i64,
+}
+
+impl HumanCard {
+    pub fn ask(id: &str, question: &str, now_wall_ms: i64) -> Self {
+        Self {
+            id: id.to_string(),
+            kind: CardKind::Ask,
+            question: question.to_string(),
+            options: Vec::new(),
+            recommendation: None,
+            reasons: Vec::new(),
+            created_wall_ms: now_wall_ms,
+        }
+    }
+}
+
+/// 用户对卡片的答复。`approved` 只对审批 / 人工确认卡有意义。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardReply {
+    pub card_id: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub approved: Option<bool>,
+}
+
+/// 完成判据（`StewardContract.success_criteria`）。由模型起草、用户确认（YOLO 模式跳过确认）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Check {
+    /// 当前帧匹配正则
+    ScreenMatches { re: String },
+    /// 只读命令退出码为 0（要过 `gate::authorize` 且 `danger::assess` 判为不危险）
+    CommandOk { cmd: String },
+    /// `test -e <path>`
+    FileExists { path: String },
+    /// 只能人确认
+    Manual { text: String },
+}
+
+impl Check {
+    pub fn describe(&self) -> String {
+        match self {
+            Self::ScreenMatches { re } => format!("屏幕匹配 /{re}/"),
+            Self::CommandOk { cmd } => format!("命令成功：`{cmd}`"),
+            Self::FileExists { path } => format!("文件存在：{path}"),
+            Self::Manual { text } => format!("人工确认：{text}"),
+        }
+    }
+
+    pub fn is_manual(&self) -> bool {
+        matches!(self, Self::Manual { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckResult {
+    pub check: Check,
+    pub passed: bool,
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// 为什么挂起：现场不在了，任务没法继续，但不算结束。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SuspendReason {
+    AppRestart,
+    ConsoleGone,
+    LlmDown,
+}
+
+/// 为什么暂停。不复用 `budget::PauseCause`：那个没有 Deadline，也不能反序列化（要进 checkpoint）。
+/// 预算原因存成给人看的一句话（`ExhaustReason::describe()`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PauseCause {
+    Budget { reason: String },
+    Deadline,
+    User,
+}
+
+/// 用户「加预算继续」时给的新上限；`None` 字段 = 不变。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetGrant {
+    #[serde(default)]
+    pub max_steps: Option<u32>,
+    #[serde(default)]
+    pub max_minutes: Option<u32>,
+    #[serde(default)]
+    pub max_output_chars: Option<u64>,
+}
+
+/// 托管任务登记表骨架。PR4 起由它 `app.manage()`、按契约起 tokio task；
+/// 现在只登记相位、按 `phase::step` 迁移，不 spawn 任何东西。
+#[derive(Default)]
+pub struct HostSupervisor {
+    phases: Mutex<HashMap<String, HostPhase>>,
+}
+
+impl HostSupervisor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, contract_id: &str, phase: HostPhase) {
+        self.phases.lock().insert(contract_id.to_string(), phase);
+    }
+
+    pub fn phase(&self, contract_id: &str) -> Option<HostPhase> {
+        self.phases.lock().get(contract_id).cloned()
+    }
+
+    pub fn remove(&self, contract_id: &str) -> Option<HostPhase> {
+        self.phases.lock().remove(contract_id)
+    }
+
+    /// 迁移一个契约的相位；非法事件不改状态。
+    pub fn apply(&self, contract_id: &str, ev: HostEvent) -> Result<Vec<Effect>, String> {
+        let mut map = self.phases.lock();
+        let cur = map.get(contract_id).ok_or_else(|| format!("没有托管契约 {contract_id}"))?;
+        let (next, effects) = step(cur, ev).map_err(|e| e.to_string())?;
+        map.insert(contract_id.to_string(), next);
+        Ok(effects)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cref(host: &str, rec: Option<&str>, label: &str, cwd: Option<&str>, id: &str) -> ConsoleRef {
+        ConsoleRef {
+            host_key: host.into(),
+            session_record_id: rec.map(Into::into),
+            label: label.into(),
+            cwd: cwd.map(Into::into),
+            tmux: None,
+            console_id: id.into(),
+        }
+    }
+
+    #[test]
+    fn run_id_is_namespaced() {
+        let h = HostHandle::new("c1");
+        assert_eq!(h.run_id, "host:c1");
+    }
+
+    #[test]
+    fn reattach_candidates_ranked_by_host_then_record_then_label_then_cwd() {
+        let saved = cref("ssh:root@a:22", Some("rec1"), "web1", Some("/srv"), "old");
+        let cands = vec![
+            cref("local", None, "", Some("/srv"), "t-cwd"),
+            cref("local", None, "web1", None, "t-label"),
+            cref("ssh:root@a:22", None, "", None, "t-host"),
+            cref("other", Some("rec1"), "", None, "t-rec"),
+            cref("local", None, "zzz", None, "t-none"),
+        ];
+        let ids: Vec<_> = saved.rank(&cands).into_iter().map(|c| c.console_id.as_str()).collect();
+        assert_eq!(ids, vec!["t-host", "t-rec", "t-label", "t-cwd"]);
+    }
+
+    #[test]
+    fn empty_fields_never_match() {
+        let a = cref("", None, "", None, "x");
+        assert_eq!(a.match_score(&cref("", None, "", None, "y")), 0);
+    }
+
+    #[test]
+    fn supervisor_applies_and_rejects() {
+        let s = HostSupervisor::new();
+        s.register("c", HostPhase::Running);
+        assert!(s.apply("c", HostEvent::Handback).is_err());
+        assert_eq!(s.phase("c"), Some(HostPhase::Running));
+        s.apply("c", HostEvent::Stop).unwrap();
+        assert_eq!(s.phase("c"), Some(HostPhase::Stopped));
+        assert!(s.apply("nope", HostEvent::Stop).is_err());
+    }
+
+    #[test]
+    fn check_serde_tagged() {
+        let c = Check::CommandOk { cmd: "cargo test".into() };
+        let j = serde_json::to_string(&c).unwrap();
+        assert_eq!(j, r#"{"kind":"commandOk","cmd":"cargo test"}"#);
+        assert_eq!(serde_json::from_str::<Check>(&j).unwrap(), c);
+    }
+}
