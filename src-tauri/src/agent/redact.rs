@@ -9,8 +9,15 @@
 //! 占位符统一用 [`PLACEHOLDER`]：区分类型的占位符（`[REDACTED:EMAIL]`）
 //! 会把「原文这里是一个邮箱」这件事也告诉对方 —— 粒度越细泄漏越多，
 //! 这里的目标是尽可能零泄漏，可读性交给周围的上下文去补。
+//!
+//! 两个入口：
+//! - [`redact`]：通用，连续被删的 PEM 行折叠成一个占位符；
+//! - [`redact_lines`]：**保持行数不变**（每个被删的行各换成一个占位符），
+//!   给「先脱敏、再编行号」的文件读取 / grep 用 —— 行号必须和真实文件对得上。
+//!
+//! 所有正则规则都不跨行（不用 `\s` 吃换行），所以两个入口在行结构上的差别只来自 PEM 扫描。
 
-use regex::Regex;
+use regex::{Captures, Regex};
 use std::sync::OnceLock;
 
 /// 所有敏感片段的统一占位符。
@@ -19,9 +26,15 @@ pub const PLACEHOLDER: &str = "[REDACTED]";
 /// 一条基于正则的脱敏规则。
 struct Rule {
     re: Regex,
-    /// true：只替换值、保留左边的参数名（`token=` 这类），保证上下文仍然可读
+    /// true：只替换名为 `v` 的捕获组（值），其余（参数名、分隔符）原样保留，
+    /// 保证上下文仍然可读；同时按 [`keep_value`] 放过显然不是秘密的值（代码里的类型名、函数调用）
     keep_name: bool,
 }
+
+/// 会被当成「凭据名」的键。前面允许带任意 `XXX_` / `xxx.` / `xxx-` 前缀
+/// （`DB_PASSWORD`、`GITHUB_TOKEN`、`spring.datasource.password`），后面不允许再接字母，
+/// 所以 `password_file=`、`check_password(` 都不会命中。
+const SECRET_NAMES: &str = r"(?:[A-Za-z0-9_.\-]*[_.\-])?(?:token|api[_-]?key|apikey|access[_-]?key|secret[_-]?key|private[_-]?key|secret|password|passwd|passphrase|pwd|Authorization|auth)";
 
 /// 规则集的匹配顺序是有意义的：前缀型 token（`sk-` / `Bearer` / `AKIA`）在前，
 /// 宽泛的邮箱与 IP 在后 —— 否则 IP 规则会先把形如地址的东西吃掉，
@@ -32,38 +45,97 @@ struct Rule {
 fn rules() -> &'static [Rule] {
     static RULES: OnceLock<Vec<Rule>> = OnceLock::new();
     RULES.get_or_init(|| {
-        let patterns: &[(&str, bool)] = &[
-            // Authorization 头里的 Bearer token
-            (r#"(?i)bearer\s+[A-Za-z0-9._~+/=\-]{8,}"#, false),
-            // OpenAI / Anthropic 风格的前缀 key
-            (r#"sk-[A-Za-z0-9_\-]{8,}"#, false),
+        // 值的三种写法（双引号 / 单引号 / 裸值），长度都有上限。
+        // regex crate 基于有限自动机、**不支持反向引用**，所以不能用
+        // `=(['"]?)X\1` 这种写法来保证引号配对。引号内允许空格但限制在单行内，
+        // 否则一处没闭合的引号会吞掉半屏正文。裸值不以 `=` 开头（`password == x` 是比较，不是赋值）。
+        let value_eq = r#"(?P<v>"[^"\n]{0,256}"|'[^'\n]{0,256}'|[^\s&"'<>`=][^\s&"'<>`]{0,511})"#;
+        // `key: value`（YAML / INI / HTTP 头）：值可以带空格，到行尾为止
+        let value_colon = r#"(?P<v>"[^"\n]{0,256}"|'[^'\n]{0,256}'|[^\s"'#][^\r\n]{0,255})"#;
+        let kv_eq = format!(r#"(?i)\b{SECRET_NAMES}["']?[ \t]*=[ \t]*{value_eq}"#);
+        // 冒号形式只认行首（可带缩进、YAML 列表的 `- `、引号），避免误伤行内的 `fn f(password: &str)`
+        let kv_colon = format!(r#"(?im)^[ \t]*(?:-[ \t]+)?["']?{SECRET_NAMES}["']?[ \t]*:[ \t]*{value_colon}"#);
+        // 单行 JSON：`{"password":"x","user":"y"}`
+        let kv_json = format!(r#"(?i)"{SECRET_NAMES}"[ \t]*:[ \t]*(?P<v>"[^"\n]{{0,256}}")"#);
+
+        let patterns: Vec<(String, bool)> = vec![
+            // Authorization 头里的 Bearer token（只吃空格 / Tab，不跨行）
+            (r#"(?i)bearer[ \t]+[A-Za-z0-9._~+/=\-]{8,}"#.into(), false),
+            // OpenAI / Anthropic 风格的前缀 key；前面要是词边界，`task-xxxx` 不算
+            (r#"\bsk-[A-Za-z0-9_\-]{16,}"#.into(), false),
+            // GitHub token：ghp_ / gho_ / ghu_ / ghs_ / ghr_ 与细粒度 PAT
+            (r#"\bgh[pousr]_[A-Za-z0-9]{30,}"#.into(), false),
+            (r#"\bgithub_pat_[A-Za-z0-9_]{22,}"#.into(), false),
+            // GitLab PAT
+            (r#"\bglpat-[A-Za-z0-9_\-]{20,}"#.into(), false),
+            // Slack token
+            (r#"\bxox[abposr]-[A-Za-z0-9\-]{10,}"#.into(), false),
+            // Google API key
+            (r#"\bAIza[0-9A-Za-z_\-]{35}"#.into(), false),
+            // JWT：三段 base64url，头部总是 `{"` 编码出来的 eyJ
+            (r#"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"#.into(), false),
             // AWS access key id
-            (r#"AKIA[0-9A-Z]{16}"#, false),
-            // URL / 命令行里的 `token=xxx` `api_key=xxx` `password='xxx'`。
-            // 值写成三选一（双引号 / 单引号 / 裸值）是为了把引号一起吃掉；
-            // regex crate 基于有限自动机、**不支持反向引用**，所以不能用
-            // `=(['"]?)X\1` 这种写法来保证引号配对。
-            // 引号内的值允许带空格（`password="my secret pw"`），
-            // 但限制在单行内（`[^"\n]`），否则一处没闭合的引号会吞掉半屏正文。
-            (r#"(?i)\b(token|api[_-]?key|access[_-]?key|secret[_-]?key|secret|password|passwd|pwd|Authorization|auth)=(?:"[^"\n]{0,256}"|'[^'\n]{0,256}'|[^\s&"'<>`]+)"#, true),
+            (r#"AKIA[0-9A-Z]{16}"#.into(), false),
+            // /etc/shadow 里的 crypt 哈希：$1$ $2b$ $5$ $6$ $y$ $gy$ $7$ $sha1$ …，到 `:` 为止
+            (r#"\$(?:1|2[abxy]?|5|6|7|y|gy|sha1|md5)\$[A-Za-z0-9./$=,+\-]{8,}"#.into(), false),
+            (kv_json, true),
+            (kv_colon, true),
+            (kv_eq, true),
             // 邮箱
-            (r#"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#, false),
+            (r#"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#.into(), false),
             // IPv4（限定每段 0-255）
-            (r#"\b(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}\b"#, false),
+            (r#"\b(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}\b"#.into(), false),
         ];
 
         patterns
-            .iter()
+            .into_iter()
             .map(|(pattern, keep_name)| Rule {
                 // 这里是程序 bug（正则写错）而不是运行时的外部输入，
                 // 且 [all_patterns_compile] 单测会锁住它能通过，故 panic 是合理的
-                re: Regex::new(pattern).unwrap_or_else(|e| {
+                re: Regex::new(&pattern).unwrap_or_else(|e| {
                     panic!("脱敏正则编译失败，请检查 pattern `{pattern}`：{e}")
                 }),
-                keep_name: *keep_name,
+                keep_name,
             })
             .collect()
     })
+}
+
+/// 值显然不是秘密：代码里的类型标注 / 字面量 / 已脱敏的占位符。
+/// 只对「键名 + 值」规则生效；宁可漏放这几个固定词，也别把 `password: &str` 改成乱码。
+fn keep_value(raw: &str) -> bool {
+    // 函数调用（`password = read_pw();`）：值是代码，不是字面量
+    static CALL: OnceLock<Regex> = OnceLock::new();
+    let call = CALL.get_or_init(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_:.]*\(.*\)[;,]?$").expect("调用形正则"));
+    if call.is_match(raw.trim()) {
+        return true;
+    }
+    let v = raw.trim().trim_end_matches([',', ';', ')', '{']).trim();
+    let v = v.trim_start_matches('&').trim_start_matches("mut ").trim();
+    if v.is_empty() || v == PLACEHOLDER || v.contains(PLACEHOLDER) {
+        return true;
+    }
+    const WORDS: &[&str] = &[
+        "str", "String", "string", "number", "bool", "boolean", "any", "unknown", "None", "null",
+        "nil", "undefined", "true", "false", "True", "False", "\"\"", "''", "Option<String>",
+        "Option<&str>", "SecretString", "Secret<String>", "Zeroizing<String>",
+    ];
+    WORDS.contains(&v)
+}
+
+/// 对一条「键名 + 值」规则做替换：只换 `v` 组，其余原样。
+fn replace_kv(re: &Regex, text: &str) -> String {
+    re.replace_all(text, |caps: &Captures| {
+        let all = caps.get(0).expect("整体匹配必然存在");
+        let Some(v) = caps.name("v") else { return all.as_str().to_string() };
+        if keep_value(v.as_str()) {
+            return all.as_str().to_string();
+        }
+        let s = all.as_str();
+        let (a, b) = (v.start() - all.start(), v.end() - all.start());
+        format!("{}{PLACEHOLDER}{}", &s[..a], &s[b..])
+    })
+    .into_owned()
 }
 
 /// PEM 私钥开始标记行的判定。
@@ -83,21 +155,36 @@ fn is_end_line(line: &str) -> bool {
 /// 取 16 作为「这确实是一段密钥而不是普通文本」的下限。
 const PEM_BODY_MIN_LEN: usize = 16;
 
-/// 是否像一行 PEM 正文：纯 base64 字母，不含空格。
+/// 一行的「正文部分」：剥掉常见前缀后剩下的 base64 串，不像正文返回 None。
 ///
-/// 有这个约束在，普通的英文句子（带空格）不会让扫描器误以为还在正文里。
-fn is_body_line(line: &str) -> bool {
-    !line.is_empty() && line.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+/// 能剥掉的前缀（都是工具自己加上去的，不能因为它们让正文漏网）：
+/// - grep 结果的 `path:12:`；
+/// - `cat -n` / nx_read 的行号 `     5\t`；
+/// - diff 的 `+` / `-` 与缩进（YAML 块标量里的密钥）；
+/// - JSON 字符串里的引号、尾随的 `\n` 转义与逗号。
+///
+/// 剥完之后要求剩下的整串都是 base64 字母（不含空格）—— 普通英文句子不会让扫描器误以为还在正文里。
+fn body_of(line: &str) -> Option<&str> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r#"^(?:[^\s:]+:\d+[:\-])?\s*(?:\d+\t)?\s*[+\-]?\s*["']?([A-Za-z0-9+/=]+)(?:\\n)?["']?,?\s*$"#)
+            .expect("PEM 正文正则")
+    });
+    re.captures(line).and_then(|c| c.get(1)).map(|m| m.as_str())
 }
 
-/// 剥离 PEM 私钥块（含被环形缓冲截断的残块）。
+fn is_body_line(line: &str) -> bool {
+    body_of(line).is_some()
+}
+
+/// 找出 PEM 私钥块（含被环形缓冲截断的残块）所在的行，返回 (按行切开的原文, 每行是否删掉)。
 ///
 /// 不用正则（`-----BEGIN [\s\S]*?-----END`）：环形缓冲会把几屏长的私钥切断，
 /// 只剩半截是常态，而 base64 正文才是真正的 key，标记行一文不值 ——
 /// 正则只认完整块，缺一头就整段失守。
 ///
 /// 故改为按行扫描：`BEGIN` 没等到 `END` 就删到串尾；`END` 前面连着的 base64 正文回溯删掉。
-fn redact_pem_blocks(text: &str) -> String {
+fn pem_lines(text: &str) -> (Vec<&str>, Vec<bool>) {
     // split_inclusive 保留换行符，重建时能原样拼回去（含 \r\n）
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let mut dropped = vec![false; lines.len()];
@@ -129,8 +216,8 @@ fn redact_pem_blocks(text: &str) -> String {
             } else {
                 i
             };
-            for j in start..=i {
-                dropped[j] = true;
+            for d in dropped.iter_mut().take(i + 1).skip(start) {
+                *d = true;
             }
             block_start = None;
             saw_begin = false;
@@ -138,11 +225,11 @@ fn redact_pem_blocks(text: &str) -> String {
             continue;
         }
 
-        if is_body_line(line) {
+        if let Some(body) = body_of(line) {
             if block_start.is_none() {
                 block_start = Some(i);
             }
-            if line.len() >= PEM_BODY_MIN_LEN {
+            if body.len() >= PEM_BODY_MIN_LEN {
                 saw_long_body = true;
             }
             continue;
@@ -152,8 +239,8 @@ fn redact_pem_blocks(text: &str) -> String {
         // 已经见过 BEGIN 却没等到 END：是被截断的上半截，删掉已确认的部分。
         if saw_begin {
             if let Some(s) = block_start {
-                for j in s..i {
-                    dropped[j] = true;
+                for d in dropped.iter_mut().take(i).skip(s) {
+                    *d = true;
                 }
             }
         }
@@ -165,28 +252,31 @@ fn redact_pem_blocks(text: &str) -> String {
     // 走到串尾 BEGIN 依然悬着（流被缓冲截掉了尾巴）
     if saw_begin {
         if let Some(s) = block_start {
-            for j in s..lines.len() {
-                dropped[j] = true;
+            for d in dropped.iter_mut().skip(s) {
+                *d = true;
             }
         }
     }
+    (lines, dropped)
+}
 
+/// 剥离 PEM 私钥块。`collapse` 为真时连续被删的行折叠成一个占位符（避免输出几十行 [REDACTED]），
+/// 否则每行各换一个占位符、行数不变。
+fn redact_pem(text: &str, collapse: bool) -> String {
+    let (lines, dropped) = pem_lines(text);
     if !dropped.iter().any(|d| *d) {
         return text.to_string();
     }
-
-    // 连续被删的行折叠成一个占位符，避免输出几十行 [REDACTED]
     let mut out = String::with_capacity(text.len());
     let mut in_run = false;
     for (i, line) in lines.iter().enumerate() {
         if dropped[i] {
-            if !in_run {
-                in_run = true;
+            if !(collapse && in_run) {
                 out.push_str(PLACEHOLDER);
-                if line.ends_with('\n') {
-                    out.push('\n');
-                }
+                // 原样保留行尾（含 \r\n）
+                out.push_str(&line[line.trim_end_matches(['\n', '\r']).len()..]);
             }
+            in_run = true;
         } else {
             in_run = false;
             out.push_str(line);
@@ -195,24 +285,34 @@ fn redact_pem_blocks(text: &str) -> String {
     out
 }
 
-/// 脱敏一段文本，返回替换后的新串。
-///
-/// `AgentManager::context` 刻意保持原文（UI 要展示），脱敏只在 LLM 请求出网这条边界上做
-/// （见 `llm::sanitize_context`）。
-#[allow(dead_code)]
-pub fn redact(text: &str) -> String {
-    // PEM 先走：它的 base64 正文不该被后面的 IP / 邮箱规则再点一遍名
-    let mut out = redact_pem_blocks(text);
+fn redact_pem_blocks(text: &str) -> String {
+    redact_pem(text, true)
+}
+
+fn apply_rules(mut out: String) -> String {
     for rule in rules() {
         out = if rule.keep_name {
-            rule.re
-                .replace_all(&out, format!("${{1}}={PLACEHOLDER}").as_str())
-                .into_owned()
+            replace_kv(&rule.re, &out)
         } else {
             rule.re.replace_all(&out, PLACEHOLDER).into_owned()
         };
     }
     out
+}
+
+/// 脱敏一段文本，返回替换后的新串。
+///
+/// `AgentManager::context` 刻意保持原文（UI 要展示），脱敏只在 LLM 请求出网这条边界上做
+/// （见 `llm::sanitize_context`）；落盘的对话历史 / 托管 checkpoint / trace / 时间线也都过它。
+pub fn redact(text: &str) -> String {
+    // PEM 先走：它的 base64 正文不该被后面的 IP / 邮箱规则再点一遍名
+    apply_rules(redact_pem_blocks(text))
+}
+
+/// 同 [`redact`]，但**行数不变**：被删的 PEM 行各自换成一个占位符。
+/// 给文件读取 / grep 用 —— 先对原文脱敏、再编行号，行号仍与真实文件一致。
+pub fn redact_lines(text: &str) -> String {
+    apply_rules(redact_pem(text, false))
 }
 
 #[cfg(test)]
@@ -385,5 +485,101 @@ mod tests {
     fn preserves_crlf_line_endings() {
         let text = "line-one\r\nline-two\r\n";
         assert_eq!(redact_pem_blocks(text), text);
+    }
+
+    // —— 加强后的规则 ——
+
+    const ED25519: &str = concat!(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+        "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n",
+        "QyNTUxOQAAACDqVZ1vYw5cX0xr8b7mJ3lK9pQh2Zr4uT1sY8eWnB0dEwAAAJgAAAAAAAAA\n",
+        "AAAAAAtzc2gtZWQyNTUxOQAAACDqVZ1vYw5cX0xr8b7mJ3lK9pQh2Zr4uT1sY8eWnB0dEw\n",
+        "AAAEB0dGVzdC1rZXktb25seS1ub3QtcmVhbA==\n",
+        "-----END OPENSSH PRIVATE KEY-----\n"
+    );
+
+    fn assert_no_body(out: &str) {
+        for body in ["b3BlbnNzaC1rZXktdjE", "QyNTUxOQAAACDqVZ1v", "AAAAAAtzc2gtZWQy", "AAAEB0dGVzdC1rZXkt"] {
+            assert!(!out.contains(body), "正文漏了 {body}：\n{out}");
+        }
+    }
+
+    /// 文件读取的行号、grep 前缀、diff 的 `+` 都不能让正文漏网
+    #[test]
+    fn pem_body_with_tool_prefixes_is_caught() {
+        let numbered: String =
+            ED25519.lines().enumerate().map(|(i, l)| format!("{:>6}\t{l}\n", i + 1)).collect();
+        assert_no_body(&redact(&numbered));
+        assert_no_body(&redact_lines(&numbered));
+        let grep: String = ED25519.lines().enumerate().map(|(i, l)| format!("/home/me/.ssh/id_ed25519:{}:{l}\n", i + 1)).collect();
+        assert_no_body(&redact(&grep));
+        let diff: String = ED25519.lines().map(|l| format!("+{l}\n")).collect();
+        assert_no_body(&redact(&diff));
+        let yaml: String = ED25519.lines().map(|l| format!("    {l}\n")).collect();
+        assert_no_body(&redact(&format!("tls:\n  key: |\n{yaml}done: 1\n")));
+    }
+
+    #[test]
+    fn redact_lines_keeps_line_count() {
+        let text = format!("before\n{ED25519}after\n");
+        let out = redact_lines(&text);
+        assert_eq!(out.lines().count(), text.lines().count(), "{out}");
+        assert_no_body(&out);
+        assert!(out.starts_with("before\n") && out.ends_with("after\n"));
+        assert_eq!(out.matches(PLACEHOLDER).count(), 6);
+        // CRLF 行尾也原样保留
+        let crlf = "x\r\n-----BEGIN RSA PRIVATE KEY-----\r\nMIIEowIBAAKCAQEA1234567890\r\n-----END RSA PRIVATE KEY-----\r\ny\r\n";
+        assert_eq!(redact_lines(crlf), format!("x\r\n{0}\r\n{0}\r\n{0}\r\ny\r\n", PLACEHOLDER));
+    }
+
+    #[test]
+    fn prefixed_and_spaced_secret_names() {
+        assert_eq!(redact("DB_PASSWORD=hunter2"), format!("DB_PASSWORD={PLACEHOLDER}"));
+        assert_eq!(redact("export GITHUB_TOKEN=abc123"), format!("export GITHUB_TOKEN={PLACEHOLDER}"));
+        assert_eq!(redact("db.password = s3cret"), format!("db.password = {PLACEHOLDER}"));
+        assert_eq!(redact("[db]\npassword = s3cret\n"), format!("[db]\npassword = {PLACEHOLDER}\n"));
+        assert_eq!(redact("db:\n  password: my secret pw\n"), format!("db:\n  password: {PLACEHOLDER}\n"));
+        assert_eq!(redact("  - api_key: \"abc\""), format!("  - api_key: {PLACEHOLDER}"));
+        assert_eq!(redact(r#"{"user":"a","password":"x y"}"#), format!(r#"{{"user":"a","password":{PLACEHOLDER}}}"#));
+        assert_eq!(redact("Secret_Key=AbC"), format!("Secret_Key={PLACEHOLDER}"));
+    }
+
+    #[test]
+    fn code_using_password_as_identifier_survives() {
+        let code = "fn check_password(password: &str) -> bool {\n    let ok = verify_password(password);\n    if password == stored { return true; }\n    let password = read_pw();\n    ok\n}\n";
+        assert_eq!(redact(code), code);
+        let ts = "interface Login {\n  password: string;\n  token?: string;\n}\n";
+        assert_eq!(redact(ts), ts);
+        assert_eq!(redact("password_file=/run/secrets/db"), "password_file=/run/secrets/db");
+        assert_eq!(redact("debug: true\nauth: false\n"), "debug: true\nauth: false\n");
+    }
+
+    #[test]
+    fn shadow_hashes_are_redacted() {
+        let line = "root:$6$Zr8qBx1L$Qk4pU2c9dYJ0oF1vXxjv5w8m3eTq7Lr2sN6aH4bG9yK1zC0iD5fE8hJ3kM7nP2qR6tV9wX4yZ1:19700:0:99999:7:::";
+        let out = redact(line);
+        assert!(!out.contains("Qk4pU2c9dYJ0") && !out.contains("Zr8qBx1L"), "{out}");
+        assert!(out.starts_with("root:") && out.ends_with(":19700:0:99999:7:::"), "{out}");
+        let y = redact("me:$y$j9T$3Lx9Qn1hV0pS$Wb8sT2kq/E4uM9fR1dY7cN0zA6gH3jL5pX2vB8nK1mQ:19800:0:99999:7:::");
+        assert!(!y.contains("Wb8sT2kq"), "{y}");
+        // 锁定账户 / 无口令不受影响
+        assert_eq!(redact("daemon:*:19000:0:99999:7:::"), "daemon:*:19000:0:99999:7:::");
+    }
+
+    #[test]
+    fn common_token_formats() {
+        for (raw, leak) in [
+            ("ghp_0123456789abcdefghijABCDEFGHIJ012345", "0123456789abcdefghij"),
+            ("github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnop"),
+            ("xoxb-1234567890-abcdefghijkl", "abcdefghijkl"),
+            ("glpat-abcdefghij0123456789", "abcdefghij0123"),
+            ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U", "dozjgNryP4J3"),
+        ] {
+            let out = redact(&format!("value {raw} end"));
+            assert!(!out.contains(leak), "{raw} → {out}");
+            assert_eq!(out, format!("value {PLACEHOLDER} end"));
+        }
+        // 太短 / 嵌在词里的 sk- 不算
+        assert_eq!(redact("task-runner sk-short"), "task-runner sk-short");
     }
 }
