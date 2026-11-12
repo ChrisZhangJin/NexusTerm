@@ -42,6 +42,8 @@ pub trait HostIo: Send + Sync {
     fn note_progress(&self, _messages: &[super::super::llm::ChatMessage], _step: usize, _spent: &Spent) {}
     /// 契约 / 授权变了（签约、`host_amend`、判据确认），下一次 `save` 一并落盘。默认不记。
     fn note_contract(&self, _contract: &StewardContract, _authority: &Authority) {}
+    /// 看门狗状态变了，下一次 `save` 一并落盘。默认不记。
+    fn note_watchdog(&self, _w: &super::watchdog::WatchdogState) {}
     /// 给人看的提示变了（随状态推给面板）。默认不记。
     fn note_notice(&self, _notice: Option<&str>) {}
     /// 待落盘的现场（接驳时从它恢复）。默认没有。
@@ -166,6 +168,14 @@ pub struct HostShared {
     ended_at: Mutex<Option<std::time::Instant>>,
     /// 上一次周期快照的时刻与对话指纹（没变就不再克隆整段历史）
     progress: Mutex<(Option<std::time::Instant>, (usize, usize, usize))>,
+    /// 看门狗（随 checkpoint 持久化）
+    watchdog: Mutex<super::watchdog::WatchdogState>,
+}
+
+/// 进程内单调时钟（毫秒）。看门狗只认它；重启后基准变了，恢复时要 `rebase`。
+pub fn mono_ms() -> i64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as i64
 }
 
 impl HostShared {
@@ -197,7 +207,29 @@ impl HostShared {
             notice: Mutex::new(None),
             ended_at: Mutex::new(None),
             progress: Mutex::new((None, (0, 0, 0))),
+            watchdog: Mutex::new(super::watchdog::WatchdogState::default()),
         })
+    }
+
+    // ——— 看门狗 ———
+
+    /// 从 checkpoint 恢复看门狗：单调时钟换了基准，先 `rebase`（停机时间不算没进展）。
+    pub fn restore_watchdog(&self, mut w: super::watchdog::WatchdogState) {
+        w.rebase(mono_ms());
+        self.io.note_watchdog(&w);
+        *self.watchdog.lock() = w;
+    }
+
+    pub fn watchdog(&self) -> super::watchdog::WatchdogState {
+        self.watchdog.lock().clone()
+    }
+
+    /// 喂一步观察，返回触发的警报与级别（L1 提示 / L2 出卡）。
+    pub fn watch_step(&self, o: super::watchdog::StepObs) -> Option<(super::watchdog::Alarm, super::watchdog::Level)> {
+        let mut w = self.watchdog.lock();
+        let r = w.step(o, mono_ms());
+        self.io.note_watchdog(&w);
+        r
     }
 
     // ——— 重启 / 接驳 ———
