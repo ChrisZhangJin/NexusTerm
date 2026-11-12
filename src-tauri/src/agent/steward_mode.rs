@@ -181,6 +181,12 @@ fn danger_reasons(lines: &[String]) -> Vec<String> {
 ///
 /// `sit.frame_id == 0` 表示局面来自旁路缓冲的启发式分类（没有新鲜的屏幕帧）：
 /// 它没有选项列表，认不出「永久授权」，所以对菜单 / 授权类的选择一律改为人工批准。
+/// 一个「光选不写」的按键：单个数字（可带回车），或者只有回车。
+fn is_bare_pick(visible: &str, enter: bool) -> bool {
+    let v = visible.trim();
+    (v.is_empty() && enter) || (!v.is_empty() && v.chars().all(|c| c.is_ascii_digit()) && v.len() <= 2)
+}
+
 pub fn assess_keys(bytes: &[u8], sit: Option<&Situation>) -> KeysVerdict {
     let enter = super::interact::contains_enter(bytes);
     let visible = strip_esc(&String::from_utf8_lossy(bytes));
@@ -219,6 +225,17 @@ pub fn assess_keys(bytes: &[u8], sit: Option<&Situation>) -> KeysVerdict {
                     );
                 }
             }
+        }
+        // 看不到选项（没有新鲜屏幕帧 / 没认出选项）时对授权卡、菜单直接按数字或回车：不知道选中的是什么
+        // （可能正是「永久允许」），任何模式都不发，让模型先读屏
+        if matches!(s.kind, SituationKind::Permission | SituationKind::Menu)
+            && (s.frame_id == 0 || s.options.is_empty())
+            && !has_navigation(bytes)
+            && is_bare_pick(&visible, enter)
+        {
+            return KeysVerdict::Refuse(
+                "看不到这个授权卡 / 菜单的选项，直接按数字或回车可能选中「永久允许」一类的项。先 nx_screen 看清选项再选。".into(),
+            );
         }
         // 没有新鲜屏幕帧：看不到选项，选择动作（数字 / 方向键 / 回车）交给人
         if s.frame_id == 0
@@ -540,14 +557,24 @@ mod tests {
     }
 
     #[test]
-    fn no_fresh_frame_menu_selection_needs_approval() {
+    fn no_fresh_frame_menu_selection_is_refused_or_needs_approval() {
         let mut blind = sit(Program::Unknown, SituationKind::Menu, vec![]);
         blind.frame_id = 0;
-        assert!(matches!(assess_keys(b"2\r", Some(&blind)), KeysVerdict::Approve(_)));
+        // 看不到选项：直接按数字 / 回车 —— 拒（先读屏）
+        for k in [&b"2\r"[..], b"2", b"\r"] {
+            assert!(matches!(assess_keys(k, Some(&blind)), KeysVerdict::Refuse(ref w) if w.contains("nx_screen")), "{k:?}");
+        }
+        let mut perm = blind.clone();
+        perm.kind = SituationKind::Permission;
+        assert!(matches!(assess_keys(b"1", Some(&perm)), KeysVerdict::Refuse(_)));
+        // 方向键挪动：仍要人确认
         assert!(matches!(assess_keys(b"\x1b[B\r", Some(&blind)), KeysVerdict::Approve(_)));
-        // 有帧：程序提示，放行
+        // 有帧但没认出选项：同样看不到选什么，拒
         let mut seen = blind.clone();
         seen.frame_id = 7;
+        assert!(matches!(assess_keys(b"2\r", Some(&seen)), KeysVerdict::Refuse(_)));
+        // 有帧、选项已知（都不是永久授权）：放行
+        seen.options = vec![super::super::situation::Choice { index: Some("2".into()), text: "Vue".into(), grants_permanent: false }];
         assert_eq!(assess_keys(b"2\r", Some(&seen)), KeysVerdict::Allow);
     }
 
