@@ -40,6 +40,25 @@ export function isUserTyping(d: string): boolean {
 }
 
 /**
+ * AI 驾驶某个会话（tab）时，这个会话只读：用户的输入一律丢掉，免得误触把 AI 挤成「你在驾驶」。
+ *
+ * - `pass`：照常发给 pty —— 没在 AI 驾驶中，或者是 xterm 自己的自动应答（CPR / DA / 焦点 / 鼠标上报，
+ *   拦了会让终端里的程序卡住等回应）；
+ * - `interrupt`：Ctrl+C 是唯一的紧急出口 —— 立即接管，并把 `^C` 发出去中断正在跑的命令；
+ * - `drop`：其余一切（打字、粘贴、方向键……）丢掉。要动手请点「接管」。
+ *
+ * 只锁 AI 正在驾驶的那个会话；别的 tab 不受影响。
+ */
+export type LockedInput = "pass" | "drop" | "interrupt";
+
+export function lockedInput(locked: boolean, d: string): LockedInput {
+  if (!locked) return "pass";
+  if (!isUserTyping(d)) return "pass";
+  if (d === "\x03") return "interrupt";
+  return "drop";
+}
+
+/**
  * 键盘闸。一个终端一个。
  *
  * - `set(state)`：后端推来的（或挂载时查询到的）状态；只有 `agentDriving` 才开闸；

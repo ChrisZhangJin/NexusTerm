@@ -133,7 +133,7 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [] }:
       {status.phase.kind === "completed" && status.phase.checks.length > 0 && (
         <ul className="host-checks">
           {checkLines(status.phase.checks).map((l, i) => (
-            <li key={i} className={l.startsWith("✓") ? "ok" : "no"}>
+            <li key={i} className={l.startsWith("✓") ? "ok" : l.startsWith("·") ? "info" : "no"}>
               {l}
             </li>
           ))}

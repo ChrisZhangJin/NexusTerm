@@ -242,7 +242,10 @@ export function describeCheck(c: HostCheck): string {
   }
 }
 
-/** 完成卡上的逐条证据（✓ / ✗ + 判据 + 证据） */
+/** 完成卡上的逐条证据（✓ 通过 / ✗ 没过 / · 人工项，不阻塞完成 + 判据 + 证据） */
 export function checkLines(results: HostCheckResult[]): string[] {
-  return results.map((r) => `${r.passed ? "✓" : "✗"} ${describeCheck(r.check)}：${r.detail}`);
+  return results.map((r) => {
+    const mark = r.check.kind === "manual" ? "·" : r.passed ? "✓" : "✗";
+    return `${mark} ${describeCheck(r.check)}：${r.detail}`;
+  });
 }

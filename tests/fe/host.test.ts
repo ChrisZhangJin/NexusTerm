@@ -153,9 +153,13 @@ import { checkLines } from "../../src/lib/host";
 test("完成卡逐条证据与新卡片胶囊", () => {
   const lines = checkLines([
     { check: { kind: "commandOk", cmd: "grep -q ok /tmp/r" }, passed: true, detail: "退出码 0" },
-    { check: { kind: "manual", text: "页面能打开" }, passed: true, detail: "用户确认" },
+    { check: { kind: "manual", text: "页面能打开" }, passed: false, detail: "未自动核验（仅供参考，不阻塞完成）" },
   ]);
-  assert.deepEqual(lines, ["✓ 命令成功：`grep -q ok /tmp/r`：退出码 0", "✓ 人工确认：页面能打开：用户确认"]);
+  // 人工项不阻塞完成：标「·」而不是「✗」，免得完成了却像失败
+  assert.deepEqual(lines, [
+    "✓ 命令成功：`grep -q ok /tmp/r`：退出码 0",
+    "· 人工确认：页面能打开：未自动核验（仅供参考，不阻塞完成）",
+  ]);
   const mk = (kind: "manualCheck" | "watchdog"): HostPhase => ({
     kind: "waitingHuman",
     card: {

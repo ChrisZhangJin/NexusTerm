@@ -1377,6 +1377,26 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 
 
 /* ——— 终端查找条 ——— */
+/* AI 驾驶中的只读横幅（只盖在被驾驶的那个会话上） */
+.ai-lock-banner {
+  position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 24;
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg-elev); border: 1px solid var(--accent, #3fb98a);
+  border-radius: var(--radius); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  padding: 6px 10px; font-size: 12.5px; color: var(--text);
+}
+.ai-lock-banner .ai-lock-dot {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--accent, #3fb98a);
+  animation: ai-lock-pulse 1.6s ease-in-out infinite;
+}
+.ai-lock-banner .ai-lock-hint { color: var(--text-dim, #8a8f98); font-size: 12px; }
+.ai-lock-banner.nudge { animation: ai-lock-nudge 0.35s ease-in-out; border-color: #e0a63a; }
+@keyframes ai-lock-pulse { 50% { opacity: 0.35; } }
+@keyframes ai-lock-nudge {
+  25% { transform: translateX(calc(-50% - 6px)); }
+  75% { transform: translateX(calc(-50% + 6px)); }
+}
+
 .find-bar {
   position: absolute; top: 8px; right: 18px; z-index: 25;
   background: var(--bg-elev); border: 1px solid var(--border);
@@ -2419,6 +2439,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .host-checks li { word-break: break-word; }
 .host-checks li.ok { color: var(--accent); }
 .host-checks li.no { color: var(--danger); }
+.host-checks li.info { color: var(--text-dim, #8a8f98); }
 
 /* ——— 文件工具：差异预览 ——— */
 .ap-diff { margin-top: 4px; }

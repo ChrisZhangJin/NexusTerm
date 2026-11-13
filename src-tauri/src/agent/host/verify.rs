@@ -9,7 +9,7 @@
 //! - FileExists：`test -e <path>`，同一条执行通道；
 //! - Manual：只能人确认。
 //!
-//! 结论：有自动项没过 → 「未满足：…」反馈给模型，仍 Running；只剩人工项 → ManualCheck 卡；
+//! 结论：有自动项没过 → 「未满足：…」反馈给模型，仍 Running；人工项不阻塞完成（只列进完成报告）；
 //! 全过 → Completed（附每条的证据）。执行经 `Prober` 注入，纯逻辑可单测。
 
 use std::future::Future;
@@ -130,7 +130,7 @@ pub async fn verify<P: Prober>(
     let mut out = Vec::with_capacity(checks.len());
     for c in checks {
         let r = match c {
-            Check::Manual { .. } => result(c, false, "待人工确认"),
+            Check::Manual { .. } => result(c, false, "未自动核验（仅供参考，不阻塞完成）"),
             Check::ScreenMatches { re } => match regex::Regex::new(re) {
                 Err(e) => result(c, false, format!("正则写错了：{e}")),
                 Ok(rx) => {
@@ -190,9 +190,8 @@ async fn command_check<P: Prober>(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
+    /// 自动项都过了（人工项不阻塞完成，只在完成报告里列出）
     AllPassed,
-    /// 自动项都过了，只剩人工确认项
-    ManualOnly,
     /// 有自动项没过：每条「判据 —— 证据」
     Unmet(Vec<String>),
 }
@@ -205,9 +204,6 @@ pub fn verdict(results: &[CheckResult]) -> Verdict {
         .collect();
     if !unmet.is_empty() {
         return Verdict::Unmet(unmet);
-    }
-    if results.iter().any(|r| r.check.is_manual()) {
-        return Verdict::ManualOnly;
     }
     Verdict::AllPassed
 }
@@ -319,12 +315,17 @@ pub(crate) mod tests {
         assert!(r[0].detail.contains("契约不允许"));
     }
 
+    /// 人工项不阻塞完成：自动项都过了就直接完成，人工项只在完成报告里列出（不再出「等你确认」卡）。
     #[tokio::test]
-    async fn manual_only_and_all_passed() {
+    async fn manual_items_do_not_block_completion() {
         let mut p = prober("nginx/1.25 ready", vec![]);
         let checks = vec![Check::ScreenMatches { re: r"nginx/1\.2\d".into() }, Check::Manual { text: "页面能打开".into() }];
         let r = verify(&checks, &policy(), false, CAP, &mut p).await;
-        assert_eq!(verdict(&r), Verdict::ManualOnly);
+        assert_eq!(verdict(&r), Verdict::AllPassed);
+        assert!(r[1].detail.contains("未自动核验"), "{}", r[1].detail);
+        // 只有人工项（判据起草失败时的兜底）同样直接完成
+        let only_manual = verify(&checks[1..], &policy(), false, CAP, &mut p).await;
+        assert_eq!(verdict(&only_manual), Verdict::AllPassed);
         let r = verify(&checks[..1], &policy(), false, CAP, &mut p).await;
         assert_eq!(verdict(&r), Verdict::AllPassed);
         assert!(evidence_text(&r).starts_with("✓ 屏幕匹配"));

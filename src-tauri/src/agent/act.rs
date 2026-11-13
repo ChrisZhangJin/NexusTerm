@@ -4385,26 +4385,6 @@ pub async fn run(
                             feedback.push_str(&evidence);
                             feedback.push_str("）\n");
                         }
-                        super::host::verify::Verdict::ManualOnly => {
-                            // 自动项都过了，只剩人工项：出确认卡；批准 → Completed，驳回 → 带着用户的话回到 Running
-                            let mut card = hosted_card(
-                                &format!("AI 说已经完成：{summary}\n自动判据都通过了，剩下的需要你确认。"),
-                                Vec::new(),
-                                None,
-                            );
-                            card.kind = super::host::CardKind::ManualCheck { summary: summary.clone(), checks: results.clone() };
-                            card.reasons = results.iter().map(|r| format!("{} {}：{}", if r.passed { "✓" } else { "待确认" }, r.check.describe(), r.detail)).collect();
-                            h.flush_progress(&messages, step);
-                            match h.ask(card).await {
-                                ParkEnd::Running => {
-                                    for f in h.take_feedback() {
-                                        feedback.push_str(&f);
-                                        feedback.push('\n');
-                                    }
-                                }
-                                _ => finished = true,
-                            }
-                        }
                     }
                     break;
                 }

@@ -63,6 +63,8 @@ enum HostEvent { UserKey, Takeover, Handback, Ask(HumanCard), Answer(CardReply),
 
 这条恢复规则堵住了预算绕过：Paused(Budget) 时按键 → UserDriving{resume_to: Paused(Budget)} → 交还后仍回 Paused。
 
+**已定（2026-11-13，修订「用户按键永远赢」）：AI 驾驶中的会话只读。** 托管和对话运行都一样：AI 正在驾驶某个会话（tab）时，这个会话的键盘输入与粘贴一律丢掉（xterm 自动应答照常放行），终端上显示「AI 托管中 · 只读」横幅。夺回控制权只有两条路：点「接管」，或按 **Ctrl+C**（立即接管并把 `^C` 发出去）。只锁被驾驶的那个会话，其它 tab 不受影响。判定见 `src/lib/control.ts` 的 `lockedInput`。原因：误触一个键就会把 AI 挤成「你在驾驶」，卡片上的操作也随之失效。
+
 **已定：挂起的卡片永远等下去**，不倒计时，没有默认动作。UserDriving / WaitingHuman 期间**零 LLM 调用**，只 `select!{ inbox.recv(), cancel }`，进入时写 checkpoint。
 
 Hosted 模式下删掉 `PAUSE_MAX_WAIT`、`MAX_TOOK_OVER`、`TOOK_OVER_FEEDBACK`。`gate_drive` 无超时等待 inbox（取消仍然有效）。`hold_paused` **不再**调用 `release_control`，只把 ControlTable 的状态置为 Paused、holder 不变。
@@ -139,7 +141,7 @@ struct ConsoleRef { host_key: String, session_record_id: Option<String>, label: 
 - FileExists 用 `test -e`
 - ScreenMatches 匹配当前帧
 
-有一项没通过就把「未满足：…」反馈给模型，仍是 Running；只剩 Manual 项时出确认卡（WaitingHuman）；全部通过 → Completed，释放租约。
+有一项自动判据没通过就把「未满足：…」反馈给模型，仍是 Running；自动项全部通过 → Completed，释放租约。**已定（2026-11-13）：Manual 项不阻塞完成**，不再出「等你确认完成」卡，只在完成报告里列为「未自动核验（仅供参考）」。
 
 看门狗 `host/watchdog.rs`（纯函数，状态写进 checkpoint）：
 ```rust

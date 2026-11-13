@@ -32,7 +32,7 @@ import { ImeGuard, type KeyLike } from "../lib/ime";
 import { buildUserCommandReport } from "../lib/userCommand";
 import { captureLineStart, readLogicalLine, recorderTapAction, type LineStart } from "../lib/termLine";
 import { isRecording, watchRecording } from "../lib/useRecorder";
-import { createControlGate } from "../lib/control";
+import { createControlGate, lockedInput } from "../lib/control";
 
 import {
   api,
@@ -295,6 +295,10 @@ export default function TerminalView({
   const searchRef = useRef<SearchAddon | null>(null);
   const hlRef = useRef<Highlighter | null>(null);
   const [findOpen, setFindOpen] = useState(false);
+  /** AI 正在驾驶这个会话：只读（见 `lib/control` 的 `lockedInput`） */
+  const [aiLocked, setAiLocked] = useState(false);
+  /** 锁住时被丢掉的按键计数：变化时横幅闪一下，告诉用户「按键没进去」 */
+  const [lockNudge, setLockNudge] = useState(0);
   const [markOpen, setMarkOpen] = useState(false);
   /** 当前生效的标记规则数（右上角徽标用） */
   const [markCount, setMarkCount] = useState(0);
@@ -798,12 +802,16 @@ export default function TerminalView({
       if (disposed || p.session !== tabId) return;
       sawControlEvent = true;
       controlGate.set(p.state);
+      setAiLocked(p.state === "agentDriving");
     }).then((u) => cleanups.push(u));
     // 挂载时对一次账（比如终端是在 Agent 已经在跑时才重建的）；期间若已有事件到达，以事件为准
     api
       .agentControlGet(tabId)
       .then((st) => {
-        if (!disposed && !sawControlEvent) controlGate.set(st);
+        if (!disposed && !sawControlEvent) {
+          controlGate.set(st);
+          setAiLocked(st === "agentDriving");
+        }
       })
       .catch(() => {});
 
@@ -816,6 +824,18 @@ export default function TerminalView({
      */
     const handleInput = (d: string) => {
       if (zmodem.isActive()) return;
+      // AI 在驾驶这个会话：只读。打字 / 粘贴一律丢掉（误触会把 AI 挤成「你在驾驶」）；
+      // Ctrl+C 是唯一的键盘出口：立即接管，再把 ^C 发出去中断正在跑的命令
+      const verdict = lockedInput(controlGate.armed, d);
+      if (verdict === "drop") {
+        setLockNudge((n) => n + 1);
+        return;
+      }
+      if (verdict === "interrupt") {
+        controlGate.set("paused");
+        setAiLocked(false);
+        api.agentControlTakeover(tabId).catch(() => {});
+      }
       // 旁路监听（宏录制、宏回放时「用户插了一脚就中止」）。发不发送由这里决定，监听方只读
       emitInput(tabId, d);
       send(d).catch(() => {});
@@ -918,7 +938,8 @@ export default function TerminalView({
       // 已收起、或在全屏程序里）就放行 —— 这几个键本来属于 shell 自己的补全与
       // 历史，不能被提示层挤掉。按 `hintsRef` 判的话候选非空但灰字没画出来的
       // 场景会误吞 Tab，表现为「Tab 突然没反应」。
-      if (ghostRef.current.active) {
+      // AI 驾驶中不走灰字快捷路径（它直接写 pty、绕过只读闸）；按键交给 xterm → handleInput 丢掉
+      if (ghostRef.current.active && !controlGate.armed) {
         // 输入法组合中一律不接管：那时回车是「选词上屏」、Esc 是「取消候选」，
         // 吞了就打不出中文。判定走 `lib/ime.ts`。
         const info: KeyLike = {
@@ -1496,6 +1517,22 @@ export default function TerminalView({
             </button>
           </div>
         </>
+      )}
+      {active && aiLocked && (
+        <div key={lockNudge} className={`ai-lock-banner${lockNudge > 0 ? " nudge" : ""}`} onMouseDown={(e) => e.stopPropagation()}>
+          <span className="ai-lock-dot" />
+          <span>AI 托管中 · 只读</span>
+          <span className="ai-lock-hint">要动手请点「接管」· Ctrl+C 立即接管并中断</span>
+          <button
+            className="st-btn primary"
+            onClick={() => {
+              setAiLocked(false);
+              api.agentControlTakeover(tabId).catch(() => {});
+            }}
+          >
+            接管
+          </button>
+        </div>
       )}
       {active && findOpen && searchRef.current && (
         <FindBar

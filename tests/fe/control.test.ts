@@ -10,6 +10,7 @@ import {
   createControlGate,
   drivingSessions,
   isUserTyping,
+  lockedInput,
   pausedSessions,
   type ControlState,
 } from "../../src/lib/control";
@@ -113,4 +114,23 @@ test("pausedSessions / drivingSessions", () => {
   const s: Record<string, ControlState> = { a: "paused", b: "agentDriving", c: "paused" };
   assert.deepEqual(pausedSessions(s).sort(), ["a", "c"]);
   assert.deepEqual(drivingSessions(s), ["b"]);
+});
+
+test("AI 驾驶的会话只读：打字 / 粘贴 / 方向键丢掉，Ctrl+C 是唯一出口", () => {
+  assert.equal(lockedInput(true, "a"), "drop");
+  assert.equal(lockedInput(true, "ls -la\r"), "drop"); // 粘贴
+  assert.equal(lockedInput(true, "\r"), "drop");
+  assert.equal(lockedInput(true, "\x1b[A"), "drop"); // 方向键
+  assert.equal(lockedInput(true, "2"), "drop"); // 不能替 AI 选菜单
+  assert.equal(lockedInput(true, "\x03"), "interrupt");
+});
+
+test("锁住时 xterm 的自动应答照常放行（拦了终端里的程序会卡住）", () => {
+  assert.equal(lockedInput(true, "\x1b[12;40R"), "pass"); // CPR
+  assert.equal(lockedInput(true, "\x1b[?1;2c"), "pass"); // DA
+  assert.equal(lockedInput(true, "\x1b[I"), "pass"); // 焦点上报
+});
+
+test("没在 AI 驾驶时一切照常", () => {
+  for (const d of ["a", "\r", "\x03", "\x1b[A"]) assert.equal(lockedInput(false, d), "pass");
 });
