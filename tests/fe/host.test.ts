@@ -148,7 +148,7 @@ test("挂起（重启 / 终端关了）只给接驳与放弃", () => {
   assert.equal(needsReattach({ kind: "running" }), false);
 });
 
-import { checkLines } from "../../src/lib/host";
+import { checkLines, formatReport } from "../../src/lib/host";
 
 test("完成卡逐条证据与新卡片胶囊", () => {
   const lines = checkLines([
@@ -173,4 +173,17 @@ test("完成卡逐条证据与新卡片胶囊", () => {
   });
   assert.equal(hostPill(mk("manualCheck")).label, "等你确认完成");
   assert.equal(hostPill(mk("watchdog")).label, "看门狗·等你看看");
+});
+
+test("完成报告：模型挤成一段时按编号与「建议」分行；已分行的原样保留", () => {
+  const squashed = "磁盘检查完成，没有删除任何文件。可清理清单： 1. Docker 镜像约 44G。 2. target 目录 19G； 3. /tmp 14G。建议先做 1 到 4 项。";
+  assert.equal(
+    formatReport(squashed),
+    "磁盘检查完成，没有删除任何文件。可清理清单：\n1. Docker 镜像约 44G。\n2. target 目录 19G；\n3. /tmp 14G。\n建议先做 1 到 4 项。"
+  );
+  const lined = "已完成\n- 第一点 1. 不拆\n建议：无";
+  assert.equal(formatReport(lined), lined);
+  assert.equal(formatReport("  "), "");
+  // 版本号、小数不能被当成编号拆开
+  assert.equal(formatReport("升级到 v1.2 后占用 3.5G"), "升级到 v1.2 后占用 3.5G");
 });

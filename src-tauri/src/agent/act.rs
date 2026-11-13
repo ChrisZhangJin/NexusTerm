@@ -421,7 +421,7 @@ pub fn hosted_tool_specs() -> Vec<llm::ToolSpec> {
         schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "summary": { "type": "string", "description": "做了什么、结果如何。" },
+                "summary": { "type": "string", "description": "给用户的完成报告（会原样显示在托管面板的「完成报告」里）。分行写，不要挤成一段：第一行一句话结论；然后用「- 」列要点（做了什么、结果数据、改动了什么 / 没改动什么、风险）；最后「建议：」列下一步。" },
                 "evidence": {
                     "type": "array",
                     "items": { "type": "string" },

@@ -242,6 +242,20 @@ export function describeCheck(c: HostCheck): string {
   }
 }
 
+/**
+ * 完成报告的显示文本。模型偶尔把整份报告挤成一段（「…。1. xxx 2. xxx 建议先…」）——
+ * 原文里一个换行都没有时，在编号条目（`1.` `2、`）与「建议」前补换行；已经分行的原样返回。
+ */
+export function formatReport(summary: string): string {
+  const s = summary.trim();
+  if (!s || s.includes("\n")) return s;
+  return s
+    .replace(/\s+(?=\d{1,2}[.、](?!\d)\s?\S)/g, "\n")
+    .replace(/[。；;]\s*(?=\d{1,2}[.、](?!\d)\s?\S)/g, (m) => m.trimEnd() + "\n")
+    .replace(/\s*(?=建议[：:先])/g, "\n")
+    .replace(/^\n+/, "");
+}
+
 /** 完成卡上的逐条证据（✓ 通过 / ✗ 没过 / · 人工项，不阻塞完成 + 判据 + 证据） */
 export function checkLines(results: HostCheckResult[]): string[] {
   return results.map((r) => {

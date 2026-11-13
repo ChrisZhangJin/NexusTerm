@@ -11,7 +11,7 @@ import { DiffView } from "./DiffView";
 import { needsIncompleteBanner } from "../lib/diff";
 import { TodoList } from "./TodoList";
 import { toFriendlyError } from "../lib/errors";
-import { checkLines, checksToText, hostButtons, hostDetail, hostPill, isTerminal, pendingCard, textToChecks } from "../lib/host";
+import { checkLines, formatReport, checksToText, hostButtons, hostDetail, hostPill, isTerminal, pendingCard, textToChecks } from "../lib/host";
 import type {
   AgentTarget,
   HostBudgetGrant,
@@ -129,15 +129,33 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [] }:
           {status.goal}
         </span>
       </div>
-      {detail && <div className="st-esc-why">{detail}</div>}
-      {status.phase.kind === "completed" && status.phase.checks.length > 0 && (
-        <ul className="host-checks">
-          {checkLines(status.phase.checks).map((l, i) => (
-            <li key={i} className={l.startsWith("✓") ? "ok" : l.startsWith("·") ? "info" : "no"}>
-              {l}
-            </li>
-          ))}
-        </ul>
+      {detail && status.phase.kind !== "completed" && <div className="st-esc-why">{detail}</div>}
+      {status.phase.kind === "completed" && (
+        <div className="host-report">
+          <div className="host-report-head">
+            <span>完成报告</span>
+            <button
+              className="st-btn"
+              disabled={!status.phase.summary}
+              onClick={() => void api.clipboardWrite(status.phase.kind === "completed" ? status.phase.summary : "").catch(() => {})}
+            >
+              复制
+            </button>
+          </div>
+          <div className="host-report-body">{formatReport(status.phase.summary) || "（AI 没有写完成报告）"}</div>
+          {status.phase.checks.length > 0 && (
+            <details className="host-report-checks">
+              <summary>核验依据（{status.phase.checks.length} 条）</summary>
+              <ul className="host-checks">
+                {checkLines(status.phase.checks).map((l, i) => (
+                  <li key={i} className={l.startsWith("✓") ? "ok" : l.startsWith("·") ? "info" : "no"}>
+                    {l}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </div>
       )}
       {status.notice && <div className="st-status warn">{status.notice}</div>}
       {status.todo && status.todo.length > 0 && <TodoList items={status.todo} />}

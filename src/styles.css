@@ -2435,6 +2435,22 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .host-question { white-space: pre-wrap; word-break: break-word; margin-bottom: 6px; }
 .host-yolo.on { color: var(--danger); font-weight: 600; }
 .host-notice .st-esc-head { color: var(--accent); }
+/* 托管完成报告：一眼能看到的结论 + 可复制，核验依据折叠在下面 */
+.host-report {
+  margin: 8px 0 4px; border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: var(--radius); background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+.host-report-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 10px; font-weight: 600; color: var(--accent);
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+}
+.host-report-body {
+  padding: 8px 10px; font-size: 12.5px; line-height: 1.6; color: var(--text);
+  white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow: auto; user-select: text;
+}
+.host-report-checks { padding: 0 10px 8px; }
+.host-report-checks > summary { cursor: pointer; font-size: 11.5px; color: var(--text-dim); }
 .host-checks { margin: 4px 0; padding-left: 18px; font-size: 11.5px; color: var(--text-dim); }
 .host-checks li { word-break: break-word; }
 .host-checks li.ok { color: var(--accent); }
