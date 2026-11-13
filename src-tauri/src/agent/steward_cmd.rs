@@ -94,11 +94,12 @@ pub fn steward_intent_push(
 /// 回放最近决策。库里存的是整条 JSON，`seq` / `outcome` 以列为准回填，
 /// 这样回执校验原地更新 outcome 后，前端看到的就是最新状态。
 #[tauri::command]
-pub fn steward_decisions(
+pub async fn steward_decisions(
     limit: Option<usize>,
     state: State<'_, AppState>,
-) -> Vec<DecisionRecord> {
-    state
+) -> Result<Vec<DecisionRecord>, String> {
+    // async：面板每 1.5s 轮询一次，SQLite 连接锁被别处占着时不能卡主线程（会让整个窗口卡顿）
+    Ok(state
         .store
         .steward_decisions(limit.unwrap_or(40))
         .into_iter()
@@ -108,7 +109,7 @@ pub fn steward_decisions(
             rec.outcome = outcome;
             Some(rec)
         })
-        .collect()
+        .collect())
 }
 
 

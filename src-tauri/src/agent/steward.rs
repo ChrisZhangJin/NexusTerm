@@ -572,16 +572,17 @@ pub fn steward_list_consoles(
 }
 
 #[tauri::command]
-pub fn steward_screen_delta(
+pub async fn steward_screen_delta(
     delta: ScreenDelta,
     screen: State<'_, ScreenStore>,
     bus: State<'_, StewardBus>,
-) -> ScreenDeltaAck {
+) -> Result<ScreenDeltaAck, String> {
+    // async：采帧期间每 180ms 一次的热路径，不占主线程
     let ack = screen.apply(&delta);
     // 事件驱动：帧一落地就唤醒常驻循环，不必等下一次心跳。
     // 前端静默期发的同哈希心跳帧也要唤醒，daemon 自己按自适应节奏决定要不要分类。
     bus.wake();
-    ack
+    Ok(ack)
 }
 
 #[tauri::command]

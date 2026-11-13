@@ -93,6 +93,35 @@ struct AppHostIo {
     notice: Mutex<Option<String>>,
 }
 
+/// 托管状态快照（`nx://host/*` 事件的负载）。
+fn status_of(
+    handle: &HostHandle,
+    console_id: &str,
+    goal: &str,
+    snap: &Mutex<HostCheckpoint>,
+    notice: &Mutex<Option<String>>,
+    phase: &HostPhase,
+) -> HostStatus {
+    // 只锁一次 `snap`：在结构体字面量里写两次 `snap.lock()`，第一个临时 guard 要活到整条语句结束，
+    // 第二次加锁就自锁了（parking_lot 不可重入）—— 曾让 `host_start` 卡死主线程、整个窗口无响应。
+    let (label, todo) = {
+        let s = snap.lock();
+        (s.console.label.clone(), s.todo.clone())
+    };
+    let notice = notice.lock().clone();
+    HostStatus {
+        contract_id: handle.contract_id.clone(),
+        run_id: handle.run_id.clone(),
+        console_id: console_id.to_string(),
+        goal: goal.to_string(),
+        state: phase.label(),
+        phase: phase.clone(),
+        label,
+        notice,
+        todo,
+    }
+}
+
 impl HostIo for AppHostIo {
     fn save(&self, phase: &HostPhase) {
         let Some(st) = self.app.try_state::<AppState>() else { return };
@@ -114,17 +143,7 @@ impl HostIo for AppHostIo {
     }
 
     fn emit(&self, phase: &HostPhase) {
-        let st = HostStatus {
-            contract_id: self.handle.contract_id.clone(),
-            run_id: self.handle.run_id.clone(),
-            console_id: self.console_id.clone(),
-            goal: self.goal.clone(),
-            state: phase.label(),
-            phase: phase.clone(),
-            label: self.snap.lock().console.label.clone(),
-            notice: self.notice.lock().clone(),
-            todo: self.snap.lock().todo.clone(),
-        };
+        let st = status_of(&self.handle, &self.console_id, &self.goal, &self.snap, &self.notice, phase);
         emit_status(&self.app, &st);
     }
 
@@ -260,7 +279,7 @@ pub(crate) fn claim_then_sign<T>(
 /// 开始托管：立即返回 contract_id，运行实况走事件。
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub fn host_start(
+pub async fn host_start(
     console_id: String,
     goal: String,
     authority_tier: Option<String>,
@@ -409,10 +428,15 @@ fn hosted(state: &AppState, contract_id: &str) -> Result<Arc<HostShared>, String
 /// 人在驾驶时点了卡片上的按钮 / 「加预算继续」：先替他交还，事件才合法。
 fn handback_if_driving(app: &AppHandle, state: &AppState, h: &HostShared) {
     if matches!(h.phase(), HostPhase::UserDriving { .. }) {
-        if let Some(st) = state.act.control.handback(&h.console_id) {
-            act::emit_control(app, &h.console_id, &state.act.control.holders_of(&h.console_id), st);
-        }
+        release_user_control(app, state, h);
         h.send(HostEvent::Handback);
+    }
+}
+
+/// 控制表那一半的「交还」：把终端从用户手里拿回来，并推控制权事件。
+fn release_user_control(app: &AppHandle, state: &AppState, h: &HostShared) {
+    if let Some(st) = state.act.control.handback(&h.console_id) {
+        act::emit_control(app, &h.console_id, &state.act.control.holders_of(&h.console_id), st);
     }
 }
 
@@ -443,7 +467,7 @@ pub async fn host_stop(
 
 /// 答复卡片（问题 / 审批）。卡片 id 不对 / 已经答过 → Err。
 #[tauri::command]
-pub fn host_answer(
+pub async fn host_answer(
     contract_id: String,
     reply: CardReply,
     app: AppHandle,
@@ -458,14 +482,13 @@ pub fn host_answer(
         HostPhase::WaitingHuman { card } if card.id == reply.card_id => {}
         _ => return Err("这张卡片已经处理过了，或不是当前等你答复的那张".to_string()),
     }
-    handback_if_driving(&app, &state, &h);
-    h.send(HostEvent::Answer(reply));
+    h.answer_card(reply, || release_user_control(&app, &state, &h));
     Ok(())
 }
 
 /// 接管：Agent 立刻让路（等同于在终端里敲了键），直到「交还」。
 #[tauri::command]
-pub fn host_takeover(contract_id: String, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn host_takeover(contract_id: String, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let h = hosted(&state, &contract_id)?;
     if let Some(st) = state.act.control.takeover(&h.console_id) {
         act::emit_control(&app, &h.console_id, &state.act.control.holders_of(&h.console_id), st);
@@ -476,7 +499,7 @@ pub fn host_takeover(contract_id: String, app: AppHandle, state: State<'_, AppSt
 
 /// 交还：回到接管前的状态（不一定是运行中：预算暂停时接管，交还后仍是暂停）。
 #[tauri::command]
-pub fn host_handback(contract_id: String, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn host_handback(contract_id: String, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let h = hosted(&state, &contract_id)?;
     if let Some(st) = state.act.control.handback(&h.console_id) {
         act::emit_control(&app, &h.console_id, &state.act.control.holders_of(&h.console_id), st);
@@ -487,7 +510,7 @@ pub fn host_handback(contract_id: String, app: AppHandle, state: State<'_, AppSt
 
 /// 暂停：下一个闸口（下一次模型调用前 / 下一个动作前）停下，等「继续」。
 #[tauri::command]
-pub fn host_pause(contract_id: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn host_pause(contract_id: String, state: State<'_, AppState>) -> Result<(), String> {
     let h = hosted(&state, &contract_id)?;
     h.send(HostEvent::Pause);
     Ok(())
@@ -495,7 +518,7 @@ pub fn host_pause(contract_id: String, state: State<'_, AppState>) -> Result<(),
 
 /// 加预算继续：只有暂停（预算 / 模型不可用 / 手动）才接受。
 #[tauri::command]
-pub fn host_resume(
+pub async fn host_resume(
     contract_id: String,
     budget: Option<BudgetGrant>,
     app: AppHandle,
@@ -512,10 +535,11 @@ pub fn host_resume(
 
 /// 确认完成判据（草稿卡上点「接受」）：编辑后的判据写进契约，再答复草稿卡让任务开跑。
 #[tauri::command]
-pub fn host_confirm_criteria(
+pub async fn host_confirm_criteria(
     contract_id: String,
     card_id: String,
     checks: Vec<Check>,
+    app: AppHandle,
     registry: State<'_, StewardRegistry>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -527,14 +551,17 @@ pub fn host_confirm_criteria(
     let checks = if checks.is_empty() { criteria::fallback() } else { checks };
     registry.set_criteria(&contract_id, checks.clone(), false);
     h.set_criteria(checks, false);
-    h.send(HostEvent::Answer(CardReply { card_id, text: String::new(), approved: Some(true) }));
+    // 等确认时用户可能动过终端（你在驾驶）：先交还再答复，否则 Answer 被静默丢掉、「接受」没反应
+    h.answer_card(CardReply { card_id, text: String::new(), approved: Some(true) }, || {
+        release_user_control(&app, &state, &h)
+    });
     Ok(())
 }
 
 /// 改契约（目标 / 档位）：不重启运行。重建 `## 托管契约` 一节，并在下一步前告诉模型「契约已更新：…」。
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub fn host_amend(
+pub async fn host_amend(
     contract_id: String,
     goal: Option<String>,
     authority_tier: Option<String>,
@@ -591,7 +618,7 @@ pub(crate) fn amend_note(goal: Option<&str>, tier: Option<&str>) -> String {
 /// Notify 档的「撤销」：没有真回滚 —— 前端先接管，这里把用户的纠正记成 Learned 偏好，
 /// 并把那条决策标成 rejected，下次同主题检索会命中它。
 #[tauri::command]
-pub fn host_correct(
+pub async fn host_correct(
     contract_id: String,
     seq: i64,
     topic: String,
@@ -1045,6 +1072,35 @@ mod tests {
         assert_eq!(c.id, "c1");
         assert_eq!(changed, Some(ControlState::AgentDriving));
         assert!(registry.for_console("t1").is_some());
+    }
+
+    /// 回归：组装托管状态时对同一把 `snap` 锁了两次（同一条语句里临时 guard 活到语句末尾），
+    /// parking_lot 不可重入 → 自锁。`host_start` 是同步命令跑在主线程上，整个窗口卡死。
+    #[test]
+    fn status_of_does_not_self_deadlock() {
+        let ctx = HostCtx::bare("c1", "t1", "目标");
+        let console = ConsoleRef {
+            host_key: "local:t1".into(),
+            console_id: "t1".into(),
+            label: "本地".into(),
+            ..Default::default()
+        };
+        let mut cp = HostCheckpoint::new(ctx.contract, ctx.authority, console, 1);
+        cp.todo = vec![super::super::todo::TodoItem { text: "第一步".into(), status: Default::default() }];
+        let snap = std::sync::Arc::new(Mutex::new(cp));
+        let notice = std::sync::Arc::new(Mutex::new(Some("提示".to_string())));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (s, n) = (snap.clone(), notice.clone());
+        std::thread::spawn(move || {
+            let st = status_of(&HostHandle::new("c1"), "t1", "目标", &s, &n, &HostPhase::Running);
+            let _ = tx.send(st);
+        });
+        let st = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("status_of 2 秒内没返回：同一把锁被重复获取（自锁）");
+        assert_eq!(st.label, "本地");
+        assert_eq!(st.todo.len(), 1);
+        assert_eq!(st.notice.as_deref(), Some("提示"));
     }
 
     #[test]

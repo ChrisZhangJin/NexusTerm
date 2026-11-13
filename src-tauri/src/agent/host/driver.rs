@@ -523,6 +523,19 @@ impl HostShared {
         self.tx.send(ev).is_ok()
     }
 
+    /// 答复一张卡（问题 / 审批 / 判据草稿）。
+    ///
+    /// 卡片等答复时用户可能动过终端（→ 你在驾驶，卡被压在下面）。`Answer` 在 UserDriving 里不合法、
+    /// 会被静默丢掉 —— 表现为「点了接受 / 回答没反应」。所以先替用户交还：`release_user` 把控制表
+    /// 交还（命令层负责，会推控制权事件），再投 Handback 回到那张卡，最后才投 Answer。
+    pub fn answer_card(&self, reply: super::CardReply, release_user: impl FnOnce()) {
+        if matches!(self.phase(), HostPhase::UserDriving { .. }) {
+            release_user();
+            self.send(HostEvent::Handback);
+        }
+        self.send(HostEvent::Answer(reply));
+    }
+
     /// 开局：落第一份 checkpoint、推一次相位、同步控制权。
     pub fn announce(&self) {
         if self.is_superseded() {
@@ -981,6 +994,30 @@ pub(crate) mod tests {
         let cp = super::super::checkpoint::HostCheckpoint::new(ctx.contract, ctx.authority, Default::default(), 1);
         let back = super::super::checkpoint::HostCheckpoint::from_json(&cp.to_json(2).unwrap()).unwrap();
         assert!(back.contract.criteria_confirmed);
+    }
+
+    /// 回归：判据草稿卡等确认时用户在终端里敲了键（→ 你在驾驶），再点「接受」没反应 ——
+    /// Answer 在 UserDriving 里不合法，被静默丢掉。答复卡片必须先替用户交还。
+    #[tokio::test(start_paused = true)]
+    async fn accepting_criteria_while_user_drives_still_proceeds() {
+        let (h, _io) = shared();
+        let draft = vec![Check::Manual { text: "由你确认完成".into() }];
+        let h2 = h.clone();
+        let task = tokio::spawn(async move { h2.settle_criteria(draft, false, "cd1", 0).await });
+        settle().await;
+        // 用户动了终端：等确认的卡被压在「你在驾驶」下面
+        h.send(HostEvent::UserKey);
+        settle().await;
+        assert!(matches!(h.phase(), HostPhase::UserDriving { .. }), "{:?}", h.phase());
+
+        let edited = vec![Check::CommandOk { cmd: "df -h".into() }];
+        h.set_criteria(edited.clone(), false);
+        let mut released = false;
+        h.answer_card(reply("cd1", "", Some(true)), || released = true);
+        settle().await;
+        assert!(released, "答复前要把控制权从用户手里交还");
+        assert!(task.is_finished(), "接受判据后托管应继续，而不是一直挂着：{:?}", h.phase());
+        assert_eq!(task.await.unwrap(), Some(edited));
     }
 
     #[tokio::test(start_paused = true)]
