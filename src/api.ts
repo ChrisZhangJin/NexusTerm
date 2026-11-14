@@ -360,8 +360,8 @@ export const api = {
   hostReattach: (contractId: string, consoleId: string | null, openNew = false) =>
     invoke<void>("host_reattach", { contractId, consoleId, openNew }),
   /** 改契约（目标 / 档位），不重启运行 */
-  hostAmend: (contractId: string, goal?: string, authorityTier?: string) =>
-    invoke<void>("host_amend", { contractId, goal: goal ?? null, authorityTier: authorityTier ?? null }),
+  hostAmend: (contractId: string, goal?: string, authorityTier?: string, deny?: string[]) =>
+    invoke<void>("host_amend", { contractId, goal: goal ?? null, authorityTier: authorityTier ?? null, deny: deny ?? null }),
   /** 通知档的纠正：记成 Learned 偏好，并把那条决策标为 rejected */
   hostCorrect: (contractId: string, seq: number, topic: string, correction: string) =>
     invoke<void>("host_correct", { contractId, seq, topic, correction }),

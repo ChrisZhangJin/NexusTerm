@@ -148,13 +148,18 @@ test("挂起（重启 / 终端关了）只给接驳与放弃", () => {
   assert.equal(needsReattach({ kind: "running" }), false);
 });
 
-import { checkLines, formatReport } from "../../src/lib/host";
+import { addDeny, checkLines, denyLabel, formatReport, isLockedDeny, removeDeny } from "../../src/lib/host";
 
 test("完成卡逐条证据与新卡片胶囊", () => {
   const lines = checkLines([
     { check: { kind: "commandOk", cmd: "grep -q ok /tmp/r" }, passed: true, detail: "退出码 0" },
     { check: { kind: "manual", text: "页面能打开" }, passed: false, detail: "未自动核验（仅供参考，不阻塞完成）" },
   ]);
+  // 没法核验的命令判据同样标「·」（终端前台是 Claude Code、又没有旁路通道）
+  assert.equal(
+    checkLines([{ check: { kind: "commandOk", cmd: "git status" }, passed: false, skipped: true, detail: "未核验：终端前台是 Claude Code" }])[0],
+    "· 命令成功：`git status`：未核验：终端前台是 Claude Code"
+  );
   // 人工项不阻塞完成：标「·」而不是「✗」，免得完成了却像失败
   assert.deepEqual(lines, [
     "✓ 命令成功：`grep -q ok /tmp/r`：退出码 0",
@@ -186,4 +191,15 @@ test("完成报告：模型挤成一段时按编号与「建议」分行；已�
   assert.equal(formatReport("  "), "");
   // 版本号、小数不能被当成编号拆开
   assert.equal(formatReport("升级到 v1.2 后占用 3.5G"), "升级到 v1.2 后占用 3.5G");
+});
+
+test("禁止项：底线项去不掉；放开 delete；加关键字去重", () => {
+  const base = ["secret", "permanent_grant", "force_push", "delete"];
+  assert.deepEqual(removeDeny(base, "delete"), ["secret", "permanent_grant", "force_push"]);
+  assert.deepEqual(removeDeny(base, "secret"), base, "底线项去不掉");
+  assert.deepEqual(addDeny(["delete"], " systemctl "), ["secret", "permanent_grant", "delete", "systemctl"]);
+  assert.deepEqual(addDeny(base, "DELETE"), base, "不分大小写去重");
+  assert.ok(isLockedDeny("permanent_grant") && !isLockedDeny("delete"));
+  assert.match(denyLabel("delete"), /删除/);
+  assert.equal(denyLabel("systemctl"), "含「systemctl」");
 });

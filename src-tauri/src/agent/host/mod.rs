@@ -209,6 +209,9 @@ pub struct CheckResult {
     pub passed: bool,
     #[serde(default)]
     pub detail: String,
+    /// 没法核验（例如终端前台是 Claude Code、又没有旁路通道）：不算没过、不阻塞完成，报告里列为「·」
+    #[serde(default)]
+    pub skipped: bool,
 }
 
 /// 为什么挂起：现场不在了，任务没法继续，但不算结束。

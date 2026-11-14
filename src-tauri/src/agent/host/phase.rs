@@ -259,7 +259,7 @@ fn answer(card: &HumanCard, reply: &CardReply) -> Result<(HostPhase, Vec<Effect>
                 .iter()
                 .map(|c| {
                     if c.check.is_manual() {
-                        CheckResult { check: c.check.clone(), passed: true, detail: "用户确认".into() }
+                        CheckResult { check: c.check.clone(), passed: true, detail: "用户确认".into(), skipped: false }
                     } else {
                         c.clone()
                     }
@@ -472,7 +472,7 @@ mod tests {
 
     #[test]
     fn complete_verified_releases_lease_rejected_stays_running() {
-        let checks = vec![CheckResult { check: Check::FileExists { path: "/x".into() }, passed: true, detail: String::new() }];
+        let checks = vec![CheckResult { check: Check::FileExists { path: "/x".into() }, passed: true, detail: String::new(), skipped: false }];
         let (n, fx) = step(&HostPhase::Running, HostEvent::CompleteVerified { summary: "done".into(), checks: checks.clone() }).unwrap();
         assert_eq!(n, HostPhase::Completed { summary: "done".into(), checks });
         assert_eq!(fx[0], Effect::ReleaseLease);
@@ -537,8 +537,8 @@ mod tests {
     #[test]
     fn manual_check_card_completes_only_on_approval() {
         let checks = vec![
-            CheckResult { check: Check::FileExists { path: "/x".into() }, passed: true, detail: String::new() },
-            CheckResult { check: Check::Manual { text: "页面能打开".into() }, passed: false, detail: String::new() },
+            CheckResult { check: Check::FileExists { path: "/x".into() }, passed: true, detail: String::new(), skipped: false },
+            CheckResult { check: Check::Manual { text: "页面能打开".into() }, passed: false, detail: String::new(), skipped: false },
         ];
         let w = HostPhase::WaitingHuman {
             card: card("m", CardKind::ManualCheck { summary: "部署完成".into(), checks }),

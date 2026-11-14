@@ -25,7 +25,7 @@ import { useHostRuns } from "../lib/useHostRuns";
 import { basePhase, hostDetail, hostPauseKind, isTerminal, needsReattach } from "../lib/host";
 import { stewardApi, stewardConsoleIds } from "../lib/steward";
 import { setStewardConsoles } from "../lib/termRegistry";
-import type { AgentMessage, AgentTarget, Skill, SkillInput } from "../types";
+import type { AgentMessage, AgentTarget, HostStartOpts, Skill, SkillInput } from "../types";
 
 export interface AgentPanelProps {
   /** 当前会话 id（绑定哪个终端） */
@@ -398,7 +398,8 @@ export function AgentPanel({
     goal: string,
     budget?: StewardBudgetPref,
     tier?: string,
-    yolo?: boolean
+    yolo?: boolean,
+    opts?: HostStartOpts
   ): Promise<void> => {
     if (run.conv.busy) return;
     setRunSession(sid);
@@ -417,6 +418,8 @@ export function AgentPanel({
         budget: budget ? { maxSteps: budget.maxSteps, maxMinutes: budget.maxMinutes } : undefined,
         // 重启后找回这个终端用（SSH 记录 / 标签 / cwd / tmux）
         consoleRef: sessions.find((x) => x.id === sid)?.hint,
+        deny: opts?.deny,
+        followUp: opts?.followUp,
       });
       // 契约已签：马上让前端开始为这个终端上报屏幕帧（不等托管页的轮询）
       void reconcileStewardConsoles();

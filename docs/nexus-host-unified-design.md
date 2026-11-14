@@ -136,7 +136,9 @@ struct ConsoleRef { host_key: String, session_record_id: Option<String>, label: 
 
 **已定：由模型起草、用户确认**——开始托管时一次 LLM 调用把目标转成草稿，用户编辑或接受。**YOLO 模式**：直接采用草稿，不经确认就开始托管（契约里加 `yolo: bool`，UI 上明显标出）。YOLO 只跳过确认这一步，不改变授权档位和 deny 规则。
 
-`nx_complete` 触发 `host::verify`：
+`nx_complete` 触发 `host::verify`。**已定（2026-11-14）：判据命令不往终端里敲**——在旁路里执行（SSH 同连接的 exec 通道 / 本地 `sh -c` 子进程，工作目录 = 终端当前目录）；终端前台是 Claude Code、vim 等也能核验，也不会在终端里留下 `__NX_CHECK_RC` 残渣。没有旁路（堡垒机兼容模式、Windows 本地）时，只有终端停在空闲 shell 提示符上才退回在终端里执行；否则这条判据记为「未核验」，不阻塞完成。
+
+
 - CommandOk 要过 `gate::authorize`，且 `danger::assess` 判为只读，否则拒绝执行
 - FileExists 用 `test -e`
 - ScreenMatches 匹配当前帧

@@ -259,7 +259,45 @@ export function formatReport(summary: string): string {
 /** 完成卡上的逐条证据（✓ 通过 / ✗ 没过 / · 人工项，不阻塞完成 + 判据 + 证据） */
 export function checkLines(results: HostCheckResult[]): string[] {
   return results.map((r) => {
-    const mark = r.check.kind === "manual" ? "·" : r.passed ? "✓" : "✗";
+    const mark = r.check.kind === "manual" || r.skipped ? "·" : r.passed ? "✓" : "✗";
     return `${mark} ${describeCheck(r.check)}：${r.detail}`;
   });
+}
+
+// ———————————— 契约禁止项 ————————————
+
+/** 后端总会补回、面板上只读的底线禁止项（与 policy.rs 的 LOCKED_DENY 一致） */
+export const LOCKED_DENY = ["secret", "permanent_grant"] as const;
+
+/** 开始托管时默认的禁止项（与后端 Authority::default 一致） */
+export const DEFAULT_DENY = ["secret", "permanent_grant", "force_push", "delete"];
+
+const DENY_LABELS: Record<string, string> = {
+  delete: "删除类操作（rm / prune / drop …）",
+  force_push: "强制推送（git push -f）",
+  secret: "替你输密码",
+  permanent_grant: "选「不再询问 / 永久允许」",
+};
+
+export function isLockedDeny(tag: string): boolean {
+  return (LOCKED_DENY as readonly string[]).includes(tag);
+}
+
+/** 面板上显示的名字；自定义关键字原样显示 */
+export function denyLabel(tag: string): string {
+  return DENY_LABELS[tag] ?? `含「${tag}」`;
+}
+
+/** 去掉一项（底线项去不掉） */
+export function removeDeny(list: readonly string[], tag: string): string[] {
+  if (isLockedDeny(tag)) return [...list];
+  return list.filter((t) => t !== tag);
+}
+
+/** 加一项：去空白、去重（不分大小写）；底线项总在 */
+export function addDeny(list: readonly string[], raw: string): string[] {
+  const t = raw.trim();
+  const base = [...new Set([...LOCKED_DENY, ...list])];
+  if (!t || base.some((x) => x.toLowerCase() === t.toLowerCase())) return base;
+  return [...base, t];
 }

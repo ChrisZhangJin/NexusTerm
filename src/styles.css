@@ -2435,6 +2435,27 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .host-question { white-space: pre-wrap; word-break: break-word; margin-bottom: 6px; }
 .host-yolo.on { color: var(--danger); font-weight: 600; }
 .host-notice .st-esc-head { color: var(--accent); }
+/* 契约禁止项编辑器（开始托管表单 / 托管卡） */
+.deny-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0; font-size: 11.5px; }
+.deny-title { color: var(--text-dim); margin-right: 2px; }
+.deny-chip {
+  display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 8px;
+  border: 1px solid var(--border); border-radius: 999px; color: var(--text);
+}
+.deny-chip.locked { padding-right: 8px; color: var(--text-dim); }
+.deny-chip.hit { border-color: var(--danger); }
+.deny-x {
+  border: 0; background: none; color: var(--text-dim); cursor: pointer; padding: 0 4px; font-size: 11px;
+}
+.deny-x:hover { color: var(--danger); }
+.deny-add {
+  min-width: 140px; flex: 0 1 180px; background: var(--bg-panel); color: var(--text);
+  border: 1px dashed var(--border); border-radius: 999px; padding: 2px 8px; font-size: 11.5px; outline: none;
+}
+/* 完成报告下面「基于此报告继续」 */
+.host-followup { display: flex; gap: 6px; align-items: flex-end; padding: 0 10px 10px; }
+.host-followup .st-goal { flex: 1; min-height: 0; }
+
 /* 托管完成报告：一眼能看到的结论 + 可复制，核验依据折叠在下面 */
 .host-report {
   margin: 8px 0 4px; border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);

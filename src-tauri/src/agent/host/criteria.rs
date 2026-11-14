@@ -19,7 +19,9 @@ pub const DRAFT_SYSTEM: &str = "你是终端托管助手。把用户的托管目
 - {\"kind\":\"fileExists\",\"path\":\"/绝对/路径\"}\n\
 - {\"kind\":\"screenMatches\",\"re\":\"终端当前屏幕应匹配的正则\"}\n\
 - {\"kind\":\"manual\",\"text\":\"只能由人确认的一项\"}\n\
-最多 5 条。能用命令或文件检验的就别用 manual；实在无法检验时给一条 manual。";
+最多 5 条。能用命令或文件检验的就别用 manual；实在无法检验时给一条 manual。\n\
+命令 / 文件判据在**另开的 shell** 里执行（工作目录 = 终端当前目录），不会敲进终端前台的程序：\
+终端里跑着 Claude Code / vim 等也照样能核验；别写依赖前台程序状态的命令。";
 
 pub fn fallback() -> Vec<Check> {
     vec![Check::Manual { text: FALLBACK_TEXT.to_string() }]

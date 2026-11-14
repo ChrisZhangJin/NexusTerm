@@ -69,6 +69,28 @@ impl Default for Authority {
     }
 }
 
+/// 用户关不掉的禁止项：替用户输密码（`secret`）与选「不再询问 / 永久允许」（`permanent_grant`）。
+/// 这两条是 fail-closed 的底线，面板上只读展示，任何契约编辑都会把它们补回来。
+pub const LOCKED_DENY: [&str; 2] = ["secret", "permanent_grant"];
+
+/// 用户在面板上编辑过的禁止项 → 落进契约的版本：去空白、去重、限长，并补回 `LOCKED_DENY`。
+pub fn normalize_deny(input: &[String]) -> Vec<String> {
+    const MAX_ITEMS: usize = 32;
+    const MAX_LEN: usize = 80;
+    let mut out: Vec<String> = LOCKED_DENY.iter().map(|s| s.to_string()).collect();
+    for raw in input {
+        let t: String = raw.trim().chars().take(MAX_LEN).collect();
+        if t.is_empty() || out.iter().any(|x| x.eq_ignore_ascii_case(&t)) {
+            continue;
+        }
+        if out.len() >= MAX_ITEMS {
+            break;
+        }
+        out.push(t);
+    }
+    out
+}
+
 impl Authority {
     /// 前端传来的档位字符串一律归一，未知值回落到最保守的 notify。
     pub fn with_tier(mut self, tier: &str) -> Self {
@@ -376,6 +398,17 @@ pub fn evaluate(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn normalize_deny_keeps_locked_items_and_dedupes() {
+        let got = normalize_deny(&["delete".into(), " Delete ".into(), "".into(), "docker".into()]);
+        assert_eq!(got, vec!["secret", "permanent_grant", "delete", "docker"]);
+        // 用户把底线项删了也会补回来
+        let got = normalize_deny(&[]);
+        assert_eq!(got, vec!["secret", "permanent_grant"]);
+        // 放开 delete：列表里就没有它
+        assert!(!normalize_deny(&["force_push".into()]).contains(&"delete".to_string()));
+    }
+
     use super::*;
     use super::super::decision::{DecisionAction, DecisionRecord};
     use super::super::situation::{Choice, Program};

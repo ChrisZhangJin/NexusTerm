@@ -4351,8 +4351,23 @@ pub async fn run(
                     };
                     // 托管：逐条核验完成判据（只读、过闸），不靠模型自己说完成
                     let ctx = h.ctx();
-                    let mut prober =
-                        ActProber { app, state, runtime, run_key: &run_key, console: &h.console_id, step, cancel: &cancel, host: h };
+                    // 判据命令在旁路通道里跑，要在终端当前目录下跑才对得上（git / 相对路径）
+                    let probe_cwd = targets
+                        .iter()
+                        .find(|t| t.id == h.console_id)
+                        .and_then(|t| t.cwd.clone())
+                        .or_else(|| h.saved_console().and_then(|c| c.cwd));
+                    let mut prober = ActProber {
+                        app,
+                        state,
+                        runtime,
+                        run_key: &run_key,
+                        console: &h.console_id,
+                        cwd: probe_cwd,
+                        step,
+                        cancel: &cancel,
+                        host: h,
+                    };
                     // 用户确认过的判据按普通托管写入过闸执行；YOLO 判据只跑只读命令。每条沿用执行通道的上限
                     h.flush_progress(&messages, step);
                     let results = super::host::verify::verify(
@@ -6387,13 +6402,15 @@ fn recent_decisions(state: &AppState, contract_id: &str, n: usize) -> Vec<String
         .collect()
 }
 
-/// 判据核验用的现场：读屏走 `situation_now`；命令走与 nx_exec 相同的执行通道（先过控制权闸）。
+/// 判据核验用的现场：读屏走 `situation_now`；命令**不往终端里敲**，优先走旁路通道（`oob_exec`）。
 struct ActProber<'a> {
     app: &'a AppHandle,
     state: &'a AppState,
     runtime: &'a ActRuntime,
     run_key: &'a str,
     console: &'a str,
+    /// 终端当前目录（前端探测 / 接驳线索）；旁路命令在这里跑
+    cwd: Option<String>,
     step: usize,
     cancel: &'a Arc<AtomicBool>,
     host: &'a HostShared,
@@ -6412,6 +6429,21 @@ impl super::host::verify::Prober for ActProber<'_> {
     fn run(&mut self, cmd: &str) -> impl std::future::Future<Output = Result<String, String>> + Send {
         let cmd = cmd.to_string();
         async move {
+            // 1) 旁路：SSH 同连接的 exec 通道 / 本地子进程。不碰终端 —— 前台是 Claude Code、vim 之类时
+            //    往里敲命令只会把字塞进人家的输入框；就算是 shell，也会留下 `__NX_CHECK_RC=0` 之类的残渣
+            match oob_exec(self.state, self.console, &cmd, self.cwd.as_deref()).await {
+                Ok(out) => return Ok(out),
+                Err(OobErr::Failed(e)) => return Err(e),
+                Err(OobErr::Unavailable) => {}
+            }
+            // 2) 没有旁路（堡垒机兼容模式 / Windows 本地）：只有终端正停在空闲的 shell 提示符上才敢敲
+            let sit = situation_now(self.app, self.state, self.console, false);
+            if let Some(why) = exec_blocker(&sit) {
+                return Err(format!(
+                    "{}终端前台是{why}，又没有旁路执行通道；没有往终端里敲这条检查",
+                    super::host::verify::UNVERIFIABLE
+                ));
+            }
             match gate_drive(self.app, self.runtime, self.run_key, self.console, self.cancel).await {
                 control::PauseWait::Ready => {}
                 _ => return Err("已取消".to_string()),
@@ -6423,6 +6455,72 @@ impl super::host::verify::Prober for ActProber<'_> {
                 return Err(format!("超时（{}）", tail_chars(o.output.trim(), 300)));
             }
             Ok(o.output)
+        }
+    }
+}
+
+enum OobErr {
+    /// 这个会话没有旁路通道（兼容模式 / 堡垒机拒绝 / 平台不支持）：调用方可以退回别的办法
+    Unavailable,
+    /// 旁路跑了但出错（网络断了、超时…）：直接当执行失败
+    Failed(String),
+}
+
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// 不经终端执行一条只读检查命令，返回合并后的输出（命令里已带 `; echo __NX_CHECK_RC=$?`）。
+/// SSH：同一连接上的 exec 旁路通道；本地（Unix）：`sh -c` 子进程。工作目录 = 终端当前目录。
+async fn oob_exec(state: &AppState, console: &str, cmd: &str, cwd: Option<&str>) -> Result<String, OobErr> {
+    const SECS: u64 = 125;
+    if state.sessions.contains(console) {
+        let script = match cwd.filter(|c| !c.trim().is_empty()) {
+            Some(dir) => format!("cd {} 2>/dev/null || echo '[nexus] 终端目录不存在，在 ~ 下执行'; {cmd}", sh_quote(dir)),
+            None => format!("echo '[nexus] 不知道终端当前目录，在 ~ 下执行'; {cmd}"),
+        };
+        return match state.sessions.run_sidecar(console, &script, None, SECS, "判据核验超时").await {
+            Ok(out) => Ok(out),
+            Err(crate::ssh::session::SessionError::Channel(m))
+                if m.contains(crate::ssh::session::SIDECAR_OFF) || m.contains(crate::ssh::session::SIDECAR_DENIED) =>
+            {
+                Err(OobErr::Unavailable)
+            }
+            Err(e) => Err(OobErr::Failed(e.to_string())),
+        };
+    }
+    #[cfg(unix)]
+    if state.local.contains(console) {
+        return local_check(cmd, cwd, SECS).await;
+    }
+    Err(OobErr::Unavailable)
+}
+
+/// 本地（Unix）旁路：`sh -c` 子进程，工作目录 = 终端当前目录（`~` 展开；不存在就退回 $HOME）。
+#[cfg(unix)]
+async fn local_check(cmd: &str, cwd: Option<&str>, secs: u64) -> Result<String, OobErr> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let dir = cwd
+        .map(|c| if let Some(rest) = c.strip_prefix('~') { format!("{home}{rest}") } else { c.to_string() })
+        .filter(|c| std::path::Path::new(c).is_dir());
+    let (dir, cmd) = match dir {
+        Some(d) => (d, cmd.to_string()),
+        None => (home, format!("echo '[nexus] 不知道终端当前目录，在 ~ 下执行'; {cmd}")),
+    };
+    let child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), child).await {
+        Err(_) => Err(OobErr::Failed("判据核验超时".to_string())),
+        Ok(Err(e)) => Err(OobErr::Failed(format!("起子进程失败：{e}"))),
+        Ok(Ok(o)) => {
+            let mut out = String::from_utf8_lossy(&o.stdout).into_owned();
+            out.push_str(&String::from_utf8_lossy(&o.stderr));
+            Ok(out)
         }
     }
 }
@@ -6769,6 +6867,25 @@ fn strip_action_blocks(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// 判据命令走本地旁路子进程：在终端当前目录下跑、拿得到退出码，不往终端里敲
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_check_runs_in_terminal_cwd_without_touching_terminal() {
+        let dir = std::env::temp_dir().join(format!("nx-oob-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker.txt"), "x").unwrap();
+        let Ok(out) = local_check("test -e marker.txt; echo __NX_CHECK_RC=$?", dir.to_str(), 10).await else {
+            panic!("本地旁路应当可用")
+        };
+        assert!(out.contains("__NX_CHECK_RC=0"), "{out}");
+        let Ok(out) = local_check("test -e nope.txt; echo __NX_CHECK_RC=$?", dir.to_str(), 10).await else {
+            panic!("本地旁路应当可用")
+        };
+        assert!(out.contains("__NX_CHECK_RC=1"), "{out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     use super::*;
 
     use super::super::host::HostPhase;
@@ -7028,8 +7145,8 @@ mod tests {
         use super::super::host::{Check, CheckResult};
         let (h, io) = super::super::host::driver::tests::shared();
         let checks = vec![
-            CheckResult { check: Check::FileExists { path: "/srv/dist".into() }, passed: true, detail: "存在".into() },
-            CheckResult { check: Check::Manual { text: "页面能打开".into() }, passed: false, detail: "待人工确认".into() },
+            CheckResult { check: Check::FileExists { path: "/srv/dist".into() }, passed: true, detail: "存在".into(), skipped: false },
+            CheckResult { check: Check::Manual { text: "页面能打开".into() }, passed: false, detail: "待人工确认".into(), skipped: false },
         ];
         let mut card = hosted_card("AI 说已经完成", Vec::new(), None);
         card.kind = super::super::host::CardKind::ManualCheck { summary: "部署完成".into(), checks: checks.clone() };

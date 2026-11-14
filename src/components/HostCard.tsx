@@ -18,8 +18,10 @@ import type {
   HostCardReply,
   HostNotice,
   HostReattachCandidate,
+  HostStartOpts,
   HostStatus,
 } from "../types";
+import DenyEditor from "./DenyEditor";
 
 export interface HostCardProps {
   status: HostStatus;
@@ -31,10 +33,13 @@ export interface HostCardProps {
   stopCtrlC?: boolean;
   /** 开着的 tab（待重新接驳时给候选排序用） */
   tabs?: AgentTarget[];
+  /** 完成后「基于此报告继续」：用新目标在同一个终端上起下一个托管，上一个目标与报告作开场上下文 */
+  onFollowUp?: (goal: string, prev: HostStartOpts["followUp"]) => Promise<void>;
 }
 
-export default function HostCard({ status, label, grant, stopCtrlC, tabs = [] }: HostCardProps) {
+export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], onFollowUp }: HostCardProps) {
   const [text, setText] = useState("");
+  const [nextGoal, setNextGoal] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const pill = hostPill(status.phase);
@@ -155,9 +160,42 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [] }:
               </ul>
             </details>
           )}
+          {onFollowUp && (
+            <div className="host-followup">
+              <textarea
+                className="st-goal"
+                rows={2}
+                value={nextGoal}
+                disabled={busy}
+                placeholder="基于这份报告接着做什么？例如：按方案执行 A 到 D 项，每项执行前后报告释放的空间"
+                onChange={(e) => setNextGoal(e.target.value)}
+              />
+              <button
+                className="st-btn primary"
+                disabled={busy || !nextGoal.trim()}
+                title="在同一个终端上开始下一个托管；上一个目标与这份完成报告会作为它的开场上下文"
+                onClick={() =>
+                  void act(async () => {
+                    if (status.phase.kind !== "completed") return;
+                    await onFollowUp(nextGoal.trim(), { goal: status.goal, summary: status.phase.summary });
+                    setNextGoal("");
+                  })
+                }
+              >
+                基于此报告继续
+              </button>
+            </div>
+          )}
         </div>
       )}
       {status.notice && <div className="st-status warn">{status.notice}</div>}
+      {live && !btn.reattach && (
+        <DenyEditor
+          value={status.deny ?? []}
+          disabled={busy}
+          onChange={(next) => void act(() => api.hostAmend(cid, undefined, undefined, next))}
+        />
+      )}
       {status.todo && status.todo.length > 0 && <TodoList items={status.todo} />}
 
       {btn.reattach && (

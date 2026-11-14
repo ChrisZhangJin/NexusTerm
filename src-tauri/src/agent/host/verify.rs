@@ -33,6 +33,9 @@ pub trait Prober {
     fn approve(&mut self, cmd: &str, reasons: &[String]) -> impl Future<Output = bool> + Send;
 }
 
+/// `Prober::run` 返回以它开头的错误 = 这条判据此刻没法核验（不是没过）：不阻塞完成。
+pub const UNVERIFIABLE: &str = "未核验：";
+
 /// YOLO 判据遇到非只读命令时的说法。
 pub const YOLO_REFUSE: &str = "该检查不是只读命令，YOLO 下不自动执行；请用 nx_exec 自行运行或让用户确认";
 const RULE_CONFIRMED: &str = "[已确认·经授权执行]";
@@ -103,7 +106,12 @@ pub fn parse_rc(out: &str) -> (Option<i32>, String) {
 }
 
 fn result(check: &Check, passed: bool, detail: impl Into<String>) -> CheckResult {
-    CheckResult { check: check.clone(), passed, detail: detail.into() }
+    CheckResult { check: check.clone(), passed, detail: detail.into(), skipped: false }
+}
+
+/// 执行通道报「此刻没法核验」：不算没过、不阻塞完成（报告里列为「·」）。
+fn unverifiable(check: &Check, why: &str) -> CheckResult {
+    CheckResult { check: check.clone(), passed: false, detail: why.to_string(), skipped: true }
 }
 
 async fn run_probe<P: Prober>(p: &mut P, cmd: &str, cap: Duration) -> Result<(bool, String), String> {
@@ -144,6 +152,7 @@ pub async fn verify<P: Prober>(
             Check::CommandOk { cmd } => command_check(c, cmd, policy, confirmed, cap, p).await,
             Check::FileExists { path } => match run_probe(p, &format!("test -e {}", shell_quote(path)), cap).await {
                 Ok((ok, ev)) => result(c, ok, if ok { "存在".to_string() } else { format!("不存在（{ev}）") }),
+                Err(e) if e.starts_with(UNVERIFIABLE) => unverifiable(c, &e),
                 Err(e) => result(c, false, format!("执行失败：{e}")),
             },
         };
@@ -184,6 +193,7 @@ async fn command_check<P: Prober>(
     }
     match run_probe(p, cmd, cap).await {
         Ok((ok, ev)) => r(ok, ev),
+        Err(e) if e.starts_with(UNVERIFIABLE) => unverifiable(c, &format!("{rule} {e}")),
         Err(e) => r(false, format!("执行失败：{e}")),
     }
 }
@@ -199,7 +209,7 @@ pub enum Verdict {
 pub fn verdict(results: &[CheckResult]) -> Verdict {
     let unmet: Vec<String> = results
         .iter()
-        .filter(|r| !r.check.is_manual() && !r.passed)
+        .filter(|r| !r.check.is_manual() && !r.skipped && !r.passed)
         .map(|r| format!("{} —— {}", r.check.describe(), r.detail))
         .collect();
     if !unmet.is_empty() {
@@ -219,6 +229,32 @@ pub fn evidence_text(results: &[CheckResult]) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    /// 终端前台不是 shell、又没有旁路：这条判据「没法核验」—— 不算没过、不阻塞完成
+    #[tokio::test]
+    async fn unverifiable_checks_do_not_block_completion() {
+        struct NoShell;
+        impl Prober for NoShell {
+            fn screen(&self) -> String {
+                "❯ ".into()
+            }
+            fn run(&mut self, _cmd: &str) -> impl std::future::Future<Output = Result<String, String>> + Send {
+                async { Err(format!("{UNVERIFIABLE}终端前台是 Claude Code，又没有旁路执行通道")) }
+            }
+            fn approve(&mut self, _cmd: &str, _r: &[String]) -> impl std::future::Future<Output = bool> + Send {
+                async { true }
+            }
+        }
+        let checks = vec![
+            Check::CommandOk { cmd: "git rev-parse --is-inside-work-tree".into() },
+            Check::FileExists { path: "/tmp/x".into() },
+        ];
+        let r = verify(&checks, &policy(), true, CAP, &mut NoShell).await;
+        assert!(r.iter().all(|x| x.skipped), "{r:?}");
+        assert!(r[0].detail.contains("Claude Code"));
+        assert_eq!(verdict(&r), Verdict::AllPassed);
+    }
+
     use super::super::super::policy::Authority;
     use super::*;
 

@@ -841,6 +841,8 @@ export interface HostCheckResult {
   check: HostCheck;
   passed: boolean;
   detail: string;
+  /** 没法核验（终端前台不是 shell、又没有旁路通道）：不阻塞完成 */
+  skipped?: boolean;
 }
 
 /** 卡片来源：ask = nx_ask_user / 无动作回复；approve = 写入审批；watchdog / manualCheck 留给 PR7 */
@@ -907,6 +909,8 @@ export interface HostStatus {
   notice?: string | null;
   /** 计划清单（nx_todo） */
   todo?: TodoItem[];
+  /** 契约当前的禁止项 */
+  deny: string[];
 }
 
 /** 前端给的 console 线索：后端据此存 ConsoleRef，重启后按它给候选 tab 排序 */
@@ -933,6 +937,12 @@ export interface HostBudgetGrant {
   maxOutputChars?: number;
 }
 
+/** 开始托管的附加选项：禁止项、基于上一个任务的完成报告继续 */
+export interface HostStartOpts {
+  deny?: string[];
+  followUp?: { goal: string; summary: string };
+}
+
 export interface HostStartRequest {
   consoleId: string;
   goal: string;
@@ -945,6 +955,10 @@ export interface HostStartRequest {
   yolo?: boolean;
   /** 重启后找回这个 console 用的线索 */
   consoleRef?: HostConsoleHint;
+  /** 契约禁止项（面板上编辑过的；后端总会补回 secret / permanent_grant） */
+  deny?: string[];
+  /** 基于上一个托管任务的完成报告继续：上一个目标与报告作为新任务的开场上下文 */
+  followUp?: { goal: string; summary: string };
 }
 
 /** `nx://host/{contractId}/notify`：通知档写入后的通知卡 */

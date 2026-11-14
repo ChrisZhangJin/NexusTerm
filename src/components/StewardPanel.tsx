@@ -20,10 +20,12 @@ import type {
   AgentMessage,
   AgentSecretRequest,
   AgentTarget,
+  HostStartOpts,
   HostStatus,
 } from "../types";
 import HostCard from "./HostCard";
-import { hostPill, isTerminal, needsReattach } from "../lib/host";
+import DenyEditor from "./DenyEditor";
+import { DEFAULT_DENY, addDeny, hostPill, isTerminal, needsReattach } from "../lib/host";
 import { pendingPrompts } from "../lib/agentRun";
 import {
   BUDGET_EXHAUSTED_BANNER,
@@ -69,6 +71,10 @@ import StewardContext from "./StewardContext";
  * AgentPanel 传进来的「运行桥」：同一份 `useAgentRun` 的只读视图 + 动作。
  * 本页不自己订阅任何 agent 事件，也不自己调 agent_approve / agent_secret_ack。
  */
+
+/** 开始托管表单上的禁止项偏好 */
+const LS_HOST_DENY = "nx.host.deny";
+
 export interface StewardRunBridge {
   /** 托管那一轮对应的托管任务（相位 / 卡片），没有为 null */
   host: HostStatus | null;
@@ -101,7 +107,8 @@ export interface StewardRunBridge {
     goal: string,
     budget?: StewardBudgetPref,
     tier?: string,
-    yolo?: boolean
+    yolo?: boolean,
+    opts?: HostStartOpts
   ) => Promise<void>;
   cancel: () => Promise<void>;
   pause: () => Promise<void>;
@@ -165,6 +172,20 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
   const [tier, setTier] = useState<StewardTier>("notify");
   /** YOLO：直接采用 AI 起草的完成判据、不经确认就开始。每次打开面板默认关 */
   const [yolo, setYolo] = useState(false);
+  /** 开始托管时的禁止项（记在本地，下次开始沿用；底线项总在） */
+  const [deny, setDenyState] = useState<string[]>(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem(LS_HOST_DENY) ?? "null");
+      if (Array.isArray(v)) return v.reduce<string[]>((acc, t) => (typeof t === "string" ? addDeny(acc, t) : acc), addDeny([], ""));
+    } catch {
+      /* 坏数据按默认 */
+    }
+    return [...DEFAULT_DENY];
+  });
+  const setDeny = (next: string[]) => {
+    setDenyState(next);
+    localStorage.setItem(LS_HOST_DENY, JSON.stringify(next));
+  };
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   /** 本轮托管的长度偏好（最长时长 / 最多步数），记在本机 */
@@ -340,7 +361,7 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
     if (!selected || !goal.trim() || busy || run.active || run.otherBusy || !run.ready) return;
     setBusy(true);
     try {
-      await run.start(selected, goal.trim(), budgetPref, tier, yolo);
+      await run.start(selected, goal.trim(), budgetPref, tier, yolo, { deny });
       await refresh();
     } finally {
       setBusy(false);
@@ -609,6 +630,7 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
             </>
           )}
         </div>
+        {!run.active && <DenyEditor value={deny} onChange={setDeny} disabled={busy} />}
         {runHere && run.active && run.paused && isBudgetPause(run.pauseKind) && (
           <div className="st-budget-banner" role="alert">
             <span>{BUDGET_EXHAUSTED_BANNER}</span>
@@ -645,6 +667,12 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
           label={label(selectedHost.consoleId)}
           grant={{ maxSteps: budgetPref.maxSteps, maxMinutes: budgetPref.maxMinutes }}
           stopCtrlC={run.stopCtrlC}
+          onFollowUp={
+            run.otherBusy || !run.ready
+              ? undefined
+              : (nextGoal: string, prev: HostStartOpts["followUp"]) =>
+                  run.start(selectedHost.consoleId, nextGoal, budgetPref, tier, yolo, { deny, followUp: prev })
+          }
         />
       )}
 
