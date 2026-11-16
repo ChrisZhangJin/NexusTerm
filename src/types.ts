@@ -563,8 +563,9 @@ export type AgentRunMode = "ask" | "act";
  *  "confirmed" 是活体确认过「真的没有前台进程了」，"silence" 是静默兜底（问不出确定答案）。 */
 export interface AgentExecResult {
   output: string;
-  /** "awaiting_input"：命令没结束，终端停在一个等待输入的交互提示上（见 `promptKind`） */
-  reason: "confirmed" | "silence" | "timeout" | "awaiting_input" | "cancelled";
+  /** "awaiting_input"：命令没结束，终端停在一个等待输入的交互提示上（见 `promptKind`）；
+   *  "handover"：终端交给了另一个程序（docker exec / ssh 的新 shell、tmux / vim 等全屏程序） */
+  reason: "confirmed" | "silence" | "timeout" | "awaiting_input" | "handover" | "cancelled";
   /** 收尾时终端停在什么上；取消时没有 */
   promptKind?: AgentPromptKind;
 }

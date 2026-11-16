@@ -1934,6 +1934,7 @@ fn feedback_for(command: &str, label: &str, outcome: &ExecOutcome) -> String {
         ExecEnd::Silence => s.push_str("状态：长时间没有新输出，按执行完毕处理（未能确认是否真的结束）\n"),
         ExecEnd::Timeout => s.push_str("状态：等待超时，命令可能仍在运行\n"),
         ExecEnd::AwaitingInput => s.push_str(AWAITING_INPUT_STATUS),
+        ExecEnd::Handover => s.push_str(HANDOVER_STATUS),
         ExecEnd::Cancelled => return format!("{s}结果：已被用户取消，不要重试这条命令。\n"),
     }
     // 首尾都留：开头的报错与结尾的最终结果都要让模型看到
@@ -1945,6 +1946,10 @@ fn feedback_for(command: &str, label: &str, outcome: &ExecOutcome) -> String {
 /// `ExecEnd::AwaitingInput` 的状态行：必须说清「命令没结束」，免得模型当成跑完了。
 const AWAITING_INPUT_STATUS: &str =
     "状态：命令**还没有结束**——终端停在一个等待输入的交互提示上（详见下方 prompt_kind / 提示）\n";
+
+/// `ExecEnd::Handover` 的状态行：终端已经交给了别的程序，原来的提示符不会回来了。
+const HANDOVER_STATUS: &str = "状态：命令把终端交给了另一个程序（新的 shell 提示符，如 docker exec / ssh / su；\
+    或全屏程序，如 tmux / vim），原来的提示符不会再回来 —— 现在就在那个程序里，先 nx_screen 读屏确认现场再继续\n";
 
 /// 把终端分类（`prompt_kind` / `confidence` / `提示`）附到反馈末尾。没有分类就什么都不加。
 fn push_guess(s: &mut String, guess: Option<&PromptGuess>) {
@@ -2667,6 +2672,7 @@ fn feedback_for_open_command(outcome: &ExecOutcome) -> String {
         ExecEnd::Silence => "长时间没有新输出，按执行完毕处理（未能确认是否真的结束）".into(),
         ExecEnd::Timeout => "等待超时，命令可能仍在运行".into(),
         ExecEnd::AwaitingInput => "命令还没有结束——终端停在一个等待输入的交互提示上".into(),
+        ExecEnd::Handover => "终端交给了另一个程序（新 shell / 全屏程序），原来的提示符不会再回来".into(),
         ExecEnd::Cancelled => return "该命令已被用户取消。\n".into(),
     };
     let mut s = format!(
@@ -5890,6 +5896,9 @@ const HOSTED_ADDENDUM: &str = "\n\n## 托管运行\n\
     - **尽量自己拿主意。** 用户把终端托管给你，就是不想被频繁打扰：可恢复的选择（用哪个参数、\
       交互脚本里选哪一项、出错后换什么做法）自己判断后直接做。不可逆 / 破坏性的写入不用你操心 —— \
       代码闸门会自动停下来请用户批准。\n\
+    - 用户让你启动的程序弹出的**常规首次确认**（信任这个目录、接受使用条款、选主题 / 语言、\
+      「首次运行要不要导入设置」），与目标一致就自己选，不要问用户 —— 用户让你在这个目录启动它，就是信任它。\
+      但「不再询问 / 永久允许」类的选项仍然不能选。\n\
     - 确实要问时调用 `nx_ask_user`。**带了 `recommendation` 的问题，在非「确认」档下会直接按你的推荐继续**\
       （用户事后能在记录里看到）；只有用户本人才能回答的（账号、密码、该部署到哪个生产环境、放开契约禁止项）\
       不要给 recommendation，任务会挂起等他回来。\n\

@@ -64,6 +64,9 @@ const INPUT_QUIET_MS: u64 = 1_000;
 pub const AWAIT_INPUT_MIN_CONFIDENCE: f32 = 0.8;
 /// 取多少字节的缓冲尾部给分类器。提示一定在最尾巴，不用多读。
 pub const CLASSIFY_TAIL_BYTES: usize = 2000;
+/// 输出安静多久之后，才去判断「终端交给了另一个程序」（新 shell / 全屏程序），见 [`ExecEnd::Handover`]。
+/// 比 [`INPUT_QUIET_MS`] 长：`docker exec` / `ssh` 登录时的 motd、tmux 重绘都是一阵一阵来的。
+const HANDOVER_QUIET_MS: u64 = 2_000;
 /// 判定「同源提示符」所需的公共前缀 / 后缀长度，见 [`same_prompt`]。
 const PROMPT_AFFIX_MATCH: usize = 8;
 
@@ -92,6 +95,10 @@ pub enum ExecEnd {
     /// 命令并没有结束——提前返回，让模型去应答而不是干等
     #[serde(rename = "awaiting_input")]
     AwaitingInput,
+    /// 提示符没回来，但终端安静下来后已经交给了**另一个程序**：一个新的 shell 提示符（`docker exec -it`、
+    /// `su`、`ssh`、`sudo -i`）或全屏程序（`tmux attach`、`vim`、`htop`）。命令本身没结束，
+    /// 只是不会再「回来」了 —— 提前返回，让模型读屏接着在新的程序里干活，而不是干等到总超时
+    Handover,
     /// 等待期间被取消
     Cancelled,
 }
@@ -102,6 +109,8 @@ pub struct WaitConfig {
     pub silence_ms: u64,
     /// 判「停在交互提示上」要求的安静时长（见 [`INPUT_QUIET_MS`]）。
     pub input_quiet_ms: u64,
+    /// 判「终端交给了另一个程序」要求的安静时长（见 [`HANDOVER_QUIET_MS`]）。
+    pub handover_quiet_ms: u64,
     pub max_wait_ms: u64,
     pub poll_ms: u64,
 }
@@ -111,6 +120,7 @@ impl Default for WaitConfig {
         Self {
             silence_ms: SILENCE_MS,
             input_quiet_ms: INPUT_QUIET_MS,
+            handover_quiet_ms: HANDOVER_QUIET_MS,
             max_wait_ms: MAX_WAIT_MS,
             poll_ms: POLL_MS,
         }
@@ -218,6 +228,8 @@ where
     let mut last_change = Instant::now();
     // 已经对「进度 = N」那一刻的尾部分类过了：输出没动，结果不会变，别每个轮询周期都再解码一遍缓冲
     let mut classified_at: Option<u64> = None;
+    let mut handover_at: Option<u64> = None;
+    let handover_quiet = Duration::from_millis(cfg.handover_quiet_ms.max(cfg.input_quiet_ms).max(cfg.silence_ms));
 
     loop {
         if cancelled() {
@@ -255,6 +267,17 @@ where
                             return finish(&mut output, &mut tail, ExecEnd::AwaitingInput, Some(g));
                         }
                     }
+                    // 再安静一会儿还是没回来：读屏看终端是不是交给了别的程序（新 shell / 全屏程序）
+                    if quiet_for >= handover_quiet && handover_at != Some(last) {
+                        handover_at = Some(last);
+                        let t: Tail = tail().into();
+                        let alt = t.alt;
+                        let g = classify_tail(t);
+                        let new_shell = g.kind == PromptKind::ShellPrompt && g.confidence >= AWAIT_INPUT_MIN_CONFIDENCE;
+                        if alt || new_shell {
+                            return finish(&mut output, &mut tail, ExecEnd::Handover, Some(g));
+                        }
+                    }
                 }
             }
         }
@@ -279,7 +302,61 @@ mod tests {
     const PROMPT: &str = "(base) chris@CHS-PowerEdge-R720:~$ ";
 
     fn cfg(silence_ms: u64, max_wait_ms: u64, poll_ms: u64) -> WaitConfig {
-        WaitConfig { silence_ms, input_quiet_ms: 1_000, max_wait_ms, poll_ms }
+        WaitConfig { silence_ms, input_quiet_ms: 1_000, handover_quiet_ms: 2_000, max_wait_ms, poll_ms }
+    }
+
+    /// 回归（截图：`docker exec -it … bash`）：命令换了一个新 shell，原提示符永远不会回来 ——
+    /// 读屏认出新的 shell 提示符就收尾，而不是干等到 120 秒总超时。
+    #[tokio::test(start_paused = true)]
+    async fn new_shell_prompt_hands_over_instead_of_timing_out() {
+        let started = Instant::now();
+        let inner = "root@ubuntu-22at159:~/workspace/Sonari# ";
+        let out = wait_for_end(
+            cfg(300, 120_000, 50),
+            Some("(base) chris@ubuntu-22at159:~/workspace$ "),
+            || 0,
+            || inner.to_string(),
+            || inner.to_string(),
+            || String::new(),
+            || false,
+        )
+        .await;
+        assert_eq!(out.reason, ExecEnd::Handover);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    /// 回归（截图：`tmux attach -t cnn` 等了 50 秒还在等）：全屏程序接管了终端，同样提前收尾。
+    #[tokio::test(start_paused = true)]
+    async fn full_screen_program_hands_over_instead_of_timing_out() {
+        let started = Instant::now();
+        let out = wait_for_end(
+            cfg(300, 120_000, 50),
+            Some("(base) chris@ubuntu-22at159:~/workspace$ "),
+            || 0,
+            || "[cnn] 0:bash- 1:sonari*      \"ubuntu-22at159\" 23:12 16-Nov-26".to_string(),
+            || Tail { text: "(base) chris@ubuntu-22at159:~/wo\n[cnn] 0:bash- 1:sonari*".into(), alt: true },
+            || String::new(),
+            || false,
+        )
+        .await;
+        assert_eq!(out.reason, ExecEnd::Handover);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// 还在跑的命令（安静了一会儿，但末行不是提示符、也不是全屏）：照旧等，不误判成交接。
+    #[tokio::test(start_paused = true)]
+    async fn quiet_running_command_is_not_a_handover() {
+        let out = wait_for_end(
+            cfg(300, 10_000, 50),
+            Some("(base) chris@ubuntu-22at159:~/workspace$ "),
+            || 0,
+            || "   Compiling serde v1.0.200".to_string(),
+            || "   Compiling serde v1.0.200".to_string(),
+            || String::new(),
+            || false,
+        )
+        .await;
+        assert_eq!(out.reason, ExecEnd::Timeout);
     }
 
     #[tokio::test(start_paused = true)]
@@ -502,8 +579,8 @@ mod tests {
         assert!(out.prompt.is_some());
     }
 
-    /// 另一个 shell 提示符（嵌套 ssh / su 之后）不是「在等输入」——它不需要应答，也不是 REPL。
-    /// 保持原来的行为（等总超时），不要误报。
+    /// 另一个 shell 提示符（嵌套 ssh / su 之后）不是「在等输入」——它不需要应答，也不是 REPL；
+    /// 但原提示符也不会回来了：按「交给了另一个程序」收尾（以前是干等到总超时）。
     #[tokio::test(start_paused = true)]
     async fn a_foreign_shell_prompt_is_not_awaiting_input() {
         let out = wait_for_end(
@@ -516,8 +593,13 @@ mod tests {
             || false,
         )
         .await;
-        assert_eq!(out.reason, ExecEnd::Timeout);
+        assert_eq!(out.reason, ExecEnd::Handover);
         assert_eq!(out.prompt.map(|g| g.kind), Some(PromptKind::ShellPrompt));
+        assert!(!is_awaiting_input(&classify_tail_for_test("root@other-box:/opt# ")));
+    }
+
+    fn classify_tail_for_test(t: &str) -> PromptGuess {
+        crate::agent::prompt::classify(t, false)
     }
 
     #[tokio::test(start_paused = true)]

@@ -384,6 +384,8 @@ fn detect_program(lower: &str, alt: bool, guess: PromptKind) -> Program {
         || lower.contains("bypass permissions on")
         || lower.contains("tell claude what to do")
         || lower.contains("do you trust the files")
+        || lower.contains("trust this folder")
+        || lower.contains("claude code'll be able to")
         || lower.contains("do you want to make this edit")
         || lower.contains("⏵⏵")
         || lower.contains("tokens") && lower.contains("⎿")
@@ -594,6 +596,9 @@ fn arrow_cue(lower: &str) -> bool {
         || lower.contains("arrow keys to")
         || lower.contains("↑/↓")
         || lower.contains("↑↓")
+        // Claude Code 新版对话框（信任目录等）：无编号选项 + 页脚「Enter to confirm · Esc to cancel」。
+        // 带编号的选择器也有这个页脚，但它们的光标行是 `❯ 1. …`，下面 `option_like` 会排除
+        || lower.contains("enter to confirm")
 }
 
 /// inquirer 一类方向键菜单：`? Pick one: (Use arrow keys)` 下面一列**不带编号**的选项，
@@ -629,12 +634,22 @@ fn parse_arrow_menu_at(raw: &[String]) -> Option<(Vec<Choice>, usize)> {
             && !is_footer_line(&lt)
             && t.chars().count() <= 120
     };
+    // 同一列选项与光标项的文字对齐（`❯ No, exit` / `  Yes, …`）：缩进对不上的是上面的说明段落
+    // （缓冲里没有空行可当分隔，Claude Code 的信任框正文就紧挨着选项）
+    let col = |l: &str| l.chars().take_while(|c| c.is_whitespace() || *c == '│' || *c == '┃').count();
+    let text_col = {
+        let l = &window[cursor_at];
+        let lead = col(l);
+        let after: String = l.chars().skip(lead + 1).collect();
+        lead + 1 + after.chars().take_while(|c| c.is_whitespace()).count()
+    };
+    let aligned = |l: &str| l.starts_with(char::is_whitespace) && col(l).abs_diff(text_col) <= 1;
     let mut lo = cursor_at;
-    while lo > 0 && is_item(&window[lo - 1]) && window[lo - 1].starts_with(char::is_whitespace) {
+    while lo > 0 && is_item(&window[lo - 1]) && aligned(&window[lo - 1]) {
         lo -= 1;
     }
     let mut hi = cursor_at;
-    while hi + 1 < window.len() && is_item(&window[hi + 1]) && window[hi + 1].starts_with(char::is_whitespace) {
+    while hi + 1 < window.len() && is_item(&window[hi + 1]) && aligned(&window[hi + 1]) {
         hi += 1;
     }
     let opts: Vec<Choice> = window[lo..=hi]
@@ -910,6 +925,8 @@ fn rule(
         && (yes_no_options
             || (!cc_chatting
                 && (recent.contains("do you want to proceed")
+                    || recent.contains("trust this folder")
+                    || recent.contains("do you trust the files")
                     || recent.contains("don't ask again")
                     || recent.contains("don’t ask again")
                     || recent.contains("yes, and ")
@@ -1403,6 +1420,29 @@ pub(crate) mod frames {
     pub const CC_BASH_PERM: [&str; 12] = ["╭──────────────────────────────────────────────────────╮", "│ Bash command                                          │", "│                                                       │", "│   rm -rf build                                        │", "│   Remove build directory                              │", "│                                                       │", "│ Do you want to proceed?                               │", "│ ❯ 1. Yes                                              │", "│   2. Yes, and don't ask again for rm commands in /x   │", "│   3. No, and tell Claude what to do differently (esc) │", "│                                                       │", "╰──────────────────────────────────────────────────────╯"];
     pub const CC_EDIT_PERM: [&str; 10] = ["Edit file", "╭─────╮", "│ foo.py │", "│ - a │", "│ + b │", "╰─────╯", "Do you want to make this edit to foo.py?", "❯ 1. Yes", "  2. Yes, allow all edits during this session (shift+tab)", "  3. No, and tell Claude what to do differently (esc)"];
     pub const CC_CREATE_PERM: [&str; 8] = ["Create file", "╭─────╮", "│ new.py │", "╰─────╯", "Do you want to create new.py?", "❯ 1. Yes", "  2. Yes, allow all edits during this session (shift+tab)", "  3. No, and tell Claude what to do differently (esc)"];
+    /// Claude Code 新版的信任目录对话框：选项不带编号，只能方向键 + 回车（截图：`claude --dangerously-skip-permissions`）
+    pub const CC_TRUST_V2: &[&str] = &[
+        "root@ubuntu-22at159:~/workspace/Sonari# pwd; ls; claude --dangerously-skip-permissions",
+        "/root/workspace/Sonari",
+        "Cargo.lock  Cargo.toml  README.md  engine  src-tauri  test  ui",
+        "",
+        "──────────────────────────────────────────────────────────",
+        " Accessing workspace:",
+        "",
+        " /root/workspace/Sonari",
+        "",
+        " Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source",
+        " project, or work from your team). If not, take a moment to review what's in this folder first.",
+        "",
+        " Claude Code'll be able to read, edit, and execute files here.",
+        "",
+        " Security guide",
+        "",
+        " ❯ No, exit",
+        "   Yes, I trust this folder",
+        "",
+        " Enter to confirm · Esc to cancel",
+    ];
     pub const CC_TRUST: [&str; 8] = ["Do you trust the files in this folder?", "", "/root/proj", "", "❯ 1. Yes, proceed", "  2. No, exit", "", "Enter to confirm · Esc to exit"];
     pub const CC_REPLY_YN_WORKING: &[&str] = &["● Options:", "  1. Yes - do it", "  2. No - skip it", "", "✻ Pondering… (12s · esc to interrupt)", "────────────────────────────────────────", "> ", "────────────────────────────────────────", "  ? for shortcuts"];
     pub const CC_REPLY_YN_IDLE: &[&str] = &["● Options:", "  1. Yes - do it", "  2. No - skip it", "", "────────────────────────────────────────", "> ", "────────────────────────────────────────", "  ? for shortcuts"];
@@ -1493,6 +1533,18 @@ mod tests {
         assert_eq!(x.topic.as_deref(), Some("settings:remember-check"));
         assert_eq!(x.options.len(), 2);
         assert!(x.confidence >= 0.8);
+    }
+
+    #[test]
+    fn claude_code_trust_dialog_v2_is_an_arrow_permission_with_options() {
+        let x = frames::classify_lines(frames::CC_TRUST_V2);
+        assert_eq!(x.kind, SituationKind::Permission, "{x:?}");
+        assert_eq!(x.program, Program::ClaudeCode);
+        let texts: Vec<&str> = x.options.iter().map(|o| o.text.as_str()).collect();
+        assert_eq!(texts, ["No, exit", "Yes, I trust this folder"], "{x:?}");
+        assert!(x.options.iter().all(|o| !o.grants_permanent), "信任目录不是「永久授权」");
+        assert!(x.evidence.iter().any(|e| e == SUBMIT_ARROW), "{:?}", x.evidence);
+        assert!(x.evidence.iter().any(|e| e == &format!("{MENU_CURSOR}0")), "{:?}", x.evidence);
     }
 
     #[test]

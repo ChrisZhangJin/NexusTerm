@@ -507,6 +507,19 @@ mod tests {
         assert!(matches!(authorize(&p, &keys("<Bogus>"), None), Gate::Deny(t) if t.contains("按键串解析失败")));
     }
 
+    /// 截图回归：`claude --dangerously-skip-permissions` 之后的信任目录框，选「Yes, I trust this folder」
+    /// 不是不可逆操作，通知 / 自动档不停下来问人
+    #[test]
+    fn claude_code_trust_dialog_is_not_parked() {
+        let s = super::super::super::situation::frames::classify_lines(super::super::super::situation::frames::CC_TRUST_V2);
+        for tier in ["auto", "notify"] {
+            for k in ["<Down><Enter>", "<Down>", "<Enter>"] {
+                let g = authorize(&policy(tier), &keys(k), Some(&s));
+                assert!(matches!(g, Gate::Allow | Gate::Notify), "{tier} {k}: {g:?}");
+            }
+        }
+    }
+
     #[test]
     fn keys_under_notify_tier_still_notify() {
         let mut shell = sit(SituationKind::Idle, "user@h:~$ ", vec![]);
