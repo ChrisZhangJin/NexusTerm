@@ -5,13 +5,13 @@
  * 卡片**永远等下去**：没有倒计时、没有默认动作（设计 §2 已定）。AgentPanel 与 StewardPanel 共用。
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, onHostNotify } from "../api";
 import { DiffView } from "./DiffView";
 import { needsIncompleteBanner } from "../lib/diff";
 import { TodoList } from "./TodoList";
 import { toFriendlyError } from "../lib/errors";
-import { checkLines, formatReport, checksToText, hostButtons, hostDetail, hostPill, isTerminal, pendingCard, textToChecks } from "../lib/host";
+import { checkLines, criteriaSummary, formatReport, checksToText, hostButtons, hostDetail, hostPill, isTerminal, pendingCard, textToChecks } from "../lib/host";
 import type {
   AgentTarget,
   HostBudgetGrant,
@@ -69,8 +69,13 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], o
   // 判据草稿：一行一条，可改；换了一张卡就重置
   const draft = card?.kind.kind === "criteriaDraft" ? card.kind.draft : null;
   const [criteria, setCriteria] = useState("");
+  const [criteriaBig, setCriteriaBig] = useState(false);
+  const criteriaRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (draft) setCriteria(checksToText(draft));
+    if (!draft) return;
+    setCriteria(checksToText(draft));
+    // 这张卡挡着托管开始：一出现就滚到眼前
+    criteriaRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [card?.id]);
   // 改目标（host_amend）
@@ -286,19 +291,54 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], o
       ))}
 
       {card && draft && (
-        <div className="st-esc host-ask">
-          <div className="st-esc-head">确认完成判据</div>
-          <div className="st-esc-why">
-            AI 按目标起草了下面的判据，一行一条（前缀：命令 / 文件 / 屏幕 / 人工）。改好后点「接受」，托管才开始。接受后，「命令」类判据会在完成时按授权档位执行（危险的先问你）。
+        <div className="host-criteria" ref={criteriaRef}>
+          <div className="host-criteria-head">
+            <span className="host-criteria-step">第 1 步</span>
+            <span className="host-criteria-title">确认完成判据</span>
+            <span className="host-criteria-wait">托管还没开始，等你接受</span>
           </div>
-          <textarea className="st-goal" rows={Math.max(3, criteria.split("\n").length)} value={criteria} disabled={busy} onChange={(e) => setCriteria(e.target.value)} />
-          <div className="st-form-row st-center">
+          <div className="host-criteria-why">
+            AI 按目标起草了下面的判据，用来判断「做完了没有」。一行一条，可直接改；接受后托管才开始。
+          </div>
+          <div className="host-criteria-legend">
+            {criteriaSummary(criteria).map((x) => (
+              <span key={x.label} className={`host-criteria-kind${x.blocking ? "" : " soft"}`}>
+                {x.label} {x.n}
+              </span>
+            ))}
+            <span className="host-criteria-hint" title="命令：在终端当前目录另开 shell 执行，退出码 0 算通过（按授权档位，危险的先问你）&#10;文件：路径存在算通过&#10;屏幕：正则命中终端屏幕算通过&#10;人工：只列进报告，不挡完成">
+              前缀：命令 / 文件 / 屏幕 / 人工（人工项不挡完成）ⓘ
+            </span>
+          </div>
+          <textarea
+            className={`host-criteria-text${criteriaBig ? " big" : ""}`}
+            rows={Math.min(16, Math.max(6, criteria.split("\n").length + 1))}
+            spellCheck={false}
+            value={criteria}
+            disabled={busy}
+            onChange={(e) => setCriteria(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !busy) {
+                e.preventDefault();
+                void act(() => api.hostConfirmCriteria(cid, card.id, textToChecks(criteria)));
+              }
+            }}
+          />
+          <div className="host-criteria-actions">
+            <button className="st-btn" disabled={busy} onClick={() => setCriteriaBig((b) => !b)}>
+              {criteriaBig ? "收起" : "放大编辑"}
+            </button>
+            <button className="st-btn" disabled={busy || criteria === checksToText(draft)} onClick={() => setCriteria(checksToText(draft))}>
+              恢复草稿
+            </button>
+            <span className="host-criteria-spacer" />
+            <span className="host-criteria-kbd">Ctrl+Enter</span>
             <button
-              className="st-btn primary"
+              className="st-btn primary host-criteria-go"
               disabled={busy}
               onClick={() => void act(() => api.hostConfirmCriteria(cid, card.id, textToChecks(criteria)))}
             >
-              接受
+              接受并开始托管
             </button>
           </div>
         </div>

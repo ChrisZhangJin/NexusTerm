@@ -465,7 +465,7 @@ fn parse_options(lines: &[&str]) -> Vec<Choice> {
 }
 
 /// 选项原文里的永久扩权特征（「don't ask again」「allow all … this session」…）。
-fn grants_permanent_text(l: &str) -> bool {
+pub(crate) fn grants_permanent_text(l: &str) -> bool {
     l.contains("don't ask")
         || l.contains("don’t ask")
         || l.contains("allow all")

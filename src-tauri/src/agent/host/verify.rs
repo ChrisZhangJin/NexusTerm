@@ -4,8 +4,9 @@
 //! - CommandOk：按判据是否经用户确认分两条规则（结果的 detail 前缀写明用的哪条）：
 //!   - 用户确认过（草稿卡上接受 / 编辑）：和普通托管写入一样过 `gate::authorize` —— deny / 硬偏好 /
 //!     危险 → Approve（挂起等批准）/ 档位全都生效，放行就执行（`cargo test` 这类通常 Allow / Notify）；
-//!   - 没确认过（YOLO）：只允许「看起来只读」的命令（`danger::assess` 不危险、无重定向、首词非写入类），
-//!     否则判不通过 —— 没人点过头的判据不能成为绕过闸门的写入口；
+//!   - 没确认过（默认：直接采用草稿）：同一道闸，但 deny 之外**一律不问人** —— 闸门要批准的、或
+//!     `danger::assess` 判危险的，记成「未核验」（skipped，不阻塞完成）；其余照跑（`cargo test` 等）。
+//!     模型本来就能用 nx_exec 跑同一条命令，所以这不是绕过闸门的写入口；
 //! - FileExists：`test -e <path>`，同一条执行通道；
 //! - Manual：只能人确认。
 //!
@@ -37,7 +38,7 @@ pub trait Prober {
 pub const UNVERIFIABLE: &str = "未核验：";
 
 /// YOLO 判据遇到非只读命令时的说法。
-pub const YOLO_REFUSE: &str = "该检查不是只读命令，YOLO 下不自动执行；请用 nx_exec 自行运行或让用户确认";
+pub const YOLO_REFUSE: &str = "这条检查有风险，判据未经确认时不执行、也不为核验打扰用户（不阻塞完成）";
 const RULE_CONFIRMED: &str = "[已确认·经授权执行]";
 const RULE_YOLO: &str = "[未确认·只读规则]";
 
@@ -184,11 +185,11 @@ async fn command_check<P: Prober>(
             }
         }
     } else {
-        if let Err(why) = read_only_reason(cmd) {
-            return r(false, format!("{YOLO_REFUSE}（{why}）"));
-        }
-        if matches!(gate, Gate::Approve(_)) {
-            return r(false, format!("{YOLO_REFUSE}（需要批准）"));
+        // 未经确认的判据：与模型自己 nx_exec 同一道闸（它本来就能跑这条命令），放行的照跑；
+        // 要批准的不为核验去打扰人，记成「未核验」，不阻塞完成（报告里照列）
+        // 危险（哪怕可恢复）的检查也不在核验时顺手执行
+        if matches!(gate, Gate::Approve(_)) || danger::assess(cmd).dangerous {
+            return unverifiable(c, &format!("{rule} {UNVERIFIABLE}{YOLO_REFUSE}"));
         }
     }
     match run_probe(p, cmd, cap).await {
@@ -312,10 +313,10 @@ pub(crate) mod tests {
             Check::CommandOk { cmd: "cargo test".into() },
             Check::ScreenMatches { re: r"test result: ok".into() },
         ];
-        // cargo test 不在只读清单里：先确认它会被拒（不是跑了失败）
+        // 未确认的判据也照常过闸执行：cargo test 跑了、失败了
         let r = verify(&checks, &policy(), false, CAP, &mut p).await;
-        assert!(!r[0].passed && r[0].detail.contains("cargo"));
-        assert!(p.ran.is_empty(), "写入类命令一条都没跑");
+        assert!(!r[0].passed && !r[0].skipped && r[0].detail.contains("FAILED"), "{:?}", r[0]);
+        assert_eq!(p.ran.len(), 1);
         match verdict(&r) {
             Verdict::Unmet(v) => assert!(v.len() == 2 && v[1].contains("屏幕尾部")),
             v => panic!("{v:?}"),
@@ -339,7 +340,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn dangerous_or_writing_command_ok_is_refused() {
         let mut p = prober("", vec![]);
-        for cmd in ["rm -rf /tmp/x && true", "echo ok > /etc/flag", "git push", "sudo test -e /root"] {
+        for cmd in ["rm -rf /tmp/x && true", "echo ok > /etc/flag", "sudo test -e /root"] {
             let r = verify(&[Check::CommandOk { cmd: cmd.into() }], &policy(), false, CAP, &mut p).await;
             assert!(!r[0].passed, "{cmd} 应被拒");
         }
@@ -384,19 +385,24 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn yolo_refuses_the_same_command() {
+    async fn unconfirmed_checks_run_through_the_gate_but_never_ask() {
         let mut p = prober("", vec![("cargo test", "__NX_CHECK_RC=0")]);
         let r = verify(&[Check::CommandOk { cmd: "cargo test".into() }], &policy(), false, CAP, &mut p).await;
-        assert!(!r[0].passed);
+        assert!(r[0].passed && r[0].detail.starts_with(RULE_YOLO), "{:?}", r[0]);
+        // 要批准的（不可逆）：不跑、不问人，记「未核验」，不阻塞完成
+        let mut p = prober("", vec![]);
+        let r = verify(&[Check::CommandOk { cmd: "sudo reboot --dry-run".into() }], &policy(), false, CAP, &mut p).await;
+        assert!(!r[0].passed && r[0].skipped, "{:?}", r[0]);
+        assert_eq!(verdict(&r), Verdict::AllPassed);
         assert!(r[0].detail.starts_with(RULE_YOLO) && r[0].detail.contains(YOLO_REFUSE), "{}", r[0].detail);
         assert!(p.ran.is_empty() && p.asked.is_empty());
     }
 
     #[tokio::test]
     async fn confirmed_dangerous_check_parks_for_approval() {
-        let cmd = "sudo systemctl is-active nginx";
-        assert!(danger::assess(cmd).dangerous, "前提：sudo 被判危险");
-        let mut p = prober("", vec![("sudo systemctl", "active\n__NX_CHECK_RC=0")]);
+        let cmd = "sudo reboot --dry-run";
+        assert!(danger::assess(cmd).critical, "前提：reboot 被判不可逆");
+        let mut p = prober("", vec![("sudo reboot", "active\n__NX_CHECK_RC=0")]);
         let checks = vec![Check::CommandOk { cmd: cmd.into() }];
         let r = verify(&checks, &policy(), true, CAP, &mut p).await;
         assert_eq!(p.asked.len(), 1, "危险 → Approve → 挂起问人");

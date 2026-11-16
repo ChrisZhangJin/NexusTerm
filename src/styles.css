@@ -2435,6 +2435,45 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .host-question { white-space: pre-wrap; word-break: break-word; margin-bottom: 6px; }
 .host-yolo.on { color: var(--danger); font-weight: 600; }
 .host-notice .st-esc-head { color: var(--accent); }
+/* 确认完成判据：挡着托管开始的那一步 —— 醒目、编辑区大 */
+.host-criteria {
+  margin: 8px 0; padding: 10px 12px 12px; border-radius: var(--radius);
+  border: 1px solid color-mix(in srgb, #e5c07b 70%, transparent);
+  border-left: 4px solid #e5c07b;
+  background: color-mix(in srgb, #e5c07b 11%, var(--bg-panel));
+  animation: host-criteria-glow 1.6s ease-in-out 3;
+}
+@keyframes host-criteria-glow {
+  0%, 100% { box-shadow: 0 0 0 0 transparent; }
+  50% { box-shadow: 0 0 0 3px color-mix(in srgb, #e5c07b 35%, transparent); }
+}
+.host-criteria-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+.host-criteria-step {
+  padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 700;
+  color: #1e1e1e; background: #e5c07b;
+}
+.host-criteria-title { font-size: 14px; font-weight: 700; color: #e5c07b; }
+.host-criteria-wait { margin-left: auto; font-size: 11px; color: #e5c07b; opacity: 0.85; }
+.host-criteria-why { color: var(--text); font-size: 12px; margin-bottom: 6px; word-break: break-word; }
+.host-criteria-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 11px; }
+.host-criteria-kind {
+  padding: 0 7px; border-radius: 999px; border: 1px solid color-mix(in srgb, #e5c07b 60%, transparent); color: #e5c07b;
+}
+.host-criteria-kind.soft { border-color: var(--border); color: var(--text-dim); }
+.host-criteria-hint { color: var(--text-dim); cursor: help; }
+.host-criteria-text {
+  width: 100%; box-sizing: border-box; min-height: 150px; resize: vertical;
+  padding: 8px 10px; border-radius: 6px; outline: none;
+  border: 1px solid color-mix(in srgb, #e5c07b 50%, var(--border)); background: var(--bg);
+  color: var(--text); font-family: var(--font-mono, ui-monospace, Menlo, Consolas, monospace);
+  font-size: 12.5px; line-height: 1.6;
+}
+.host-criteria-text:focus { border-color: #e5c07b; box-shadow: 0 0 0 2px color-mix(in srgb, #e5c07b 25%, transparent); }
+.host-criteria-text.big { min-height: 55vh; }
+.host-criteria-actions { display: flex; align-items: center; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.host-criteria-spacer { flex: 1; }
+.host-criteria-kbd { font-size: 10.5px; color: var(--text-dim); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; }
+.host-criteria-go { font-size: 13px; padding: 5px 16px; font-weight: 600; }
 /* 契约禁止项编辑器（开始托管表单 / 托管卡） */
 .deny-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0; font-size: 11.5px; }
 .deny-title { color: var(--text-dim); margin-right: 2px; }

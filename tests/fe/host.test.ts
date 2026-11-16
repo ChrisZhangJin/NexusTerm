@@ -203,3 +203,15 @@ test("禁止项：底线项去不掉；放开 delete；加关键字去重", () =
   assert.match(denyLabel("delete"), /删除/);
   assert.equal(denyLabel("systemctl"), "含「systemctl」");
 });
+
+import { criteriaSummary } from "../../src/lib/host";
+
+test("criteriaSummary：按固定顺序计数，只列出现过的类；认不出前缀的算人工", () => {
+  const s = criteriaSummary("屏幕: done\n命令: ls\n\n命令: true\n随便一句话");
+  assert.deepEqual(s, [
+    { label: "命令", n: 2, blocking: true },
+    { label: "屏幕", n: 1, blocking: true },
+    { label: "人工", n: 1, blocking: false },
+  ]);
+  assert.deepEqual(criteriaSummary("  \n"), []);
+});

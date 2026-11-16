@@ -301,3 +301,13 @@ export function addDeny(list: readonly string[], raw: string): string[] {
   if (!t || base.some((x) => x.toLowerCase() === t.toLowerCase())) return base;
   return [...base, t];
 }
+
+/** 判据文本的分类计数（确认卡上的「命令 2 · 屏幕 1 · 人工 1」），只列出现过的类，按固定顺序。 */
+export function criteriaSummary(text: string): Array<{ label: string; n: number; blocking: boolean }> {
+  const cs = textToChecks(text);
+  return CHECK_PREFIX.map(([kind, label]) => ({
+    label,
+    n: cs.filter((c) => c.kind === kind).length,
+    blocking: kind !== "manual",
+  })).filter((x) => x.n > 0);
+}

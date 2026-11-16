@@ -164,13 +164,22 @@ fn is_long_text(line: &str) -> bool {
     line.chars().count() > 3 || line.contains(' ')
 }
 
+/// 审批原因里打了这个前缀的，是**不可逆 / 破坏性**的（`danger::is_critical_reason`）。
+/// 托管的「通知 / 自动」档只为这一类停下来问人；其余审批原因（看不清提交的那行、危险但可恢复）照常执行并发通知。
+pub const CRITICAL_MARK: &str = "⚠ 不可逆：";
+
+pub fn has_critical(reasons: &[String]) -> bool {
+    reasons.iter().any(|r| r.starts_with(CRITICAL_MARK))
+}
+
 fn danger_reasons(lines: &[String]) -> Vec<String> {
     let mut reasons = Vec::new();
     for line in lines {
         let r = assess(line);
         if r.dangerous {
             for why in r.reasons {
-                reasons.push(format!("`{line}`：{why}"));
+                let mark = if super::danger::is_critical_reason(&why) { CRITICAL_MARK } else { "" };
+                reasons.push(format!("{mark}`{line}`：{why}"));
             }
         }
     }
@@ -232,7 +241,13 @@ pub fn assess_keys(bytes: &[u8], sit: Option<&Situation>) -> KeysVerdict {
                 let reasons = danger_reasons(&lines);
                 if !reasons.is_empty() {
                     return KeysVerdict::Approve(
-                        reasons.into_iter().map(|r| format!("批准对话框里的命令 {r}")).collect(),
+                        reasons
+                            .into_iter()
+                            .map(|r| match r.strip_prefix(CRITICAL_MARK) {
+                                Some(rest) => format!("{CRITICAL_MARK}批准对话框里的命令 {rest}"),
+                                None => format!("批准对话框里的命令 {r}"),
+                            })
+                            .collect(),
                     );
                 }
             }
@@ -254,9 +269,11 @@ pub fn assess_keys(bytes: &[u8], sit: Option<&Situation>) -> KeysVerdict {
             && is_bare_pick(&visible, enter)
         {
             if s.kind == SituationKind::Menu && s.frame_id != 0 && digit {
-                return KeysVerdict::Approve(vec![
-                    "屏幕上有菜单，但没认出它的选项，按编号选择需要你确认选中的是哪一项".into(),
-                ]);
+                // 屏幕上看得到「永久 / 不再询问」一类字样：选错就是永久授权，算不可逆
+                let mark = if super::situation::grants_permanent_text(&s.tail.to_lowercase()) { CRITICAL_MARK } else { "" };
+                return KeysVerdict::Approve(vec![format!(
+                    "{mark}屏幕上有菜单，但没认出它的选项，按编号选择需要你确认选中的是哪一项"
+                )]);
             }
             return KeysVerdict::Refuse(
                 "看不到这个授权卡 / 菜单的选项，直接按数字或回车可能选中「永久允许」一类的项。先 nx_screen 看清选项再选。".into(),
@@ -267,9 +284,9 @@ pub fn assess_keys(bytes: &[u8], sit: Option<&Situation>) -> KeysVerdict {
             && matches!(s.kind, SituationKind::Permission | SituationKind::Menu)
             && (enter || has_navigation(bytes) || visible.trim().chars().any(|c| c.is_ascii_digit()))
         {
-            return KeysVerdict::Approve(vec![
-                "没有新鲜的屏幕帧，看不到菜单 / 授权对话框的选项（可能含「永久授权」），需要人确认这次选择".into(),
-            ]);
+            return KeysVerdict::Approve(vec![format!(
+                "{CRITICAL_MARK}没有新鲜的屏幕帧，看不到菜单 / 授权对话框的选项（可能含「永久授权」），需要人确认这次选择"
+            )]);
         }
         // 程序自己的提示：短答复放行；较长的文字仍过危险评估
         if is_program_prompt(s) {

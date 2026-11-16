@@ -74,6 +74,8 @@ import StewardContext from "./StewardContext";
 
 /** 开始托管表单上的禁止项偏好 */
 const LS_HOST_DENY = "nx.host.deny";
+/** 开始托管前要不要先确认完成判据（默认不要：托管的主旨是少打扰人） */
+const LS_HOST_CONFIRM_CRITERIA = "nx.host.confirmCriteria";
 
 export interface StewardRunBridge {
   /** 托管那一轮对应的托管任务（相位 / 卡片），没有为 null */
@@ -135,9 +137,9 @@ export interface StewardPanelProps {
 }
 
 const TIERS: Array<{ value: StewardTier; label: string; hint: string }> = [
-  { value: "auto", label: TIER_LABELS.auto, hint: "范围内自主执行，事后可查" },
-  { value: "notify", label: TIER_LABELS.notify, hint: "自主执行并立即通知，可接管并纠正" },
-  { value: "approve", label: TIER_LABELS.approve, hint: "每次写入都先等你批准" },
+  { value: "auto", label: TIER_LABELS.auto, hint: "范围内自主执行、自主作答，只有不可逆的操作才停下来问你；事后可查" },
+  { value: "notify", label: TIER_LABELS.notify, hint: "同「自动」，另外每次写入都发通知卡，可接管并纠正" },
+  { value: "approve", label: TIER_LABELS.approve, hint: "每次写入都先等你批准，AI 的问题也都交给你答" },
 ];
 
 /** 事件流后端最多留 200 条：全拉下来，局面按 console 过滤，列表只显示最近 60 条 */
@@ -170,8 +172,17 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
   const [selected, setSelected] = useState(sessionId);
   const [goal, setGoal] = useState("");
   const [tier, setTier] = useState<StewardTier>("notify");
-  /** YOLO：直接采用 AI 起草的完成判据、不经确认就开始。每次打开面板默认关 */
-  const [yolo, setYolo] = useState(false);
+  /** 开始前先确认 AI 起草的完成判据（默认关 = 直接采用草稿开始，未确认的判据只跑只读检查、不阻塞完成）。记在本地 */
+  const [confirmCriteria, setConfirmCriteriaState] = useState(() => localStorage.getItem(LS_HOST_CONFIRM_CRITERIA) === "1");
+  const setConfirmCriteria = (on: boolean) => {
+    setConfirmCriteriaState(on);
+    try {
+      localStorage.setItem(LS_HOST_CONFIRM_CRITERIA, on ? "1" : "0");
+    } catch {
+      /* 存不了就只在这次生效 */
+    }
+  };
+  const yolo = !confirmCriteria;
   /** 开始托管时的禁止项（记在本地，下次开始沿用；底线项总在） */
   const [deny, setDenyState] = useState<string[]>(() => {
     try {
@@ -586,11 +597,11 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
                 步
               </label>
               <label
-                className={`st-meta host-yolo${yolo ? " on" : ""}`}
-                title="开启后直接采用 AI 起草的完成判据，不再请你确认就开始托管。只跳过这一步：授权档位和禁止项照常生效。"
+                className="st-meta"
+                title="勾上：开始前先出一张「确认完成判据」卡，你改好点接受才开始。不勾（默认）：直接采用 AI 起草的判据开始；未确认的判据只跑只读检查，跑不了的记「未核验」，不挡完成。"
               >
-                <input type="checkbox" checked={yolo} disabled={busy} onChange={(e) => setYolo(e.target.checked)} />
-                YOLO（跳过判据确认）
+                <input type="checkbox" checked={confirmCriteria} disabled={busy} onChange={(e) => setConfirmCriteria(e.target.checked)} />
+                开始前确认判据
               </label>
               {contract && (
                 <button className="st-btn danger" disabled={busy} onClick={() => void stop()}>

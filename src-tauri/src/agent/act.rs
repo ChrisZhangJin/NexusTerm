@@ -3611,6 +3611,9 @@ pub async fn run(
     let mut context_retry_used = false;
     // 用户接管且等到超时的次数（见 `MAX_TOOK_OVER`）
     let mut took_over_times = 0usize;
+    // 托管自主：替用户按推荐作答的次数；纯文本回复是否已经退回过一次
+    let mut self_answers = 0u32;
+    let mut no_action_nudged = false;
     // 服务方不认 tools 时置 false：此后一律走围栏协议，不再每轮都白试一次。
     let mut use_tools = true;
     let specs = if host.is_some() { hosted_tool_specs() } else { tool_specs() };
@@ -4095,15 +4098,22 @@ pub async fn run(
                     feedback.push_str(&alarm.hint());
                     feedback.push('\n');
                 }
+                // 第一次只是退回让模型自己继续（非「确认」档）；连着第二次才当成问人
+                if !std::mem::replace(&mut no_action_nudged, true) && h.ctx().authority.tier != super::policy::TIER_APPROVE {
+                    push_user(&mut messages, HOSTED_NO_ACTION_NUDGE.to_string());
+                    continue;
+                }
                 h.flush_progress(&messages, step);
                 if !park_on_no_action(h, &text, &mut messages, &mut feedback).await {
                     break;
                 }
+                no_action_nudged = false;
                 continue;
             }
             break;
         }
 
+        no_action_nudged = false;
         // 先把「模型调用了什么」摆到界面上，再逐个展示执行过程。
         //
         // 这张卡是原生工具调用独有的：围栏路径只是一段文本，没有结构化的
@@ -4329,6 +4339,22 @@ pub async fn run(
                         finished = true;
                         break;
                     };
+                    if let Some(reply) = self_answer(&h.ctx().authority.tier, recommendation.as_deref(), self_answers) {
+                        self_answers += 1;
+                        emit_step(
+                            app,
+                            &session,
+                            StepPayload {
+                                text: Some(format!(
+                                    "替你决定（托管自主）：按推荐「{}」继续。不可逆的操作仍会停下来问你。",
+                                    recommendation.as_deref().unwrap_or("").trim()
+                                )),
+                                ..StepPayload::new("note", step)
+                            },
+                        );
+                        push_user(&mut messages, reply);
+                        break;
+                    }
                     h.flush_progress(&messages, step);
                     if !host_ask(h, hosted_card(&question, options, recommendation), &mut messages).await {
                         finished = true;
@@ -5861,10 +5887,35 @@ pub enum RunMode {
 /// 托管模式追加在系统提示词后面的约定。
 const HOSTED_ADDENDUM: &str = "\n\n## 托管运行\n\
     这是一次托管运行：用户不在旁边逐步看着，任务一直持续到你调用 `nx_complete`。\n\
-    - 需要用户决定 / 补充信息时调用 `nx_ask_user`（可给选项和推荐），任务会挂起等他回来；\
-      不要用纯文本回复提问或收尾 —— 没有动作的回复会被当成向用户提问。\n\
+    - **尽量自己拿主意。** 用户把终端托管给你，就是不想被频繁打扰：可恢复的选择（用哪个参数、\
+      交互脚本里选哪一项、出错后换什么做法）自己判断后直接做。不可逆 / 破坏性的写入不用你操心 —— \
+      代码闸门会自动停下来请用户批准。\n\
+    - 确实要问时调用 `nx_ask_user`。**带了 `recommendation` 的问题，在非「确认」档下会直接按你的推荐继续**\
+      （用户事后能在记录里看到）；只有用户本人才能回答的（账号、密码、该部署到哪个生产环境、放开契约禁止项）\
+      不要给 recommendation，任务会挂起等他回来。\n\
+    - 不要用纯文本回复提问或收尾 —— 没有动作的回复第一次会被退回让你继续，再犯才会当成向用户提问。\n\
     - 目标确实达成后调用 `nx_complete`，附上总结和证据。没调用它之前任务不会结束。\n\
     - 用户随时可能接管终端；交还后请先读屏核对现场再继续。\n";
+
+/// 一次托管里最多替用户「按推荐作答」几次：再多就是在兜圈子，交给人。
+const SELF_ANSWER_CAP: u32 = 12;
+
+/// 托管自主作答：非「确认」档、问题带了推荐、额度没用完 → 按推荐继续，返回交回给模型的答复。
+/// 不可逆的写入仍由 `gate::authorize` 拦下请人批准，所以替人答「可恢复的选择」是安全的。
+fn self_answer(tier: &str, recommendation: Option<&str>, used: u32) -> Option<String> {
+    if tier == super::policy::TIER_APPROVE || used >= SELF_ANSWER_CAP {
+        return None;
+    }
+    let rec = recommendation.map(str::trim).filter(|r| !r.is_empty())?;
+    Some(format!(
+        "（托管自主作答：用户不在旁边，按你的推荐继续 ——「{rec}」。不可逆的操作仍会被闸门拦下请用户批准；\
+         如果这个问题其实只有用户本人能回答，下次不要给 recommendation。）"
+    ))
+}
+
+/// 托管里模型回了纯文本（没有动作）：第一次退回让它自己继续，不打扰人。
+const HOSTED_NO_ACTION_NUDGE: &str = "（托管中没有人在看纯文本回复。请直接执行下一步动作；\
+    目标达成就调用 nx_complete；只有用户本人才能回答的问题才用 nx_ask_user。）";
 
 /// 模型回了一段空话（没有动作也没有文字）时卡片上的问题。
 const HOSTED_EMPTY_REPLY_QUESTION: &str = "（模型没有给出任何内容）要我怎么继续？";
@@ -7641,6 +7692,16 @@ mod tests {
         }
         h.send(HostEvent::Stop);
         task.await.unwrap();
+    }
+
+    #[test]
+    fn self_answer_only_with_recommendation_outside_approve_tier_and_capped() {
+        assert!(self_answer("notify", Some("用默认端口 8080"), 0).is_some_and(|r| r.contains("8080")));
+        assert!(self_answer("auto", Some("选 2"), 0).is_some());
+        assert_eq!(self_answer("approve", Some("选 2"), 0), None, "确认档：一律问人");
+        assert_eq!(self_answer("auto", None, 0), None, "没有推荐 = 只有用户能答");
+        assert_eq!(self_answer("auto", Some("  "), 0), None);
+        assert_eq!(self_answer("auto", Some("选 2"), SELF_ANSWER_CAP), None, "兜圈子了：交给人");
     }
 
     #[test]

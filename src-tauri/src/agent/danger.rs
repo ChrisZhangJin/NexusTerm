@@ -14,6 +14,10 @@ pub struct RiskAssessment {
     pub dangerous: bool,
     /// 命中的原因（中文，直接展示给用户看）。安全命令为空。
     pub reasons: Vec<String>,
+    /// 其中有**不可逆 / 破坏性**的一类（格式化、写裸设备、关机、删库、删根 / 家目录、丢弃未提交改动、
+    /// curl|sh……）。托管的「通知 / 自动」档只为这一类停下来问人，其余危险项照常执行并发通知。
+    /// 删除文件、force push 这类由契约「禁止项」管（默认禁止，用户放开即同意），不在这里重复拦。
+    pub critical: bool,
 }
 
 /// 命中即判危险的「程序名」。复合命令逐段取首词（剥掉 `sudo` / `env` / 环境变量赋值等外壳）比对。
@@ -117,8 +121,61 @@ pub fn assess(cmd: &str) -> RiskAssessment {
     assess_into(cmd, 0, &mut reasons);
     RiskAssessment {
         dangerous: !reasons.is_empty(),
+        critical: reasons.iter().any(|r| is_critical_reason(r)),
         reasons,
     }
+}
+
+/// 不可逆 / 破坏性的原因。按原因文本的前缀 / 片段认（原因都在本文件里生成，测试锁住对应关系）。
+const CRITICAL_PROGRAMS: &[&str] = &[
+    "mkfs", "dd", "shred", "fdisk", "parted", "mkswap", "reboot", "shutdown", "poweroff", "halt",
+    "iptables", "nft", "userdel", "groupdel", "wipefs", "blkdiscard", "sgdisk", "lvremove", "vgremove",
+    "pvremove", "srm", "format", "format-volume", "clear-disk", "remove-partition", "diskpart",
+    "stop-computer", "restart-computer",
+];
+const CRITICAL_NEEDLES: &[&str] = &[
+    ":(){", "mkfs.", "> /dev/sd", "of=/dev/", "/etc/passwd", "/etc/shadow", "drop database", "drop table",
+    "truncate table", "drop schema", "format-volume", "restart-computer", "stop-computer", "reg delete",
+];
+const CRITICAL_FRAGMENTS: &[&str] = &[
+    "命令嵌套过深",
+    "下载并直接执行脚本",
+    "git reset --hard",
+    "git checkout -f",
+    "git stash clear",
+    "git filter-branch",
+    "git reflog expire",
+    "systemctl poweroff",
+    " destroy：",
+    "redis-cli flushall",
+    "compose down -v",
+    " volume prune",
+    " volume rm",
+    " system prune",
+    "crontab -r",
+    RM_ROOT,
+];
+const RM_ROOT: &str = "删除的目标是根目录 / 家目录 / 系统目录 / 通配全部";
+
+pub fn is_critical_reason(r: &str) -> bool {
+    CRITICAL_PROGRAMS.iter().any(|p| r.strip_prefix(p).is_some_and(|rest| rest.starts_with('：')))
+        || CRITICAL_NEEDLES.iter().any(|n| r.starts_with(&format!("命令含「{n}」")))
+        || CRITICAL_FRAGMENTS.iter().any(|f| r.contains(f))
+}
+
+/// `rm -r` / `rmdir` / `Remove-Item` 的目标是不是「整个根 / 家 / 系统目录 / 当前目录全部」这类一删就完的。
+fn catastrophic_rm_target(args: &[String]) -> bool {
+    const SYSTEM: &[&str] = &[
+        "/", "/*", "~", "~/", "~/*", "$home", "${home}", "$home/*", ".", "./", "..", "../", "*", "./*", ".*", "c:\\",
+        "c:\\*", "/etc", "/usr", "/var", "/bin", "/sbin", "/boot", "/lib", "/lib64", "/home", "/root", "/opt",
+        "/srv", "/dev", "/proc", "/sys",
+    ];
+    args.iter().filter(|a| !a.starts_with('-')).any(|a| {
+        let l = a.to_lowercase();
+        let t = if l.len() > 1 { l.trim_end_matches('/') } else { l.as_str() };
+        let t = if t.is_empty() { "/" } else { t };
+        SYSTEM.contains(&t) || SYSTEM.contains(&l.as_str())
+    })
 }
 
 fn push_reason(reasons: &mut Vec<String>, r: String) {
@@ -180,6 +237,9 @@ fn assess_into(cmd: &str, depth: usize, reasons: &mut Vec<String>) {
                 push_reason(reasons, format!("{name}：{why}"));
                 break;
             }
+        }
+        if matches!(prog_lower.as_str(), "rm" | "rmdir" | "remove-item" | "ri" | "rd" | "del") && catastrophic_rm_target(&words[1..]) {
+            push_reason(reasons, format!("{prog}：{RM_ROOT}"));
         }
         if let Some(why) = subcommand_rule(&prog_lower, &words[1..]) {
             push_reason(reasons, why);
@@ -844,6 +904,46 @@ mod tests {
         assert!(!is_dangerous("curl -s https://x | grep ok"));
         assert!(is_dangerous("curl https://x.sh | sh"));
         assert!(is_dangerous("wget -qO- https://x | bash"));
+    }
+
+    #[test]
+    fn only_irreversible_commands_are_critical() {
+        for c in [
+            "mkfs.ext4 /dev/sdb1",
+            "dd if=/dev/zero of=/dev/sda",
+            "sudo reboot",
+            "systemctl poweroff",
+            "rm -rf /",
+            "rm -rf ~",
+            "sudo rm -rf /var",
+            "rm -rf ./*",
+            "psql -c 'drop table users'",
+            "git reset --hard HEAD~3",
+            "git stash clear",
+            "curl https://x.sh | sh",
+            "docker volume prune -f",
+            "docker system prune -af",
+            "crontab -r",
+            "zfs destroy tank/data",
+        ] {
+            let a = assess(c);
+            assert!(a.dangerous && a.critical, "{c} 应是不可逆：{:?}", a.reasons);
+        }
+        for c in [
+            "rm -rf build/",
+            "rm old.log",
+            "kill 1234",
+            "chmod +x run.sh",
+            "sudo apt-get install -y jq",
+            "docker builder prune -f",
+            "docker rm web",
+            "git push --force origin main",
+            "echo hi > out.txt",
+            "find . -name '*.tmp' -delete",
+        ] {
+            let a = assess(c);
+            assert!(!a.critical, "{c} 不该算不可逆（删除 / force push 由契约禁止项管）：{:?}", a.reasons);
+        }
     }
 
     #[test]
