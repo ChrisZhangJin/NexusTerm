@@ -450,15 +450,32 @@ struct HostToolArgs {
     evidence: Vec<String>,
 }
 
+/// 模型偶尔把换行双重转义，参数里就成了字面的 `\n`（卡片上一串「\n\n- …」）。
+/// 只在整段**没有真换行**却含字面 `\n` 时还原 —— 有真换行说明模型写对了，里面的 `\n` 可能是有意的（如 printf 示例）。
+fn unescape_newlines(s: &str) -> String {
+    if s.contains('\n') || !s.contains("\\n") {
+        return s.to_string();
+    }
+    s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "  ").trim().to_string()
+}
+
 /// 解析托管专用动作。缺了必填字段（问题 / 总结为空）就不产出动作。
 fn parse_host_action(action: &str, args: &serde_json::Value) -> Vec<AgentAction> {
     let a: HostToolArgs = serde_json::from_value(args.clone()).unwrap_or_default();
-    let nonempty = |s: Option<String>| s.map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
+    let nonempty = |s: Option<String>| s.map(|x| unescape_newlines(x.trim())).filter(|x| !x.is_empty());
     match action {
         "ask_user" => nonempty(a.question)
             .map(|question| AgentAction::AskUser {
                 question,
-                options: a.options.into_iter().filter(|o| !o.label.trim().is_empty()).collect(),
+                options: a
+                    .options
+                    .into_iter()
+                    .filter(|o| !o.label.trim().is_empty())
+                    .map(|mut o| {
+                        o.reply = unescape_newlines(&o.reply);
+                        o
+                    })
+                    .collect(),
                 recommendation: nonempty(a.recommendation),
             })
             .into_iter()
@@ -466,7 +483,7 @@ fn parse_host_action(action: &str, args: &serde_json::Value) -> Vec<AgentAction>
         "complete" => nonempty(a.summary)
             .map(|summary| AgentAction::Complete {
                 summary,
-                evidence: a.evidence.into_iter().filter(|e| !e.trim().is_empty()).collect(),
+                evidence: a.evidence.into_iter().filter(|e| !e.trim().is_empty()).map(|e| unescape_newlines(&e)).collect(),
             })
             .into_iter()
             .collect(),
@@ -7701,6 +7718,24 @@ mod tests {
         }
         h.send(HostEvent::Stop);
         task.await.unwrap();
+    }
+
+    #[test]
+    fn host_args_with_literal_newlines_are_unescaped() {
+        let args = serde_json::json!({
+            "question": "服务端已就绪。\\n\\n- TCP：443\\n- UDP：8443",
+            "recommendation": "先测 443",
+            "options": [{"label": "好", "reply": "a\\nb"}]
+        });
+        match &parse_host_action("ask_user", &args)[0] {
+            AgentAction::AskUser { question, options, .. } => {
+                assert_eq!(question, "服务端已就绪。\n\n- TCP：443\n- UDP：8443");
+                assert_eq!(options[0].reply, "a\nb");
+            }
+            a => panic!("{a:?}"),
+        }
+        // 已经有真换行：里面的字面 \n 是有意的，不动
+        assert_eq!(unescape_newlines("printf 'a\\n'\n下一行"), "printf 'a\\n'\n下一行");
     }
 
     #[test]

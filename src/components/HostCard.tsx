@@ -22,6 +22,7 @@ import type {
   HostStatus,
 } from "../types";
 import DenyEditor from "./DenyEditor";
+import HostText from "./HostText";
 
 export interface HostCardProps {
   status: HostStatus;
@@ -152,7 +153,11 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], o
               复制
             </button>
           </div>
-          <div className="host-report-body">{formatReport(status.phase.summary) || "（AI 没有写完成报告）"}</div>
+          {status.phase.summary.trim() ? (
+            <HostText className="host-report-body" text={formatReport(status.phase.summary)} />
+          ) : (
+            <div className="host-report-body">（AI 没有写完成报告）</div>
+          )}
           {status.phase.checks.length > 0 && (
             <details className="host-report-checks">
               <summary>核验依据（{status.phase.checks.length} 条）</summary>
@@ -347,7 +352,7 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], o
       {card && secret && (
         <div className="st-esc host-ask">
           <div className="st-esc-head">等你输入密码</div>
-          <div className="host-question">{card.question}</div>
+          <HostText className="host-question-body" text={card.question} />
           <div className="st-esc-why">密码只在下方的密码卡片里输入，直接写进终端，AI 看不到它。不限时。</div>
         </div>
       )}
@@ -357,7 +362,7 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], o
           <div className="st-esc-head">
             {manualCheck ? "等你确认完成" : approve ? "等你批准" : card.kind.kind === "watchdog" ? "看门狗：它好像卡住了" : "等你回答"}
           </div>
-          <div className="host-question">{card.question}</div>
+          <HostText className="host-question-body" text={card.question} />
           {card.reasons.length > 0 &&
             (manualCheck || card.kind.kind === "watchdog" ? (
               <ul className="host-checks">
@@ -368,7 +373,12 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], o
             ) : (
               <div className="st-esc-why">原因：{card.reasons.join("；")}</div>
             ))}
-          {card.recommendation && <div className="st-esc-why">建议：{card.recommendation}</div>}
+          {card.recommendation && (
+            <div className="host-reco">
+              <span className="host-reco-tag">AI 建议</span>
+              <HostText text={card.recommendation} />
+            </div>
+          )}
           {needsIncompleteBanner(card.previewComplete, card.diff) && (
             <div className="ap-diff-incomplete" role="alert">
               ⚠ 预览不完整：卡上看不到全部修改，批准写入的是完整内容
@@ -376,11 +386,11 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], o
           )}
           {card.diff && <DiffView diff={card.diff} open />}
           {card.options.length > 0 && (
-            <div className="st-form-row st-center">
+            <div className="host-options">
               {card.options.map((o, i) => (
                 <button
                   key={`${o.label}-${i}`}
-                  className="st-btn"
+                  className="st-btn host-option"
                   disabled={busy}
                   title={o.reply}
                   onClick={() => void answer({ text: o.reply })}
@@ -390,18 +400,21 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], o
               ))}
             </div>
           )}
-          <div className="st-form-row st-center">
-            <input
-              className="st-input"
+          <div className="host-answer-row">
+            <textarea
+              className="st-input host-answer"
+              rows={Math.min(5, Math.max(1, text.split("\n").length))}
               value={text}
               disabled={busy}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.nativeEvent.isComposing && !approve && text.trim()) {
+                // Enter 发送，Shift+Enter 换行
+                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && !approve && text.trim()) {
+                  e.preventDefault();
                   void answer({ text: text.trim() });
                 }
               }}
-              placeholder={approve ? "可选：附一句话给 AI" : "写下你的答复"}
+              placeholder={approve ? "可选：附一句话给 AI" : card.options.length > 0 ? "或者自己写答复（Enter 发送，Shift+Enter 换行）" : "写下你的答复（Enter 发送，Shift+Enter 换行）"}
             />
             {approve ? (
               <>

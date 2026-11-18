@@ -311,3 +311,60 @@ export function criteriaSummary(text: string): Array<{ label: string; n: number;
     blocking: kind !== "manual",
   })).filter((x) => x.n > 0);
 }
+
+// ———————————— 卡片正文：段落 / 列表 / 行内代码 ————————————
+
+export type TextBlock = { kind: "p"; text: string } | { kind: "ul" | "ol"; items: string[] };
+
+/** 模型把换行双重转义时的字面 `\n`（与后端 `unescape_newlines` 同一规则：有真换行就不动） */
+export function unescapeNewlines(s: string): string {
+  if (s.includes("\n") || !s.includes("\\n")) return s;
+  return s.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\\t/g, "  ");
+}
+
+const BULLET = /^\s*[-•*·]\s+(.*)$/;
+const ORDERED = /^\s*\d{1,2}[.、)]\s*(.*)$/;
+
+/** 把 AI 写给人的一段话切成块：空行分段；`- ` / `1. ` 开头的连续行是列表。 */
+export function textBlocks(raw: string): TextBlock[] {
+  const out: TextBlock[] = [];
+  let para: string[] = [];
+  const flush = () => {
+    if (para.length) out.push({ kind: "p", text: para.join("\n") });
+    para = [];
+  };
+  for (const line of unescapeNewlines(raw.trim()).split("\n")) {
+    const b = BULLET.exec(line);
+    const o = b ? null : ORDERED.exec(line);
+    const item = b?.[1] ?? o?.[1];
+    if (item !== undefined) {
+      flush();
+      const kind = b ? "ul" : "ol";
+      const last = out[out.length - 1];
+      if (last && last.kind === kind) last.items.push(item.trim());
+      else out.push({ kind, items: [item.trim()] });
+    } else if (!line.trim()) {
+      flush();
+    } else {
+      para.push(line.trim());
+    }
+  }
+  flush();
+  return out;
+}
+
+export type InlinePart = { code: boolean; text: string };
+
+/** 行内：反引号里的、以及路径（`/etc/x`、`~/a/b`）显示成代码样式 */
+export function inlineParts(s: string): InlinePart[] {
+  const out: InlinePart[] = [];
+  const re = /`([^`]+)`|((?:~|\/)[\w.@-]*(?:\/[\w.@-]+)+\/?)/g;
+  let at = 0;
+  for (let m = re.exec(s); m; m = re.exec(s)) {
+    if (m.index > at) out.push({ code: false, text: s.slice(at, m.index) });
+    out.push({ code: true, text: m[1] ?? m[2] });
+    at = m.index + m[0].length;
+  }
+  if (at < s.length) out.push({ code: false, text: s.slice(at) });
+  return out;
+}

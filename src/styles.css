@@ -2474,6 +2474,37 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .host-criteria-spacer { flex: 1; }
 .host-criteria-kbd { font-size: 10.5px; color: var(--text-dim); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; }
 .host-criteria-go { font-size: 13px; padding: 5px 16px; font-weight: 600; }
+/* AI 写给人的正文（问题 / 建议 / 完成报告）：段落、列表、行内代码 */
+.host-text { font-size: 12.5px; line-height: 1.65; color: var(--text); word-break: break-word; }
+.host-text p { margin: 0 0 6px; white-space: pre-wrap; }
+.host-text p:last-child, .host-text ul:last-child, .host-text ol:last-child { margin-bottom: 0; }
+.host-text ul, .host-text ol { margin: 0 0 6px; padding-left: 20px; }
+.host-text li { margin: 2px 0; }
+.host-text li::marker { color: var(--text-dim); }
+.host-text-code {
+  font-family: var(--font-mono, ui-monospace, Menlo, Consolas, monospace); font-size: 11.5px;
+  padding: 0 4px; border-radius: 4px; background: color-mix(in srgb, var(--text) 9%, transparent);
+}
+.host-question-body {
+  max-height: 280px; overflow: auto; margin: 4px 0 8px; padding: 8px 10px; border-radius: 6px;
+  background: var(--bg); border: 1px solid var(--border); user-select: text;
+}
+.host-reco {
+  display: flex; gap: 8px; align-items: flex-start; margin: 0 0 8px; padding: 7px 10px; border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+.host-reco-tag {
+  flex: none; padding: 0 6px; border-radius: 999px; font-size: 10.5px; font-weight: 600; line-height: 18px;
+  color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 60%, transparent);
+}
+.host-reco .host-text { flex: 1; min-width: 0; }
+.host-options { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.host-option { padding: 4px 12px; border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.host-option:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.host-answer-row { display: flex; gap: 6px; align-items: flex-end; }
+.host-answer { resize: none; line-height: 1.5; padding: 5px 8px; font-family: inherit; }
+.host-report-body.host-text { white-space: normal; }
 /* 契约禁止项编辑器（开始托管表单 / 托管卡） */
 .deny-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0; font-size: 11.5px; }
 .deny-title { color: var(--text-dim); margin-right: 2px; }

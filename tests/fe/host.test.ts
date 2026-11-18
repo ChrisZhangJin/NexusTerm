@@ -215,3 +215,28 @@ test("criteriaSummary：按固定顺序计数，只列出现过的类；认不�
   ]);
   assert.deepEqual(criteriaSummary("  \n"), []);
 });
+
+import { inlineParts, textBlocks, unescapeNewlines } from "../../src/lib/host";
+
+test("textBlocks：字面 \\n 还原，空行分段，连续 - / 1. 行成列表", () => {
+  const q = "服务端已就绪，请完成 S:5。\\n\\n本机 ufw 是 inactive。放行：\\n- TCP：443、2053\\n- UDP：8443\\n\\n结果如何？";
+  assert.deepEqual(textBlocks(q), [
+    { kind: "p", text: "服务端已就绪，请完成 S:5。" },
+    { kind: "p", text: "本机 ufw 是 inactive。放行：" },
+    { kind: "ul", items: ["TCP：443、2053", "UDP：8443"] },
+    { kind: "p", text: "结果如何？" },
+  ]);
+  assert.deepEqual(textBlocks("1. 甲\n2. 乙"), [{ kind: "ol", items: ["甲", "乙"] }]);
+  assert.equal(unescapeNewlines("a\nb \\n"), "a\nb \\n", "有真换行就不动");
+});
+
+test("inlineParts：反引号与路径显示成代码", () => {
+  assert.deepEqual(inlineParts("见 /root/proxy-nodes.txt（权限 `600`）"), [
+    { code: false, text: "见 " },
+    { code: true, text: "/root/proxy-nodes.txt" },
+    { code: false, text: "（权限 " },
+    { code: true, text: "600" },
+    { code: false, text: "）" },
+  ]);
+  assert.deepEqual(inlineParts("TCP/UDP 都行"), [{ code: false, text: "TCP/UDP 都行" }]);
+});
