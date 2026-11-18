@@ -27,6 +27,8 @@ use super::{BudgetGrant, CardKind, Check, HostHandle, HumanCard, SuspendReason};
 
 /// 挂起等人期间多久看一眼 console 还在不在。
 pub const LIVENESS_POLL: Duration = Duration::from_secs(3);
+/// 断线的 console 连回来之后，连续几轮存活检查都在才自动接着托管（约 6 秒，给前端重连后的自动宏 / tmux attach 留时间）
+pub const CONSOLE_BACK_POLLS: u32 = 2;
 
 /// 挂起期间多久看一眼取消标记。不是超时：等多久都行，只是取消要及时生效。
 pub const CANCEL_POLL: Duration = Duration::from_millis(200);
@@ -60,6 +62,10 @@ pub trait HostIo: Send + Sync {
     /// 待落盘的现场（接驳时从它恢复）。默认没有。
     fn snapshot(&self) -> Option<super::checkpoint::HostCheckpoint> {
         None
+    }
+    /// 被托管 console 当前这条连接的代号；不在为 `None`。断线重连后同一个 console 换新代号。默认 0。
+    fn console_generation(&self) -> Option<u64> {
+        self.console_alive().then_some(0)
     }
 }
 
@@ -186,6 +192,8 @@ pub struct HostShared {
     deadline_acked: AtomicBool,
     /// 计划清单（nx_todo，随 checkpoint 持久化）
     todo: Mutex<Vec<super::super::todo::TodoItem>>,
+    /// 上次看到的 console 连接代号（断线重连检测，见 `note_reconnect`）
+    seen_generation: Mutex<Option<u64>>,
 }
 
 /// 进程内单调时钟（毫秒）。看门狗只认它；重启后基准变了，恢复时要 `rebase`。
@@ -226,7 +234,20 @@ impl HostShared {
             watchdog: Mutex::new(super::watchdog::WatchdogState::default()),
             deadline_acked: AtomicBool::new(false),
             todo: Mutex::new(Vec::new()),
+            seen_generation: Mutex::new(None),
         })
+    }
+
+    // ——— 断线重连 ———
+
+    /// 同一个 console 是不是换了一条新连接（断线后自动 / 手动重连了）。返回 true 一次，随即记下新代号；
+    /// console 不在时不更新（等它回来再比）。第一次调用只记基线。
+    pub fn note_reconnect(&self) -> bool {
+        let Some(g) = self.io.console_generation() else { return false };
+        let mut seen = self.seen_generation.lock();
+        let changed = seen.is_some_and(|old| old != g);
+        *seen = Some(g);
+        changed
     }
 
     // ——— 计划清单 ———
@@ -633,6 +654,7 @@ impl HostShared {
     /// 不在 Running 就挂起：只等收件箱和取消，**没有超时**、零 LLM 调用。
     pub async fn park(&self) -> ParkEnd {
         let mut rx = self.rx.lock().await;
+        let mut back_polls = 0u32;
         loop {
             let p = self.phase();
             if p.is_terminal() {
@@ -652,6 +674,16 @@ impl HostShared {
                 _ = tokio::time::sleep(LIVENESS_POLL) => {
                     if !self.io.console_alive() {
                         self.console_gone();
+                        back_polls = 0;
+                    } else if matches!(self.phase(), HostPhase::Suspended { reason: super::SuspendReason::ConsoleGone, .. }) {
+                        // 断线的 console 又连上了：再等一轮确认连接稳住（前端重连后还要跑自动宏、
+                        // attach 回 tmux），然后自动接着托管 —— 同一个 tab，不需要人来点「重新接驳」
+                        back_polls += 1;
+                        if back_polls >= CONSOLE_BACK_POLLS {
+                            self.note_reconnect();
+                            let _ = self.apply(HostEvent::ConsoleBack);
+                            back_polls = 0;
+                        }
                     }
                     None
                 }
@@ -760,6 +792,8 @@ pub(crate) mod tests {
         /// console 没了（tab 关了）
         pub dead: Mutex<bool>,
         pub acked: Mutex<bool>,
+        /// 连接代号（断线重连后换新的）
+        pub generation: Mutex<u64>,
     }
 
     impl HostIo for Arc<FakeIo> {
@@ -777,6 +811,9 @@ pub(crate) mod tests {
         }
         fn console_alive(&self) -> bool {
             !*self.dead.lock()
+        }
+        fn console_generation(&self) -> Option<u64> {
+            (!*self.dead.lock()).then(|| *self.generation.lock())
         }
         fn note_deadline_ack(&self, acked: bool) {
             *self.acked.lock() = acked;
@@ -1058,6 +1095,50 @@ pub(crate) mod tests {
         let more = vec![msgs[0].clone(), super::super::super::llm::ChatMessage::assistant("b".to_string())];
         h.flush_progress(&more, 2);
         assert_eq!(io.saves.lock().len(), 1);
+    }
+
+    /// 网络断了又自动重连上（同一个 tab、新连接）：不用人点「重新接驳」，稳住两轮后自动接着跑，
+    /// 并告诉模型现在是新 shell、先读屏
+    #[tokio::test(start_paused = true)]
+    async fn reconnected_console_resumes_by_itself() {
+        let (h, io) = shared();
+        assert!(!h.note_reconnect(), "第一次只记基线");
+        h.apply(HostEvent::Suspend(SuspendReason::ConsoleGone)).unwrap();
+        let h2 = h.clone();
+        let task = tokio::spawn(async move { h2.park().await });
+        settle().await;
+        // 还断着：一直挂起
+        *io.dead.lock() = true;
+        tokio::time::advance(LIVENESS_POLL * 5).await;
+        settle().await;
+        assert!(matches!(h.phase(), HostPhase::Suspended { reason: SuspendReason::ConsoleGone, .. }));
+        // 连回来了（新连接）：第一轮先不动，第二轮才接着跑
+        *io.generation.lock() = 7;
+        *io.dead.lock() = false;
+        tokio::time::advance(LIVENESS_POLL).await;
+        settle().await;
+        assert!(!task.is_finished(), "刚连上，先等它稳住");
+        tokio::time::advance(LIVENESS_POLL).await;
+        settle().await;
+        assert_eq!(task.await.unwrap(), ParkEnd::Running);
+        assert_eq!(h.phase(), HostPhase::Running);
+        assert!(h.take_force_screen(), "接着跑之前先读屏");
+        assert!(h.take_user().iter().any(|u| u.contains("自动重连")));
+        assert!(!h.note_reconnect(), "代号已经记过了，运行循环不再重复提醒");
+        assert_eq!(*io.released.lock(), 0, "租约一直没放");
+    }
+
+    #[test]
+    fn note_reconnect_flags_a_new_connection_once() {
+        let (h, io) = shared();
+        assert!(!h.note_reconnect());
+        assert!(!h.note_reconnect());
+        *io.dead.lock() = true;
+        assert!(!h.note_reconnect(), "断着的时候不更新");
+        *io.dead.lock() = false;
+        *io.generation.lock() = 2;
+        assert!(h.note_reconnect(), "同一个 tab、新连接");
+        assert!(!h.note_reconnect());
     }
 
     #[tokio::test(start_paused = true)]

@@ -167,6 +167,14 @@ fn observe(&mut self, o: StepObs, mono_ms: i64) -> Option<Alarm>
 - **完成判据**：默认不确认，直接采用草稿（面板上「开始前确认判据」可勾回来）。未确认的判据与 nx_exec 同一道闸，但除 deny 外一律不问人：要批准的或判危险的记「未核验」，不阻塞完成。
 - 仍然问人：密码、不可逆写入、契约禁止项需要放开、看门狗二级（确实卡住了）、预算用完 / 模型不可用、受保护路径的文件写入。
 
+## 5.2 断线重连自动接着托管（已定，2026-11-18）
+
+SSH 断线 → 会话从 `SessionManager` 摘掉 → 托管挂起（`Suspended{ConsoleGone}`，租约不放）。前端自动重连用的是**同一个会话 id**，
+每条连接有一个新的代号（`SessionManager::generation`）。挂起中的 `park()` 每 3 秒查一次：同一个 console 连回来、连续两轮都在
+（≈6 秒，给自动宏 / tmux attach 留时间）→ `HostEvent::ConsoleBack` → 回到挂起前的状态，强制读屏，并告诉模型「新 shell，
+前台程序 / 目录可能没了，上一条命令可能没跑完」（`RECONNECT_NOTE`）。断得太短、没被判成 ConsoleGone 的，运行循环在每步开头
+比对连接代号，同样提醒模型。应用重启（`AppRestart`）与 tab 被关掉仍走人工接驳。
+
 ## 6. 迁移计划
 
 | PR | 内容 | 依赖 |

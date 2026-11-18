@@ -212,9 +212,15 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], o
         <div className="st-esc host-ask">
           <div className="st-esc-head">
             {status.phase.kind === "suspended" && status.phase.reason === "consoleGone"
-              ? "被托管的终端已经关闭"
+              ? "被托管的终端断开了"
               : "应用重启了，托管停在这里"}
           </div>
+          {status.phase.kind === "suspended" && status.phase.reason === "consoleGone" && (
+            <div className="st-esc-why">
+              如果是网络断了：这个标签页重连成功后，托管会在几秒内<b>自动接着跑</b>（AI 先读屏核对现场），不用做任何事。
+              标签页已经关掉了，才需要在下面手动接回。
+            </div>
+          )}
           <div className="st-esc-why">
             选一个终端接回去（按和原来的相似度排序），或按保存的连接新开一个。接回后 AI 会先读屏核对现场；
             屏幕和原来不一样时会降为「确认」档，每次写入都先问你。

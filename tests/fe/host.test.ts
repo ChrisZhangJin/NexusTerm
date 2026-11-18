@@ -139,7 +139,7 @@ test("ConsoleRef 线索：SSH 带记录 id、本地不带；cwd / tmux 取探测
 
 test("挂起（重启 / 终端关了）只给接驳与放弃", () => {
   const p: HostPhase = { kind: "suspended", reason: "consoleGone", resume_to: { kind: "running" } };
-  assert.equal(hostPill(p).label, "终端已关闭·待接驳");
+  assert.equal(hostPill(p).label, "终端断开·等重连");
   assert.equal(needsReattach(p), true);
   const b = hostButtons(p);
   assert.equal(b.reattach, true);

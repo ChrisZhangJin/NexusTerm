@@ -193,6 +193,11 @@ impl HostIo for AppHostIo {
         self.app.try_state::<AppState>().map_or(true, |st| act::session_alive(&st, &self.console_id))
     }
 
+    fn console_generation(&self) -> Option<u64> {
+        let st = self.app.try_state::<AppState>()?;
+        act::session_generation(&st, &self.console_id)
+    }
+
     fn note_notice(&self, notice: Option<&str>) {
         *self.notice.lock() = notice.map(str::to_string);
     }

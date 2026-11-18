@@ -55,7 +55,7 @@ export function hostPill(p: HostPhase): HostPill {
           return { label: "已暂停", tone: "warn" };
       }
     case "suspended":
-      return { label: p.reason === "consoleGone" ? "终端已关闭·待接驳" : "待重新接驳", tone: "warn" };
+      return { label: p.reason === "consoleGone" ? "终端断开·等重连" : "待重新接驳", tone: "warn" };
     case "completed":
       return { label: "完成", tone: "done" };
     case "failed":

@@ -16,6 +16,11 @@ use super::{BudgetGrant, CardKind, CardReply, CheckResult, ConsoleRef, HumanCard
 
 /// 重新接驳后追加给模型的那句话。
 pub const REATTACH_NOTE: &str = "应用重启后重新接驳，先读屏核对现场";
+/// 断线重连后自动接着托管时告诉模型的话
+pub const RECONNECT_NOTE: &str = "（网络断开过，终端已自动重连。现在是一个**新的 shell 会话**：断线前的前台程序\
+    （docker exec / ssh / claude / vim 等）、当前目录和环境变量可能都没了（用了 tmux 的话通常已自动 attach 回原会话）。\
+    断线前最后一条命令可能没有执行完。请先读屏核对现场，需要的话重新进入原来的环境（cd / docker exec / tmux attach），\
+    确认上一步的结果后再继续。）";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -87,6 +92,8 @@ pub enum HostEvent {
     Suspend(SuspendReason),
     /// 用户确认重新接驳到这个 console
     Reattach(ConsoleRef),
+    /// 同一个 console 断线后又连上了（网络恢复、自动重连成功）：只能离开 ConsoleGone 挂起
+    ConsoleBack,
     /// `nx_complete` 且 checks 全过
     CompleteVerified { summary: String, checks: Vec<CheckResult> },
     /// `nx_complete` 但有没满足的项；参数是未满足项的描述
@@ -111,6 +118,7 @@ impl HostEvent {
             Self::Restart => "restart",
             Self::Suspend(_) => "suspend",
             Self::Reattach(_) => "reattach",
+            Self::ConsoleBack => "console_back",
             Self::CompleteVerified { .. } => "complete_verified",
             Self::CompleteRejected(_) => "complete_rejected",
             Self::Stop => "stop",
@@ -202,6 +210,11 @@ pub fn step(phase: &HostPhase, ev: HostEvent) -> Result<(HostPhase, Vec<Effect>)
             P::Suspended { reason: *r, resume_to: Box::new(phase.base().clone()) },
             vec![],
         ),
+        (P::Suspended { reason: SuspendReason::ConsoleGone, resume_to }, E::ConsoleBack) => moved(
+            (**resume_to).clone(),
+            vec![Effect::ForceScreen, Effect::AppendUser(RECONNECT_NOTE.to_string())],
+        ),
+        (_, E::ConsoleBack) => Err(invalid()),
         (P::Suspended { resume_to, .. }, E::Reattach(c)) => moved(
             (**resume_to).clone(),
             vec![
@@ -586,6 +599,19 @@ mod tests {
         let s = HostPhase::Suspended { reason: SuspendReason::ConsoleGone, resume_to: Box::new(paused_budget()) };
         assert_eq!(next(&s, HostEvent::Restart), suspended(paused_budget()));
         assert!(step(&s, HostEvent::Suspend(SuspendReason::LlmDown)).is_err());
+    }
+
+    #[test]
+    fn console_back_only_leaves_console_gone() {
+        let gone = HostPhase::Suspended { reason: SuspendReason::ConsoleGone, resume_to: Box::new(HostPhase::Running) };
+        let (next, fx) = step(&gone, HostEvent::ConsoleBack).unwrap();
+        assert_eq!(next, HostPhase::Running);
+        assert!(fx.contains(&Effect::ForceScreen));
+        assert!(fx.iter().any(|e| matches!(e, Effect::AppendUser(n) if n == RECONNECT_NOTE)));
+        // 应用重启的挂起要人确认接驳；运行中也不接受
+        let restart = HostPhase::Suspended { reason: SuspendReason::AppRestart, resume_to: Box::new(HostPhase::Running) };
+        assert!(step(&restart, HostEvent::ConsoleBack).is_err());
+        assert!(step(&HostPhase::Running, HostEvent::ConsoleBack).is_err());
     }
 
     #[test]

@@ -3376,6 +3376,12 @@ pub(super) fn session_alive(state: &AppState, id: &str) -> bool {
     state.sessions.contains(id) || state.local.contains(id)
 }
 
+/// 会话这条连接的代号（`SessionManager::generation`）：断线重连后同一个 id 换新代号。
+/// 本地终端不会重连，在就是 0；不在为 `None`。
+pub(super) fn session_generation(state: &AppState, id: &str) -> Option<u64> {
+    state.sessions.generation(id).or_else(|| state.local.contains(id).then_some(0))
+}
+
 /// 越界被拒后喂回模型的话。
 fn beyond_scope_feedback(what: &str) -> String {
     format!(
@@ -3704,6 +3710,11 @@ pub async fn run(
                 } else {
                     "（重启前等批准的那个动作被拒绝了，没有执行。）\n"
                 });
+            }
+            // 断线后很快又连上了（没赶上被判成 ConsoleGone）：同一个 tab，但已经是新的 shell —— 告诉模型、强制读屏
+            if h.note_reconnect() {
+                push_user(&mut messages, super::host::phase::RECONNECT_NOTE.to_string());
+                feedback.push_str(&reattach_screen_feedback(&situation_now(app, state, &h.console_id, false)));
             }
             // 托管的 console 没了（tab 关了）：挂起（ConsoleGone），不再请模型往一个不存在的终端写
             if !session_alive(state, &h.console_id) && {
@@ -6675,7 +6686,7 @@ async fn try_reflex(
 /// 接驳后强制读屏的结果（喂给模型）。屏幕尾部已脱敏（出网前还会再过一遍闸门）。
 fn reattach_screen_feedback(sit: &super::situation::Situation) -> String {
     format!(
-        "（接驳后读屏）当前局面：kind={} program={}\n屏幕尾部：\n{}\n请先核对这是不是重启前的现场，再决定下一步。\n",
+        "（接驳后读屏）当前局面：kind={} program={}\n屏幕尾部：\n{}\n请先核对这是不是断线 / 重启前的现场，再决定下一步。\n",
         sit.kind.as_str(),
         sit.program.as_str(),
         tail_chars(sit.tail.trim(), 3000)
