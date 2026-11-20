@@ -61,6 +61,8 @@ pub mod learning;
 pub mod steward_core;
 #[cfg(test)]
 mod steward_e2e;
+#[cfg(test)]
+mod e2e;
 pub mod timeline;
 pub mod todo;
 pub mod trace;

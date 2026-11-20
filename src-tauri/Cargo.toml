@@ -105,6 +105,9 @@ rustls = { version = "0.23", default-features = false, features = [
 # 单测里暂停 tokio 时钟（`#[tokio::test(start_paused = true)]`），
 # 让 executor 那些按真实时间计的等待逻辑瞬间跑完且结果确定。
 tokio = { version = "1", features = ["full", "test-util"] }
+# 托管端到端回放（`agent::e2e`）：`tauri::test::mock_context` 造一个不带窗口、不嵌前端资源的 Context。
+# `test` feature 没有额外依赖，只在测试构建里打开。
+tauri = { version = "2", features = ["test"] }
 
 # 凭据存储后端随平台切换。keyring 的通用 API 三端一致，
 # 只是 native backend 要按目标选择，否则在别的平台上编译不过或退化到 secret-service。
