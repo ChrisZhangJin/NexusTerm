@@ -25,13 +25,13 @@ use super::host::checkpoint::LoadError;
 use super::host::driver::Seed;
 use super::policy::TIER_APPROVE;
 use super::host::context::HostContext;
-use super::host::attention::attention_for;
+use super::host::attention::{attention_for, attention_key};
 use super::host::criteria;
 use super::host_notify;
 use super::host::gate::HardRule;
 use super::host::{
     BudgetGrant, CardKind, CardReply, Check, ConsoleRef, HostCtx, HostEvent, HostHandle, HostIo, HostPhase,
-    HostShared,
+    HostShared, SuspendReason,
 };
 use super::policy::Authority;
 use super::llm::ChatMessage;
@@ -213,7 +213,11 @@ impl HostIo for AppHostIo {
         emit_status(&self.app, &st);
         let prev = self.attn_prev.lock().replace(phase.clone());
         if let Some(a) = prev.and_then(|p| attention_for(&p, phase, &st.label)) {
-            host_notify::dispatch(&self.app, &a, &st.label);
+            // 同一件事（例如连接来回抖时反复的「终端断开」）10 分钟内只提醒一次
+            let key = attention_key(phase).unwrap_or_default();
+            if host_notify::should_send(&self.handle.contract_id, &key, now_ms()) {
+                host_notify::dispatch(&self.app, &a, &st.label);
+            }
         }
     }
 
@@ -378,15 +382,9 @@ pub(crate) fn claim_all_then_sign<T>(
     run_id: &str,
     sign: impl FnOnce() -> Result<T, String>,
 ) -> Result<(T, Vec<(String, ControlState)>), String> {
-    if let Some(busy) = console_ids.iter().find(|c| control.holders_of(c).iter().any(|h| h != run_id)) {
-        return Err(format!("终端「{busy}」正被另一轮运行驾驶着（对话 / 技能 / 另一份托管），先停掉它再开始托管"));
-    }
-    let mut changed = Vec::new();
-    for c in console_ids {
-        if let Some(st) = control.acquire(c, run_id) {
-            changed.push((c.clone(), st));
-        }
-    }
+    let changed = control.try_acquire_all(console_ids, run_id).map_err(|busy| {
+        format!("终端「{busy}」正被另一轮运行驾驶着（对话 / 技能 / 另一份托管），先停掉它再开始托管")
+    })?;
     match sign() {
         Ok(v) => Ok((v, changed)),
         Err(e) => {
@@ -1011,6 +1009,8 @@ pub fn boot_scan(app: &AppHandle) {
     for cp in restored {
         let h = shared_from_checkpoint(app, &cp);
         h.restore(cp.phase.clone(), Vec::new());
+        // 没有运行任务：当作「已退出」，接驳时不必等它
+        h.mark_exited();
         state.act.host.register(h);
     }
     if !expired.is_empty() {
@@ -1120,15 +1120,66 @@ pub(crate) fn reattach_slot_plan(
         return Ok((next, Vec::new(), drifted));
     }
     let mut fx = next.reattach_slot(slot, console, &verdict)?;
-    // 密码卡的请求通道随旧进程没了，没法再答：回到运行，让模型重新发起 nx_secret
+    drop_stale_secret(&mut next, &mut fx);
+    next.contract.authority_tier = next.authority.tier.clone();
+    Ok((next, fx, drifted))
+}
+
+/// 密码卡的请求通道随旧进程没了，没法再答：回到运行，让模型重新发起 nx_secret
+fn drop_stale_secret(next: &mut HostCheckpoint, fx: &mut Vec<super::host::phase::Effect>) {
     if matches!(&next.phase, HostPhase::WaitingHuman { card } if card.kind == CardKind::Secret) {
         next.phase = HostPhase::Running;
         fx.push(super::host::phase::Effect::Feedback(
             "（重启前等你输入的密码请求已经失效，没有写入任何东西；需要的话请重新调用 nx_secret。）".to_string(),
         ));
     }
+}
+
+/// 部分接驳之后，还缺的终端自己以原 id 连回来了（断线重连）：按「同一个 tab 连回来」接着跑，
+/// 与驱动里的 ConsoleBack 一样不按屏幕判漂移（前几步接驳已经判过、降过的档保留），只看过期。
+/// ConsoleGone 挂起走 ConsoleBack（告诉模型是新 shell 会话），其余（重启挂起）走接驳。
+pub(crate) fn auto_resume_plan(
+    cp: &HostCheckpoint,
+    now: i64,
+) -> Result<(HostCheckpoint, Vec<super::host::phase::Effect>), String> {
+    if let ResumeVerdict::Expired { reason } = cp.reattach_verdict(Some(&cp.last_screen_hash), now) {
+        return Err(reason);
+    }
+    let mut next = cp.clone();
+    let ev = match &cp.phase {
+        HostPhase::Suspended { reason: SuspendReason::ConsoleGone, .. } => HostEvent::ConsoleBack,
+        HostPhase::Suspended { .. } => HostEvent::Reattach(cp.console.clone()),
+        _ => return Err("这份托管没有在等重新接驳".to_string()),
+    };
+    let (p, mut fx) = super::host::phase::step(&cp.phase, ev).map_err(|e| e.to_string())?;
+    next.phase = p;
+    drop_stale_secret(&mut next, &mut fx);
     next.contract.authority_tier = next.authority.tier.clone();
-    Ok((next, fx, drifted))
+    Ok((next, fx))
+}
+
+/// 部分接驳挂着的「还差 …」那一行的开头。
+const WAITING_MARK: &str = "已接上「";
+/// [`drift_notice`] 的开头。
+const DRIFT_MARK: &str = "接驳时的屏幕和重启前不一样";
+
+/// 多步接驳时往下一步带的提示：去掉上一步「还差 …」那一行，其余（例如降档提示）原样带上。
+pub(crate) fn carried_notice(n: Option<String>) -> Option<String> {
+    let kept: Vec<&str> = n.as_deref().unwrap_or("").lines().filter(|l| !l.starts_with(WAITING_MARK)).collect();
+    let s = kept.join("\n");
+    (!s.trim().is_empty()).then_some(s)
+}
+
+/// 这一步接驳之后面板上的提示。`prior` 是上一步留下的（已去掉「还差」行），`from_partial` = 上一步是部分接驳。
+/// 漂移：上一步已有降档提示就沿用（它说的才是**原来**的档位，这一步的 prev_tier 已经是确认档了）。
+pub(crate) fn reattach_notice(prior: Option<String>, from_partial: bool, partial: bool, drifted: bool, prev_tier: &str) -> Option<String> {
+    if drifted {
+        return Some(prior.filter(|p| p.contains(DRIFT_MARK)).unwrap_or_else(|| drift_notice(prev_tier)));
+    }
+    if partial || from_partial {
+        return prior;
+    }
+    None
 }
 
 /// 用户确认接驳：接到 `console_id` 这个 tab，或 `open_new` 按保存的线索新开一个连接。
@@ -1239,6 +1290,8 @@ pub async fn host_reattach(
     if had_task {
         old.supersede();
     }
+    // 上一步是部分接驳（仍挂着「还差 …」）：它的降档提示要带到这一步
+    let from_partial = old.notice().is_some_and(|n| n.lines().any(|l| l.starts_with(WAITING_MARK)));
     if partial {
         // 新开连接后要恢复现场的话：这一次不起任务，记进对话（最后一个接上后模型第一步就看得到）
         if let Some(n) = restore_note.take() {
@@ -1263,13 +1316,9 @@ pub async fn host_reattach(
     if let Some(n) = restore_note {
         h.send_user_note(n);
     }
-    if drifted {
-        h.set_notice(Some(drift_notice(&prev_tier)));
-    } else if partial {
-        h.set_notice(old.notice());
-    }
+    h.set_notice(reattach_notice(carried_notice(old.notice()), from_partial, partial, drifted, &prev_tier));
     if partial {
-        let waiting = format!("已接上「{}」；还差 {}，全部接上后自动接着托管。", saved.label, still_missing.iter().map(|l| format!("「{l}」")).collect::<Vec<_>>().join("、"));
+        let waiting = format!("{WAITING_MARK}{}」；还差 {}，全部接上后自动接着托管。", saved.label, still_missing.iter().map(|l| format!("「{l}」")).collect::<Vec<_>>().join("、"));
         let n = h.notice().map_or(waiting.clone(), |n| format!("{n}\n{waiting}"));
         h.set_notice(Some(n));
     }
@@ -1277,9 +1326,110 @@ pub async fn host_reattach(
     h.set_ctx(build_ctx(&app, &state, c.contract, c.authority, &c.label, &c.extra), None);
     state.act.host.register(Arc::clone(&h));
     h.announce();
-    if !partial {
+    if partial {
+        // 这一份没有运行任务：当作「已退出」，最后一步接驳不必等它（复审 L6）
+        h.mark_exited();
+        // 还缺的终端若以原 id 自己连回来（断线重连），没人点也要接着跑（复审 M2）
+        spawn_partial_watch(app.clone(), h);
+    } else {
         spawn_resumed(app.clone(), h, had_task.then(|| Arc::clone(&old)));
     }
+    Ok(())
+}
+
+/// 部分接驳后看着还缺的终端：每 [`PARTIAL_WATCH_POLL`] 看一次，连续 [`PARTIAL_WATCH_STABLE`] 次全都在就
+/// 自动接完（同最后一格接上）。这一份被停掉 / 被别处接驳顶替 / 已经不挂起了就退出。
+pub(crate) const PARTIAL_WATCH_POLL: Duration = Duration::from_secs(3);
+pub(crate) const PARTIAL_WATCH_STABLE: u32 = 2;
+
+/// 看守循环的纯骨架（假时钟 / 假状态可测）：`current` 为假就退出；`complete` 成功就退出，失败重新计数。
+pub(crate) async fn watch_partial<Fut>(
+    current: impl Fn() -> bool,
+    all_alive: impl Fn() -> bool,
+    mut complete: impl FnMut() -> Fut,
+    poll: Duration,
+) where
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut stable = 0u32;
+    loop {
+        tokio::time::sleep(poll).await;
+        if !current() {
+            return;
+        }
+        if !all_alive() {
+            stable = 0;
+            continue;
+        }
+        stable += 1;
+        if stable < PARTIAL_WATCH_STABLE {
+            continue;
+        }
+        match complete().await {
+            Ok(()) => return,
+            Err(e) => {
+                tracing::info!("部分接驳的托管暂时接不完：{e}");
+                stable = 0;
+            }
+        }
+    }
+}
+
+fn spawn_partial_watch(app: AppHandle, h: Arc<HostShared>) {
+    tauri::async_runtime::spawn(async move {
+        let cid = h.contract_id().to_string();
+        let current = || {
+            app.try_state::<AppState>().is_some_and(|st| {
+                st.act.host.get(&cid).is_some_and(|cur| {
+                    Arc::ptr_eq(&cur, &h) && matches!(cur.phase(), HostPhase::Suspended { .. })
+                })
+            })
+        };
+        watch_partial(current, || h.all_alive(), || complete_partial(&app, &h), PARTIAL_WATCH_POLL).await;
+    });
+}
+
+/// 部分接驳的那一份：其余终端都以原 id 回来了，按最后一格接上的同一条路接着跑（新任务、带对话与提示）。
+async fn complete_partial(app: &AppHandle, old: &Arc<HostShared>) -> Result<(), String> {
+    let state = app.try_state::<AppState>().ok_or("应用状态不在")?;
+    let (registry, core) = (
+        app.try_state::<StewardRegistry>().ok_or("守护进程不在")?,
+        app.try_state::<StewardCore>().ok_or("守护进程不在")?,
+    );
+    let contract_id = old.contract_id().to_string();
+    let _reattaching =
+        state.act.host.begin_reattach(&contract_id).ok_or_else(|| "这份托管正在接驳中".to_string())?;
+    still_reattachable(&state.act.host, &contract_id, old)?;
+    if !old.all_alive() {
+        return Err("还有终端不在".to_string());
+    }
+    let mut cp = old.checkpoint().ok_or_else(|| "没有可接驳的现场".to_string())?;
+    let live = old.ctx();
+    cp.contract = live.contract.clone();
+    cp.authority = live.authority.clone();
+    let (next, effects) = auto_resume_plan(&cp, now_ms())?;
+    // 全部终端的租约（断线期间可能已从表里清掉）：拿不到就先不接，下一轮再看
+    let ids: Vec<String> = next.consoles().map(|c| c.console_id.clone()).collect();
+    let changes = state
+        .act
+        .control
+        .try_acquire_all(&ids, old.run_id())
+        .map_err(|busy| format!("终端「{busy}」正被另一轮运行驾驶着"))?;
+    for (session, st) in changes {
+        act::emit_control(app, &session, &state.act.control.holders_of(&session), st);
+    }
+    registry.restore(next.contract.clone());
+    core.set_authority(&contract_id, next.authority.clone());
+    let h = shared_from_checkpoint(app, &next);
+    h.restore(next.phase.clone(), effects);
+    h.set_seed(Seed { messages: next.messages.clone(), step: next.step });
+    h.set_notice(carried_notice(old.notice()));
+    let c = h.ctx();
+    h.set_ctx(build_ctx(app, &state, c.contract, c.authority, &c.label, &c.extra), None);
+    state.act.host.register(Arc::clone(&h));
+    h.announce();
+    tracing::info!("托管 {contract_id} 其余终端已连回，自动接着托管");
+    spawn_resumed(app.clone(), h, None);
     Ok(())
 }
 
@@ -1888,6 +2038,81 @@ mod tests {
         // 过期一样拒
         let late = cp.saved_wall_ms + CHECKPOINT_TTL_MS + 1;
         assert!(reattach_slot_plan(&cp, "tab-b-old", saved_console("x"), None, late, true).is_err());
+    }
+
+    /// 部分接驳后其余终端以原 id 连回（ConsoleGone 挂起）：走 ConsoleBack，告诉模型是新 shell；降过的档保留
+    #[test]
+    fn auto_resume_after_partial_uses_console_back_and_keeps_tier() {
+        let mut cp = multi_cp(HostPhase::Running);
+        cp.phase = HostPhase::Suspended { reason: SuspendReason::ConsoleGone, resume_to: Box::new(HostPhase::Running) };
+        cp.authority.tier = TIER_APPROVE.into();
+        let (next, fx) = auto_resume_plan(&cp, 10_000).unwrap();
+        assert_eq!(next.phase, HostPhase::Running);
+        assert_eq!(next.authority.tier, TIER_APPROVE);
+        assert_eq!(next.contract.authority_tier, TIER_APPROVE);
+        assert!(fx.iter().any(|e| matches!(e, super::super::host::phase::Effect::AppendUser(n) if n == super::super::host::phase::RECONNECT_NOTE)));
+        // 重启挂起：走接驳（REATTACH_NOTE）
+        let mut cp2 = multi_cp(HostPhase::Running);
+        cp2.suspend_for_restart();
+        let (n2, fx2) = auto_resume_plan(&cp2, 10_000).unwrap();
+        assert_eq!(n2.phase, HostPhase::Running);
+        assert!(fx2.iter().any(|e| matches!(e, super::super::host::phase::Effect::ForceScreen)));
+        // 过期 / 没挂起：不接
+        assert!(auto_resume_plan(&cp, cp.saved_wall_ms + CHECKPOINT_TTL_MS + 1).is_err());
+        assert!(auto_resume_plan(&multi_cp(HostPhase::Running), 10_000).is_err());
+    }
+
+    /// 看守：全在要连续两次才接；接失败重新计数；不再是当前那一份就退出
+    #[tokio::test(start_paused = true)]
+    async fn partial_watch_completes_after_stable_polls_and_stops_when_superseded() {
+        use std::sync::atomic::AtomicU32;
+        let polls = AtomicU32::new(0);
+        let calls = AtomicU32::new(0);
+        // 第 1 次不在，第 2、3 次在 → 第 3 次（连续两次）调 complete；第一次失败，第 4、5 次后再调成功
+        let alive = || polls.fetch_add(1, Ordering::Relaxed) != 0;
+        watch_partial(
+            || true,
+            alive,
+            || {
+                let n = calls.fetch_add(1, Ordering::Relaxed);
+                async move { if n == 0 { Err("租约忙".to_string()) } else { Ok(()) } }
+            },
+            PARTIAL_WATCH_POLL,
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(polls.load(Ordering::Relaxed), 5);
+        // 被顶替 / 停掉：一次都不接就退出
+        let calls = AtomicU32::new(0);
+        watch_partial(
+            || false,
+            || true,
+            || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async { Ok(()) }
+            },
+            PARTIAL_WATCH_POLL,
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// 多步接驳：第一步漂移降档的提示（说的是原来的档位）一直带到最后一步；「还差 …」那行不重复堆
+    #[test]
+    fn drift_notice_survives_multi_step_reattach() {
+        let first = reattach_notice(None, false, true, true, "auto").unwrap();
+        assert!(first.contains("「自动执行」"));
+        let shown = format!("{first}\n已接上「A」；还差「B」，全部接上后自动接着托管。");
+        // 最后一步：没再漂移 → 原提示照带
+        let last = reattach_notice(carried_notice(Some(shown.clone())), true, false, false, TIER_APPROVE);
+        assert_eq!(last.as_deref(), Some(first.as_str()));
+        // 最后一步又判漂移：仍是说「自动执行」的那句，而不是「确认档改回确认档」
+        let last = reattach_notice(carried_notice(Some(shown.clone())), true, false, true, TIER_APPROVE).unwrap();
+        assert!(last.contains("「自动执行」"));
+        assert!(!last.contains(WAITING_MARK));
+        // 单步接驳不带旧提示
+        assert_eq!(reattach_notice(Some("旧".into()), false, false, false, "auto"), None);
+        assert_eq!(carried_notice(Some("已接上「A」；还差「B」".into())), None);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use tauri_plugin_notification::NotificationExt;
 use crate::cmd::AppState;
 use crate::store::Store;
 
-use super::host::attention::Attention;
+use super::host::attention::{Attention, AttentionLimiter};
 use super::steward::now_ms;
 
 const SETTING_KEY: &str = "host_notify";
@@ -64,6 +64,15 @@ pub fn host_notify_set(config: HostNotifyConfig, state: State<'_, AppState>) -> 
     let c = normalize(config)?;
     let json = serde_json::to_string(&c).map_err(|e| e.to_string())?;
     state.store.set_setting(SETTING_KEY, &json)
+}
+
+/// 全进程一份的提醒限流（见 [`AttentionLimiter`]）。
+static LIMITER: std::sync::LazyLock<parking_lot::Mutex<AttentionLimiter>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// 这条提醒（契约 + 去重键）现在能不能发：同一件事 10 分钟内只发一次。
+pub fn should_send(contract_id: &str, key: &str, now_ms: i64) -> bool {
+    LIMITER.lock().allow(contract_id, key, now_ms)
 }
 
 /// webhook 的载荷。只有一行原因，不带终端内容。

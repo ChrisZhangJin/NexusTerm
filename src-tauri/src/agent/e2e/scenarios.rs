@@ -378,3 +378,58 @@ fn multi_console_keys_judged_by_target_screen() {
     assert!(!h.screen_of(&b).contains("hunter2"), "按键不该进 B：\n{}", h.screen_of(&b));
     assert!(h.screen().contains("a-ok-hunter2"), "A 上照常执行：\n{}", h.screen());
 }
+
+/// 9. 终端消失又以同一个 id 回来（断线重连）：多终端托管里 B 没了 → 挂起（ConsoleGone）；B 回来、稳住两轮
+/// 后自动接着托管（回到挂起前那张等人卡），模型拿到「终端已自动重连、是新 shell」的提示。
+#[test]
+fn console_gone_then_back_auto_resumes_with_reconnect_note() {
+    use crate::agent::host::SuspendReason;
+    let mut h = harness!(
+        vec![turn(None, "nx_ask_user", json!({ "question": "继续吗？" })), complete(Some("自动重连"))],
+        vec![],
+        always_ok()
+    );
+    let b = h.add_console("b");
+    h.start_with("断线重连", "auto", &[&b]);
+    h.wait_phase(Duration::from_secs(30), "等人", |p| matches!(p, HostPhase::WaitingHuman { .. }));
+    h.kill_console(&b);
+    h.wait_phase(Duration::from_secs(15), "挂起（终端断开）", |p| {
+        matches!(p, HostPhase::Suspended { reason: SuspendReason::ConsoleGone, .. })
+    });
+    assert_eq!(h.llm.cursor(), 1, "挂起时不该再请求模型");
+    h.respawn_console(&b);
+    let p = h.wait_phase(Duration::from_secs(20), "自动回到等人卡", |p| matches!(p, HostPhase::WaitingHuman { .. }));
+    assert!(matches!(p, HostPhase::WaitingHuman { card } if card.kind == CardKind::Ask));
+    h.answer("继续");
+    let p = h.wait_terminal(Duration::from_secs(30));
+    assert_completed(&h, &p);
+    assert!(h.llm.feedback().iter().any(|f| f.contains("继续")), "答复也到了模型：{}", h.dump());
+}
+
+/// 10. 多终端托管里在**其余终端** B 上点「接管」：整份托管让路（人在驾驶，A 也不再写、不再请求模型）；
+/// 在 B 上「交还」后接着跑完。
+#[test]
+fn takeover_on_extra_console_pauses_whole_run_until_handback() {
+    use crate::agent::control::{ControlEvent, ControlState};
+    let mut h = harness!(
+        vec![
+            turn(None, "nx_exec", json!({ "command": "sleep 2; echo slept-ok" })),
+            complete(Some("slept-ok")),
+        ],
+        vec![],
+        always_ok()
+    );
+    let b = h.add_console("b");
+    h.start_with("接管其余终端", "auto", &[&b]);
+    h.wait_screen(Duration::from_secs(30), |s| s.contains("sleep 2; echo slept-ok"));
+    h.state().act.user_control(&h.app, &b, ControlEvent::Takeover);
+    h.wait_phase(Duration::from_secs(15), "人在驾驶", |p| matches!(p, HostPhase::UserDriving { .. }));
+    // 整份托管都让路：主终端 A 也落到 Paused（相位先变、控制表随后同步）；模型不再被请求
+    h.wait_until(Duration::from_secs(5), "主终端也让路", |h| h.state().act.control.state(&h.console) == ControlState::Paused);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(h.llm.cursor(), 1, "人在驾驶时不该再请求模型：{}", h.dump());
+    assert!(matches!(h.phase(), HostPhase::UserDriving { .. }));
+    h.state().act.user_control(&h.app, &b, ControlEvent::Handback);
+    let p = h.wait_terminal(Duration::from_secs(30));
+    assert_completed(&h, &p);
+}

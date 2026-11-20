@@ -7,7 +7,7 @@
 //! 改动摘要在托管每次落盘时增量并进 `host_changes` 表（决策表全局只留最近 500 条，早期改动 / 老托管靠它）。
 
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::cmd::AppState;
 
@@ -137,25 +137,38 @@ pub(crate) fn history_item(row: &crate::store::host::HostSessionRow, changes: Ch
     })
 }
 
+/// 历史托管。读几百行 JSON、逐个解析、扫备份目录，可能要几百毫秒：放到阻塞线程池里做，不占主线程
+/// （同步命令跑在主线程上，会卡住界面）。
 #[tauri::command]
-pub fn host_history(limit: Option<usize>, app: AppHandle, state: State<'_, AppState>) -> Vec<HostHistoryItem> {
-    let root = backup_root(&app);
-    state
-        .store
-        .host_history_rows(limit.unwrap_or(crate::store::host::HISTORY_KEEP))
-        .iter()
-        .filter_map(|row| {
-            history_item(row, changes_for(&state.store, &row.contract_id), backup::list(&root, &row.contract_id))
-        })
-        .collect()
+pub async fn host_history(limit: Option<usize>, app: AppHandle) -> Result<Vec<HostHistoryItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let root = backup_root(&app);
+        state
+            .store
+            .host_history_rows(limit.unwrap_or(crate::store::host::HISTORY_KEEP))
+            .iter()
+            .filter_map(|row| {
+                history_item(row, changes_for(&state.store, &row.contract_id), backup::list(&root, &row.contract_id))
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| format!("读取历史托管失败：{e}"))
 }
 
+/// 一次托管的实际改动（没定格就按决策记录现算）+ 备份清单：同上，放到阻塞线程池里。
 #[tauri::command]
-pub fn host_changes(contract_id: String, app: AppHandle, state: State<'_, AppState>) -> HostChanges {
-    HostChanges {
-        changes: changes_for(&state.store, &contract_id),
-        backups: backup::list(&backup_root(&app), &contract_id),
-    }
+pub async fn host_changes(contract_id: String, app: AppHandle) -> Result<HostChanges, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        HostChanges {
+            changes: changes_for(&state.store, &contract_id),
+            backups: backup::list(&backup_root(&app), &contract_id),
+        }
+    })
+    .await
+    .map_err(|e| format!("读取托管改动失败：{e}"))
 }
 
 /// 把备份的原文写回去。走原来那个终端的文件通道；终端已经关了就报错。

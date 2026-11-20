@@ -215,11 +215,14 @@ fn common_affix(a: impl Iterator<Item = u8>, b: impl Iterator<Item = u8>) -> usi
 pub struct Tail {
     pub text: String,
     pub alt: bool,
+    /// 渲染帧里光标真正所在的那一行（帧没带光标 / 没有帧时为 `None`，退回 `text` 的最后一行）。
+    /// `text` 会去掉尾部空行：安静的命令最后打了一行 `Ready>`、光标停在下面的空行上，不能把 `Ready>` 当成光标行。
+    pub cursor_line: Option<String>,
 }
 
 impl From<String> for Tail {
     fn from(text: String) -> Self {
-        Self { text, alt: false }
+        Self { text, alt: false, cursor_line: None }
     }
 }
 
@@ -307,7 +310,10 @@ where
                         handover_at = Some(last);
                         let t: Tail = tail().into();
                         let alt = t.alt;
-                        let cursor_line = t.text.rsplit('\n').next().unwrap_or_default().to_string();
+                        let cursor_line = t
+                            .cursor_line
+                            .clone()
+                            .unwrap_or_else(|| t.text.rsplit('\n').next().unwrap_or_default().to_string());
                         let g = classify_tail(t);
                         let new_shell = g.kind == PromptKind::ShellPrompt && g.confidence >= AWAIT_INPUT_MIN_CONFIDENCE;
                         if alt || new_shell {
@@ -389,6 +395,39 @@ mod tests {
         assert!(g.confidence < AWAIT_INPUT_MIN_CONFIDENCE, "形状判断，不冒充分类器的把握");
     }
 
+    /// 复审 L1：安静的命令最后打了一行像提示符的 `Ready>`，光标却停在它下面的空行上 —— 那是命令还在跑，
+    /// 不是交接。按渲染帧的真实光标行判，不按最后一个非空行。
+    #[tokio::test(start_paused = true)]
+    async fn custom_prompt_handover_uses_real_cursor_row() {
+        let tail = |cursor: &str| {
+            let cursor = cursor.to_string();
+            move || Tail { text: "root@e2e:/tmp/work# ./server\nReady>".into(), alt: false, cursor_line: Some(cursor.clone()) }
+        };
+        let out = wait_for_end(
+            cfg(300, 10_000, 50),
+            Some("root@e2e:/tmp/work# "),
+            || 0,
+            || String::new(),
+            tail(""),
+            || String::new(),
+            || false,
+        )
+        .await;
+        assert_eq!(out.reason, ExecEnd::Timeout, "光标在空行上：命令还在跑");
+        // 光标就停在 `Ready>` 那一行：照旧按交接收尾
+        let out = wait_for_end(
+            cfg(300, 10_000, 50),
+            Some("root@e2e:/tmp/work# "),
+            || 0,
+            || "Ready>".to_string(),
+            tail("Ready>"),
+            || String::new(),
+            || false,
+        )
+        .await;
+        assert_eq!(out.reason, ExecEnd::Handover);
+    }
+
     #[test]
     fn custom_prompt_shape() {
         let base = "chris@host:~$ ";
@@ -424,7 +463,7 @@ mod tests {
             Some("(base) chris@ubuntu-22at159:~/workspace$ "),
             || 0,
             || "[cnn] 0:bash- 1:sonari*      \"ubuntu-22at159\" 23:12 16-Nov-26".to_string(),
-            || Tail { text: "(base) chris@ubuntu-22at159:~/wo\n[cnn] 0:bash- 1:sonari*".into(), alt: true },
+            || Tail { text: "(base) chris@ubuntu-22at159:~/wo\n[cnn] 0:bash- 1:sonari*".into(), alt: true, cursor_line: None },
             || String::new(),
             || false,
         )

@@ -2156,9 +2156,9 @@ pub(super) fn tail_from(
     match frame {
         Some(f) => {
             let (text, alt) = super::situation::frame_text(f);
-            super::executor::Tail { text, alt }
+            super::executor::Tail { text, alt, cursor_line: super::situation::cursor_line(f) }
         }
-        None => super::executor::Tail { text: raw(), alt },
+        None => super::executor::Tail { text: raw(), alt, cursor_line: None },
     }
 }
 
@@ -3287,6 +3287,10 @@ pub(super) async fn gate_drive(
             control::PauseWait::Cancelled
         };
     }
+    // 别的标签页上的对话 / 技能不许去写一个正被托管的终端（复审 L4）：连租约都不拿
+    if refuse_unhosted_write(&runtime.host, target) {
+        return control::PauseWait::Refused;
+    }
     if let Some(st) = runtime.control.acquire(target, run) {
         emit_control(app, target, &[run.to_string()], st);
     }
@@ -3298,6 +3302,11 @@ pub(super) async fn gate_drive(
         tokio::time::sleep,
     )
     .await
+}
+
+/// 非托管运行要写的 `target` 是不是正被一份未结束的托管（含挂起 / 人在驾驶）占着。
+pub(super) fn refuse_unhosted_write(host: &super::host::HostSupervisor, target: &str) -> bool {
+    host.live_on_console(target).is_some()
 }
 
 /// 等满上限用户仍没交还时喂给模型的话：别再下发终端动作，直接收尾。
@@ -3839,6 +3848,11 @@ pub async fn run(
                     took_over = true;
                     break;
                 }
+                control::PauseWait::Refused => {
+                    emit_step(app, &session, StepPayload { text: Some(control::HOSTED_BUSY.into()), ..StepPayload::new("note", step) });
+                    feedback.push_str(&format!("{}：这一步没有往终端写入任何内容，别再对它下发终端动作。\n", control::HOSTED_BUSY));
+                    break;
+                }
             }
         };
     }
@@ -4011,7 +4025,7 @@ pub async fn run(
                     emit_step(app, &session, StepPayload { text: Some("已取消。".into()), ..StepPayload::new("note", step) });
                     break;
                 }
-                control::PauseWait::TookOver => {
+                control::PauseWait::TookOver | control::PauseWait::Refused => {
                     emit_step(
                         app,
                         &session,
@@ -5738,7 +5752,7 @@ pub async fn run(
                                     last_change = std::time::Instant::now();
                                 }
                                 control::PauseWait::Cancelled => continue,
-                                control::PauseWait::TookOver => {
+                                control::PauseWait::TookOver | control::PauseWait::Refused => {
                                     took_over = true;
                                     break;
                                 }
@@ -8742,6 +8756,22 @@ mod tests {
             updated_at,
             idle_frames: 0,
         }
+    }
+
+    /// 复审 L4：别的标签页上的对话不许写正被托管（含挂起中）的终端；托管结束后照常
+    #[test]
+    fn unhosted_run_refused_on_live_hosted_console() {
+        use super::super::host::{HostEvent, HostSupervisor, SuspendReason};
+        let sup = HostSupervisor::new();
+        let (h, _io) = super::super::host::driver::tests::shared_multi("c1", "A", &["B"]);
+        sup.register(h.clone());
+        assert!(refuse_unhosted_write(&sup, "A"));
+        assert!(refuse_unhosted_write(&sup, "B"), "多终端托管的其余终端同样不许");
+        assert!(!refuse_unhosted_write(&sup, "C"));
+        h.apply(HostEvent::Suspend(SuspendReason::ConsoleGone)).unwrap();
+        assert!(refuse_unhosted_write(&sup, "B"), "挂起中仍归托管");
+        h.apply(HostEvent::Stop).unwrap();
+        assert!(!refuse_unhosted_write(&sup, "A"), "托管结束了就放行");
     }
 
     #[test]

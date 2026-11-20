@@ -250,6 +250,11 @@ pub fn cursor_index(snap: &ScreenSnapshot) -> Option<usize> {
     (idx < total).then_some(idx)
 }
 
+/// 光标真正所在那一行的文本（去 ANSI、去行尾空白）；帧没带光标为 `None`。
+pub fn cursor_line(snap: &ScreenSnapshot) -> Option<String> {
+    cursor_index(snap).map(|i| strip_ansi(&snap.lines[i]).trim_end().to_string())
+}
+
 /// 「当前行」为止的窗口终点：光标下面还画着东西时取到光标行（含它上面最后一个非空行），否则就是 `end`。
 fn current_end(snap: &ScreenSnapshot, start: usize, end: usize) -> usize {
     cursor_index(snap)
@@ -1519,6 +1524,22 @@ mod tests {
             updated_at: 1_000,
             idle_frames: 0,
         }
+    }
+
+    /// 复审 L1：光标在最后一行输出下面的空行上 —— 光标行是空的，不是那行输出
+    #[test]
+    fn cursor_line_is_the_real_cursor_row() {
+        let mut s = snap(&["$ ./server", "Ready>", ""], false);
+        s.rows = 3;
+        s.cursor_y = 2;
+        assert_eq!(cursor_line(&s).as_deref(), Some(""));
+        assert!(frame_text(&s).0.ends_with("Ready>"), "给分类器的文本照旧去掉尾部空行");
+        s.cursor_y = 1;
+        s.cursor_x = 6;
+        assert_eq!(cursor_line(&s).as_deref(), Some("Ready>"));
+        s.cursor_x = 0;
+        s.cursor_y = 0;
+        assert_eq!(cursor_line(&s), None, "帧没带光标");
     }
 
     fn c(s: &ScreenSnapshot) -> Situation {

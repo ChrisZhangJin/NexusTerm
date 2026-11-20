@@ -108,6 +108,32 @@ impl ControlTable {
         Some(new)
     }
 
+    /// 全有或全无地拿下一组会话：同一把锁里先查「有没有别的运行占着」、再全部 acquire，
+    /// 两轮运行并发抢重叠的终端时只有一轮能拿到。返回 `(会话, 新状态)` 变化清单；
+    /// 有会话已被别的运行驾驶着就一个都不拿，返回 `Err(那个会话)`。
+    pub fn try_acquire_all(&self, sessions: &[String], run: &str) -> Result<Vec<(String, ControlState)>, String> {
+        let mut map = self.inner.lock();
+        if let Some(busy) = sessions
+            .iter()
+            .find(|s| map.get(s.as_str()).is_some_and(|e| e.holders.iter().any(|h| h != run)))
+        {
+            return Err(busy.clone());
+        }
+        let mut changed = Vec::new();
+        for s in sessions {
+            let e = map.entry(s.clone()).or_insert(Entry { state: ControlState::UserDriving, holders: Vec::new() });
+            if !e.holders.iter().any(|h| h == run) {
+                e.holders.push(run.to_string());
+            }
+            let new = next(e.state, ControlEvent::RunStarted);
+            if new != e.state {
+                e.state = new;
+                changed.push((s.clone(), new));
+            }
+        }
+        Ok(changed)
+    }
+
     /// 运行 `run` 结束（正常 / 出错 / 被停止）：从它驾驶过的所有会话上撤下。
     /// 返回 `(会话, 新状态)` 的变化清单；还有别的运行在驾驶的会话保持原状。
     pub fn release_run(&self, run: &str) -> Vec<(String, ControlState)> {
@@ -234,7 +260,12 @@ pub enum PauseWait {
     Cancelled,
     /// 等满上限用户仍没交还：按「用户接管了终端」处理，别再写。
     TookOver,
+    /// 目标终端正被一份（未结束的）托管占着，而这轮不是那份托管：不拿租约、不写（见 [`HOSTED_BUSY`]）。
+    Refused,
 }
+
+/// 非托管运行（对话 / 技能）想写一个正被托管的终端时给模型 / 面板的话。
+pub const HOSTED_BUSY: &str = "这个终端正在被托管，先停掉托管或接管";
 
 /// Agent 写 pty 之前的闸：`Paused` 就轮询等待，直到交还 / 取消 / 超过 `max`。
 ///
@@ -458,5 +489,36 @@ mod tests {
         .await;
         assert_eq!(r, PauseWait::TookOver);
         assert_eq!(slept.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn try_acquire_all_is_atomic_under_concurrent_overlap() {
+        use std::sync::Arc;
+        for _ in 0..200 {
+            let t = Arc::new(ControlTable::new());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let spawn = |run: &'static str, ids: Vec<String>| {
+                let (t, b) = (t.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    t.try_acquire_all(&ids, run).is_ok()
+                })
+            };
+            let a = spawn("host:a", vec!["s1".into(), "s2".into()]);
+            let b = spawn("host:b", vec!["s2".into(), "s3".into()]);
+            let (ra, rb) = (a.join().unwrap(), b.join().unwrap());
+            assert!(ra ^ rb, "恰好一轮拿到：a={ra} b={rb}");
+            let winner = if ra { "host:a" } else { "host:b" };
+            assert_eq!(t.holders_of("s2"), vec![winner.to_string()]);
+            // 输的一方一个都没拿
+            let loser = if ra { "host:b" } else { "host:a" };
+            assert!(t.sessions_of(loser).is_empty());
+        }
+        // 自己已持有的不算忙；失败返回占着的那个会话
+        let t = ControlTable::new();
+        assert!(t.try_acquire_all(&["x".into()], "r1").is_ok());
+        assert!(t.try_acquire_all(&["x".into(), "y".into()], "r1").is_ok());
+        assert_eq!(t.try_acquire_all(&["z".into(), "x".into()], "r2"), Err("x".to_string()));
+        assert!(t.holders_of("z").is_empty());
     }
 }

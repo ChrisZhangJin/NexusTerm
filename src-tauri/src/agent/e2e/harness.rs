@@ -368,6 +368,23 @@ impl Harness {
         std::thread::sleep(HEARTBEAT * 2);
     }
 
+    /// 模拟终端消失（tab 关了 / 连接断了）：杀掉这个本地会话的 PTY 并从会话表里摘掉。
+    pub fn kill_console(&self, id: &str) {
+        self.state().local.close(id).expect("关本地会话");
+    }
+
+    /// 以**同一个 id** 重新起一个 bash（= 断线后连回来），屏幕从空白开始。
+    pub fn respawn_console(&self, id: &str) {
+        let (dir, vt) = if id == self.console {
+            (self.dir.clone(), Arc::clone(&self.vt))
+        } else {
+            let r = self.rig(id);
+            (r.dir.clone(), Arc::clone(&r.vt))
+        };
+        *vt.lock() = Vt::new(COLS, ROWS);
+        boot_shell(&self.app, id, &dir, &vt);
+    }
+
     pub fn state(&self) -> tauri::State<'_, AppState> {
         self.app.state::<AppState>()
     }

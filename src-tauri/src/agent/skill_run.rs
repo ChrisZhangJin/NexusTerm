@@ -1276,6 +1276,7 @@ impl<I: SkillIo> Engine<'_, I> {
             PauseWait::Ready => Gate::Go,
             PauseWait::Cancelled => Gate::Cancelled,
             PauseWait::TookOver => Gate::TookOver,
+            PauseWait::Refused => Gate::Declined(super::control::HOSTED_BUSY.into()),
         }
     }
 
@@ -1462,6 +1463,7 @@ impl<I: SkillIo> Engine<'_, I> {
                 PauseWait::Ready => {}
                 PauseWait::Cancelled => return Err(StepEnd::Cancelled),
                 PauseWait::TookOver => return Err(StepEnd::TookOver),
+                PauseWait::Refused => return Err(StepEnd::Declined(super::control::HOSTED_BUSY.into())),
             }
         } else {
             match self.gate_write(&req).await {
@@ -1826,6 +1828,7 @@ impl SkillIo for TauriIo<'_> {
             PauseWait::Ready => {}
             PauseWait::Cancelled => return SecretStatus::Cancelled,
             PauseWait::TookOver => return SecretStatus::WriteFailed("用户接管了终端，密码没有写入".into()),
+            PauseWait::Refused => return SecretStatus::WriteFailed(format!("{}，密码没有写入", super::control::HOSTED_BUSY)),
         }
 
         // 写入前记起点：之后的才是这个密码引出的输出
@@ -3131,6 +3134,18 @@ mod tests {
         let r = run(&mut io, &s, &opts()).await;
         assert_eq!(r.outcome, RunOutcome::Cancelled);
         assert!(io.cmds.is_empty());
+    }
+
+    /// 复审 L4：目标终端正被托管 → 不写，按未获批收尾，原因说清楚
+    #[tokio::test]
+    async fn hosted_console_refuses_skill_write() {
+        let s = skill(serde_json::json!([{"kind":"exec","command":"a"}]), None);
+        let mut io = FakeIo::new();
+        io.drive.push_back(PauseWait::Refused);
+        let r = run(&mut io, &s, &opts()).await;
+        assert!(io.cmds.is_empty());
+        assert_ne!(r.outcome, RunOutcome::Completed);
+        assert!(format!("{r:?}").contains(super::super::control::HOSTED_BUSY), "{r:?}");
     }
 
     #[tokio::test]

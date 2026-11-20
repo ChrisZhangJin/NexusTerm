@@ -82,6 +82,30 @@ pub fn attention_for(prev: &HostPhase, next: &HostPhase, label: &str) -> Option<
     Some(Attention { title, body, kind })
 }
 
+/// 同一份托管、同一个去重键（[`attention_key`]）的提醒多久内只发一次。等人卡每张 id 不同，不受影响；
+/// 管的是连接来回抖（ConsoleGone → ConsoleBack → ConsoleGone…）这类反复迁入同一状态的刷屏。
+pub const REPEAT_WINDOW_MS: i64 = 10 * 60 * 1000;
+
+/// 按 (契约, 去重键) 记上次发出的时刻。纯数据结构，时钟由调用方给。
+#[derive(Debug, Default)]
+pub struct AttentionLimiter {
+    last: std::collections::HashMap<(String, String), i64>,
+}
+
+impl AttentionLimiter {
+    /// 这一条能不能发；能发就记下 `now`。窗口内重复的不发（也不刷新时刻：窗口从上一次真正发出算起）。
+    pub fn allow(&mut self, contract_id: &str, key: &str, now_ms: i64) -> bool {
+        // 过期的顺手清掉，表不随托管数涨
+        self.last.retain(|_, t| now_ms - *t < REPEAT_WINDOW_MS);
+        let k = (contract_id.to_string(), key.to_string());
+        if self.last.contains_key(&k) {
+            return false;
+        }
+        self.last.insert(k, now_ms);
+        true
+    }
+}
+
 /// 脱敏、压成一行、截短。
 fn one_line(s: &str) -> String {
     let flat = super::super::redact::redact(s).split_whitespace().collect::<Vec<_>>().join(" ");
@@ -190,5 +214,24 @@ mod tests {
         assert!(!a.body.contains('\n'));
         assert!(a.body.ends_with('…'));
         assert!(a.body.chars().count() <= "等你回答：".chars().count() + BODY_MAX_CHARS + 1);
+    }
+
+    /// 复审 L5：连接来回抖，每次断开只在 10 分钟里提醒一次；别的托管 / 别的原因 / 每张新卡照发
+    #[test]
+    fn limiter_suppresses_repeats_per_contract_and_key() {
+        let mut l = AttentionLimiter::default();
+        let gone = attention_key(&HostPhase::Suspended {
+            reason: SuspendReason::ConsoleGone,
+            resume_to: Box::new(HostPhase::Running),
+        })
+        .unwrap();
+        assert!(l.allow("c1", &gone, 0));
+        assert!(!l.allow("c1", &gone, 60_000), "一分钟后又断：不再提醒");
+        assert!(!l.allow("c1", &gone, REPEAT_WINDOW_MS - 1));
+        assert!(l.allow("c2", &gone, 60_000), "别的托管照发");
+        assert!(l.allow("c1", "paused:budget", 60_000), "别的原因照发");
+        assert!(l.allow("c1", &attention_key(&card("a", CardKind::Ask, "q")).unwrap(), 60_000));
+        assert!(l.allow("c1", &attention_key(&card("b", CardKind::Ask, "q")).unwrap(), 60_001), "每张新卡照发");
+        assert!(l.allow("c1", &gone, REPEAT_WINDOW_MS), "过了窗口再断：再提醒一次");
     }
 }
