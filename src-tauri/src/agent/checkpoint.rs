@@ -23,6 +23,20 @@ pub struct Spent {
     pub elapsed_secs: u64,
     pub output_chars: u64,
     pub injections: u32,
+    /// 模型调用累计的输入 / 输出 token（#8；旧 checkpoint 没有这几个字段，落到 0）
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// 其中有服务方没报、按字数估的
+    #[serde(default)]
+    pub estimated: bool,
+    /// 按单价折算的累计花费（微美元）；`priced = false` 时无意义
+    #[serde(default)]
+    pub cost_micros: u64,
+    /// 是否有单价（没有就只显示 token、不显示钱）
+    #[serde(default)]
+    pub priced: bool,
 }
 
 /// `resume_verdict` 的输入：一次托管的现场摘要（由 `HostCheckpoint` 现拼，不落盘）。
@@ -115,6 +129,18 @@ pub fn resume_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spent_loads_old_checkpoints_without_token_fields() {
+        let old: Spent = serde_json::from_str(r#"{"steps":3,"elapsedSecs":60,"outputChars":100,"injections":0}"#).unwrap();
+        assert_eq!((old.steps, old.input_tokens, old.output_tokens, old.cost_micros), (3, 0, 0, 0));
+        assert!(!old.estimated && !old.priced);
+        let s = Spent { input_tokens: 12_000, output_tokens: 300, estimated: true, cost_micros: 33_000, priced: true, ..Default::default() };
+        let v = serde_json::to_value(s).unwrap();
+        assert_eq!(v["inputTokens"], 12_000);
+        assert_eq!(v["costMicros"], 33_000);
+        assert_eq!(serde_json::from_value::<Spent>(v).unwrap(), s);
+    }
 
     #[test]
     fn resume_clean_drift_expired_suspended() {

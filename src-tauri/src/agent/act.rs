@@ -164,6 +164,9 @@ pub struct RunBudgetOverride {
     pub max_steps: Option<u32>,
     #[serde(default)]
     pub max_minutes: Option<u32>,
+    /// 最多花费（微美元）。`Some(0)` = 不限。
+    #[serde(default)]
+    pub max_cost_micros: Option<u64>,
 }
 
 impl AgentRunRequest {
@@ -191,6 +194,9 @@ pub fn effective_budget(base: budget::RunBudget, req: &AgentRunRequest) -> budge
         }
         if let Some(m) = o.max_minutes {
             b.max_minutes = m;
+        }
+        if let Some(c) = o.max_cost_micros {
+            b.max_cost_micros = c;
         }
     }
     b.clamped()
@@ -3744,7 +3750,11 @@ pub async fn run(
     let mut meter = match &host {
         Some(h) => Meter::cumulative(h.spent()),
         None => Meter::default(),
-    };
+    }
+    .with_price(&cfg.prices, &acct.model);
+    // 这一轮（对话）一共花了多少：不随「继续」清零，结束时推给对话面板显示
+    let mut run_usage = super::usage::Usage::default();
+    let run_started = std::time::Instant::now();
     // 会话 id → 本轮里上一次动过它（exec / 按键 / 等待）之后缓冲的位置，供 `nx_wait` 当起点：
     // 模型思考的那几秒里到达的输出也该算「新输出」，否则等的提示早出现了反而永远等不到。
     let mut marks: HashMap<String, u64> = HashMap::new();
@@ -4151,6 +4161,13 @@ pub async fn run(
             messages.push(ChatMessage::assistant(describe_tool_calls(&reply)));
         }
         meter.spent.output_chars += reply.text.chars().count() as u64;
+        meter.record_usage(&reply.usage);
+        run_usage.add(&reply.usage);
+        if let Some(h) = &host {
+            // 托管卡的「花了多少」随每次模型调用刷新
+            meter.tick();
+            h.publish_spent(meter.contract_spent());
+        }
 
         // 叫了不存在的工具：`actions_from_tool_call` 对它一个动作都不产出。不能静默吞掉 ——
         // 模型会以为它做过了；更不能混进「缺少必要参数」的提示里，那会让它反复补参数。
@@ -6320,6 +6337,10 @@ pub async fn run(
         flush_round(&mut messages, &mut feedback, &mut round_ids, &mut spans, acct.redact);
         save_chat_history(state, req.conversation_key(), &messages);
     }
+    if host.is_none() && !run_usage.is_empty() {
+        let u = super::usage::RunUsage::priced(run_usage, &cfg.prices, &acct.model, run_started.elapsed().as_secs());
+        let _ = app.emit(&format!("nx://agent/usage/{session}"), u);
+    }
     runtime.finish(&run_key);
     Ok(())
 }
@@ -7505,19 +7526,56 @@ struct Meter {
     base: BudgetSpent,
     cumulative: bool,
     seg_start: std::time::Instant,
+    /// 当前模型的单价（美元 / 百万 token：输入, 输出）；没有就只计 token 不计钱
+    price: Option<(f64, f64)>,
+    /// 累计里有没有按单价算过钱（托管：接驳前的段算过也算）
+    priced: bool,
 }
 
 impl Default for Meter {
     fn default() -> Self {
-        Self { spent: BudgetSpent::default(), base: BudgetSpent::default(), cumulative: false, seg_start: std::time::Instant::now() }
+        Self {
+            spent: BudgetSpent::default(),
+            base: BudgetSpent::default(),
+            cumulative: false,
+            seg_start: std::time::Instant::now(),
+            price: None,
+            priced: false,
+        }
     }
 }
 
 impl Meter {
     /// 托管：从契约级累计接着算（PR6 重启接驳时 `h.spent()` 来自 checkpoint）。
     fn cumulative(s: super::checkpoint::Spent) -> Self {
-        let spent = BudgetSpent { steps: s.steps, elapsed_secs: s.elapsed_secs, output_chars: s.output_chars };
-        Self { spent, base: spent, cumulative: true, seg_start: std::time::Instant::now() }
+        let spent = BudgetSpent {
+            steps: s.steps,
+            elapsed_secs: s.elapsed_secs,
+            output_chars: s.output_chars,
+            input_tokens: s.input_tokens,
+            output_tokens: s.output_tokens,
+            estimated: s.estimated,
+            cost_micros: s.cost_micros,
+        };
+        Self { spent, base: spent, cumulative: true, priced: s.priced, ..Self::default() }
+    }
+
+    /// 按配置的单价表给当前模型定价（找不到就只计 token）。
+    fn with_price(mut self, prices: &[super::usage::ModelPrice], model: &str) -> Self {
+        self.price = super::usage::price_for(prices, model).map(|p| (p.input_per_m, p.output_per_m));
+        self.priced |= self.price.is_some();
+        self
+    }
+
+    /// 记一次模型调用的用量（token + 折算的钱）。
+    fn record_usage(&mut self, u: &super::usage::Usage) {
+        self.spent.input_tokens = self.spent.input_tokens.saturating_add(u.input_tokens);
+        self.spent.output_tokens = self.spent.output_tokens.saturating_add(u.output_tokens);
+        self.spent.estimated |= u.estimated;
+        if let Some((input_per_m, output_per_m)) = self.price {
+            let p = super::usage::ModelPrice { pattern: String::new(), input_per_m, output_per_m };
+            self.spent.cost_micros = self.spent.cost_micros.saturating_add(super::usage::cost_micros(&p, u));
+        }
     }
 
     /// 刷新耗时：段起点的累计 + 本段墙钟。
@@ -7531,6 +7589,10 @@ impl Meter {
             steps: self.spent.steps.saturating_sub(self.base.steps),
             elapsed_secs: self.spent.elapsed_secs.saturating_sub(self.base.elapsed_secs),
             output_chars: self.spent.output_chars.saturating_sub(self.base.output_chars),
+            input_tokens: self.spent.input_tokens.saturating_sub(self.base.input_tokens),
+            output_tokens: self.spent.output_tokens.saturating_sub(self.base.output_tokens),
+            estimated: self.spent.estimated,
+            cost_micros: self.spent.cost_micros.saturating_sub(self.base.cost_micros),
         }
     }
 
@@ -7553,6 +7615,11 @@ impl Meter {
             elapsed_secs: self.spent.elapsed_secs,
             output_chars: self.spent.output_chars,
             injections: 0,
+            input_tokens: self.spent.input_tokens,
+            output_tokens: self.spent.output_tokens,
+            estimated: self.spent.estimated,
+            cost_micros: self.spent.cost_micros,
+            priced: self.priced,
         }
     }
 }
@@ -7567,6 +7634,9 @@ fn apply_grant(mut b: budget::RunBudget, g: super::host::BudgetGrant) -> budget:
     }
     if let Some(c) = g.max_output_chars {
         b.max_output_chars = c;
+    }
+    if let Some(c) = g.max_cost_micros {
+        b.max_cost_micros = c;
     }
     b.clamped()
 }
@@ -7748,6 +7818,52 @@ mod tests {
         chat.spent.steps = 9;
         chat.new_segment();
         assert_eq!(chat.spent.steps, 0);
+    }
+
+    #[test]
+    fn meter_records_tokens_and_cost_per_segment() {
+        let prices = vec![super::super::usage::ModelPrice { pattern: "gpt-4o".into(), input_per_m: 2.5, output_per_m: 10.0 }];
+        let mut m = Meter::cumulative(super::super::checkpoint::Spent {
+            input_tokens: 1_000,
+            output_tokens: 100,
+            cost_micros: 7,
+            priced: true,
+            ..Default::default()
+        })
+        .with_price(&prices, "gpt-4o");
+        m.record_usage(&super::super::usage::Usage { input_tokens: 10_000, output_tokens: 2_000, ..Default::default() });
+        let seg = m.segment();
+        assert_eq!((seg.input_tokens, seg.output_tokens, seg.cost_micros), (10_000, 2_000, 45_000));
+        let c = m.contract_spent();
+        assert_eq!((c.input_tokens, c.output_tokens, c.cost_micros), (11_000, 2_100, 45_007));
+        assert!(c.priced && !c.estimated);
+        // 花费预算按这一段判定
+        let lim = budget::RunBudget { max_cost_micros: 40_000, ..Default::default() };
+        assert!(matches!(budget::check_budget(&seg, &lim), BudgetCheck::Exhausted(budget::ExhaustReason::Cost { .. })));
+        // 「继续」后新的一段从零算，累计不动
+        m.new_segment();
+        assert_eq!(m.segment().cost_micros, 0);
+        assert_eq!(m.contract_spent().cost_micros, 45_007);
+
+        // 没单价：只计 token，估算标记带上
+        let mut chat = Meter::default().with_price(&prices, "deepseek-chat");
+        chat.record_usage(&super::super::usage::Usage { input_tokens: 5, output_tokens: 5, estimated: true, ..Default::default() });
+        let c = chat.contract_spent();
+        assert_eq!((c.input_tokens, c.cost_micros, c.priced, c.estimated), (5, 0, false, true));
+    }
+
+    #[test]
+    fn cost_budget_from_request_and_grant() {
+        let req: AgentRunRequest = serde_json::from_value(serde_json::json!({
+            "sessionId": "s", "question": "q", "budget": {"maxCostMicros": 500_000}
+        }))
+        .unwrap();
+        assert_eq!(effective_budget(budget::RunBudget::default(), &req).max_cost_micros, 500_000);
+        let g = super::super::host::BudgetGrant { max_cost_micros: Some(1_000_000), ..Default::default() };
+        assert_eq!(apply_grant(budget::RunBudget::default(), g).max_cost_micros, 1_000_000);
+        // 没给就不变
+        let b = budget::RunBudget { max_cost_micros: 3, ..Default::default() };
+        assert_eq!(apply_grant(b, Default::default()).max_cost_micros, 3);
     }
 
     // ——— 托管强制（gate::authorize 接线）———
@@ -9940,11 +10056,11 @@ mod tests {
         r.mode = Some("steward".into());
         let b = effective_budget(base, &r);
         assert_eq!((b.max_steps, b.max_minutes), (400, 360));
-        r.budget = Some(RunBudgetOverride { max_steps: Some(30), max_minutes: None });
+        r.budget = Some(RunBudgetOverride { max_steps: Some(30), max_minutes: None, max_cost_micros: None });
         let b = effective_budget(base, &r);
         assert_eq!((b.max_steps, b.max_minutes), (30, 360));
         // 越界被夹紧
-        r.budget = Some(RunBudgetOverride { max_steps: Some(u32::MAX), max_minutes: Some(u32::MAX) });
+        r.budget = Some(RunBudgetOverride { max_steps: Some(u32::MAX), max_minutes: Some(u32::MAX), max_cost_micros: None });
         let b = effective_budget(base, &r);
         assert!(b.max_steps <= budget::MAX_STEPS_CEIL && b.max_minutes <= budget::MAX_MINUTES_CEIL);
     }
@@ -10087,6 +10203,7 @@ mod tests {
             }],
             tools_supported: true,
             truncated: false,
+            usage: Default::default(),
         };
         let text = describe_tool_calls(&reply);
         assert!(text.contains("nx_tab"), "工具名要留在历史里：{text}");

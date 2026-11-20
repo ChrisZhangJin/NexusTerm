@@ -105,10 +105,18 @@ import {
 test("托管长度偏好：缺失 / 损坏回落默认，时长只认选项，步数夹到 [1,500]", () => {
   assert.deepEqual(parseStewardBudgetPref(null), DEFAULT_STEWARD_BUDGET_PREF);
   assert.deepEqual(parseStewardBudgetPref("not json"), DEFAULT_STEWARD_BUDGET_PREF);
-  assert.deepEqual(DEFAULT_STEWARD_BUDGET_PREF, { maxMinutes: 360, maxSteps: 400 });
-  assert.deepEqual(parseStewardBudgetPref('{"maxMinutes":720,"maxSteps":50}'), { maxMinutes: 720, maxSteps: 50 });
-  assert.deepEqual(parseStewardBudgetPref('{"maxMinutes":999,"maxSteps":9999}'), { maxMinutes: 360, maxSteps: 500 });
-  assert.deepEqual(parseStewardBudgetPref('{"maxMinutes":120,"maxSteps":0}'), { maxMinutes: 120, maxSteps: 400 });
+  assert.deepEqual(DEFAULT_STEWARD_BUDGET_PREF, { maxMinutes: 360, maxSteps: 400, maxCostUsd: 0 });
+  assert.deepEqual(parseStewardBudgetPref('{"maxMinutes":720,"maxSteps":50}'), { maxMinutes: 720, maxSteps: 50, maxCostUsd: 0 });
+  assert.deepEqual(parseStewardBudgetPref('{"maxMinutes":999,"maxSteps":9999}'), { maxMinutes: 360, maxSteps: 500, maxCostUsd: 0 });
+  assert.deepEqual(parseStewardBudgetPref('{"maxMinutes":120,"maxSteps":0}'), { maxMinutes: 120, maxSteps: 400, maxCostUsd: 0 });
+});
+
+test("托管花费上限：默认不限，非法 / 负数回落 0，保留两位小数并封顶", () => {
+  assert.equal(parseStewardBudgetPref('{"maxMinutes":120,"maxSteps":5,"maxCostUsd":1.234}').maxCostUsd, 1.23);
+  assert.equal(parseStewardBudgetPref('{"maxCostUsd":-3}').maxCostUsd, 0);
+  assert.equal(parseStewardBudgetPref('{"maxCostUsd":"abc"}').maxCostUsd, 0);
+  assert.equal(parseStewardBudgetPref('{"maxCostUsd":1e9}').maxCostUsd, 10_000);
+  assert.equal(isBudgetPause("cost"), true);
 });
 
 test("isBudgetPause：预算三项是，手动暂停 / 未暂停不是", () => {

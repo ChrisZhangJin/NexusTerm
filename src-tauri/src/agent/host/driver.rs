@@ -47,6 +47,8 @@ pub trait HostIo: Send + Sync {
     fn note_progress(&self, _messages: &[super::super::llm::ChatMessage], _step: usize, _spent: &Spent) {}
     /// 契约 / 授权变了（签约、`host_amend`、判据确认），下一次 `save` 一并落盘。默认不记。
     fn note_contract(&self, _contract: &StewardContract, _authority: &Authority) {}
+    /// 契约级花费（token / 钱）变了：记进快照并推一次状态（托管卡头显示它）。默认不记。
+    fn note_spent(&self, _spent: &Spent, _phase: &HostPhase) {}
     /// 计划清单变了：记进快照并推一次状态（面板的托管卡显示它）。默认不记。
     fn note_todo(&self, _todo: &[super::super::todo::TodoItem], _phase: &HostPhase) {}
     /// 看门狗状态变了，下一次 `save` 一并落盘。默认不记。
@@ -508,6 +510,15 @@ impl HostShared {
 
     pub fn set_spent(&self, s: Spent) {
         *self.spent.lock() = s;
+    }
+
+    /// 记下最新花费并推一次状态：托管卡头的 token / 花费随每次模型调用刷新。
+    pub fn publish_spent(&self, s: Spent) {
+        self.set_spent(s);
+        if self.is_superseded() {
+            return;
+        }
+        self.io.note_spent(&s, &self.phase());
     }
 
     // ——— 现场 ———

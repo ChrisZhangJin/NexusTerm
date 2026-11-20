@@ -21,6 +21,7 @@ import { enterVerdict, ImeGuard, isImeKey, keyInfoFrom } from "../lib/ime";
 import { matchSessions, scanMention } from "../lib/mention";
 import { useAgentHistory } from "../lib/useAgentHistory";
 import { useAgentRun } from "../lib/useAgentRun";
+import { fromRunUsage, usageTooltip, usageWithTime, usdToMicros } from "../lib/usage";
 import { useHostRuns } from "../lib/useHostRuns";
 import { useHostFeeds } from "../lib/useHostFeeds";
 import { basePhase, hostDetail, isTerminal, needsReattach } from "../lib/host";
@@ -422,7 +423,9 @@ export function AgentPanel({
         label,
         consoleText: snap?.text,
         consoleAlt: snap?.alt,
-        budget: budget ? { maxSteps: budget.maxSteps, maxMinutes: budget.maxMinutes } : undefined,
+        budget: budget
+          ? { maxSteps: budget.maxSteps, maxMinutes: budget.maxMinutes, maxCostMicros: usdToMicros(budget.maxCostUsd) }
+          : undefined,
         // 重启后找回这个终端用（SSH 记录 / 标签 / cwd / tmux）
         consoleRef: sessions.find((x) => x.id === sid)?.hint,
         deny: opts?.deny,
@@ -886,6 +889,11 @@ export function AgentPanel({
             )}
             <div className="ap-input-row">
               <span className="ap-input-hint">Enter 发送 · Shift+Enter 换行</span>
+              {!busy && conv.lastUsage && (
+                <span className="ap-input-hint ap-usage" title={usageTooltip(fromRunUsage(conv.lastUsage))}>
+                  上一轮 {usageWithTime(fromRunUsage(conv.lastUsage))}
+                </span>
+              )}
               {busy ? (
                 <>
                   <label

@@ -6,8 +6,8 @@
  * 其余步骤不改变它。一轮结束 / 出错 / 被停止时对话状态整体重建，暂停标记随之消失。
  */
 
-/** 为什么暂停：预算三项之一、用户手动暂停，或模型服务连续出错（`llm`）。与后端 `StepPayload.pauseKind` 一致。 */
-export type PauseKind = "steps" | "time" | "output" | "user" | "llm";
+/** 为什么暂停：预算四项之一（步数 / 时间 / 输出 / 花费）、用户手动暂停，或模型服务连续出错（`llm`）。与后端 `StepPayload.pauseKind` 一致。 */
+export type PauseKind = "steps" | "time" | "output" | "cost" | "user" | "llm";
 
 /** 与后端 `RunBudget`（camelCase）对应。0 的含义见各字段。 */
 export interface RunBudget {
@@ -60,7 +60,7 @@ export interface PauseStepLike {
   pauseKind?: string;
 }
 
-const PAUSE_KINDS: readonly string[] = ["steps", "time", "output", "user", "llm"];
+const PAUSE_KINDS: readonly string[] = ["steps", "time", "output", "cost", "user", "llm"];
 
 /**
  * 给定当前暂停状态与一个新到的步骤，返回新的暂停状态（`undefined` = 没在暂停）。
@@ -83,6 +83,8 @@ export function pauseBannerText(kind: PauseKind): string {
       return "已达到时间上限，本轮暂停。点「继续」换一份新预算接着做，或点「停止」结束。";
     case "output":
       return "已达到输出量上限，本轮暂停。点「继续」换一份新预算接着做，或点「停止」结束。";
+    case "cost":
+      return "已达到花费上限，本轮暂停。点「继续」换一份新预算接着做，或点「停止」结束。";
     case "llm":
       return "模型服务连续请求失败，自动重试后仍未恢复，本轮暂停（进度都还在）。稍后点「继续」重新请求，或点「停止」结束。";
     default:
@@ -94,6 +96,8 @@ export function pauseBannerText(kind: PauseKind): string {
 export interface StewardBudgetPref {
   maxMinutes: number;
   maxSteps: number;
+  /** 最多花费（美元，按模型单价折算）。0 = 不限（默认） */
+  maxCostUsd: number;
 }
 
 /** 「最长时长」下拉的可选项（分钟）。 */
@@ -104,7 +108,9 @@ export const STEWARD_DURATION_OPTIONS: ReadonlyArray<{ minutes: number; label: s
   { minutes: 1440, label: "24 小时" },
 ];
 
-export const DEFAULT_STEWARD_BUDGET_PREF: StewardBudgetPref = { maxMinutes: 360, maxSteps: 400 };
+export const DEFAULT_STEWARD_BUDGET_PREF: StewardBudgetPref = { maxMinutes: 360, maxSteps: 400, maxCostUsd: 0 };
+/** 花费上限的最大值（美元），与后端 `MAX_COST_MICROS_CEIL` 一致 */
+export const MAX_COST_USD_CEIL = 10_000;
 export const LS_STEWARD_BUDGET = "nx.steward.budget";
 
 /** 读本机存的偏好：缺失 / 损坏 / 越界 都回落默认；时长只认下拉里的选项，步数夹到 [1, 500]。 */
@@ -115,9 +121,12 @@ export function parseStewardBudgetPref(raw: string | null | undefined): StewardB
     const o = JSON.parse(raw) as Partial<StewardBudgetPref> | null;
     const mins = Number(o?.maxMinutes);
     const steps = Math.round(Number(o?.maxSteps));
+    const cost = Math.round(Number(o?.maxCostUsd) * 100) / 100;
     return {
       maxMinutes: STEWARD_DURATION_OPTIONS.some((x) => x.minutes === mins) ? mins : d.maxMinutes,
       maxSteps: Number.isFinite(steps) && steps >= 1 ? Math.min(steps, MAX_STEPS_CEIL) : d.maxSteps,
+      // 缺失 / 非法 / 负数 = 不限（旧偏好没有这一项）
+      maxCostUsd: Number.isFinite(cost) && cost > 0 ? Math.min(cost, MAX_COST_USD_CEIL) : 0,
     };
   } catch {
     return d;
@@ -126,7 +135,7 @@ export function parseStewardBudgetPref(raw: string | null | undefined): StewardB
 
 /** 预算类暂停（步数 / 时间 / 输出量用尽）—— 区别于用户手动暂停。 */
 export const isBudgetPause = (k: PauseKind | undefined): boolean =>
-  k === "steps" || k === "time" || k === "output";
+  k === "steps" || k === "time" || k === "output" || k === "cost";
 
 /** 托管页预算用尽横幅。后端暂停后 1 小时没人点「继续」会自动结束这一轮。 */
 export const BUDGET_EXHAUSTED_BANNER = "已达到预算上限，点「继续」接着跑（1 小时内不点会自动结束）";

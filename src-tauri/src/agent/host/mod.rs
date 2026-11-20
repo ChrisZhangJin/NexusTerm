@@ -250,6 +250,9 @@ pub struct BudgetGrant {
     pub max_minutes: Option<u32>,
     #[serde(default)]
     pub max_output_chars: Option<u64>,
+    /// 最多花费（微美元）
+    #[serde(default)]
+    pub max_cost_micros: Option<u64>,
 }
 
 /// 结束的托管记录留多久给面板看结局。

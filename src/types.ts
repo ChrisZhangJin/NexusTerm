@@ -325,6 +325,35 @@ export interface AgentConfig {
    * 旧配置没有这一项，后端 serde(default) 与前端 normalize 都落到默认（25 步 / 10 分钟 / 输出不限）。
    */
   budget: RunBudget;
+  /**
+   * 模型单价表（美元 / 百万 token，按模型名匹配；多条命中取最长的）。
+   * 没命中就只显示 token、不显示钱。旧配置没有这一项时后端给几款价格确定的默认值。
+   */
+  prices: ModelPrice[];
+}
+
+/** 一条模型单价（后端 `usage::ModelPrice`） */
+export interface ModelPrice {
+  /** 模型名里含它（不分大小写）就用这条 */
+  pattern: string;
+  /** 美元 / 百万输入 token */
+  inputPerM: number;
+  /** 美元 / 百万输出 token */
+  outputPerM: number;
+}
+
+/** 一轮对话的用量（`nx://agent/usage/{session}` 与流式问答 `done` 里的 `usage`，后端 `usage::RunUsage`） */
+export interface RunUsage {
+  /** 含缓存命中 / 写入 */
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  /** 服务方没报用量、按字数估的 */
+  estimated: boolean;
+  /** 有单价才有 */
+  costUsd?: number | null;
+  elapsedSecs: number;
 }
 
 /** 某个会话当前的旁路缓冲状态（后端 `BufferStats` 的镜像） */
@@ -342,6 +371,8 @@ export type AgentDoneReason = "stop" | "length" | "cancelled";
 /** `nx://agent/done/{sessionId}` 的载荷 */
 export interface AgentDonePayload {
   reason: AgentDoneReason;
+  /** 这次问答的用量（旧后端没有） */
+  usage?: RunUsage;
 }
 
 /** 聊天面板里的一条消息。纯前端对象，不进 IPC。 */
@@ -412,6 +443,8 @@ export interface AgentRunRequest {
 export interface AgentRunBudgetOverride {
   maxSteps?: number;
   maxMinutes?: number;
+  /** 最多花费（微美元），0 = 不限 */
+  maxCostMicros?: number;
 }
 
 /**
@@ -933,6 +966,21 @@ export interface HostStatus {
   deny: string[];
   /** 当前授权档位（auto / notify / approve / yolo） */
   tier?: string;
+  /** 契约级花费（步数 / 时长 / token / 钱） */
+  spent?: HostSpent;
+}
+
+/** 托管契约级花费（后端 `checkpoint::Spent`）。token / 钱的字段旧记录没有 */
+export interface HostSpent {
+  steps: number;
+  elapsedSecs: number;
+  outputChars: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  estimated?: boolean;
+  /** 微美元；`priced` 为 false 时无意义 */
+  costMicros?: number;
+  priced?: boolean;
 }
 
 /** 一次托管的「实际改动」：从真正执行了的命令 / 文件写入里提取（后端 `host::changes`），不是模型的说法 */
@@ -1007,6 +1055,8 @@ export interface HostBudgetGrant {
   maxSteps?: number;
   maxMinutes?: number;
   maxOutputChars?: number;
+  /** 最多花费（微美元），0 = 不限 */
+  maxCostMicros?: number;
 }
 
 /** 开始托管的附加选项：禁止项、基于上一个任务的完成报告继续 */
@@ -1020,7 +1070,7 @@ export interface HostStartRequest {
   goal: string;
   authorityTier?: string;
   label?: string;
-  budget?: { maxSteps?: number; maxMinutes?: number };
+  budget?: { maxSteps?: number; maxMinutes?: number; maxCostMicros?: number };
   consoleText?: string;
   consoleAlt?: boolean;
   /** YOLO：直接采用模型起草的完成判据，不经确认就开始（不改档位与禁项） */

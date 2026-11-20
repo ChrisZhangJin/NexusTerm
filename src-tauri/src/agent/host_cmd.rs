@@ -65,6 +65,8 @@ pub struct HostStatus {
     pub deny: Vec<String>,
     /// 当前授权档位（auto / notify / approve / yolo；面板上可以在运行中切换）
     pub tier: String,
+    /// 契约级花费：步数 / 时长 / token / 折算的钱（卡头显示）
+    pub spent: Spent,
 }
 
 impl HostStatus {
@@ -83,6 +85,7 @@ impl HostStatus {
             todo: h.todo(),
             tier: ctx.authority.tier.clone(),
             deny: ctx.authority.deny,
+            spent: h.spent(),
         }
     }
 }
@@ -116,9 +119,9 @@ fn status_of(
 ) -> HostStatus {
     // 只锁一次 `snap`：在结构体字面量里写两次 `snap.lock()`，第一个临时 guard 要活到整条语句结束，
     // 第二次加锁就自锁了（parking_lot 不可重入）—— 曾让 `host_start` 卡死主线程、整个窗口无响应。
-    let (label, todo, deny, tier) = {
+    let (label, todo, deny, tier, spent) = {
         let s = snap.lock();
-        (s.console.label.clone(), s.todo.clone(), s.authority.deny.clone(), s.authority.tier.clone())
+        (s.console.label.clone(), s.todo.clone(), s.authority.deny.clone(), s.authority.tier.clone(), s.spent)
     };
     let notice = notice.lock().clone();
     HostStatus {
@@ -133,6 +136,7 @@ fn status_of(
         todo,
         deny,
         tier,
+        spent,
     }
 }
 
@@ -190,6 +194,13 @@ impl HostIo for AppHostIo {
 
     fn note_progress(&self, messages: &[ChatMessage], step: usize, spent: &Spent) {
         record_progress(&mut self.snap.lock(), messages, step, spent);
+    }
+
+    fn note_spent(&self, spent: &Spent, phase: &HostPhase) {
+        self.snap.lock().spent = *spent;
+        // 只推状态、不走 `emit` 的「需要人」提醒判断：花费变化不是相位迁移
+        let st = status_of(&self.handle, &self.console_id, &self.goal, &self.snap, &self.notice, phase);
+        emit_status(&self.app, &st);
     }
 
     fn note_todo(&self, todo: &[super::todo::TodoItem], phase: &HostPhase) {
@@ -1258,7 +1269,7 @@ mod tests {
         let ctx = HostCtx::bare("c1", "t1", "目标");
         let console = ConsoleRef { host_key: "local:t1".into(), console_id: "t1".into(), ..Default::default() };
         let mut cp = HostCheckpoint::new(ctx.contract, ctx.authority, console, 1);
-        let spent = Spent { steps: 412, elapsed_secs: 3_600, output_chars: 90_000, injections: 0 };
+        let spent = Spent { steps: 412, elapsed_secs: 3_600, output_chars: 90_000, injections: 0, ..Default::default() };
         record_progress(&mut cp, &[ChatMessage::user("目标".to_string())], 412, &spent);
         let back = HostCheckpoint::from_json(&cp.to_json(2).unwrap()).unwrap();
         assert_eq!(back.spent, spent);
@@ -1306,7 +1317,7 @@ mod tests {
             ChatMessage::user("（cargo update 的输出）".to_string()),
         ];
         cp.step = 7;
-        cp.spent = Spent { steps: 7, elapsed_secs: 120, output_chars: 5_000, injections: 0 };
+        cp.spent = Spent { steps: 7, elapsed_secs: 120, output_chars: 5_000, injections: 0, ..Default::default() };
         cp.last_screen_hash = "h-before".into();
         cp
     }

@@ -18,6 +18,8 @@ import type {
   VaultStatus,
 } from "../types";
 import { normalizeBudget, parseBudgetInput, type RunBudget } from "../lib/agentBudget";
+import { normalizePrice, priceFor } from "../lib/usage";
+import type { ModelPrice } from "../types";
 import MasterPasswordDialog, { type MasterPasswordMode } from "./MasterPasswordDialog";
 import ConnMigrateDialog, { type ConnMigrateMode } from "./ConnMigrateDialog";
 import { CONN_FILE_EXT, type MigrateReport } from "../lib/connMigrate";
@@ -437,6 +439,67 @@ const CONTEXT_CHOICES: readonly { bytes: number; label: string }[] = [
 
 const DEFAULT_HOST_NOTIFY: HostNotifyConfig = { system: true, taskbar: true, webhook: "" };
 
+/** 单价表的一行：数字先按文本编辑（输入「0.」时不被吞掉），失焦再规整 */
+function PriceRow({
+  price,
+  disabled,
+  onChange,
+  onRemove,
+}: {
+  price: ModelPrice;
+  disabled: boolean;
+  onChange: (p: ModelPrice) => void;
+  onRemove: () => void;
+}) {
+  const [inDraft, setInDraft] = useState<string | null>(null);
+  const [outDraft, setOutDraft] = useState<string | null>(null);
+  const num = (n: number) => (n > 0 ? String(n) : "");
+  return (
+    <div className="row ag-price-row">
+      <input
+        className="ag-price-pattern"
+        placeholder="模型名包含…（如 deepseek-chat）"
+        value={price.pattern}
+        disabled={disabled}
+        onChange={(e) => onChange({ ...price, pattern: e.target.value })}
+      />
+      <input
+        className="ag-price-num"
+        type="number"
+        min={0}
+        step={0.01}
+        placeholder="输入"
+        title="美元 / 百万输入 token"
+        value={inDraft ?? num(price.inputPerM)}
+        disabled={disabled}
+        onChange={(e) => setInDraft(e.target.value)}
+        onBlur={() => {
+          if (inDraft !== null) onChange(normalizePrice({ ...price, inputPerM: Number(inDraft) }));
+          setInDraft(null);
+        }}
+      />
+      <input
+        className="ag-price-num"
+        type="number"
+        min={0}
+        step={0.01}
+        placeholder="输出"
+        title="美元 / 百万输出 token"
+        value={outDraft ?? num(price.outputPerM)}
+        disabled={disabled}
+        onChange={(e) => setOutDraft(e.target.value)}
+        onBlur={() => {
+          if (outDraft !== null) onChange(normalizePrice({ ...price, outputPerM: Number(outDraft) }));
+          setOutDraft(null);
+        }}
+      />
+      <button className="ap-mini" disabled={disabled} onClick={onRemove} title="删除这一行">
+        删除
+      </button>
+    </div>
+  );
+}
+
 export function AgentDialog({ onClose }: { onClose: () => void }) {
   const saved = useAgentConfig();
   const [draft, setDraft] = useState<AgentConfig>(saved);
@@ -814,6 +877,36 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
           一轮 Agent 运行最多做这么多步（一次 <code>nx_skill</code> 运行算 1 步）、最多跑这么久、最多读写这么多字符；
           任何一项用完都不会直接失败，而是<strong>暂停</strong>并说明已做了什么，由你点「继续」（换一份新预算接着做）或「停止」。
           运行中也可以随时手动「暂停」。
+        </p>
+
+        <div className="settings-section">模型单价</div>
+        {draft.prices.map((p, i) => (
+          <PriceRow
+            key={i}
+            price={p}
+            disabled={!draft.enabled}
+            onChange={(next) => patch({ prices: draft.prices.map((x, j) => (j === i ? next : x)) })}
+            onRemove={() => patch({ prices: draft.prices.filter((_, j) => j !== i) })}
+          />
+        ))}
+        <div className="row">
+          <button
+            className="ap-mini"
+            disabled={!draft.enabled}
+            onClick={() => patch({ prices: [...draft.prices, { pattern: current.model.trim(), inputPerM: 0, outputPerM: 0 }] })}
+          >
+            + 添加一行
+          </button>
+          <span className="ag-hint">
+            {priceFor(draft.prices, current.model)
+              ? `当前模型「${current.model}」按「${priceFor(draft.prices, current.model)?.pattern}」计价`
+              : `当前模型「${current.model || "未填"}」没有单价：只显示 token，不显示花费`}
+          </span>
+        </div>
+        <p className="ag-hint">
+          美元 / 百万 token（输入、输出）。模型名包含左栏的文字（不分大小写）就用这一行，多行命中取最长的那行。
+          用来在托管卡和对话框底部显示「≈$」、以及托管的「最多花费」。只预置了几款价格确定的模型，别的请按服务商的价目自己填；
+          不含缓存折扣，结果只是估算。
         </p>
 
         <div className="settings-section">托管需要我时</div>

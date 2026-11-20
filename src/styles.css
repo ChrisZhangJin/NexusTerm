@@ -1587,6 +1587,8 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .ag-ta:focus { border-color: var(--accent); }
 
 .ag-hint { margin: 6px 0 0; color: var(--text-dim); font-size: 11.5px; line-height: 1.6; }
+.ag-price-row .ag-price-pattern { flex: 2 1 0; min-width: 0; }
+.ag-price-row .ag-price-num { flex: 1 1 0; min-width: 0; }
 
 /* 测试连接那一行：左边距 92px 与 .row 的输入列对齐（label 82 + gap 10） */
 .ag-test-row { display: flex; align-items: center; gap: 8px; margin: 4px 0 0 92px; }
@@ -2021,6 +2023,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .ap-ta:disabled { opacity: .55; cursor: not-allowed; }
 .ap-input-row { display: flex; align-items: center; gap: 8px; margin-top: 7px; }
 .ap-input-hint { flex: 1; min-width: 0; color: var(--text-dim); font-size: 11px; }
+.ap-usage { flex: 0 1 auto; opacity: .75; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: default; }
 .ap-input-row .btn { padding: 5px 14px; font-size: 12px; }
 .ap-stop-ctrlc {
   display: flex; align-items: center; gap: 4px; flex: none;
@@ -2409,6 +2412,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .hc-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 12.5px; }
 .hc-title { flex: 1 1 80px; min-width: 0; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hc-acts { flex: none; display: flex; gap: 5px; margin-left: auto; }
+.hc-usage { flex: none; font-size: 11px; color: var(--text-dim); white-space: nowrap; cursor: default; font-variant-numeric: tabular-nums; }
 .hc-goal {
   color: var(--text-dim); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
 }

@@ -527,6 +527,8 @@ pub struct LlmReply {
     ///
     /// 截断的回复不能当成最终结论：调用方应请模型接着写（见 `act::run`）。
     pub truncated: bool,
+    /// 这次调用的 token 用量。服务方没报时由 [`complete_reply_once`] 按字数估（`estimated = true`）。
+    pub usage: super::usage::Usage,
 }
 
 fn openai_tools(specs: &[ToolSpec]) -> Vec<OpenAiTool> {
@@ -853,6 +855,15 @@ pub enum SseAction {
 #[derive(Debug, Default)]
 pub struct SseState {
     event: Option<String>,
+    /// 流里报过的用量（OpenAI 的 include_usage 末 chunk / Anthropic 的 message_start + message_delta），合并后的值
+    usage: super::usage::Usage,
+}
+
+impl SseState {
+    /// 到目前为止流里报过的用量；一个都没报是空的（`is_empty`）。
+    pub fn usage(&self) -> super::usage::Usage {
+        self.usage
+    }
 }
 
 /// 把一行喂进状态机，返回这一行要产生的动作。
@@ -869,6 +880,10 @@ pub fn dispatch_line(provider: Provider, state: &mut SseState, line: &str) -> Ss
     let Some(data) = parse_data_line(line) else {
         return SseAction::Nothing;
     };
+    // 用量与正文 / 结束可能在同一个 chunk 里，单独顺手收一份，不影响下面的动作
+    if let Some(u) = super::usage::usage_in_sse_data(data) {
+        state.usage.merge_max(&u);
+    }
     match provider {
         Provider::OpenAI => parse_openai_event(data),
         Provider::Anthropic => parse_anthropic_event(state.event.as_deref(), data),
@@ -1369,6 +1384,9 @@ impl Drop for InflightGuard {
 #[derive(Clone, Serialize)]
 struct DonePayload {
     reason: FinishReason,
+    /// 这次问答的用量（取消时也给已花掉的估算）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<super::usage::RunUsage>,
 }
 
 /// `nx://agent/token/{session}` → 增量文本块。
@@ -1381,9 +1399,13 @@ fn emit_token(app: &AppHandle, session: &str, text: &str) {
 
 /// `nx://agent/done/{session}` → `{ reason }`。
 fn emit_done(app: &AppHandle, session: &str, reason: FinishReason) {
+    emit_done_with(app, session, reason, None);
+}
+
+fn emit_done_with(app: &AppHandle, session: &str, reason: FinishReason, usage: Option<super::usage::RunUsage>) {
     let _ = app.emit(
         &format!("nx://agent/done/{session}"),
-        DonePayload { reason },
+        DonePayload { reason, usage },
     );
 }
 
@@ -1420,11 +1442,13 @@ fn step(
     app: &AppHandle,
     session: &str,
     reasoning: Option<&mut String>,
+    answer: &mut String,
 ) -> Step {
     match dispatch_line(provider, state, line) {
         SseAction::Nothing => Step::Continue,
         SseAction::Text(text) => {
             emit_token(app, session, &text);
+            answer.push_str(&text);
             Step::Continue
         }
         SseAction::Reasoning(text) => {
@@ -1523,6 +1547,9 @@ async fn stream_answer(
     let mut finished: Option<FinishReason> = None;
     // 过程日志开着才攒推理文本；关着就是 None，step 里连 push 都不会发生
     let mut reasoning = cfg.trace.then(String::new);
+    // 收到的正文：服务方没报用量时按它估输出
+    let mut answer = String::new();
+    let started = std::time::Instant::now();
 
     while let Some(item) = stream.next().await {
         // 取消检查放在每段的开头：置位后最多再多处理一个网络包就停。
@@ -1540,11 +1567,15 @@ async fn stream_answer(
         };
         decoder.push(&chunk, &mut lines);
         for line in lines.drain(..) {
-            match step(provider, &mut state, &line, &app, &session, reasoning.as_mut()) {
+            if finished.is_some() {
+                // 已经结束：同一包里剩下的行只收用量（OpenAI include_usage 的末 chunk 排在 finish_reason 之后）
+                let _ = dispatch_line(provider, &mut state, &line);
+                continue;
+            }
+            match step(provider, &mut state, &line, &app, &session, reasoning.as_mut(), &mut answer) {
                 Step::Continue => {}
                 Step::Finished(reason) => {
                     finished = Some(reason);
-                    break;
                 }
                 Step::Aborted(message) => {
                     emit_error(&app, &session, &message);
@@ -1561,7 +1592,7 @@ async fn stream_answer(
     // 冲刷残行再判一次，否则最后一段答案会丢。
     if finished.is_none() {
         if let Some(line) = decoder.finish() {
-            match step(provider, &mut state, &line, &app, &session, reasoning.as_mut()) {
+            match step(provider, &mut state, &line, &app, &session, reasoning.as_mut(), &mut answer) {
                 Step::Continue => {}
                 Step::Finished(reason) => finished = Some(reason),
                 Step::Aborted(message) => {
@@ -1576,12 +1607,15 @@ async fn stream_answer(
         super::trace::record(&session, 0, "reasoning（流式问答）", &r);
     }
 
-    match finished {
-        Some(reason) => emit_done(&app, &session, reason),
-        // 既没有 [DONE] 也没有 message_stop 就断了：按正常结束处理。
-        // 少发一个 done，前端就会永远停在「生成中」。
-        None => emit_done(&app, &session, FinishReason::Stop),
+    let mut used = state.usage();
+    if used.is_empty() {
+        let input = super::compact::estimate_tokens(system_prompt(acct)) + super::compact::estimate_tokens(&user);
+        used = super::usage::estimate(input, &answer);
     }
+    let run_usage = super::usage::RunUsage::priced(used, &cfg.prices, &acct.model, started.elapsed().as_secs());
+    // 既没有 [DONE] 也没有 message_stop 就断了：按正常结束处理。
+    // 少发一个 done，前端就会永远停在「生成中」。
+    emit_done_with(&app, &session, finished.unwrap_or(FinishReason::Stop), Some(run_usage));
 }
 
 // ——————————————————————————————— 测试连接 ———————————————————————————————
@@ -1603,6 +1637,9 @@ pub fn extract_answer_text(provider: Provider, body: &str) -> Option<String> {
 pub fn extract_reply(provider: Provider, body: &str) -> Option<LlmReply> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let mut reply = LlmReply::default();
+    if let Some(u) = super::usage::usage_in(&value) {
+        reply.usage = u;
+    }
     let stop = match provider {
         Provider::OpenAI => value.pointer("/choices/0/finish_reason"),
         Provider::Anthropic => value.pointer("/stop_reason"),
@@ -1924,6 +1961,9 @@ pub async fn complete_reply_once(
 
     let mut reply = extract_reply(provider, &res.body).unwrap_or_default();
     reply.tools_supported = !tools.is_empty() && !degraded;
+    if reply.usage.is_empty() {
+        reply.usage = estimate_reply_usage(system, messages, &reply);
+    }
     if reply.text.trim().is_empty() && reply.tool_calls.is_empty() {
         // 偶发的空回复（网关抖动、模型把 token 全花在推理上）重试往往就好
         return Err(LlmFailure::new(
@@ -1932,6 +1972,19 @@ pub async fn complete_reply_once(
         ));
     }
     Ok(reply)
+}
+
+/// 服务方没报用量：按发出去的提示词与收到的回复粗估（标 `estimated`）。
+fn estimate_reply_usage(system: &str, messages: &[ChatMessage], reply: &LlmReply) -> super::usage::Usage {
+    let input = super::compact::estimate_tokens(system) + super::compact::total_tokens(messages);
+    let mut out = String::with_capacity(reply.text.len() + reply.reasoning.len());
+    out.push_str(&reply.text);
+    out.push_str(&reply.reasoning);
+    for c in &reply.tool_calls {
+        out.push_str(&c.name);
+        out.push_str(&c.arguments);
+    }
+    super::usage::estimate(input, &out)
 }
 
 /// 发一次非流式请求。返回「状态码 + 响应体 + 解析出的 provider」。
@@ -2388,6 +2441,75 @@ mod tests {
             ),
             SseAction::Text("hi".to_string())
         );
+    }
+
+    #[test]
+    fn extract_reply_reads_usage_for_both_providers() {
+        let oa = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":7}}"#;
+        let u = extract_reply(Provider::OpenAI, oa).unwrap().usage;
+        assert_eq!((u.input_tokens, u.output_tokens, u.estimated), (100, 7, false));
+        let an = r#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":50,"output_tokens":3,"cache_read_input_tokens":10}}"#;
+        let u = extract_reply(Provider::Anthropic, an).unwrap().usage;
+        assert_eq!((u.input_tokens, u.output_tokens, u.cache_read_tokens), (60, 3, 10));
+        // 没报用量：空的，由 complete_reply_once 估
+        let bare = r#"{"choices":[{"message":{"content":"hi"}}]}"#;
+        assert!(extract_reply(Provider::OpenAI, bare).unwrap().usage.is_empty());
+    }
+
+    #[test]
+    fn estimate_reply_usage_counts_prompt_and_reply() {
+        let reply = LlmReply {
+            text: "好的".into(),
+            tool_calls: vec![ToolCall { id: String::new(), name: "nx_exec".into(), arguments: r#"{"command":"ls"}"#.into() }],
+            ..Default::default()
+        };
+        let u = estimate_reply_usage("系统提示", &[ChatMessage::user("帮我看看磁盘")], &reply);
+        assert!(u.estimated);
+        assert!(u.input_tokens >= 4 + 6, "{u:?}");
+        assert!(u.output_tokens > 2, "{u:?}");
+    }
+
+    #[test]
+    fn sse_state_collects_usage_openai_and_anthropic() {
+        let mut st = SseState::default();
+        assert_eq!(
+            dispatch_line(Provider::OpenAI, &mut st, r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#),
+            SseAction::Text("hi".into())
+        );
+        assert!(st.usage().is_empty());
+        // 有的网关把 usage 和 finish_reason 放在同一个 chunk
+        assert_eq!(
+            dispatch_line(
+                Provider::OpenAI,
+                &mut st,
+                r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2}}"#
+            ),
+            SseAction::Done(FinishReason::Stop)
+        );
+        assert_eq!((st.usage().input_tokens, st.usage().output_tokens), (11, 2));
+        // include_usage 的末 chunk：choices 为空
+        let mut st = SseState::default();
+        dispatch_line(Provider::OpenAI, &mut st, r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":9}}"#);
+        assert_eq!(st.usage().output_tokens, 9);
+
+        let mut st = SseState::default();
+        dispatch_line(Provider::Anthropic, &mut st, "event: message_start");
+        dispatch_line(
+            Provider::Anthropic,
+            &mut st,
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":25,"output_tokens":1}}}"#,
+        );
+        dispatch_line(Provider::Anthropic, &mut st, "");
+        dispatch_line(Provider::Anthropic, &mut st, "event: message_delta");
+        assert_eq!(
+            dispatch_line(
+                Provider::Anthropic,
+                &mut st,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15}}"#
+            ),
+            SseAction::Done(FinishReason::Stop)
+        );
+        assert_eq!((st.usage().input_tokens, st.usage().output_tokens), (25, 15));
     }
 
     #[test]
@@ -2951,14 +3073,24 @@ mod tests {
     fn done_payload_serializes_as_expected() {
         let json = serde_json::to_value(DonePayload {
             reason: FinishReason::Cancelled,
+            usage: None,
         })
         .expect("应能序列化");
         assert_eq!(json, serde_json::json!({"reason": "cancelled"}));
         let json = serde_json::to_value(DonePayload {
             reason: FinishReason::Length,
+            usage: None,
         })
         .expect("应能序列化");
         assert_eq!(json, serde_json::json!({"reason": "length"}));
+        let u = super::super::usage::Usage { input_tokens: 3, output_tokens: 4, estimated: true, ..Default::default() };
+        let json = serde_json::to_value(DonePayload {
+            reason: FinishReason::Stop,
+            usage: Some(super::super::usage::RunUsage { usage: u, cost_usd: None, elapsed_secs: 2 }),
+        })
+        .expect("应能序列化");
+        assert_eq!(json["usage"]["outputTokens"], 4);
+        assert_eq!(json["usage"]["estimated"], true);
     }
 
     #[test]

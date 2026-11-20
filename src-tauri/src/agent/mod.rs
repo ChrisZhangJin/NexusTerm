@@ -65,6 +65,7 @@ pub mod timeline;
 pub mod todo;
 pub mod trace;
 pub mod usercmd;
+pub mod usage;
 pub mod watch;
 pub mod compact;
 
@@ -238,6 +239,10 @@ pub struct AgentConfig {
     /// 旧配置没有这个字段，靠 `serde(default)` 落到默认值（25 步 / 10 分钟 / 输出不限）。
     #[serde(default)]
     pub budget: budget::RunBudget,
+    /// 模型单价表（美元 / 百万 token，按模型名匹配），用来把 token 折成钱，见 `usage`。
+    /// 旧配置没有这个字段时落到内置默认（几款价格确定的模型）；用户清空就是空表（只显示 token）。
+    #[serde(default = "usage::default_prices")]
+    pub prices: Vec<usage::ModelPrice>,
 }
 
 impl Default for AgentConfig {
@@ -255,6 +260,7 @@ impl Default for AgentConfig {
             exec_mode: ExecMode::Approval,
             trace: false,
             budget: budget::RunBudget::default(),
+            prices: usage::default_prices(),
         }
     }
 }
@@ -400,6 +406,7 @@ fn migrate_legacy_config(raw: &str) -> AgentConfig {
         exec_mode: ExecMode::Approval,
         trace: false,
         budget: budget::RunBudget::default(),
+        prices: usage::default_prices(),
     }
 }
 

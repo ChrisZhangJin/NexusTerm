@@ -8,6 +8,8 @@
 //! - **墙钟时间**：从本轮开始（或最近一次「继续」）算起。含等审批 / 等用户的时间，不做扣除。
 //! - **输出字符**（可选，0 = 不限）：喂回模型的终端内容 + 模型回复文本的累计字符数，
 //!   用来给「一路 `tail -f` / `cat` 大文件烧 token」兜底。
+//! - **花费**（可选，0 = 不限）：按模型单价（`usage::price_for`）折算的累计花费，微美元计。
+//!   当前模型没有单价时花费恒为 0，这一项等于不生效（界面上会提示）。
 //!
 //! 预算用尽**不是失败**：运行停在 [`RunPhase::Paused`]，向面板推一张 `paused` 步骤卡
 //! （做了什么、还差什么、怎么继续），**同一轮继续占着会话**，对话历史 / 计划上下文原封不动
@@ -43,6 +45,8 @@ pub const DEFAULT_MAX_MINUTES: u32 = 10;
 pub const MAX_MINUTES_CEIL: u32 = 24 * 60;
 /// 输出字符上限的最大值。
 pub const MAX_OUTPUT_CHARS_CEIL: u64 = 100_000_000;
+/// 花费上限的最大值（微美元，= $10000）。
+pub const MAX_COST_MICROS_CEIL: u64 = 10_000 * 1_000_000;
 
 /// 暂停后最多挂多久还没人点「继续 / 停止」，就当用户走开了、收束这一轮（秒）。
 pub const PAUSE_IDLE_LIMIT_SECS: u64 = 60 * 60;
@@ -59,11 +63,13 @@ pub struct RunBudget {
     pub max_minutes: u32,
     /// 喂回模型 + 模型回复的累计字符上限。0 = 不限。
     pub max_output_chars: u64,
+    /// 最多花多少钱（微美元，按模型单价折算）。0 = 不限（默认）。
+    pub max_cost_micros: u64,
 }
 
 impl Default for RunBudget {
     fn default() -> Self {
-        Self { max_steps: DEFAULT_MAX_STEPS, max_minutes: DEFAULT_MAX_MINUTES, max_output_chars: 0 }
+        Self { max_steps: DEFAULT_MAX_STEPS, max_minutes: DEFAULT_MAX_MINUTES, max_output_chars: 0, max_cost_micros: 0 }
     }
 }
 
@@ -78,6 +84,7 @@ impl RunBudget {
             },
             max_minutes: self.max_minutes.min(MAX_MINUTES_CEIL),
             max_output_chars: self.max_output_chars.min(MAX_OUTPUT_CHARS_CEIL),
+            max_cost_micros: self.max_cost_micros.min(MAX_COST_MICROS_CEIL),
         }
     }
 
@@ -94,6 +101,13 @@ pub struct BudgetSpent {
     pub steps: u32,
     pub elapsed_secs: u64,
     pub output_chars: u64,
+    /// 模型调用的 token（只计量 / 展示，不设上限）
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// 其中有估算的（服务方没报用量）
+    pub estimated: bool,
+    /// 按单价折算的花费（微美元）；当前模型没单价时恒为 0
+    pub cost_micros: u64,
 }
 
 /// 哪一项预算用尽了。携带的数字只用于文案。
@@ -103,6 +117,18 @@ pub enum ExhaustReason {
     Steps { used: u32, max: u32 },
     Time { used_secs: u64, max_secs: u64 },
     Output { used: u64, max: u64 },
+    /// 微美元
+    Cost { used_micros: u64, max_micros: u64 },
+}
+
+/// 微美元 → 「$0.42」（文案用，不足一分显示到 0.001）。
+fn usd(micros: u64) -> String {
+    let d = micros as f64 / 1_000_000.0;
+    if d < 0.1 && micros > 0 {
+        format!("${d:.3}")
+    } else {
+        format!("${d:.2}")
+    }
 }
 
 impl ExhaustReason {
@@ -116,6 +142,9 @@ impl ExhaustReason {
                 max_secs / 60
             ),
             Self::Output { used, max } => format!("累计输出 {used} 字符，达到输出上限（{max} 字符）"),
+            Self::Cost { used_micros, max_micros } => {
+                format!("已花费约 {}，达到花费上限（{}）", usd(used_micros), usd(max_micros))
+            }
         }
     }
 
@@ -125,6 +154,7 @@ impl ExhaustReason {
             Self::Steps { .. } => "steps",
             Self::Time { .. } => "time",
             Self::Output { .. } => "output",
+            Self::Cost { .. } => "cost",
         }
     }
 }
@@ -137,7 +167,7 @@ pub enum BudgetCheck {
 }
 
 /// 纯函数：已花的预算 vs. 上限。**`>=` 即用尽**（「最多 N 步」= 做满 N 步就停）。
-/// 多项同时用尽时按 步数 → 时间 → 输出 的顺序报第一项。
+/// 多项同时用尽时按 步数 → 时间 → 输出 → 花费 的顺序报第一项。
 pub fn check_budget(spent: &BudgetSpent, limits: &RunBudget) -> BudgetCheck {
     let l = limits.clamped();
     if spent.steps >= l.max_steps {
@@ -153,6 +183,12 @@ pub fn check_budget(spent: &BudgetSpent, limits: &RunBudget) -> BudgetCheck {
         return BudgetCheck::Exhausted(ExhaustReason::Output {
             used: spent.output_chars,
             max: l.max_output_chars,
+        });
+    }
+    if l.max_cost_micros > 0 && spent.cost_micros >= l.max_cost_micros {
+        return BudgetCheck::Exhausted(ExhaustReason::Cost {
+            used_micros: spent.cost_micros,
+            max_micros: l.max_cost_micros,
         });
     }
     BudgetCheck::Continue
@@ -334,10 +370,10 @@ mod tests {
     use super::*;
 
     fn lim(steps: u32, minutes: u32, chars: u64) -> RunBudget {
-        RunBudget { max_steps: steps, max_minutes: minutes, max_output_chars: chars }
+        RunBudget { max_steps: steps, max_minutes: minutes, max_output_chars: chars, max_cost_micros: 0 }
     }
     fn spent(steps: u32, secs: u64, chars: u64) -> BudgetSpent {
-        BudgetSpent { steps, elapsed_secs: secs, output_chars: chars }
+        BudgetSpent { steps, elapsed_secs: secs, output_chars: chars, ..Default::default() }
     }
 
     // ——— check_budget ———
@@ -406,6 +442,30 @@ mod tests {
         assert!(ExhaustReason::Steps { used: 25, max: 25 }.describe().contains("25"));
         assert!(ExhaustReason::Time { used_secs: 601, max_secs: 600 }.describe().contains("11"));
         assert_eq!(ExhaustReason::Output { used: 1, max: 1 }.code(), "output");
+    }
+
+    #[test]
+    fn cost_limit_is_optional_and_pauses_when_reached() {
+        let mut l = lim(25, 0, 0);
+        let mut s = spent(1, 1, 0);
+        s.cost_micros = 5_000_000;
+        assert_eq!(check_budget(&s, &l), BudgetCheck::Continue, "0 = 不限");
+        l.max_cost_micros = 500_000; // $0.50
+        match check_budget(&s, &l) {
+            BudgetCheck::Exhausted(r @ ExhaustReason::Cost { used_micros: 5_000_000, max_micros: 500_000 }) => {
+                assert_eq!(r.code(), "cost");
+                assert!(r.describe().contains("$5.00") && r.describe().contains("$0.50"), "{}", r.describe());
+            }
+            other => panic!("{other:?}"),
+        }
+        s.cost_micros = 499_999;
+        assert_eq!(check_budget(&s, &l), BudgetCheck::Continue);
+        // 步数先用尽时报步数
+        s.steps = 25;
+        s.cost_micros = 9_000_000;
+        assert!(matches!(check_budget(&s, &l), BudgetCheck::Exhausted(ExhaustReason::Steps { .. })));
+        assert_eq!(RunBudget { max_cost_micros: u64::MAX, ..l }.clamped().max_cost_micros, MAX_COST_MICROS_CEIL);
+        assert!(ExhaustReason::Cost { used_micros: 42_000, max_micros: 40_000 }.describe().contains("$0.042"));
     }
 
     // ——— 配置兼容 ———

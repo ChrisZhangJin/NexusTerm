@@ -19,6 +19,7 @@ import { toFriendlyError } from "../lib/errors";
 import { checkLines, criteriaSummary, formatReport, checksToText, hostDetail, hostPill, isTerminal, needsReattach, pendingCard, textToChecks } from "../lib/host";
 import { HOST_TIERS, hostHeadActions, hostSettingsSummary, type HostHeadAction } from "../lib/hostUi";
 import { STEWARD_DURATION_OPTIONS } from "../lib/agentBudget";
+import { fmtUsd, fromHostSpent, usageTooltip, usageWithTime } from "../lib/usage";
 import type {
   AgentTarget,
   HostBudgetGrant,
@@ -163,6 +164,9 @@ export default function HostCard({ status, label, grant, stopCtrlC, onStopCtrlC,
     }
   };
   const summary = hostSettingsSummary(status.tier, status.deny);
+  // 卡头的「花了多少」：token · ≈钱 · 用时（结束后就是全程合计）
+  const usage = status.spent ? fromHostSpent(status.spent) : null;
+  const usageText = usage ? usageWithTime(usage) : "";
   const settings = live && !reattach;
 
   return (
@@ -171,6 +175,11 @@ export default function HostCard({ status, label, grant, stopCtrlC, onStopCtrlC,
       <div className="hc-head">
         <span className={`st-badge host-pill ${pill.tone}`}>{pill.label}</span>
         <span className="hc-title">{label ? `托管 · ${label}` : "托管"}</span>
+        {usage && usageText && (
+          <span className="hc-usage" title={usageTooltip(usage)}>
+            {usageText}
+          </span>
+        )}
         {acts.length > 0 && (
           <span className="hc-acts">
             {acts.map((a) => (
@@ -531,7 +540,8 @@ export default function HostCard({ status, label, grant, stopCtrlC, onStopCtrlC,
             )}
             {grant && (
               <div className="st-meta">
-                预算：最长 {durationLabel(grant.maxMinutes)} · 最多 {grant.maxSteps ?? "—"} 步（「加预算继续」时按这份给）
+                预算：最长 {durationLabel(grant.maxMinutes)} · 最多 {grant.maxSteps ?? "—"} 步
+                {grant.maxCostMicros ? ` · 最多花 ${fmtUsd(grant.maxCostMicros / 1_000_000)}` : ""}（「加预算继续」时按这份给）
               </div>
             )}
           </div>

@@ -17,6 +17,7 @@ import {
   onAgentSecret,
   onAgentStep,
   onAgentToken,
+  onAgentUsage,
 } from "../api";
 import { toFriendlyError } from "./errors";
 import { applyControl, drivingSessions, pausedSessions, type ControlState } from "./control";
@@ -32,6 +33,7 @@ import {
   withSecretResult,
   withStep,
   withToken,
+  withUsage,
   type Conversation,
 } from "./agentRun";
 import type { AgentApproveRequest, AgentSecretRequest } from "../types";
@@ -118,12 +120,12 @@ export function useAgentRun(opts: {
 
     void (async () => {
       try {
-        const [offToken, offDone, offError, offStep, offApprove, offSecret, offControl] = await Promise.all([
+        const [offToken, offDone, offError, offStep, offApprove, offSecret, offControl, offUsage] = await Promise.all([
           onAgentToken(runSession, (chunk) => {
             if (!disposed) patch((c) => withToken(c, chunk));
           }),
           onAgentDone(runSession, (p) => {
-            if (!disposed) patch((c) => withDone(c, p.reason));
+            if (!disposed) patch((c) => withUsage(withDone(c, p.reason), p.usage));
           }),
           onAgentError(runSession, (msg) => {
             if (!disposed) patch((c) => withError(c, msg));
@@ -147,6 +149,9 @@ export function useAgentRun(opts: {
           onAgentControl(runSession, (p) => {
             if (!disposed) setControl((s) => applyControl(s, p));
           }),
+          onAgentUsage(runSession, (u) => {
+            if (!disposed) patch((c) => withUsage(c, u));
+          }),
         ]);
         // 竞态：listen 是异步的，等它 resolve 时这一轮可能已经结束了 —— 这时要立刻退订
         if (disposed) {
@@ -157,9 +162,10 @@ export function useAgentRun(opts: {
           offApprove();
           offSecret();
           offControl();
+          offUsage();
           return;
         }
-        unlisteners.push(offToken, offDone, offError, offStep, offApprove, offSecret, offControl);
+        unlisteners.push(offToken, offDone, offError, offStep, offApprove, offSecret, offControl, offUsage);
         // 订阅之前就已经在跑的一轮（面板刚打开 / 重新挂载）：对一次账，补上发起会话的状态
         api
           .agentControlGet(runSession)

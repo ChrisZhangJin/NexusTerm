@@ -11,6 +11,7 @@ import type {
   AgentMessage,
   AgentSecretRequest,
   AgentStep,
+  RunUsage,
 } from "../types";
 
 /** 单个会话的对话状态。按 sessionId 分桶，切会话时彼此完全隔离。 */
@@ -25,6 +26,13 @@ export interface Conversation {
    * 只从 `paused` / `resumed` 步骤推出；一轮结束时对话状态被整体重建，标记随之消失。
    */
   paused?: PauseKind;
+  /** 上一轮（对话 / 问答）花了多少 token / 钱 / 时间：输入框下面淡淡显示一行 */
+  lastUsage?: RunUsage;
+}
+
+/** 一轮结束时后端推来的用量 */
+export function withUsage(c: Conversation, u: RunUsage | undefined | null): Conversation {
+  return u ? { ...c, lastUsage: u } : c;
 }
 
 export const EMPTY_CONV: Conversation = { messages: [], busy: false, interrupted: false };

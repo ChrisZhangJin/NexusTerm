@@ -5,6 +5,7 @@ import type {
   AgentBufferStats,
   AgentConfig,
   AgentDonePayload,
+  RunUsage,
   AgentExecResult,
   AgentRunRequest,
   HostBudgetGrant,
@@ -655,6 +656,14 @@ export async function onAgentDone(
   handler: (p: AgentDonePayload) => void
 ): Promise<UnlistenFn> {
   return listen<AgentDonePayload>(`nx://agent/done/${id}`, (ev) => handler(ev.payload));
+}
+
+/** 一轮对话结束时的用量（token / 花费 / 用时），在 `answer` 之后、本轮登记摘掉之前推 */
+export async function onAgentUsage(
+  id: string,
+  handler: (u: RunUsage) => void
+): Promise<UnlistenFn> {
+  return listen<RunUsage>(`nx://agent/usage/${id}`, (ev) => handler(ev.payload));
 }
 
 /** 终态错误，payload 是后端翻译好的中文文案 */

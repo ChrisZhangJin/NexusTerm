@@ -30,6 +30,8 @@ import DenyEditor from "./DenyEditor";
 import { DEFAULT_DENY, addDeny, hostPill, isTerminal, needsReattach } from "../lib/host";
 import { HOST_PRESETS, HOST_TIERS, LS_HOST_TIER, TIER_HINTS, hostSettingsSummary, parseHostTier, presetOfTier } from "../lib/hostUi";
 import { pendingPrompts } from "../lib/agentRun";
+import { activeAccount, useAgentConfig } from "../lib/agent";
+import { fmtUsd, parseCostInput, priceFor, usdToMicros } from "../lib/usage";
 import {
   LS_STEWARD_BUDGET,
   STEWARD_DURATION_OPTIONS,
@@ -223,6 +225,16 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
     updateBudgetPref({ maxSteps: Number(stepsDraft) });
     setStepsDraft(null);
   };
+  /** 花费上限输入框的草稿（美元，空 = 不限） */
+  const [costDraft, setCostDraft] = useState<string | null>(null);
+  const commitCost = () => {
+    if (costDraft === null) return;
+    updateBudgetPref({ maxCostUsd: parseCostInput(costDraft) });
+    setCostDraft(null);
+  };
+  // 花费上限要靠模型单价折算：当前模型没单价时这一项不生效，表单上说一声
+  const agentCfg = useAgentConfig();
+  const modelPriced = priceFor(agentCfg.prices, activeAccount(agentCfg).model) !== null;
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
   /** 用户在列表里手动点过别的终端（非当前标签）时记下；为 null 时跟随当前标签 */
@@ -527,7 +539,11 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
         <HostCard
           status={selectedHost}
           label={label(selectedHost.consoleId)}
-          grant={{ maxSteps: budgetPref.maxSteps, maxMinutes: budgetPref.maxMinutes }}
+          grant={{
+            maxSteps: budgetPref.maxSteps,
+            maxMinutes: budgetPref.maxMinutes,
+            maxCostMicros: usdToMicros(budgetPref.maxCostUsd),
+          }}
           stopCtrlC={run.stopCtrlC}
           onStopCtrlC={run.toggleStopCtrlC}
           onStop={stopHosting}
@@ -616,7 +632,9 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
               更多设置
               <span className="st-meta">
                 {" "}
-                · 最长 {durationLabel} · 最多 {budgetPref.maxSteps} 步{confirmCriteria ? " · 先确认判据" : ""} · {formSummary.deny}
+                · 最长 {durationLabel} · 最多 {budgetPref.maxSteps} 步
+                {budgetPref.maxCostUsd > 0 ? ` · 最多花 ${fmtUsd(budgetPref.maxCostUsd)}` : ""}
+                {confirmCriteria ? " · 先确认判据" : ""} · {formSummary.deny}
               </span>
             </summary>
             <div className="hc-settings-body">
@@ -668,7 +686,30 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
                   />
                   步
                 </label>
+                <label
+                  className="st-meta"
+                  title="按模型单价折算的花费，到了就暂停等你点「加预算继续」。留空 = 不限。单价在 AI 设置的「模型单价」里改"
+                >
+                  最多花费 $
+                  <input
+                    className="st-num"
+                    type="number"
+                    min={0}
+                    step={0.1}
+                    placeholder="不限"
+                    value={costDraft ?? (budgetPref.maxCostUsd > 0 ? String(budgetPref.maxCostUsd) : "")}
+                    disabled={busy}
+                    onChange={(e) => setCostDraft(e.target.value)}
+                    onBlur={commitCost}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") commitCost();
+                    }}
+                  />
+                </label>
               </div>
+              {budgetPref.maxCostUsd > 0 && !modelPriced && (
+                <div className="st-status warn">当前模型没有设置单价，花费上限不会生效（只计 token）。可在 AI 设置的「模型单价」里补上。</div>
+              )}
               <label
                 className="st-meta hc-row"
                 title="勾上：开始前先出一张「确认完成判据」卡，你改好点接受才开始。不勾（默认）：直接采用 AI 起草的判据开始；未确认的判据只跑只读检查，跑不了的记「未核验」，不挡完成。"
