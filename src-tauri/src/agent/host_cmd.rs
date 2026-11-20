@@ -409,6 +409,7 @@ pub async fn host_start(
         console_alt: console_alt.unwrap_or(false),
         mode: Some("steward".to_string()),
         budget,
+        conversation: None,
     };
     let task_app = app.clone();
     let task_host = Arc::clone(&shared);
@@ -1099,6 +1100,7 @@ fn spawn_resumed(app: AppHandle, h: Arc<HostShared>, old: Option<Arc<HostShared>
             console_alt: false,
             mode: Some("steward".to_string()),
             budget: None,
+            conversation: None,
         };
         let res = act::run(&app, &st, &st.act, &cfg, &req, RunMode::Hosted(Arc::clone(&h))).await;
         finish_hosted(&app, &h, res);

@@ -404,6 +404,8 @@ export interface AgentRunRequest {
   mode?: "steward" | null;
   /** 可选的预算覆盖（后端会夹紧）。缺省用该模式的默认预算 */
   budget?: AgentRunBudgetOverride | null;
+  /** 这一轮属于哪段对话（按连接分开，见 `convKeyOf`）：模型消息历史与运行摘要按它存取 */
+  conversation?: string;
 }
 
 /** `agent_run` 的预算覆盖（camelCase，与后端 `RunBudgetOverride` 一致）；字段缺省 = 用默认 */

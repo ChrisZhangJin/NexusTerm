@@ -98,8 +98,8 @@ pub fn agent_clear(session_id: String, state: State<'_, AppState>) -> Result<(),
 
 /// 读回已保存的面板对话（消息对象数组，结构由前端定义，后端只透传）。
 #[tauri::command]
-pub fn agent_history_load(state: State<'_, AppState>) -> Vec<serde_json::Value> {
-    state.store.agent_conv_load()
+pub fn agent_history_load(key: Option<String>, state: State<'_, AppState>) -> Vec<serde_json::Value> {
+    state.store.agent_conv_load_in(key.as_deref().unwrap_or(""))
 }
 
 /// 覆盖保存面板对话。落盘前由后端统一清洗：只留最近若干条、文本脱敏并截断、
@@ -109,22 +109,23 @@ pub fn agent_history_load(state: State<'_, AppState>) -> Vec<serde_json::Value> 
 #[tauri::command]
 pub async fn agent_history_save(
     messages: Vec<serde_json::Value>,
+    key: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let cleaned = super::history::sanitize_messages(messages);
-    state.store.agent_conv_save(&cleaned)
+    state.store.agent_conv_save_in(key.as_deref().unwrap_or(""), &cleaned)
 }
 
 /// 「新对话」：下一次提问不再接着之前的模型消息历史（面板上的记录不动）。
 #[tauri::command]
-pub fn agent_conversation_reset(state: State<'_, AppState>) -> Result<(), String> {
-    state.store.agent_llm_clear()
+pub fn agent_conversation_reset(key: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+    state.store.agent_llm_clear_in(key.as_deref().unwrap_or(""))
 }
 
 /// 「清空对话」：真删已保存的对话与运行摘要。
 #[tauri::command]
-pub fn agent_history_clear(state: State<'_, AppState>) -> Result<(), String> {
-    state.store.agent_history_clear()
+pub fn agent_history_clear(key: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+    state.store.agent_history_clear_in(key.as_deref().unwrap_or(""))
 }
 
 /// 缓冲统计（字节数 / 累计丢弃量 / 是否已被截断）。

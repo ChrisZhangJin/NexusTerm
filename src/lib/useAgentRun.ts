@@ -6,7 +6,7 @@
  * 同一个审批弹两次的情况。托管视图只是把 `conv.messages` 的一段切出来画（见 `sliceFromMessage`）。
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   api,
@@ -36,17 +36,42 @@ import {
 } from "./agentRun";
 import type { AgentApproveRequest, AgentSecretRequest } from "../types";
 
+/** 对每段对话套一次 `fn`；结果没变的保持原对象（React 据此跳过重渲染） */
+function mapConvs(all: Record<string, Conversation>, fn: (c: Conversation) => Conversation): Record<string, Conversation> {
+  let changed = false;
+  const out: Record<string, Conversation> = {};
+  for (const [k, c] of Object.entries(all)) {
+    const n = fn(c);
+    if (n !== c) changed = true;
+    out[k] = n;
+  }
+  return changed ? out : all;
+}
+
 /** 「停止时同时发 Ctrl-C」的本机偏好（"1" = 开，默认关） */
 const LS_STOP_CTRL_C = "nx.agent.stopCtrlC";
 
 export function useAgentRun(opts: {
   /** 当前绑定的会话（取消 / 暂停 / 继续在没有 runSession 时的兜底） */
   sessionId: string;
+  /** 面板此刻在看哪段对话（按连接分开，见 `convKeyOf`）：切标签就切到那个连接自己的对话 */
+  convKey: string;
   /** 动作失败时的一行错误文案（由调用方决定怎么显示） */
   onError: (msg: string) => void;
 }) {
-  const { sessionId, onError } = opts;
-  const [conv, setConv] = useState<Conversation>(EMPTY_CONV);
+  const { sessionId, convKey, onError } = opts;
+  /** 每个连接一段对话。正在跑的那一轮的事件进它发起时的那一段（`runKey`），不跟着面板切走 */
+  const [convs, setConvs] = useState<Record<string, Conversation>>({});
+  const conv = convs[convKey] ?? EMPTY_CONV;
+  const [runKey, setRunKeyState] = useState<string | null>(null);
+  /** 改某一段对话 */
+  const patchIn = useCallback((key: string, fn: (c: Conversation) => Conversation) => {
+    setConvs((all) => ({ ...all, [key]: fn(all[key] ?? EMPTY_CONV) }));
+  }, []);
+  /** 改面板此刻在看的那一段 */
+  const setConv = useCallback((fn: (c: Conversation) => Conversation) => patchIn(convKey, fn), [patchIn, convKey]);
+  /** 有没有哪段对话正在跑（同一时刻只有一份事件订阅，所以别的连接上也不能再起一轮） */
+  const anyBusy = Object.values(convs).some((c) => c.busy);
   /**
    * 这一轮实际发起的会话。事件订阅挂在它上面，而**不跟随 sessionId** ——
    * 用户切到别的标签时，正在跑的那条流仍要收得到，否则答案会断在半截。
@@ -65,9 +90,21 @@ export function useAgentRun(opts: {
     localStorage.setItem(LS_STOP_CTRL_C, on ? "1" : "0");
   };
 
-  const patch = useCallback((fn: (c: Conversation) => Conversation) => {
-    setConv((prev) => fn(prev));
+  /** 正在跑的那一轮的事件：进它发起时的那段对话 */
+  const runKeyRef = useRef<string | null>(null);
+  runKeyRef.current = runKey;
+  /** 起一轮时定下它属于哪段对话（同步写 ref：紧接着的 patch 不必等重渲染） */
+  const setRunKey = useCallback((k: string | null) => {
+    runKeyRef.current = k;
+    setRunKeyState(k);
   }, []);
+  const patch = useCallback(
+    (fn: (c: Conversation) => Conversation) => {
+      const k = runKeyRef.current;
+      if (k !== null) patchIn(k, fn);
+    },
+    [patchIn]
+  );
 
   // ——— 事件订阅：挂在这一轮发起的会话上 ———
   // **不跟随面板可见性**：后端那一轮不会因为面板收起而停，收起期间发出的审批 / 密码卡片
@@ -195,7 +232,8 @@ export function useAgentRun(opts: {
       onError(`提交审批结果失败：${toFriendlyError(e).message}`);
       return;
     }
-    patch((c) => withDecision(c, req.requestId, approved));
+    // 卡片可能在任何一段对话里（不一定是正在跑的那段）：按 requestId 找，找不到的那几段原样不动
+    setConvs((all) => mapConvs(all, (c) => withDecision(c, req.requestId, approved)));
   };
 
   /**
@@ -211,8 +249,10 @@ export function useAgentRun(opts: {
     try {
       const accepted = await api.agentSecretAck(req.requestId, value);
       // false：这个请求已经超时 / 被取消 / 重复提交，后端不再等了
-      patch((c) =>
-        withSecretResult(c, req.requestId, accepted ? (value === undefined ? "skipped" : "submitted") : "expired")
+      setConvs((all) =>
+        mapConvs(all, (c) =>
+          withSecretResult(c, req.requestId, accepted ? (value === undefined ? "skipped" : "submitted") : "expired")
+        )
       );
       return null;
     } catch (e) {
@@ -222,7 +262,12 @@ export function useAgentRun(opts: {
 
   return {
     conv,
+    convs,
     setConv,
+    patchIn,
+    runKey,
+    setRunKey,
+    anyBusy,
     patch,
     runSession,
     setRunSession,

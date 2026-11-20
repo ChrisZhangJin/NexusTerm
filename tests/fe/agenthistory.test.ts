@@ -157,3 +157,13 @@ test("createDebouncedSaver：flush 立刻写、cancel 丢弃", () => {
   s.flush();
   assert.deepEqual(saved, [1], "cancel 之后什么都不会被写出去");
 });
+
+import { convKeyOf } from "../../src/lib/agentHistory";
+
+test("convKeyOf：按保存的连接分段，本地终端共用一段", () => {
+  assert.equal(convKeyOf({ id: "tab-1", hint: { sessionRecordId: "rec-9" } }), "ssh:rec-9");
+  assert.equal(convKeyOf({ id: "tab-2", hint: { sessionRecordId: "rec-9" } }), "ssh:rec-9", "同一台主机两个标签共用");
+  assert.equal(convKeyOf({ id: "tab-3", hint: { sessionRecordId: null } }), "local");
+  assert.equal(convKeyOf({ id: "tab-4" }), "local");
+  assert.equal(convKeyOf(undefined), "local");
+});

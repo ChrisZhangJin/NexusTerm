@@ -132,8 +132,8 @@ export interface StewardPanelProps {
   sessionId: string;
   /** 标签树里的可读名字，由 App 传入；后端只认 id */
   sessions?: AgentTarget[];
-  /** 托管那一轮的运行桥（由 AgentPanel 提供） */
-  run: StewardRunBridge;
+  /** 某个终端的托管运行桥（由 AgentPanel 提供）：每个终端各自一份，同一时刻可托管多个终端 */
+  runFor: (consoleId: string) => StewardRunBridge;
 }
 
 const TIERS: Array<{ value: StewardTier; label: string; hint: string }> = [
@@ -154,7 +154,7 @@ const hhmmss = (ms: number) => {
   }
 };
 
-export default function StewardPanel({ sessionId, sessions, run }: StewardPanelProps) {
+export default function StewardPanel({ sessionId, sessions, runFor }: StewardPanelProps) {
   const [consoles, setConsoles] = useState<ConsoleInfo[]>([]);
   const [contracts, setContracts] = useState<StewardContract[]>([]);
   const [snapshot, setSnapshot] = useState<ScreenSnapshot | null>(null);
@@ -170,6 +170,8 @@ export default function StewardPanel({ sessionId, sessions, run }: StewardPanelP
   const [explanation, setExplanation] = useState<Explanation | null>(null);
   const [showReview, setShowReview] = useState(false);
   const [selected, setSelected] = useState(sessionId);
+  /** 选中的那个终端的托管（别的终端上的托管不影响这里能不能开始） */
+  const run = runFor(selected);
   const [goal, setGoal] = useState("");
   const [tier, setTier] = useState<StewardTier>("notify");
   /** 开始前先确认 AI 起草的完成判据（默认关 = 直接采用草稿开始，未确认的判据只跑只读检查、不阻塞完成）。记在本地 */

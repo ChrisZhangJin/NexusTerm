@@ -218,14 +218,14 @@ export const api = {
     invoke<string>("agent_context", { sessionId, maxBytes: maxBytes ?? null }),
   /** 清空缓冲（让 agent 忘掉刚才的事） */
   agentClear: (sessionId: string) => invoke<void>("agent_clear", { sessionId }),
-  /** 读回已保存的面板对话（全局一份）。结构见 `lib/agentHistory`。 */
-  agentHistoryLoad: () => invoke<unknown[]>("agent_history_load"),
+  /** 读回某个连接（`convKeyOf`）已保存的面板对话。结构见 `lib/agentHistory`。 */
+  agentHistoryLoad: (key: string) => invoke<unknown[]>("agent_history_load", { key }),
   /** 覆盖保存面板对话。后端落盘前会再脱敏、截断、限量。 */
-  agentHistorySave: (messages: unknown[]) => invoke<void>("agent_history_save", { messages }),
+  agentHistorySave: (messages: unknown[], key: string) => invoke<void>("agent_history_save", { messages, key }),
   /** 「清空对话」：真删已保存的对话与运行摘要。 */
-  agentHistoryClear: () => invoke<void>("agent_history_clear"),
+  agentHistoryClear: (key: string) => invoke<void>("agent_history_clear", { key }),
   /** 「新对话」：下一次提问不再接着之前的模型消息历史（面板记录不动） */
-  agentConversationReset: () => invoke<void>("agent_conversation_reset"),
+  agentConversationReset: (key: string) => invoke<void>("agent_conversation_reset", { key }),
   // ——— Skill（Phase 3.1）。校验失败的 reject 文案是换行分隔的全部问题。———
   /** 最近更新在前；`query` 非空时按名称 / 描述子串搜索 */
   skillList: (query?: string) => invoke<Skill[]>("skill_list", { query: query ?? null }),

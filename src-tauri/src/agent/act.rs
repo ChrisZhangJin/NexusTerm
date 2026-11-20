@@ -150,6 +150,10 @@ pub struct AgentRunRequest {
     /// 可选的预算覆盖（会被夹紧）。缺省时托管用 400 步 / 360 分钟，普通运行用配置里的预算。
     #[serde(default)]
     pub budget: Option<RunBudgetOverride>,
+    /// 这一轮属于哪段对话（按连接分开：`ssh:<连接记录 id>` / `local`）。模型消息历史与运行摘要都按它存取，
+    /// 不同连接的对话互不串；缺省 = 旧的全局一份
+    #[serde(default)]
+    pub conversation: Option<String>,
 }
 
 /// 请求里的预算覆盖：只覆盖给了的字段。
@@ -163,6 +167,11 @@ pub struct RunBudgetOverride {
 }
 
 impl AgentRunRequest {
+    /// 对话分段的键（缺省为空 = 旧的全局一份）。
+    pub fn conversation_key(&self) -> &str {
+        self.conversation.as_deref().map(str::trim).unwrap_or("")
+    }
+
     /// 是不是托管模式。
     pub fn is_steward(&self) -> bool {
         self.mode.as_deref().map(str::trim) == Some("steward")
@@ -2986,6 +2995,8 @@ impl Drop for ControlLease<'_> {
 pub(super) struct RunLogGuard<'a> {
     pub(super) state: &'a AppState,
     pub(super) run: String,
+    /// 摘要落在哪个会话（连接）名下；空 = 旧的全局一份
+    pub(super) conversation: String,
 }
 
 impl Drop for RunLogGuard<'_> {
@@ -2996,7 +3007,7 @@ impl Drop for RunLogGuard<'_> {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         if let Some(summary) = log.finish(now) {
-            if let Err(e) = self.state.store.agent_summary_push(&summary) {
+            if let Err(e) = self.state.store.agent_summary_push_in(&self.conversation, &summary) {
                 tracing::warn!("保存运行摘要失败: {e}");
             }
         }
@@ -3545,14 +3556,14 @@ pub async fn run(
     }
     // 此前几轮的摘要要在 `runlog.start` 之前取（本轮自己还没落库，但保持顺序更直观）
     let prior_runs = super::history::render_prior_runs(
-        &state.store.agent_summaries_recent(super::history::PRIOR_RUNS_IN_CONTEXT),
+        &state.store.agent_summaries_recent_in(req.conversation_key(), super::history::PRIOR_RUNS_IN_CONTEXT),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0),
     );
     runtime.runlog.start(&req.session_id, &req.question);
-    let _runlog = RunLogGuard { state, run: req.session_id.clone() };
+    let _runlog = RunLogGuard { state, run: req.session_id.clone(), conversation: req.conversation_key().to_string() };
     let acct = cfg.active_account();
     let max_bytes = if acct.max_context_bytes == 0 {
         super::DEFAULT_MAX_CONTEXT_BYTES
@@ -3591,7 +3602,7 @@ pub async fn run(
     // 对话模式的连续性：同一面板对话里的追问接着之前的模型消息历史（已压缩、已脱敏）；
     // 「新对话」清掉它之后才从零开始（那时带上最近几轮运行摘要）
     let continuing = host.is_none() && !req.is_steward();
-    let prior_history = if continuing { load_chat_history(state) } else { Vec::new() };
+    let prior_history = if continuing { load_chat_history(state, req.conversation_key()) } else { Vec::new() };
     let plan_text = plan_message(state, req, &targets, max_bytes, capture.as_deref(), acct.redact);
     let mut messages = if prior_history.is_empty() {
         vec![ChatMessage::user(format!("{}{}", scrub(acct.redact, &prior_runs), plan_text))]
@@ -3971,7 +3982,7 @@ pub async fn run(
                 runtime.runlog.mark_error(&session);
                 if continuing {
                     flush_round(&mut messages, &mut feedback, &mut round_ids, &mut spans, acct.redact);
-                    save_chat_history(state, &messages);
+                    save_chat_history(state, req.conversation_key(), &messages);
                 }
                 // 先把自己这一轮从登记表里摘掉，再报错 —— 否则会话会被永久卡住「运行中」
                 runtime.finish(&run_key);
@@ -5904,7 +5915,7 @@ pub async fn run(
     if continuing {
         // 收尾那一轮的回执也要配上，再落盘给下一次追问续用
         flush_round(&mut messages, &mut feedback, &mut round_ids, &mut spans, acct.redact);
-        save_chat_history(state, &messages);
+        save_chat_history(state, req.conversation_key(), &messages);
     }
     runtime.finish(&run_key);
     Ok(())
@@ -6083,14 +6094,14 @@ fn attach_round(messages: &mut Vec<ChatMessage>, text: String, results: Vec<llm:
 }
 
 /// 读回对话模式的模型消息历史；读不回来的条目丢掉，配对修好。
-fn load_chat_history(state: &AppState) -> Vec<ChatMessage> {
-    chat_history_from(state.store.agent_llm_load())
+fn load_chat_history(state: &AppState, conversation: &str) -> Vec<ChatMessage> {
+    chat_history_from(state.store.agent_llm_load_in(conversation))
 }
 
 /// 落盘：压缩到预算内、全文脱敏（不看开关：静止数据里不该有凭据形态的文本；密码通道的值本来就不进历史），
 /// 配对修好。失败只记日志。
-fn save_chat_history(state: &AppState, messages: &[ChatMessage]) {
-    if let Err(e) = state.store.agent_llm_save(&chat_history_values(messages)) {
+fn save_chat_history(state: &AppState, conversation: &str, messages: &[ChatMessage]) {
+    if let Err(e) = state.store.agent_llm_save_in(conversation, &chat_history_values(messages)) {
         tracing::warn!("保存对话历史失败：{e}");
     }
 }
@@ -8371,6 +8382,7 @@ mod tests {
             console_alt: false,
             mode: None,
             budget: None,
+            conversation: None,
         };
         let resolved = resolve_targets(&req);
         assert_eq!(resolved.len(), 1);
@@ -9087,6 +9099,7 @@ mod tests {
             console_alt: alt,
             mode: None,
             budget: None,
+            conversation: None,
         }
     }
 

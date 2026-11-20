@@ -1984,7 +1984,7 @@ pub async fn run_skill(
         emit_control(ctx.app, target_session, &[target_session.to_string()], st);
     }
     ctx.runtime.runlog.start(target_session, &format!("运行技能「{}」", skill.name));
-    let _runlog = RunLogGuard { state: ctx.state, run: target_session.to_string() };
+    let _runlog = RunLogGuard { state: ctx.state, run: target_session.to_string(), conversation: String::new() };
 
     // 信任与范围（4.4）：都由后端按 skill 自己的状态定，调用方给的只能更严、不能更宽
     let trust = trust_info(skill);

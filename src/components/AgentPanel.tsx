@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import ConfirmDialog, { type ConfirmOptions } from "./ConfirmDialog";
 import SkillManager from "./SkillManager";
 import { HostMemoryDialog } from "./HostMemory";
@@ -10,9 +10,9 @@ import { RunCard, isRunCard } from "./RunFeed";
 import { api } from "../api";
 import { isAgentReady, useAgentConfig } from "../lib/agent";
 import { pauseBannerText, type StewardBudgetPref } from "../lib/agentBudget";
+import { convKeyOf } from "../lib/agentHistory";
 import {
   finishWithoutAnswer,
-  sliceFromMessage,
   uid,
   withError,
 } from "../lib/agentRun";
@@ -22,10 +22,11 @@ import { matchSessions, scanMention } from "../lib/mention";
 import { useAgentHistory } from "../lib/useAgentHistory";
 import { useAgentRun } from "../lib/useAgentRun";
 import { useHostRuns } from "../lib/useHostRuns";
+import { useHostFeeds } from "../lib/useHostFeeds";
 import { basePhase, hostDetail, hostPauseKind, isTerminal, needsReattach } from "../lib/host";
 import { stewardApi, stewardConsoleIds } from "../lib/steward";
 import { setStewardConsoles } from "../lib/termRegistry";
-import type { AgentMessage, AgentTarget, HostStartOpts, Skill, SkillInput } from "../types";
+import type { AgentTarget, HostStartOpts, Skill, SkillInput } from "../types";
 
 export interface AgentPanelProps {
   /** 当前会话 id（绑定哪个终端） */
@@ -117,7 +118,9 @@ export function AgentPanel({
    * 切标签只换「当前会话」这个上下文，不换聊天记录 —— 助手是同一个助手。
    */
   const [err, setErr] = useState<string | null>(null);
-  const run = useAgentRun({ sessionId, onError: setErr });
+  /** 面板此刻看的是哪段对话：按连接分（同一台主机的标签共用一段），切标签就切过去 */
+  const convKey = convKeyOf(sessions.find((x) => x.id === sessionId));
+  const run = useAgentRun({ sessionId, convKey, onError: setErr });
   // 托管任务总表（每个 console 的胶囊 / 卡片）。任务结束时后端已停契约，这里顺手撤掉屏幕帧采集
   const hostRuns = useHostRuns(() => {
     void stewardApi
@@ -161,10 +164,15 @@ export function AgentPanel({
     const ta = taRef.current;
     if (ta) ta.selectionStart = ta.selectionEnd = input.length;
   }, [input]);
-  /** 当前 / 最近一轮是「对话」发起的还是「托管」发起的（只决定托管页要不要认领这一轮） */
-  const [runMode, setRunMode] = useState<"chat" | "steward">("chat");
-  /** 托管那一轮起手时挂上的目标消息 id：托管页只展示它之后的消息 */
-  const [stewardFromId, setStewardFromId] = useState<string | null>(null);
+  /** 本次会话里从托管页开过托管的终端（结束后实况仍留着看） */
+  const [hostStarted, setHostStarted] = useState<string[]>([]);
+  /** 每个托管终端一份实况：活着的托管 + 本次开过的 */
+  const hostFeeds = useHostFeeds([
+    ...hostStarted,
+    ...Object.values(hostRuns.hosts)
+      .filter((h) => !isTerminal(h.phase))
+      .map((h) => h.consoleId),
+  ]);
   const [pending, setPending] = useState<
     { kind: "clear" } | { kind: "clearConv" } | { kind: "cmd"; cmd: string } | null
   >(null);
@@ -195,14 +203,7 @@ export function AgentPanel({
   const activeScope = scoped && scoped.length > 0 ? scoped : [sessionId];
 
   // ——— 对话持久化：重载 / 重启后恢复，变化时防抖写盘 ———
-  const history = useAgentHistory(
-    messages,
-    useCallback(
-      (fn: (prev: AgentMessage[]) => AgentMessage[]) =>
-        setConv((c) => ({ ...c, messages: fn(c.messages) })),
-      []
-    )
-  );
+  const history = useAgentHistory(run.convs, convKey, run.patchIn);
 
   // ——— 清空记忆 ———
 
@@ -222,8 +223,8 @@ export function AgentPanel({
    */
   const newConversation = async () => {
     try {
-      await api.agentConversationReset();
-      patch((c) => ({
+      await api.agentConversationReset(convKey);
+      setConv((c) => ({
         ...c,
         messages: [...c.messages, { id: uid(), role: "assistant" as const, text: "——— 新对话：之后的提问不再接着上面的上下文 ———", ts: Date.now() }],
       }));
@@ -278,6 +279,10 @@ export function AgentPanel({
     const q = input.trim();
     setMention(null);
     if (!q || busy || !sessionId) return;
+    if (run.anyBusy) {
+      setErr("另一个连接上的对话还在跑：等它结束（或在那个标签里停止）再问");
+      return;
+    }
     if (!ready.ok) {
       // 引导态会盖住输入框，正常到不了这里；真到了就把原因说清楚而不是发一个注定失败的请求
       patch((c) => withError(c, ready.reason ?? "Nexus AI Agent 尚未配置完成"));
@@ -293,17 +298,15 @@ export function AgentPanel({
    * 不再提前立一个空的助手泡：这一轮的过程是一张张 step 卡片，
    * 结论等它自己给出时才落地 —— 先立一个空泡只会让对话里多一条空气泡。
    */
-  const startRun = (q: string, mode: "chat" | "steward" = "chat"): string => {
-    // 托管是从「托管」页发起的，不该顺手清掉对话输入框里还没发的草稿
-    if (mode === "chat") {
-      setInput("");
-      historyIndexRef.current = -1;
-      draftRef.current = "";
-    }
+  const startRun = (q: string): string => {
+    setInput("");
+    historyIndexRef.current = -1;
+    draftRef.current = "";
     setErr(null);
     stickRef.current = true;
-    setRunMode(mode);
     const id = uid();
+    // 这一轮属于面板此刻看的那段对话：之后的事件都进它，哪怕中途切到别的标签
+    run.setRunKey(convKey);
     patch((c) => ({
       busy: true,
       interrupted: false,
@@ -375,6 +378,7 @@ export function AgentPanel({
     try {
       await api.agentRun({
         sessionId: sid,
+        conversation: convKey,
         question: q,
         targets: targetsForRun(),
         consoleText: snap?.text,
@@ -401,9 +405,12 @@ export function AgentPanel({
     yolo?: boolean,
     opts?: HostStartOpts
   ): Promise<void> => {
-    if (run.conv.busy) return;
-    setRunSession(sid);
-    setStewardFromId(startRun(`托管目标：${goal}`, "steward"));
+    // 托管不占对话：实况进这个终端自己的那一份（别的终端上的托管照常跑、照常看）
+    setErr(null);
+    hostFeeds.begin(sid, `托管目标：${goal}`);
+    setHostStarted((l) => (l.includes(sid) ? l : [...l, sid]));
+    // 对话页上一轮恰好订阅着这个终端：让出来，免得同一张密码卡在两处出现
+    if (runSession === sid && !busy) setRunSession(null);
     const snap = onGetConsole?.(sid) ?? null;
     const label = sessions.find((x) => x.id === sid)?.label ?? "当前会话";
     try {
@@ -424,10 +431,7 @@ export function AgentPanel({
       // 契约已签：马上让前端开始为这个终端上报屏幕帧（不等托管页的轮询）
       void reconcileStewardConsoles();
     } catch (e) {
-      patch((c) => withError(c, toFriendlyError(e).message));
-    } finally {
-      // 转圈只代表「正在发起」；托管中的状态看胶囊（HostCard），不占着对话输入框
-      patch((c) => (c.busy ? { ...c, busy: false } : c));
+      hostFeeds.patch(sid, (c) => withError(c, toFriendlyError(e).message));
     }
   };
 
@@ -447,7 +451,7 @@ export function AgentPanel({
    */
   const runSkill = async (skill: Skill, params: Record<string, string>) => {
     const sid = sessionId;
-    if (!sid || busy) return;
+    if (!sid || busy || run.anyBusy) return;
     setSkillUi(null);
     setRunSession(sid);
     startRun(`运行技能「${skill.name}」`);
@@ -485,51 +489,53 @@ export function AgentPanel({
     else void insertCommand(p.cmd);
   };
 
-  /** 托管页看到的这一轮：只含托管那一轮的消息，动作全部转给同一份 `useAgentRun` */
-  const stewardOwned = runMode === "steward";
-  /** 托管页那一轮对应的托管任务（未结束的优先） */
-  const hosted = stewardOwned ? hostRuns.forConsole(runSession) : null;
-  const hostedLive = !!hosted && !isTerminal(hosted.phase);
-  const hostedBase = hosted ? basePhase(hosted.phase) : null;
-  const stewardBridge: StewardRunBridge = {
-    session: stewardOwned ? runSession : null,
-    active: hostedLive,
-    otherBusy: busy && !stewardOwned,
-    messages: sliceFromMessage(messages, stewardFromId),
-    paused: hostedLive && hostedBase?.kind === "paused",
-    pauseText: hosted ? (hostDetail(hosted.phase) ?? undefined) : undefined,
-    pauseKind: hosted ? hostPauseKind(hosted.phase) : undefined,
-    userPaused: hostedLive && hosted?.phase.kind === "userDriving",
-    driving: hostedLive && (hosted?.phase.kind === "running" || hosted?.phase.kind === "waitingHuman"),
-    host: hosted,
-    hostFor: hostRuns.forConsole,
-    awaitingReattach: hostRuns.awaitingReattach,
-    stopCtrlC: run.stopCtrlC,
-    toggleStopCtrlC: run.toggleStopCtrlC,
-    start: runSteward,
-    cancel: async () => {
-      if (hosted) await hostAct(() => api.hostStop(hosted.contractId, run.stopCtrlC));
-    },
-    pause: async () => {
-      if (hosted) await hostAct(() => api.hostPause(hosted.contractId));
-    },
-    resume: async (b?: StewardBudgetPref) => {
-      if (hosted)
-        await hostAct(() =>
-          api.hostResume(hosted.contractId, b ? { maxSteps: b.maxSteps, maxMinutes: b.maxMinutes } : undefined)
-        );
-    },
-    takeover: () => {
-      if (hosted) void hostAct(() => api.hostTakeover(hosted.contractId));
-    },
-    handback: () => {
-      if (hosted) void hostAct(() => api.hostHandback(hosted.contractId));
-    },
-    decide: run.decide,
-    answerSecret: run.answerSecret,
-    ready: ready.ok,
-    notReadyReason: ready.reason,
-    error: err,
+  /** 托管页上某个终端的运行桥：每个终端各看各的托管（同一时刻可以托管好几个终端） */
+  const stewardBridgeFor = (cid: string): StewardRunBridge => {
+    const hosted = hostRuns.forConsole(cid);
+    const hostedLive = !!hosted && !isTerminal(hosted.phase);
+    const hostedBase = hosted ? basePhase(hosted.phase) : null;
+    const feed = hostFeeds.feed(cid);
+    return {
+      session: hosted || feed.messages.length > 0 ? cid : null,
+      active: hostedLive,
+      // 只有同一个终端上正跑着一轮对话 / 技能才挡（别的终端上的不相干）
+      otherBusy: run.anyBusy && runSession === cid,
+      messages: feed.messages,
+      paused: hostedLive && hostedBase?.kind === "paused",
+      pauseText: hosted ? (hostDetail(hosted.phase) ?? undefined) : undefined,
+      pauseKind: hosted ? hostPauseKind(hosted.phase) : undefined,
+      userPaused: hostedLive && hosted?.phase.kind === "userDriving",
+      driving: hostedLive && (hosted?.phase.kind === "running" || hosted?.phase.kind === "waitingHuman"),
+      host: hosted,
+      hostFor: hostRuns.forConsole,
+      awaitingReattach: hostRuns.awaitingReattach,
+      stopCtrlC: run.stopCtrlC,
+      toggleStopCtrlC: run.toggleStopCtrlC,
+      start: runSteward,
+      cancel: async () => {
+        if (hosted) await hostAct(() => api.hostStop(hosted.contractId, run.stopCtrlC));
+      },
+      pause: async () => {
+        if (hosted) await hostAct(() => api.hostPause(hosted.contractId));
+      },
+      resume: async (b?: StewardBudgetPref) => {
+        if (hosted)
+          await hostAct(() =>
+            api.hostResume(hosted.contractId, b ? { maxSteps: b.maxSteps, maxMinutes: b.maxMinutes } : undefined)
+          );
+      },
+      takeover: () => {
+        if (hosted) void hostAct(() => api.hostTakeover(hosted.contractId));
+      },
+      handback: () => {
+        if (hosted) void hostAct(() => api.hostHandback(hosted.contractId));
+      },
+      decide: run.decide,
+      answerSecret: (req, value) => hostFeeds.answerSecret(cid, req, value),
+      ready: ready.ok,
+      notReadyReason: ready.reason,
+      error: err,
+    };
   };
 
   if (!visible || !sessionId) return null;
@@ -589,7 +595,7 @@ export function AgentPanel({
       )}
 
       {view === "steward" && (
-        <StewardPanel sessionId={sessionId} sessions={sessions} run={stewardBridge} />
+        <StewardPanel sessionId={sessionId} sessions={sessions} runFor={stewardBridgeFor} />
       )}
 
       <div className="ap-status">

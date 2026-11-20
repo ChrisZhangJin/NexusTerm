@@ -22,6 +22,18 @@ pub const GLOBAL_SCOPE: &str = "global";
 /// 对话模式下发给模型的消息历史（结构化 ChatMessage，跨轮续用；「新对话」清掉）。
 pub const LLM_SCOPE: &str = "llm";
 
+/// 按会话（连接）分开的 scope：`global:<key>` / `llm:<key>`；`key` 为空时退回旧的全局一份（兼容旧数据与测试）。
+/// 运行摘要表本来就有 `scope` 列，直接用 `key`（空 = `global`）。
+fn conv_scope(key: &str) -> String {
+    if key.is_empty() { GLOBAL_SCOPE.to_string() } else { format!("{GLOBAL_SCOPE}:{key}") }
+}
+fn llm_scope(key: &str) -> String {
+    if key.is_empty() { LLM_SCOPE.to_string() } else { format!("{LLM_SCOPE}:{key}") }
+}
+fn summary_scope(key: &str) -> &str {
+    if key.is_empty() { GLOBAL_SCOPE } else { key }
+}
+
 /// 建表（幂等）。由 `Store::open` 在 `migrate` 之后调用。
 pub(super) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -46,22 +58,39 @@ pub(super) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 impl Store {
     /// 覆盖保存全局对话。`messages` 必须已经过 `agent::history::sanitize_messages`。
     pub fn agent_conv_save(&self, messages: &[Value]) -> Result<(), String> {
-        self.scope_save(GLOBAL_SCOPE, messages)
+        self.agent_conv_save_in("", messages)
+    }
+
+    /// 覆盖保存某个会话（连接）的面板对话。
+    pub fn agent_conv_save_in(&self, key: &str, messages: &[Value]) -> Result<(), String> {
+        self.scope_save(&conv_scope(key), messages)
     }
 
     /// 覆盖保存对话模式的模型消息历史（调用方保证已脱敏、已压缩）。
     pub fn agent_llm_save(&self, messages: &[Value]) -> Result<(), String> {
-        self.scope_save(LLM_SCOPE, messages)
+        self.agent_llm_save_in("", messages)
+    }
+
+    pub fn agent_llm_save_in(&self, key: &str, messages: &[Value]) -> Result<(), String> {
+        self.scope_save(&llm_scope(key), messages)
     }
 
     pub fn agent_llm_load(&self) -> Vec<Value> {
-        self.scope_load(LLM_SCOPE)
+        self.agent_llm_load_in("")
+    }
+
+    pub fn agent_llm_load_in(&self, key: &str) -> Vec<Value> {
+        self.scope_load(&llm_scope(key))
     }
 
     /// 「新对话」：只清模型消息历史，面板上的记录与运行摘要不动。
     pub fn agent_llm_clear(&self) -> Result<(), String> {
+        self.agent_llm_clear_in("")
+    }
+
+    pub fn agent_llm_clear_in(&self, key: &str) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM agent_conversations WHERE scope = ?1", params![LLM_SCOPE])
+        conn.execute("DELETE FROM agent_conversations WHERE scope = ?1", params![llm_scope(key)])
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -80,7 +109,11 @@ impl Store {
 
     /// 读全局对话。没有 / 数据损坏都当空：坏数据不该让面板打不开。
     pub fn agent_conv_load(&self) -> Vec<Value> {
-        self.scope_load(GLOBAL_SCOPE)
+        self.agent_conv_load_in("")
+    }
+
+    pub fn agent_conv_load_in(&self, key: &str) -> Vec<Value> {
+        self.scope_load(&conv_scope(key))
     }
 
     fn scope_load(&self, scope: &str) -> Vec<Value> {
@@ -98,7 +131,7 @@ impl Store {
             .unwrap_or_default()
     }
 
-    /// 「清空对话」：对话与运行摘要一并删除（摘要也是对话内容的衍生物，留着等于没清）。
+    /// 「清空对话」（全部）：对话与运行摘要一并删除（摘要也是对话内容的衍生物，留着等于没清）。
     pub fn agent_history_clear(&self) -> Result<(), String> {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -109,19 +142,41 @@ impl Store {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    /// 「清空对话」（一个会话）：只删这个会话的面板对话、模型历史与运行摘要，别的会话不动。
+    pub fn agent_history_clear_in(&self, key: &str) -> Result<(), String> {
+        if key.is_empty() {
+            return self.agent_history_clear();
+        }
+        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM agent_conversations WHERE scope IN (?1, ?2)",
+            params![conv_scope(key), llm_scope(key)],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM agent_run_summaries WHERE scope = ?1", params![summary_scope(key)])
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     /// 追加一条运行摘要，并把超出 [`MAX_SUMMARIES_KEPT`] 的最旧几条删掉。
     pub fn agent_summary_push(&self, s: &RunSummary) -> Result<(), String> {
+        self.agent_summary_push_in("", s)
+    }
+
+    pub fn agent_summary_push_in(&self, key: &str, s: &RunSummary) -> Result<(), String> {
+        let scope = summary_scope(key);
         let json = serde_json::to_string(s).map_err(|e| e.to_string())?;
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO agent_run_summaries (scope, ts, summary) VALUES (?1, ?2, ?3)",
-            params![GLOBAL_SCOPE, s.ts, json],
+            params![scope, s.ts, json],
         )
         .map_err(|e| e.to_string())?;
         conn.execute(
             "DELETE FROM agent_run_summaries WHERE scope = ?1 AND id NOT IN
                (SELECT id FROM agent_run_summaries WHERE scope = ?1 ORDER BY id DESC LIMIT ?2)",
-            params![GLOBAL_SCOPE, MAX_SUMMARIES_KEPT as i64],
+            params![scope, MAX_SUMMARIES_KEPT as i64],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -129,6 +184,10 @@ impl Store {
 
     /// 最近 `n` 条摘要，**从旧到新**。单条损坏就跳过。
     pub fn agent_summaries_recent(&self, n: usize) -> Vec<RunSummary> {
+        self.agent_summaries_recent_in("", n)
+    }
+
+    pub fn agent_summaries_recent_in(&self, key: &str, n: usize) -> Vec<RunSummary> {
         let Ok(conn) = self.conn.lock() else {
             return Vec::new();
         };
@@ -137,7 +196,7 @@ impl Store {
         ) else {
             return Vec::new();
         };
-        let rows = stmt.query_map(params![GLOBAL_SCOPE, n as i64], |r| r.get::<_, String>(0));
+        let rows = stmt.query_map(params![summary_scope(key), n as i64], |r| r.get::<_, String>(0));
         let mut out: Vec<RunSummary> = match rows {
             Ok(it) => it
                 .flatten()
@@ -258,5 +317,25 @@ mod tests {
         let again = Store::open(base).unwrap();
         assert_eq!(again.agent_conv_load().len(), 1);
         assert_eq!(again.agent_summaries_recent(5).len(), 1);
+    }
+
+    #[test]
+    fn conversations_are_kept_per_connection() {
+        let (store, _d) = temp_store_at("per-conn");
+        store.agent_conv_save_in("ssh:office", &[json!({"id":"a","role":"user","text":"office 的问题"})]).unwrap();
+        store.agent_conv_save_in("ssh:nerd", &[json!({"id":"b","role":"user","text":"nerd 的问题"})]).unwrap();
+        store.agent_llm_save_in("ssh:office", &[json!({"role":"user","content":"x"})]).unwrap();
+        store.agent_summary_push_in("ssh:office", &summ(1)).unwrap();
+        assert_eq!(store.agent_conv_load_in("ssh:office")[0]["text"], "office 的问题");
+        assert_eq!(store.agent_conv_load_in("ssh:nerd")[0]["text"], "nerd 的问题");
+        assert!(store.agent_llm_load_in("ssh:nerd").is_empty(), "模型历史不串到别的连接");
+        assert!(store.agent_summaries_recent_in("ssh:nerd", 5).is_empty());
+        assert_eq!(store.agent_summaries_recent_in("ssh:office", 5).len(), 1);
+        // 清一个会话不碰别的
+        store.agent_history_clear_in("ssh:office").unwrap();
+        assert!(store.agent_conv_load_in("ssh:office").is_empty());
+        assert!(store.agent_llm_load_in("ssh:office").is_empty());
+        assert!(store.agent_summaries_recent_in("ssh:office", 5).is_empty());
+        assert_eq!(store.agent_conv_load_in("ssh:nerd").len(), 1);
     }
 }

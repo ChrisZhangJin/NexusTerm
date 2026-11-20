@@ -135,3 +135,12 @@ export function createDebouncedSaver<T>(
     pending: () => latest !== null,
   };
 }
+
+/**
+ * 一个终端的对话属于哪一段：按**保存的连接**分（`ssh:<连接记录 id>`），本地终端共用 `local`。
+ * 同一台主机开两个标签共用一段；重连、重启应用后还能找回来（标签 id 每次都变，不能拿它当键）。
+ */
+export function convKeyOf(target: { id: string; hint?: { sessionRecordId?: string | null } } | undefined): string {
+  const rec = target?.hint?.sessionRecordId?.trim();
+  return rec ? `ssh:${rec}` : "local";
+}
