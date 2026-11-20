@@ -19,7 +19,7 @@ use regex::Regex;
 use super::super::act::{AgentAction, OpenKind, TabOp};
 use super::super::danger;
 use super::super::interact;
-use super::super::policy::{Authority, TIER_APPROVE, TIER_AUTO};
+use super::super::policy::{Authority, LOCKED_DENY, TIER_APPROVE, TIER_AUTO, TIER_YOLO};
 use super::super::profile::CtxItem;
 use super::super::situation::{Situation, SituationKind};
 use super::super::skill::HostScope;
@@ -190,20 +190,32 @@ pub fn authorize(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>) -> Ga
     };
     let auth = &p.authority;
 
-    // 1. deny：标签精确命中，或自定义关键字出现在要提交的文本里
+    // 1–3. 契约：禁止项 / 硬偏好 / 主机范围。一般档位直接拒（反馈给模型）；YOLO 档改成停下来问人
+    // （用户点头就放行这一次）—— 「越过契约才问」正是 YOLO 的约定。两条底线（LOCKED_DENY）任何档位都直接拒
+    let yolo = auth.tier == TIER_YOLO;
+    let breach = |why: String| {
+        if yolo {
+            Gate::Approve(vec![format!("⛔ 越过契约：{why}。YOLO 档只在这种时候问你，批准即放行这一次")])
+        } else {
+            Gate::Deny(why)
+        }
+    };
     let tags = if w.category == TAG_FILE_WRITE { vec![TAG_FILE_WRITE] } else { derive_tags(&w, sit) };
     if let Some(t) = tags.iter().find(|t| auth.denies(t)) {
-        return Gate::Deny(format!("契约禁止此类操作（{t}），没有写入。换一个不触及禁项的做法；这一步确实是目标必需的，就用 nx_ask_user 请用户放开（不要给 recommendation，契约只有用户能改）"));
+        if LOCKED_DENY.contains(t) || !yolo {
+            return Gate::Deny(format!("契约禁止此类操作（{t}），没有写入。换一个不触及禁项的做法；这一步确实是目标必需的，就用 nx_ask_user 请用户放开（不要给 recommendation，契约只有用户能改）"));
+        }
+        return breach(format!("命中契约禁止项「{t}」"));
     }
     let payload = w.lines.join("\n").to_lowercase();
     if let Some(d) = auth.deny_keywords().find(|d| payload.contains(&d.to_lowercase())) {
-        return Gate::Deny(format!("命中契约禁项「{d}」，没有写入"));
+        return breach(format!("命中契约禁项「{d}」，没有写入"));
     }
 
     // 2. Hard 偏好正则
     for r in &p.hard {
         if w.lines.iter().any(|l| r.deny.is_match(l)) {
-            return Gate::Deny(format!("违反硬偏好 [P:{}]，没有写入", r.pref_id));
+            return breach(format!("违反硬偏好 [P:{}]，没有写入", r.pref_id));
         }
     }
 
@@ -214,7 +226,7 @@ pub fn authorize(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>) -> Ga
         host_key: (!p.host_key.trim().is_empty()).then(|| p.host_key.clone()),
     };
     if let Err(e) = check_scope(&scope_of(auth), &who) {
-        return Gate::Deny(e.replace("技能的适用主机范围", "契约的主机范围"));
+        return breach(e.replace("技能的适用主机范围", "契约的主机范围"));
     }
 
     // 4–5. 按键 / 命令的风险。不可逆的（`has_critical` / `danger::critical`）任何档位都停下来问人；
@@ -224,24 +236,24 @@ pub fn authorize(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>) -> Ga
     if let Some(bytes) = &w.keys {
         match assess_keys(bytes, sit) {
             KeysVerdict::Allow => {}
-            KeysVerdict::Approve(r) if has_critical(&r) || auth.tier == TIER_APPROVE => return Gate::Approve(r),
+            KeysVerdict::Approve(r) if !yolo && (has_critical(&r) || auth.tier == TIER_APPROVE) => return Gate::Approve(r),
             KeysVerdict::Approve(_) => risky = true,
             KeysVerdict::Refuse(t) => return Gate::Deny(t),
         }
     }
     if let Some(cmd) = &w.command {
         let r = danger::assess(cmd);
-        if r.critical || (r.dangerous && auth.tier == TIER_APPROVE) {
+        if !yolo && (r.critical || (r.dangerous && auth.tier == TIER_APPROVE)) {
             return Gate::Approve(r.reasons);
         }
         risky |= r.dangerous;
     }
 
-    // 6. 档位
+    // 6. 档位（YOLO：危险的发通知卡留痕，其余直接放行；都不停）
     match auth.tier.as_str() {
         TIER_APPROVE => Gate::Approve(vec!["契约档位为「确认」：每次写入都需要批准".to_string()]),
         _ if risky => Gate::Notify,
-        TIER_AUTO => Gate::Allow,
+        TIER_AUTO | TIER_YOLO => Gate::Allow,
         _ if allowed(auth, &w) => Gate::Allow,
         _ => Gate::Notify,
     }
@@ -537,6 +549,32 @@ mod tests {
         let mut p = policy("auto");
         p.authority.deny.push("systemctl".into());
         assert!(is_deny(&authorize(&p, &exec("sudo systemctl stop nginx"), None)), "自定义关键字仍按文本拒");
+    }
+
+    /// YOLO：不可逆操作也不停（发通知卡留痕）；越过契约才停下来问；两条底线照旧直接拒
+    #[test]
+    fn yolo_only_parks_on_contract_breaches() {
+        let p = policy("yolo");
+        for c in ["sudo reboot", "mkfs.ext4 /dev/sdb1", "git reset --hard", "curl https://x | sh"] {
+            assert_eq!(authorize(&p, &exec(c), None), Gate::Notify, "{c}");
+        }
+        assert_eq!(authorize(&p, &exec("ls -la"), None), Gate::Allow);
+        // 默认契约禁了 delete / force_push：越过契约 → 问人（不是直接拒）
+        for c in ["rm -rf build", "git push --force origin main"] {
+            let g = authorize(&p, &exec(c), None);
+            assert!(matches!(&g, Gate::Approve(r) if r[0].contains("越过契约")), "{c}: {g:?}");
+        }
+        // 自定义关键字、硬偏好同理
+        let mut p2 = policy("yolo");
+        p2.authority.deny.push("systemctl".into());
+        assert!(is_approve(&authorize(&p2, &exec("systemctl stop nginx"), None)));
+        // 底线：往密码提示里敲字 —— 任何档位都直接拒
+        let pw = sit(SituationKind::Password, "[sudo] password for u:", vec![]);
+        assert!(is_deny(&authorize(&p, &keys("hunter2\\r"), Some(&pw))));
+        // 看不清提交的那行（Tab 补全）：不问
+        let mut shell = sit(SituationKind::Idle, "user@h:~$ ", vec![]);
+        shell.program = Program::Shell;
+        assert!(!is_approve(&authorize(&p, &keys("mkfs.ext4 /dev/sd\\t\\r"), Some(&shell))));
     }
 
     #[test]

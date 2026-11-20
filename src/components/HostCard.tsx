@@ -23,6 +23,7 @@ import type {
 } from "../types";
 import DenyEditor from "./DenyEditor";
 import HostText from "./HostText";
+import { TIER_LABELS } from "../lib/steward";
 
 export interface HostCardProps {
   status: HostStatus;
@@ -199,6 +200,25 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], o
         </div>
       )}
       {status.notice && <div className="st-status warn">{status.notice}</div>}
+      {live && !btn.reattach && status.tier && (
+        <div className="host-tier-row">
+          <span className="deny-title">授权档位</span>
+          <select
+            className={`st-select${status.tier === "yolo" ? " st-select-yolo" : ""}`}
+            value={status.tier}
+            disabled={busy}
+            title="运行中也能改，下一步起生效"
+            onChange={(e) => void act(() => api.hostAmend(cid, undefined, e.target.value))}
+          >
+            {(["auto", "notify", "approve", "yolo"] as const).map((t) => (
+              <option key={t} value={t}>
+                {TIER_LABELS[t]}
+              </option>
+            ))}
+          </select>
+          {status.tier === "yolo" && <span className="st-meta host-yolo on">只有越过禁止项才会停下来问你</span>}
+        </div>
+      )}
       {live && !btn.reattach && (
         <DenyEditor
           value={status.deny ?? []}

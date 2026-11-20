@@ -914,6 +914,8 @@ export interface HostStatus {
   todo?: TodoItem[];
   /** 契约当前的禁止项 */
   deny: string[];
+  /** 当前授权档位（auto / notify / approve / yolo） */
+  tier?: string;
 }
 
 /** 前端给的 console 线索：后端据此存 ConsoleRef，重启后按它给候选 tab 排序 */

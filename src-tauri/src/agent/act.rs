@@ -4343,7 +4343,9 @@ pub async fn run(
                     if call.is_write() {
                         drive_gate!(&target_id);
                     }
-                    let mut approver = FileApprover { app, runtime, session: &session, target: &target_id, label: &label, host: host.as_deref() };
+                    let unattended = host.as_ref().is_some_and(|h| h.ctx().authority.tier == super::policy::TIER_YOLO)
+                        && !matches!(host_write.as_ref().map(|w| &w.gate), Some(Gate::Approve(_)));
+                    let mut approver = FileApprover { app, runtime, session: &session, target: &target_id, label: &label, host: host.as_deref(), unattended };
                     let out = super::files_tool::run(&ops, &call, wgate, &mut approver, acct.redact).await;
                     drop(ops);
                     if let Some(h) = &host {
@@ -6712,6 +6714,8 @@ struct FileApprover<'a> {
     target: &'a str,
     label: &'a str,
     host: Option<&'a HostShared>,
+    /// 托管 YOLO 档、且闸门没判「越过契约」：受保护路径 / 预览不完整都不再出卡，直接放行
+    unattended: bool,
 }
 
 impl super::files_tool::Approver for FileApprover<'_> {
@@ -6720,6 +6724,9 @@ impl super::files_tool::Approver for FileApprover<'_> {
         // 标题由 files_tool 统一拼：受保护路径（读 / 写）写明路径，预览不完整在标题里就说出来
         let title = req.title();
         async move {
+            if self.unattended {
+                return true;
+            }
             match self.host {
                 Some(h) => {
                     let mut card = hosted_approval_card(&title, &req.reasons);

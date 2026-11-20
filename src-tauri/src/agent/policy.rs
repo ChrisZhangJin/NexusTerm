@@ -20,6 +20,9 @@ use super::situation::{Choice, Situation, SituationKind};
 pub const TIER_AUTO: &str = "auto";
 pub const TIER_NOTIFY: &str = "notify";
 pub const TIER_APPROVE: &str = "approve";
+/// 完全放手：只有越过契约（禁止项 / 硬偏好 / 主机范围）才停下来问人，其余一律自主执行（含不可逆操作）。
+/// 两条底线（`LOCKED_DENY`：替人输密码、选「永久允许」）仍然直接拒绝，问都不问。
+pub const TIER_YOLO: &str = "yolo";
 
 pub const DEFAULT_UNDO_WINDOW_MS: u64 = 30_000;
 
@@ -98,7 +101,7 @@ impl Authority {
     /// 前端传来的档位字符串一律归一，未知值回落到最保守的 notify。
     pub fn with_tier(mut self, tier: &str) -> Self {
         self.tier = match tier {
-            TIER_AUTO | TIER_APPROVE => tier.to_string(),
+            TIER_AUTO | TIER_APPROVE | TIER_YOLO => tier.to_string(),
             _ => TIER_NOTIFY.to_string(),
         };
         self

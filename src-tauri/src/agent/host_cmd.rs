@@ -61,6 +61,8 @@ pub struct HostStatus {
     pub todo: Vec<super::todo::TodoItem>,
     /// 契约当前的禁止项（面板「改契约」/「放开此项」用）
     pub deny: Vec<String>,
+    /// 当前授权档位（auto / notify / approve / yolo；面板上可以在运行中切换）
+    pub tier: String,
 }
 
 impl HostStatus {
@@ -77,6 +79,7 @@ impl HostStatus {
             label: ctx.label,
             notice: h.notice(),
             todo: h.todo(),
+            tier: ctx.authority.tier.clone(),
             deny: ctx.authority.deny,
         }
     }
@@ -109,9 +112,9 @@ fn status_of(
 ) -> HostStatus {
     // 只锁一次 `snap`：在结构体字面量里写两次 `snap.lock()`，第一个临时 guard 要活到整条语句结束，
     // 第二次加锁就自锁了（parking_lot 不可重入）—— 曾让 `host_start` 卡死主线程、整个窗口无响应。
-    let (label, todo, deny) = {
+    let (label, todo, deny, tier) = {
         let s = snap.lock();
-        (s.console.label.clone(), s.todo.clone(), s.authority.deny.clone())
+        (s.console.label.clone(), s.todo.clone(), s.authority.deny.clone(), s.authority.tier.clone())
     };
     let notice = notice.lock().clone();
     HostStatus {
@@ -125,6 +128,7 @@ fn status_of(
         notice,
         todo,
         deny,
+        tier,
     }
 }
 

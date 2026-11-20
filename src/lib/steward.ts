@@ -19,7 +19,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ScreenDelta, ScreenDeltaAck } from "./termRegistry";
 
-export type StewardTier = "auto" | "notify" | "approve";
+export type StewardTier = "auto" | "notify" | "approve" | "yolo";
 
 export interface ConsoleInfo {
   id: string;
@@ -382,6 +382,7 @@ export const TIER_LABELS: Record<StewardTier, string> = {
   auto: "自动执行",
   notify: "通知后执行",
   approve: "需确认后执行",
+  yolo: "YOLO·完全放手",
 };
 
 export const tierLabel = (t: string): string => TIER_LABELS[t as StewardTier] ?? t;

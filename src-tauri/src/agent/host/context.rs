@@ -152,6 +152,7 @@ fn tier_text(t: &str) -> &'static str {
     match t {
         "auto" => "auto（自动执行）",
         "approve" => "approve（每次写入都要用户批准）",
+        "yolo" => "yolo（完全放手：自主执行一切，只有越过契约才会停下来问用户）",
         _ => "notify（执行并通知用户，可撤销）",
     }
 }

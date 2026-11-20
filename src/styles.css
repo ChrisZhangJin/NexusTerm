@@ -2505,6 +2505,14 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .host-answer-row { display: flex; gap: 6px; align-items: flex-end; }
 .host-answer { resize: none; line-height: 1.5; padding: 5px 8px; font-family: inherit; }
 .host-report-body.host-text { white-space: normal; }
+/* YOLO 档：选中时下拉框与提示条标红 */
+.host-tier-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; font-size: 11.5px; }
+.st-select-yolo { color: var(--danger); border-color: var(--danger); font-weight: 600; }
+.st-yolo-warn {
+  margin: 4px 0; padding: 6px 9px; border-radius: 6px; font-size: 11.5px; line-height: 1.5;
+  color: var(--danger); border: 1px solid color-mix(in srgb, var(--danger) 55%, transparent);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
 /* 契约禁止项编辑器（开始托管表单 / 托管卡） */
 .deny-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0; font-size: 11.5px; }
 .deny-title { color: var(--text-dim); margin-right: 2px; }

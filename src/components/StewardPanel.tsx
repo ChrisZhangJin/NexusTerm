@@ -140,6 +140,11 @@ const TIERS: Array<{ value: StewardTier; label: string; hint: string }> = [
   { value: "auto", label: TIER_LABELS.auto, hint: "范围内自主执行、自主作答，只有不可逆的操作才停下来问你；事后可查" },
   { value: "notify", label: TIER_LABELS.notify, hint: "同「自动」，另外每次写入都发通知卡，可接管并纠正" },
   { value: "approve", label: TIER_LABELS.approve, hint: "每次写入都先等你批准，AI 的问题也都交给你答" },
+  {
+    value: "yolo",
+    label: TIER_LABELS.yolo,
+    hint: "一切自主执行，包括不可逆的操作（格式化、重启、删库……）；只有越过契约（禁止项 / 硬偏好 / 主机范围）才停下来问你。替你输密码、选「永久允许」仍然不会做",
+  },
 ];
 
 /** 事件流后端最多留 200 条：全拉下来，局面按 console 过滤，列表只显示最近 60 条 */
@@ -554,7 +559,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
                 开始托管
               </button>
               <select
-                className="st-select"
+                className={`st-select${tier === "yolo" ? " st-select-yolo" : ""}`}
                 value={tier}
                 disabled={busy}
                 onChange={(e) => setTier(e.target.value as StewardTier)}
@@ -643,6 +648,12 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
             </>
           )}
         </div>
+        {!run.active && tier === "yolo" && (
+          <div className="st-yolo-warn">
+            YOLO·完全放手：AI 会自己执行一切，包括格式化、重启、删库这类不可逆操作，不再问你。
+            只有越过下面的「禁止项」时才会停下来问。生产机器慎用。
+          </div>
+        )}
         {!run.active && <DenyEditor value={deny} onChange={setDeny} disabled={busy} />}
         {runHere && run.active && run.paused && isBudgetPause(run.pauseKind) && (
           <div className="st-budget-banner" role="alert">
