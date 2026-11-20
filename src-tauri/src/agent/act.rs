@@ -1120,7 +1120,7 @@ pub struct StepPayload {
     /// 运行摘要（`history::RunLog::record`）不认 `reveal`，前端落盘前（`toPersisted`）丢掉它。
     /// `text` 是标题，`command` 是来源，`output` 是「N 行，M 字节」
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reveal_content: Option<String>,
+    pub reveal_content: Option<super::reveal::RevealContent>,
 }
 
 impl StepPayload {
@@ -4764,7 +4764,7 @@ pub async fn run(
                                     command: Some(src.describe()),
                                     text: Some(title.clone()),
                                     output: Some(super::reveal::size_note(&content)),
-                                    reveal_content: Some(content),
+                                    reveal_content: Some(super::reveal::RevealContent(content)),
                                     ..StepPayload::new("reveal", step)
                                 },
                             );

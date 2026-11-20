@@ -108,6 +108,10 @@ pub fn sanitize_messages(msgs: Vec<Value>) -> Vec<Value> {
             let mut m = clean_value(None, m);
             if let Some(o) = m.as_object_mut() {
                 o.remove("streaming");
+                // 交付卡（nx_reveal）的内容只在内存里：前端 toPersisted 已剥掉，这里再兜一道
+                if let Some(step) = o.get_mut("step").and_then(Value::as_object_mut) {
+                    step.remove("revealContent");
+                }
             }
             m
         })

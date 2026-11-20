@@ -216,6 +216,18 @@ pub async fn fetch_file<A: Approver>(ops: &FileOps<'_>, path: &str, approver: &m
     Ok((resolved, check_content(bytes)?))
 }
 
+/// 交给用户的内容（步骤卡上的 `revealContent`）。序列化透明（前端拿到原文），
+/// 但 `Debug` 只打印字节数 —— 任何 `{:?}` 日志 / trace 都不会把内容带出去。
+#[derive(Clone, serde::Serialize)]
+#[serde(transparent)]
+pub struct RevealContent(pub String);
+
+impl std::fmt::Debug for RevealContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RevealContent(<已隐藏，{} 字节>)", self.0.len())
+    }
+}
+
 /// 「N 行，M 字节」
 pub fn size_note(content: &str) -> String {
     format!("{} 行，{} 字节", content.lines().count(), content.len())
@@ -370,12 +382,48 @@ mod tests {
             command: Some("命令 `cat /etc/sing-box/links.txt`".into()),
             text: Some("节点链接".into()),
             output: Some("1 行，120 字节".into()),
-            reveal_content: Some(SECRET.into()),
+            reveal_content: Some(RevealContent(SECRET.into())),
             ..super::super::act::StepPayload::new("reveal", 1)
         });
         log.record(&super::super::act::StepPayload { text: Some("好了".into()), ..super::super::act::StepPayload::new("answer", 2) });
         let s = format!("{:?}", log.finish(0));
         assert!(!s.contains("1b6f3c2e") && !s.contains("vless"), "{s}");
+    }
+
+    /// 内容只经序列化（事件）到前端；`{:?}`（tracing / trace / panic 信息）里看不到
+    #[test]
+    fn step_payload_serializes_content_but_debug_hides_it() {
+        let p = super::super::act::StepPayload {
+            text: Some("节点链接".into()),
+            reveal_content: Some(RevealContent(SECRET.into())),
+            ..super::super::act::StepPayload::new("reveal", 1)
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["revealContent"], SECRET, "前端要拿到原文");
+        let dbg = format!("{p:?}");
+        assert!(!dbg.contains("1b6f3c2e") && dbg.contains("已隐藏"), "{dbg}");
+    }
+
+    /// 后端落盘对话历史（`agent_history_save` → `sanitize_messages`）再兜一道：带着内容的交付卡也存不进去
+    #[test]
+    fn saved_panel_history_drops_reveal_content() {
+        let msgs = vec![serde_json::json!({
+            "id": "m1", "role": "assistant", "text": "", "ts": 1,
+            "step": {"kind": "reveal", "step": 1, "text": "节点链接", "revealContent": SECRET}
+        })];
+        let out = super::super::history::sanitize_messages(msgs);
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(!s.contains("1b6f3c2e") && s.contains("节点链接"), "{s}");
+    }
+
+    /// trace 的「actions」段按 `{:?}` 记动作：动作里只有标题与来源
+    #[test]
+    fn traced_action_has_no_content_field() {
+        let a = AgentAction::Reveal { target: None, title: "节点链接".into(), source: RevealSource::Path("/root/links.txt".into()) };
+        assert_eq!(
+            format!("{a:?}"),
+            r#"Reveal { target: None, title: "节点链接", source: Path("/root/links.txt") }"#
+        );
     }
 
     #[test]
