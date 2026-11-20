@@ -659,7 +659,11 @@ pub async fn host_amend(
     let authority = core.authority(&contract_id);
     let note = amend_note(goal.as_deref(), tier.as_deref(), deny.as_deref());
     h.set_ctx(build_ctx(&app, &state, contract, authority, &prev.label), Some(note));
-    // 面板上的禁止项 / 目标立即刷新
+    // 用户自己定了档位：接驳时「已降为确认档」那句提示就过时了
+    if tier.is_some() {
+        h.set_notice(None);
+    }
+    // 面板上的禁止项 / 目标 / 档位立即刷新
     h.announce();
     Ok(())
 }
@@ -968,6 +972,7 @@ pub async fn host_reattach(
     let live = old.ctx();
     cp.contract = live.contract.clone();
     cp.authority = live.authority.clone();
+    let prev_tier = cp.authority.tier.clone();
     let (next, effects, drifted) = reattach_plan(&cp, console, current.as_deref(), now_ms())?;
 
     // 租约换到新 console：拿不到（别的运行占着）就不接驳、不写；拿到后撤掉旧 console 上的。
@@ -992,7 +997,7 @@ pub async fn host_reattach(
         h.send_user_note(n);
     }
     if drifted {
-        h.set_notice(Some("接驳时的屏幕和重启前不一样（或是新开的连接），已降为「确认」档：每次写入都会先问你。".to_string()));
+        h.set_notice(Some(drift_notice(&prev_tier)));
     }
     let c = h.ctx();
     h.set_ctx(build_ctx(&app, &state, c.contract, c.authority, &c.label), None);
@@ -1000,6 +1005,20 @@ pub async fn host_reattach(
     h.announce();
     spawn_resumed(app.clone(), h, had_task.then(|| Arc::clone(&old)));
     Ok(())
+}
+
+/// 接驳时屏幕漂移、降到确认档的提示：说清原来是什么档、怎么改回去。
+pub(crate) fn drift_notice(prev_tier: &str) -> String {
+    let was = match prev_tier {
+        super::policy::TIER_YOLO => "「YOLO·完全放手」",
+        super::policy::TIER_AUTO => "「自动执行」",
+        super::policy::TIER_NOTIFY => "「通知后执行」",
+        _ => "",
+    };
+    let back = if was.is_empty() { String::new() } else { format!("；核对过现场没问题，可以在下面的「授权档位」改回{was}") };
+    format!(
+        "接驳时的屏幕和重启前不一样（或是新开的连接），已降为「确认」档：每次写入都会先问你{back}。"
+    )
 }
 
 /// 托管任务退出时要不要收尾（迁终态 / 放租约 / 停契约）。被接驳顶替的旧任务一律不收。
@@ -1192,6 +1211,12 @@ mod tests {
         let back = HostCheckpoint::from_json(&cp.to_json(2).unwrap()).unwrap();
         assert_eq!(back.spent, spent);
         assert_eq!(back.step, 412);
+    }
+
+    #[test]
+    fn drift_notice_says_how_to_go_back() {
+        assert!(drift_notice("yolo").contains("改回「YOLO·完全放手」"));
+        assert!(!drift_notice("approve").contains("改回"));
     }
 
     #[test]

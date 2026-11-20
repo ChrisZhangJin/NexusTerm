@@ -89,6 +89,12 @@ impl HostContext {
         out.push_str(&format!("- 档位：{}\n", tier_text(&a.tier)));
         if !a.deny.is_empty() {
             out.push_str(&format!("- 禁止：{}\n", a.deny.join("、")));
+            // 内置标签的含义写清楚：模型曾把 secret 理解成「凡是生成凭据都不许」，去请用户放开一条放不开的底线
+            for d in &a.deny {
+                if let Some(m) = deny_meaning(d) {
+                    out.push_str(&format!("  - {d}：{m}\n"));
+                }
+            }
         }
         if !a.allow.is_empty() {
             out.push_str(&format!("- 放行：{}\n", a.allow.join("、")));
@@ -155,6 +161,19 @@ fn tier_text(t: &str) -> &'static str {
         "yolo" => "yolo（完全放手：自主执行一切，只有越过契约才会停下来问用户）",
         _ => "notify（执行并通知用户，可撤销）",
     }
+}
+
+/// 内置禁止标签的含义（只按动作推出的标签匹配，不是文本关键字）。底线项用户也放不开，别请用户「移除」它们。
+fn deny_meaning(tag: &str) -> Option<&'static str> {
+    Some(match tag {
+        "secret" => "往密码 / 口令提示里替用户输入（底线，用户也不能放开；密码请用 nx_secret 让用户本人输入）。\
+                     生成密钥、写带密码的配置文件、脚本里出现 secret 字样都**不受**它限制",
+        "permanent_grant" => "在授权框里选「不再询问 / 永久允许」一类选项（底线，用户也不能放开）",
+        "force_push" => "git push --force 一类改写远端历史的推送（用户可在面板上放开）",
+        "delete" => "删除类操作：rm / prune / drop / kubectl delete 等（用户可在面板上放开）",
+        "file_write" => "用 nx_write / nx_edit 写改文件（用户可在面板上放开）",
+        _ => return None,
+    })
 }
 
 /// 折成一行：模型看的是列表项，多行文本会打乱结构，也能防止伪造标题。
