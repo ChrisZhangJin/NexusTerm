@@ -2,7 +2,7 @@
 //!
 //! `authorize` 只在 `drive_gate!` 之后调用一次，覆盖 Exec / Keys / Secret / Skill-run / Open /
 //! Tab-close；只读动作（读屏、等待、观察、检索）直接放行。检查顺序固定：
-//! 1. `Authority.deny`：从动作推出的标签（force_push / delete / secret / permanent_grant）精确命中，
+//! 1. `Authority.deny`：从动作推出的标签（force_push / delete / file_write / secret / permanent_grant）精确命中，
 //!    或自定义关键字出现在真正要提交的文本里（与 `policy::evaluate` 同一口径）；
 //! 2. Hard 偏好的 `extra.denyPattern` 正则，匹配命令或键入的每一行；
 //! 3. 主机范围 `skill_run::check_scope`，fail-closed（认不出主机就拒）；
@@ -25,14 +25,23 @@ use super::super::situation::{Situation, SituationKind};
 use super::super::skill::HostScope;
 use super::super::skill_run::{check_scope, HostIdentity};
 use super::super::skilltool::SkillOp;
-use super::super::steward_mode::{assess_keys, has_critical, permanent_pick, strip_esc, typed_lines, KeysVerdict};
+use super::super::steward_mode::{
+    assess_keys, has_blind_pick, has_critical, permanent_pick, strip_esc, submitted_extra, typed_lines, KeysVerdict,
+};
 
 pub const TAG_FORCE_PUSH: &str = "force_push";
 pub const TAG_DELETE: &str = "delete";
 pub const TAG_SECRET: &str = "secret";
 pub const TAG_PERMANENT_GRANT: &str = "permanent_grant";
-/// 写 / 改文件（`nx_write` / `nx_edit`）。契约 deny 里写 `file_write` 就是「不许它改文件」
+/// 写 / 改文件：`nx_write` / `nx_edit`，以及 shell 里写文件的命令（重定向、tee、sed -i、cp / mv / install …，
+/// 见 `changes::files_written`）。契约 deny 里写 `file_write` 就是「不许它改文件」，不分工具
 pub const TAG_FILE_WRITE: &str = "file_write";
+
+/// YOLO 下「看不到选项就按选择键」的拒绝反馈（见 `steward_mode::BLIND_PICK_MARK`）。
+const BLIND_PICK_YOLO: &str = "没有发送：看不到这个授权卡 / 菜单的选项（没有新鲜的屏幕帧，或选项没认出来、屏幕上又有「永久 / 不再询问」字样），\
+     这个编号 / 回车可能正选中「永久允许 / 不再询问」，那是底线（YOLO 档也不替用户选）。\
+     先 nx_screen 看清选项，再明确按一个**不是**永久授权的选项的序号（如「仅本次允许」）；\
+     读屏后选项仍认不出，就用 nx_ask_user 请用户本人选。";
 
 /// Hard 偏好正则的编译上限，防止用户写出病态 pattern 拖慢每一次写入。
 const HARD_RE_SIZE_LIMIT: usize = 1 << 16;
@@ -155,16 +164,35 @@ static DELETE_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// 从动作推出 deny 标签。
-fn derive_tags(w: &Write, sit: Option<&Situation>) -> Vec<&'static str> {
+/// 禁止项 / 硬偏好要匹配的文本行：本次提交的文本，加上按键**真正会提交**的那几行
+/// （屏幕上已敲着的 + 本次键入拼出的整行；授权对话框里被批准的命令），与 `danger` 看到的一致。
+fn deny_lines(w: &Write, sit: Option<&Situation>) -> Vec<String> {
+    let mut lines = w.lines.clone();
+    if let (Some(bytes), Some(s)) = (&w.keys, sit) {
+        for l in submitted_extra(bytes, s) {
+            if !lines.contains(&l) {
+                lines.push(l);
+            }
+        }
+    }
+    lines
+}
+
+/// 从动作推出 deny 标签。`lines` = [`deny_lines`]；`screen` = 按屏幕推「替你输密码 / 永久允许」用的局面
+/// （担保过的屏幕传 `None`）。
+fn derive_tags(w: &Write, lines: &[String], screen: Option<&Situation>) -> Vec<&'static str> {
     let mut tags = Vec::new();
-    if w.lines.iter().any(|l| FORCE_PUSH_RE.is_match(l)) {
+    if lines.iter().any(|l| FORCE_PUSH_RE.is_match(l)) {
         tags.push(TAG_FORCE_PUSH);
     }
-    if w.lines.iter().any(|l| DELETE_RE.is_match(l)) {
+    if lines.iter().any(|l| DELETE_RE.is_match(l)) {
         tags.push(TAG_DELETE);
     }
-    if let (Some(bytes), Some(s)) = (&w.keys, sit) {
+    // shell 写文件（nx_exec / nx_run / 交付命令 / 打开会话带的命令 / 按键提交的行）
+    if matches!(w.category, "exec" | "keys" | "open") && !super::changes::files_written(&lines.join("\n")).is_empty() {
+        tags.push(TAG_FILE_WRITE);
+    }
+    if let (Some(bytes), Some(s)) = (&w.keys, screen) {
         let visible = strip_esc(&String::from_utf8_lossy(bytes));
         if s.kind == SituationKind::Password && !visible.trim().is_empty() {
             tags.push(TAG_SECRET);
@@ -203,12 +231,18 @@ enum Hit {
 }
 
 /// 第 1 步的判定（`authorize` 与 `explain` 共用同一口径）：标签优先，其次自定义关键字。
-fn contract_hit(auth: &Authority, w: &Write, sit: Option<&Situation>) -> Option<Hit> {
-    let tags = if w.category == TAG_FILE_WRITE { vec![TAG_FILE_WRITE] } else { derive_tags(w, sit) };
+/// `vouched`：担保过的屏幕不按屏幕推底线标签（拼出的提交行、对话框里批准的命令照常看）。
+fn contract_hit(auth: &Authority, w: &Write, sit: Option<&Situation>, vouched: bool) -> Option<Hit> {
+    let lines = deny_lines(w, sit);
+    let tags = if w.category == TAG_FILE_WRITE {
+        vec![TAG_FILE_WRITE]
+    } else {
+        derive_tags(w, &lines, if vouched { None } else { sit })
+    };
     if let Some(t) = tags.into_iter().find(|t| auth.denies(t)) {
         return Some(Hit::Tag(t));
     }
-    let payload = w.lines.join("\n").to_lowercase();
+    let payload = lines.join("\n").to_lowercase();
     auth.deny_keywords().find(|d| payload.contains(&d.to_lowercase())).map(|d| Hit::Keyword(d.to_string()))
 }
 
@@ -235,10 +269,13 @@ pub fn screen_line(sit: &Situation) -> String {
     }
 }
 
+/// 屏幕被认成密码提示时，按键内容一律换成这句（门禁卡、决策记录、trace 都不留原文）。
+pub const KEYS_HIDDEN: &str = "发送按键（屏幕被认成密码提示，按键内容不显示）";
+
 /// 门禁卡上显示的「想做的那一步」：脱敏；屏幕被认成密码提示时不显示按键内容（真是密码提示的话那就是口令）。
 pub fn shown_write(a: &AgentAction, text: &str, sit: Option<&Situation>) -> String {
     if matches!(a, AgentAction::Keys { .. }) && sit.is_some_and(|s| s.kind == SituationKind::Password) {
-        return "发送按键（屏幕被认成密码提示，按键内容不显示）".to_string();
+        return KEYS_HIDDEN.to_string();
     }
     super::super::redact::redact(text)
 }
@@ -288,7 +325,7 @@ pub fn explain_vouched(
     };
     // 只有 Deny / YOLO 越界的 Approve 可能由禁止项引起；命中的话它一定是第一个拦下来的（第 1 步最先查）
     let hit = match (g, write_of(a)) {
-        (Gate::Deny(_) | Gate::Approve(_), Ok(Some(w))) => contract_hit(&p.authority, &w, if vouched { None } else { sit }),
+        (Gate::Deny(_) | Gate::Approve(_), Ok(Some(w))) => contract_hit(&p.authority, &w, sit, vouched),
         _ => None,
     };
     let reason = match (g, &hit) {
@@ -340,7 +377,7 @@ pub fn authorize_vouched(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation
             Gate::Deny(why)
         }
     };
-    let hit = contract_hit(auth, &w, if vouched { None } else { sit });
+    let hit = contract_hit(auth, &w, sit, vouched);
     if let Some(Hit::Tag(t)) = &hit {
         // 「替你输密码」底线：说清楚是**屏幕被认成了密码提示**，以及模型自己怎么脱困 ——
         // 只说「契约禁止 secret」，模型会以为生成凭据被禁了，转头去请用户「移除 secret 禁项」（放不开的底线）
@@ -362,9 +399,10 @@ pub fn authorize_vouched(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation
         return breach(format!("命中契约禁项「{d}」，没有写入"));
     }
 
-    // 2. Hard 偏好正则
+    // 2. Hard 偏好正则（与禁止项同一组行：含按键拼出的提交行、对话框里批准的命令）
+    let lines = deny_lines(&w, sit);
     for r in &p.hard {
-        if w.lines.iter().any(|l| r.deny.is_match(l)) {
+        if lines.iter().any(|l| r.deny.is_match(l)) {
             return breach(format!("违反硬偏好 [P:{}]，没有写入", r.pref_id));
         }
     }
@@ -391,6 +429,8 @@ pub fn authorize_vouched(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation
     if let Some(bytes) = &w.keys {
         match assess_keys(bytes, unpw.as_ref().or(sit)) {
             KeysVerdict::Allow => {}
+            // 看不到选项就按选择键（可能正选中「永久允许」）：YOLO 也不替人按 —— 底线不能靠「没看清」蒙过去
+            KeysVerdict::Approve(r) if yolo && has_blind_pick(&r) => return Gate::Deny(BLIND_PICK_YOLO.to_string()),
             KeysVerdict::Approve(r) if !yolo && (has_critical(&r) || auth.tier == TIER_APPROVE) => return Gate::Approve(r),
             KeysVerdict::Approve(_) => risky = true,
             KeysVerdict::Refuse(t) => return Gate::Deny(t),
@@ -854,5 +894,112 @@ mod tests {
         ];
         let perm = sit(SituationKind::Permission, "Do you want to proceed?", opts);
         assert!(is_deny(&authorize_vouched(&p, &keys("2"), Some(&perm), true)));
+    }
+
+    /// YOLO：看不到选项就按选择键（可能选中永久授权）不发送、直接拒；其他不可逆按键照旧发（通知卡）
+    #[test]
+    fn yolo_refuses_blind_picks_but_sends_other_critical_keys() {
+        let p = policy("yolo");
+        // 有新鲜帧、选项没认出、屏幕上有 don't ask again 字样：按编号
+        let mut menu = sit(SituationKind::Menu, "1. Yes\n2. Yes, and don't ask again\n3. No", vec![]);
+        menu.program = Program::Unknown;
+        let g = authorize(&p, &keys("2"), Some(&menu));
+        assert!(matches!(&g, Gate::Deny(t) if t.contains("nx_screen") && t.contains("永久")), "{g:?}");
+        assert!(is_approve(&authorize(&policy("auto"), &keys("2"), Some(&menu))), "非 YOLO：照旧问人");
+        // 没有字样：不是这一类，YOLO 照常执行（通知）
+        let mut plain = menu.clone();
+        plain.tail = "1. React\n2. Vue".into();
+        assert_eq!(authorize(&p, &keys("2"), Some(&plain)), Gate::Notify);
+        // 没有新鲜帧的授权框：方向键 + 回车
+        let mut blind = sit(SituationKind::Permission, "Do you want to proceed?", vec![]);
+        blind.frame_id = 0;
+        let g = authorize(&p, &keys("<Down><Enter>"), Some(&blind));
+        assert!(matches!(&g, Gate::Deny(t) if t.contains("nx_screen")), "{g:?}");
+        assert!(is_approve(&authorize(&policy("auto"), &keys("<Down><Enter>"), Some(&blind))));
+        // 门禁卡原因就是这段反馈
+        let ex = explain(&p, &keys("<Down><Enter>"), Some(&blind), &g).unwrap();
+        assert_eq!(ex.verdict, "refused");
+        assert!(ex.reason.contains("nx_screen"));
+        // 其他不可逆按键（敲一条危险命令）：YOLO 照旧发送
+        let mut shell = sit(SituationKind::Idle, "user@h:~$ ", vec![]);
+        shell.program = Program::Shell;
+        assert_eq!(authorize(&p, &keys("mkfs.ext4 /dev/sdb1\r"), Some(&shell)), Gate::Notify);
+    }
+
+    /// 禁止项 / 硬偏好看的是**真正提交**的那一行：屏幕上已敲着的 + 本次键入；授权框里被批准的命令
+    #[test]
+    fn deny_sees_the_submitted_line_and_the_approved_command() {
+        let p = policy("auto");
+        let mut shell = sit(SituationKind::Idle, "user@h:~$ r", vec![]);
+        shell.program = Program::Shell;
+        let k = keys("m -rf build\r");
+        let g = authorize(&p, &k, Some(&shell));
+        assert!(matches!(&g, Gate::Deny(t) if t.contains("（delete）")), "{g:?}");
+        assert_eq!(explain(&p, &k, Some(&shell), &g).unwrap().deny_item.as_deref(), Some("delete"));
+        // 先清掉输入行（Ctrl-U）再敲：屏幕上的 `r` 不算
+        assert!(!is_deny(&authorize(&p, &keys("<C-u>m -rf build\r"), Some(&shell))));
+        // Claude Code 授权框：按 1 批准 `rm -rf build/`
+        let opts = vec![
+            Choice { index: Some("1".into()), text: "Yes".into(), grants_permanent: false },
+            Choice { index: Some("2".into()), text: "No, and tell Claude what to do differently".into(), grants_permanent: false },
+        ];
+        let dlg = sit(
+            SituationKind::Permission,
+            "Bash command\n\n  rm -rf build/\n  Remove build output\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No, and tell Claude what to do differently",
+            opts,
+        );
+        let g = authorize(&p, &keys("1"), Some(&dlg));
+        assert!(matches!(&g, Gate::Deny(t) if t.contains("（delete）")), "{g:?}");
+        // 选拒绝项：没批准任何命令
+        assert!(!is_deny(&authorize(&p, &keys("2"), Some(&dlg))));
+        // coreutils 的确认句
+        let mut rmq = sit(SituationKind::Question, "rm: remove regular file 'a.txt'? ", vec![]);
+        rmq.program = Program::Unknown;
+        assert!(is_deny(&authorize(&p, &keys("y\r"), Some(&rmq))));
+        assert!(!is_deny(&authorize(&p, &keys("n\r"), Some(&rmq))));
+        // 自定义关键字分几次敲
+        let mut p2 = policy("auto");
+        p2.authority.deny = vec!["prod-db".into()];
+        let mut half = shell.clone();
+        half.tail = "user@h:~$ psql -h prod".into();
+        assert!(is_deny(&authorize(&p2, &keys("-db\r"), Some(&half))));
+        half.tail = "user@h:~$ psql -h prod-db".into();
+        assert!(is_deny(&authorize(&p2, &keys("\r"), Some(&half))));
+        // 硬偏好同理
+        let mut p3 = policy("auto");
+        p3.hard = HardRule::from_prefs(&[pref("p1", "hard", json!({"denyPattern": "(?i)\\bnpm\\s+publish\\b"}))]);
+        half.tail = "user@h:~$ npm pub".into();
+        assert!(matches!(authorize(&p3, &keys("lish\r"), Some(&half)), Gate::Deny(t) if t.contains("[P:p1]")));
+    }
+
+    /// `file_write` 不分工具：shell 里写文件的命令同样推出这个标签
+    #[test]
+    fn file_write_tag_covers_shell_writes() {
+        let mut p = policy("auto");
+        p.authority.deny = vec![TAG_FILE_WRITE.into()];
+        for c in [
+            "cat > notes.txt <<'EOF'\nhello\nEOF",
+            "echo hi > f",
+            "echo hi >> ~/.bashrc",
+            "echo x | sudo tee /etc/motd",
+            "sed -i 's/a/b/' app.conf",
+            "cp a.conf /etc/app.conf",
+            "mv a b",
+            "sudo install -m 644 /tmp/x /etc/x",
+            "echo hi > /tmp/x",
+            "bash -c 'echo 1 > f'",
+        ] {
+            let g = authorize(&p, &exec(c), None);
+            assert!(matches!(&g, Gate::Deny(t) if t.contains("（file_write）")), "{c}: {g:?}");
+        }
+        for c in ["ls > /dev/null", "make 2>&1 | tee /dev/stderr", "cat a.txt", "echo \"a > b\"", "grep x f 2>/dev/null"] {
+            assert_eq!(authorize(&p, &exec(c), None), Gate::Allow, "{c}");
+        }
+        // 按键在 shell 上提交（含屏幕上已敲着的半截）
+        let mut shell = sit(SituationKind::Idle, "user@h:~$ echo hi ", vec![]);
+        shell.program = Program::Shell;
+        assert!(is_deny(&authorize(&p, &keys("> f\r"), Some(&shell))));
+        // 没禁 file_write：照常
+        assert!(!is_deny(&authorize(&policy("auto"), &exec("echo hi > f"), None)));
     }
 }

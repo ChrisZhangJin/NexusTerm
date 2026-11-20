@@ -299,9 +299,15 @@ pub fn heredoc_write(cmd: &str) -> Option<String> {
     })
 }
 
-/// 改道话术：告诉模型这次没执行、该换哪个工具。
-pub fn feedback(h: &Heredoc) -> String {
+/// 改道话术：告诉模型这次没执行、该换哪个工具。`file_write_denied` = 契约禁止写 / 改文件：
+/// 这时不指路到 nx_write / shell 写文件（那些同样会被拒），直接说这一步不能做。
+pub fn feedback(h: &Heredoc, file_write_denied: bool) -> String {
     match h {
+        Heredoc::File { path, .. } if file_write_denied => format!(
+            "没有执行：这是用 heredoc 往文件「{path}」里写内容，而契约禁止写 / 改文件（file_write）—— \
+             不论用 nx_write / nx_edit 还是 shell（重定向、tee、cp …）都一样不许。换一个不改文件的做法；\
+             这一步确实是目标必需的，就用 nx_ask_user 请用户放开（不要给 recommendation，契约只有用户能改）"
+        ),
         Heredoc::File { path, append } => {
             let how = if *append {
                 format!(
@@ -344,7 +350,7 @@ pub fn card_reason(h: &Heredoc) -> String {
 ///
 /// 按键只在终端前台是 shell（或认不出）时才管：往 vim / Claude Code 输入框里打一段含 `<<` 的文字不是在敲 heredoc。
 pub fn redirect(a: &AgentAction, sit: Option<&Situation>) -> Option<String> {
-    find(a, sit).map(|h| feedback(&h))
+    find(a, sit).map(|h| feedback(&h, false))
 }
 
 /// 同 [`redirect`]，返回识别结果本身（拼卡片 / 话术由调用方决定）。
@@ -446,5 +452,8 @@ mod tests {
         let h = find(&exec("cat > /etc/x.json <<'EOF'"), None).unwrap();
         assert!(card_reason(&h).contains("nx_write") && card_reason(&h).contains("/etc/x.json"));
         assert!(card_reason(&find(&exec("psql <<SQL"), None).unwrap()).contains("nx_run"));
+        // 契约禁止写文件：不指路到 nx_write / shell 写文件
+        let fb = feedback(&h, true);
+        assert!(fb.contains("file_write") && !fb.contains("调用 nx_write") && !fb.contains("sudo install") && !fb.contains(">>"), "{fb}");
     }
 }

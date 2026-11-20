@@ -381,6 +381,15 @@ fn split_simple(toks: Vec<Tok>) -> Vec<Simple> {
 
 // ───────────────────────────── 分析 ─────────────────────────────
 
+/// 一段 shell 命令（可多行）会写哪些文件：重定向目标（`>` `>>` `&>` …，heredoc 的 `cat > f <<EOF` 也在内）、
+/// `tee`、`sed -i`、`cp` / `mv` / `install` 的目标、`dd of=`；`/dev/*`（`/dev/null`、`/dev/stdout` …）不算。
+/// 托管门禁据此给 shell 写文件推出 `file_write` 标签（契约里 deny `file_write` = 不许改文件，不分工具）。
+pub fn files_written(cmd: &str) -> Vec<String> {
+    let mut s = ChangeSummary::default();
+    analyze_script(cmd, &mut s);
+    s.files_written
+}
+
 fn analyze_script(src: &str, s: &mut ChangeSummary) {
     analyze_depth(src, s, 0);
 }
@@ -612,6 +621,38 @@ fn analyze_cmd(prog: &str, args: &[String], s: &mut ChangeSummary, depth: u8) {
         "docker-compose" | "podman-compose" => compose(prog, args, s),
         "curl" => curl(args, s),
         "wget" => wget(args, s),
+        "cp" | "mv" | "install" | "ln" | "rsync" => {
+            // 目标：`-t DIR` / `--target-directory=DIR`，否则最后一个位置参数（至少两个时）；`install -d` 的每个参数都是要建的目录
+            let dirs_only = prog == "install" && args.iter().any(|a| a == "-d" || a == "--directory");
+            let takes = ["-t", "--target-directory", "-S", "--suffix", "-m", "--mode", "-o", "--owner", "-g", "--group", "-e"];
+            let p = positionals(args, &takes);
+            let target = args.iter().enumerate().find_map(|(i, a)| {
+                if a == "-t" || a == "--target-directory" {
+                    args.get(i + 1).cloned()
+                } else {
+                    a.strip_prefix("--target-directory=").map(str::to_string)
+                }
+            });
+            let dests: Vec<String> = if dirs_only {
+                p.iter().map(|x| x.to_string()).collect()
+            } else if let Some(t) = target {
+                vec![t]
+            } else if p.len() >= 2 {
+                vec![p[p.len() - 1].to_string()]
+            } else {
+                Vec::new()
+            };
+            for f in dests.into_iter().filter(|f| is_real_file(f)) {
+                push(&mut s.files_written, f);
+            }
+        }
+        "dd" => {
+            for a in args {
+                if let Some(f) = a.strip_prefix("of=").filter(|f| is_real_file(f)) {
+                    push(&mut s.files_written, f.to_string());
+                }
+            }
+        }
         "tee" => {
             for f in positionals(args, &[]) {
                 if is_real_file(f) {
@@ -1162,6 +1203,16 @@ mod tests {
         assert_eq!(s.files_written, vec!["/etc/nginx/nginx.conf", "f1", "f2"]);
         // 比较运算 / 引号里的 > 不是重定向
         assert!(sum("test 1 -gt 0 && echo \"a>b\" && awk '$1 > 3'").files_written.is_empty());
+    }
+
+    #[test]
+    fn files_written_covers_copies_and_skips_dev() {
+        assert_eq!(files_written("cp a.txt /etc/app.conf && mv -f x y/"), vec!["/etc/app.conf", "y/"]);
+        assert_eq!(files_written("sudo install -m 644 /tmp/f /etc/f"), vec!["/etc/f"]);
+        assert_eq!(files_written("cp -t /srv a b"), vec!["/srv"]);
+        assert_eq!(files_written("dd if=/dev/zero of=disk.img bs=1M count=1"), vec!["disk.img"]);
+        assert!(files_written("ls > /dev/null 2>/dev/stderr; echo hi >&2; cp a").is_empty());
+        assert_eq!(files_written("cat > /tmp/x <<EOF\nhi\nEOF"), vec!["/tmp/x"]);
     }
 
     #[test]

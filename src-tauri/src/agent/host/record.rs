@@ -92,6 +92,12 @@ pub fn hosted_decision(
 ) -> DecisionRecord {
     let why: String = rationale.trim().chars().take(RATIONALE_CAP).collect();
     let why = if why.is_empty() { "（模型这一轮没有写说明）".to_string() } else { why };
+    // 落库的按键 / 命令：脱敏；屏幕被认成密码提示时按键一个字都不留（那可能就是口令）
+    let text = if kind == "keys" && sit.is_some_and(|s| s.kind == super::super::situation::SituationKind::Password) {
+        super::gate::KEYS_HIDDEN.to_string()
+    } else {
+        super::super::redact::redact(text)
+    };
     DecisionRecord {
         seq: 0,
         ts_ms: now_ms,
@@ -103,7 +109,7 @@ pub fn hosted_decision(
         candidates: Vec::new(),
         chosen: DecisionAction {
             kind: kind.to_string(),
-            text: text.to_string(),
+            text,
             option_index: None,
             injectable: true,
             submit: Default::default(),
@@ -137,6 +143,34 @@ mod tests {
         assert!(r.rationale.starts_with("[执行后通知]") && r.rationale.contains("[P:p1]"));
         assert_eq!(r.outcome, "applied");
         assert_eq!(r.contract_id, "c1");
+    }
+
+    #[test]
+    fn keys_are_redacted_and_hidden_on_password_prompts() {
+        use super::super::super::situation::{Program, SituationKind};
+        let ctx = HostCtx::bare("c1", "t1", "部署");
+        let a = AgentAction::Keys { target: None, keys: "export TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789<Enter>".into() };
+        let (kind, text) = describe_write(&a).unwrap();
+        let r = hosted_decision(&ctx, "t1", kind, &text, "", &Gate::Allow, None, 1);
+        assert!(!r.chosen.text.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"), "{}", r.chosen.text);
+        let pw = Situation {
+            frame_id: 1,
+            screen_hash: "h".into(),
+            program: Program::Shell,
+            kind: SituationKind::Password,
+            topic: None,
+            options: vec![],
+            confidence: 0.9,
+            tail: "Password: ".into(),
+            evidence: vec![],
+            stale_ms: 0,
+            signature: String::new(),
+        };
+        let a = AgentAction::Keys { target: None, keys: "hunter2<Enter>".into() };
+        let (kind, text) = describe_write(&a).unwrap();
+        let r = hosted_decision(&ctx, "t1", kind, &text, "", &Gate::Allow, Some(&pw), 1);
+        assert!(!r.chosen.text.contains("hunter2"));
+        assert_eq!(r.chosen.text, super::super::gate::KEYS_HIDDEN);
     }
 
     #[test]

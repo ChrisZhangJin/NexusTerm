@@ -172,6 +172,15 @@ pub fn has_critical(reasons: &[String]) -> bool {
     reasons.iter().any(|r| r.starts_with(CRITICAL_MARK))
 }
 
+/// 不可逆原因里再打这个标记的，是「看不到选项就按了选择键、可能正选中永久授权」的那两种
+/// （有帧但没认出选项、屏幕上又有「永久 / 不再询问」字样；没有新鲜帧）。YOLO 档对这一类不发送、直接拒，
+/// 让模型先读屏再明确选非永久的那项 —— 底线 `permanent_grant` 在任何档位都不能靠「没看清」蒙过去。
+pub const BLIND_PICK_MARK: &str = "〔看不到选项〕";
+
+pub fn has_blind_pick(reasons: &[String]) -> bool {
+    reasons.iter().any(|r| r.strip_prefix(CRITICAL_MARK).map_or(false, |x| x.starts_with(BLIND_PICK_MARK)))
+}
+
 fn danger_reasons(lines: &[String]) -> Vec<String> {
     let mut reasons = Vec::new();
     for line in lines {
@@ -270,7 +279,11 @@ pub fn assess_keys(bytes: &[u8], sit: Option<&Situation>) -> KeysVerdict {
         {
             if s.kind == SituationKind::Menu && s.frame_id != 0 && digit {
                 // 屏幕上看得到「永久 / 不再询问」一类字样：选错就是永久授权，算不可逆
-                let mark = if super::situation::grants_permanent_text(&s.tail.to_lowercase()) { CRITICAL_MARK } else { "" };
+                let mark = if super::situation::grants_permanent_text(&s.tail.to_lowercase()) {
+                    format!("{CRITICAL_MARK}{BLIND_PICK_MARK}")
+                } else {
+                    String::new()
+                };
                 return KeysVerdict::Approve(vec![format!(
                     "{mark}屏幕上有菜单，但没认出它的选项，按编号选择需要你确认选中的是哪一项"
                 )]);
@@ -285,7 +298,7 @@ pub fn assess_keys(bytes: &[u8], sit: Option<&Situation>) -> KeysVerdict {
             && (enter || has_navigation(bytes) || visible.trim().chars().any(|c| c.is_ascii_digit()))
         {
             return KeysVerdict::Approve(vec![format!(
-                "{CRITICAL_MARK}没有新鲜的屏幕帧，看不到菜单 / 授权对话框的选项（可能含「永久授权」），需要人确认这次选择"
+                "{CRITICAL_MARK}{BLIND_PICK_MARK}没有新鲜的屏幕帧，看不到菜单 / 授权对话框的选项（可能含「永久授权」），需要人确认这次选择"
             )]);
         }
         // 程序自己的提示：短答复放行；较长的文字仍过危险评估
@@ -353,6 +366,39 @@ pub fn assess_keys(bytes: &[u8], sit: Option<&Situation>) -> KeysVerdict {
     } else {
         KeysVerdict::Approve(reasons)
     }
+}
+
+/// 这次按键**会提交出去**、却不在本次键入文字里的那几行，给契约禁止项 / 硬偏好匹配用（与 `assess_keys` 同一口径）：
+/// - shell（或认不出、末行像 shell 提示符）上按回车：屏幕上已敲着的 + 本次键入的第一段拼成的那一行
+///   （`r` 和 `m -rf build<Enter>` 分两次发，单看本次只有 `m -rf build`）；
+/// - 授权对话框 / 确认提示里按的不是拒绝项：被批准的那条命令（`policy::approved_payload`）。
+pub(crate) fn submitted_extra(bytes: &[u8], s: &Situation) -> Vec<String> {
+    let mut out = Vec::new();
+    let enter = super::interact::contains_enter(bytes);
+    let visible = strip_esc(&String::from_utf8_lossy(bytes));
+    let dialog = matches!(
+        s.kind,
+        SituationKind::Permission | SituationKind::Question | SituationKind::Menu | SituationKind::AwaitingInput
+    ) && !shell_visible(s);
+    if let Some(cmd) = dialog.then(|| super::policy::approved_payload(&s.tail)).flatten() {
+        if !declines(bytes, &visible, s) {
+            out.extend(cmd.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()));
+        }
+    }
+    let shell_line = !is_program_prompt(s) || is_ambiguous(s) || tail_has_shell_prompt(s);
+    if enter && shell_line && !has_opaque_edit(bytes) {
+        let clears = bytes.iter().position(|&b| b == 0x15 || b == 0x03);
+        let first_enter = bytes.iter().position(|&b| b == b'\r' || b == b'\n');
+        let line_cleared = matches!((clears, first_enter), (Some(c), Some(e)) if c < e);
+        if let (false, Some(cur)) = (line_cleared, current_input_line(s)) {
+            let first = typed_segments(bytes).into_iter().next().unwrap_or_default();
+            let joined = format!("{cur}{first}").trim().to_string();
+            if !joined.is_empty() {
+                out.push(joined);
+            }
+        }
+    }
+    out
 }
 
 /// 局面是不是「某个程序在问我 / 在跑」（而不是停在 shell 提示符上）。

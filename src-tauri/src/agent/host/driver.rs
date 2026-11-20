@@ -165,7 +165,8 @@ impl HostCtx {
 
     /// 写 `console` 时的 `gate::authorize` 输入：禁止项 / 硬偏好 / 档位相同，主机范围按**被写的那个终端**的主机判。
     /// 其余终端用它自己的主机键（认不出 = 空，设了主机范围就 fail-closed）；主终端以及不属于本次托管的
-    /// （本次运行新开的会话、YOLO 下批准过的越界）沿用主终端的主机键 —— 与单终端托管一直以来的行为一致。
+    /// （YOLO 下批准过的越界）沿用主终端的主机键。本次运行 nx_open 新开的会话用它自己的主机键，
+    /// 见 [`HostShared::policy_for`]。
     pub fn policy_for(&self, console: &str) -> HostPolicy {
         let mut p = self.policy();
         if let Some(c) = self.extra.iter().find(|c| c.console_id == console && c.console_id != self.contract.console_id) {
@@ -255,8 +256,9 @@ pub struct HostShared {
     seen_generation: Mutex<HashMap<String, u64>>,
     /// 「这是误判」的一次性担保（同一屏上的下一次按键不按屏幕推底线标签）
     pub vouch: super::misread::Vouch,
-    /// 本次运行里经 nx_open（过了门禁）新开的会话：可以写，按主终端的契约判（与单终端托管一直以来的行为一致）
-    opened: Mutex<Vec<String>>,
+    /// 本次运行里经 nx_open（过了门禁）新开的会话及其主机键：可以写，禁止项 / 档位按主终端的契约判，
+    /// 主机范围按它自己的主机键判（认不出 = 空，设了主机范围就 fail-closed）
+    opened: Mutex<Vec<(String, String)>>,
 }
 
 /// 进程内单调时钟（毫秒）。看门狗只认它；重启后基准变了，恢复时要 `rebase`。
@@ -328,17 +330,30 @@ impl HostShared {
         self.console_id == id || self.extra.iter().any(|c| c == id)
     }
 
-    /// 记下本次运行新开的会话（nx_open 成功后）。
-    pub fn note_opened(&self, id: &str) {
+    /// 记下本次运行新开的会话（nx_open 成功后）与它连到的主机键（`hostmem::host_key` 的推导；认不出传空）。
+    pub fn note_opened(&self, id: &str, host_key: &str) {
         let mut o = self.opened.lock();
-        if !o.iter().any(|x| x == id) {
-            o.push(id.to_string());
+        match o.iter_mut().find(|(x, _)| x == id) {
+            Some(e) => e.1 = host_key.to_string(),
+            None => o.push((id.to_string(), host_key.to_string())),
         }
     }
 
     /// 能不能往 `id` 写：本次托管的终端，或本次运行自己新开的会话。
     pub fn may_write(&self, id: &str) -> bool {
-        self.owns(id) || self.opened.lock().iter().any(|x| x == id)
+        self.owns(id) || self.opened.lock().iter().any(|(x, _)| x == id)
+    }
+
+    /// 写 `console` 时的 `gate::authorize` 输入：[`HostCtx::policy_for`]，但本次运行新开的会话
+    /// 按它自己的主机键判主机范围（不继承主终端的 —— 否则开一个连到范围外主机的 tab 就绕过了主机范围）。
+    pub fn policy_for(&self, ctx: &HostCtx, console: &str) -> HostPolicy {
+        let mut p = ctx.policy_for(console);
+        if !ctx.owns(console) {
+            if let Some((_, k)) = self.opened.lock().iter().find(|(x, _)| x == console) {
+                p.host_key = k.clone();
+            }
+        }
+        p
     }
 
     /// 此刻不在的终端（tab 关了 / 连接断了）。
@@ -1362,7 +1377,7 @@ pub(crate) mod tests {
         assert_eq!(h.consoles(), vec!["A", "B", "C"], "主终端在前，重复的主终端不再算一次");
         assert!(h.owns("B") && h.owns("A") && !h.owns("D"));
         assert!(!h.may_write("D"));
-        h.note_opened("D");
+        h.note_opened("D", "local");
         assert!(h.may_write("D") && !h.owns("D"), "本次运行新开的会话可写，但不算托管的终端");
         assert!(h.missing_consoles().is_empty());
         io.dead_ids.lock().push("C".into());
@@ -1462,6 +1477,27 @@ pub(crate) mod tests {
         for c in ["A", "B", "C"] {
             assert!(!matches!(authorize(&ctx.policy_for(c), &rm, None), Gate::Allow), "{c}");
         }
+    }
+
+    /// 本次运行 nx_open 新开的 tab 按它自己的主机键判主机范围，不继承主终端的；认不出（空键）fail-closed
+    #[test]
+    fn opened_tab_uses_its_own_host_key() {
+        use super::super::gate::{authorize, Gate};
+        use super::super::super::act::AgentAction;
+        let (h, _io) = shared_multi("c1", "A", &["B"]);
+        let mut ctx = multi_ctx("auto");
+        ctx.authority.host_scope = vec!["web1".into()];
+        let exec = AgentAction::Exec { target: None, command: "uptime".into() };
+        h.note_opened("D", "ssh:root@db9:22");
+        h.note_opened("E", "");
+        h.note_opened("F", "ssh:root@web1:22");
+        assert_eq!(h.policy_for(&ctx, "D").host_key, "ssh:root@db9:22");
+        assert!(matches!(authorize(&h.policy_for(&ctx, "D"), &exec, None), Gate::Deny(t) if t.contains("契约的主机范围")));
+        assert!(matches!(authorize(&h.policy_for(&ctx, "E"), &exec, None), Gate::Deny(_)), "认不出主机：拒");
+        assert_eq!(authorize(&h.policy_for(&ctx, "F"), &exec, None), Gate::Allow);
+        // 托管的终端照旧
+        assert_eq!(authorize(&h.policy_for(&ctx, "A"), &exec, None), Gate::Allow);
+        assert!(matches!(authorize(&h.policy_for(&ctx, "B"), &exec, None), Gate::Deny(_)));
     }
 
     #[test]
