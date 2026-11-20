@@ -67,12 +67,53 @@ pub struct HostStatus {
     pub tier: String,
     /// 契约级花费：步数 / 时长 / token / 折算的钱（卡头显示）
     pub spent: Spent,
+    /// 本次托管操作的全部终端（主终端在前）；单终端托管只有一项
+    pub consoles: Vec<HostConsoleStatus>,
+}
+
+/// 托管卡 / 标签页徽标上的一个终端。
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HostConsoleStatus {
+    pub console_id: String,
+    pub label: String,
+    pub primary: bool,
+    /// 此刻不在（tab 关了 / 连接断了）
+    pub missing: bool,
+}
+
+/// 主终端 + 其余终端 → 状态里的终端清单。
+pub(crate) fn console_statuses(primary: &ConsoleRef, extra: &[ConsoleRef], alive: impl Fn(&str) -> bool) -> Vec<HostConsoleStatus> {
+    std::iter::once((primary, true))
+        .chain(extra.iter().map(|c| (c, false)))
+        .map(|(c, primary)| HostConsoleStatus {
+            console_id: c.console_id.clone(),
+            label: c.label.clone(),
+            primary,
+            missing: !alive(&c.console_id),
+        })
+        .collect()
+}
+
+/// 多终端：提醒 / 卡头上的名字带上其余终端（「A + B」）；单终端就是它自己的名字。
+fn joined_label(primary: &str, consoles: &[HostConsoleStatus]) -> String {
+    if consoles.len() <= 1 {
+        return primary.to_string();
+    }
+    consoles.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(" + ")
+}
+
+fn app_alive(app: &AppHandle) -> impl Fn(&str) -> bool + '_ {
+    move |id: &str| app.try_state::<AppState>().map_or(true, |st| act::session_alive(&st, id))
 }
 
 impl HostStatus {
-    fn of(h: &HostShared, phase: &HostPhase) -> Self {
+    fn of(h: &HostShared, phase: &HostPhase, alive: impl Fn(&str) -> bool) -> Self {
         // ctx 只取一次（锁内克隆一份），别在一条语句里反复加锁
         let ctx = h.ctx();
+        let primary = ConsoleRef { console_id: h.console_id.clone(), label: ctx.label.clone(), ..Default::default() };
+        let consoles = console_statuses(&primary, &ctx.extra, alive);
+        let label = joined_label(&ctx.label, &consoles);
         Self {
             contract_id: h.contract_id().to_string(),
             run_id: h.run_id().to_string(),
@@ -80,12 +121,13 @@ impl HostStatus {
             goal: h.goal.clone(),
             state: phase.label(),
             phase: phase.clone(),
-            label: ctx.label,
+            label,
             notice: h.notice(),
             todo: h.todo(),
             tier: ctx.authority.tier.clone(),
             deny: ctx.authority.deny,
             spent: h.spent(),
+            consoles,
         }
     }
 }
@@ -116,13 +158,16 @@ fn status_of(
     snap: &Mutex<HostCheckpoint>,
     notice: &Mutex<Option<String>>,
     phase: &HostPhase,
+    alive: impl Fn(&str) -> bool,
 ) -> HostStatus {
     // 只锁一次 `snap`：在结构体字面量里写两次 `snap.lock()`，第一个临时 guard 要活到整条语句结束，
     // 第二次加锁就自锁了（parking_lot 不可重入）—— 曾让 `host_start` 卡死主线程、整个窗口无响应。
-    let (label, todo, deny, tier, spent) = {
+    let (label, todo, deny, tier, spent, consoles) = {
         let s = snap.lock();
-        (s.console.label.clone(), s.todo.clone(), s.authority.deny.clone(), s.authority.tier.clone(), s.spent)
+        let consoles = console_statuses(&s.console, &s.extra, alive);
+        (s.console.label.clone(), s.todo.clone(), s.authority.deny.clone(), s.authority.tier.clone(), s.spent, consoles)
     };
+    let label = joined_label(&label, &consoles);
     let notice = notice.lock().clone();
     HostStatus {
         contract_id: handle.contract_id.clone(),
@@ -137,6 +182,7 @@ fn status_of(
         deny,
         tier,
         spent,
+        consoles,
     }
 }
 
@@ -165,7 +211,7 @@ impl HostIo for AppHostIo {
     }
 
     fn emit(&self, phase: &HostPhase) {
-        let st = status_of(&self.handle, &self.console_id, &self.goal, &self.snap, &self.notice, phase);
+        let st = status_of(&self.handle, &self.console_id, &self.goal, &self.snap, &self.notice, phase, app_alive(&self.app));
         emit_status(&self.app, &st);
         let prev = self.attn_prev.lock().replace(phase.clone());
         if let Some(a) = prev.and_then(|p| attention_for(&p, phase, &st.label)) {
@@ -199,7 +245,7 @@ impl HostIo for AppHostIo {
     fn note_spent(&self, spent: &Spent, phase: &HostPhase) {
         self.snap.lock().spent = *spent;
         // 只推状态、不走 `emit` 的「需要人」提醒判断：花费变化不是相位迁移
-        let st = status_of(&self.handle, &self.console_id, &self.goal, &self.snap, &self.notice, phase);
+        let st = status_of(&self.handle, &self.console_id, &self.goal, &self.snap, &self.notice, phase, app_alive(&self.app));
         emit_status(&self.app, &st);
     }
 
@@ -216,13 +262,13 @@ impl HostIo for AppHostIo {
         self.snap.lock().deadline_acked = acked;
     }
 
-    fn console_alive(&self) -> bool {
-        self.app.try_state::<AppState>().map_or(true, |st| act::session_alive(&st, &self.console_id))
+    fn console_alive(&self, id: &str) -> bool {
+        self.app.try_state::<AppState>().map_or(true, |st| act::session_alive(&st, id))
     }
 
-    fn console_generation(&self) -> Option<u64> {
+    fn console_generation(&self, id: &str) -> Option<u64> {
         let st = self.app.try_state::<AppState>()?;
-        act::session_generation(&st, &self.console_id)
+        act::session_generation(&st, id)
     }
 
     fn note_notice(&self, notice: Option<&str>) {
@@ -255,6 +301,7 @@ pub(crate) fn build_ctx(
     contract: StewardContract,
     authority: Authority,
     label: &str,
+    extra: &[ConsoleRef],
 ) -> HostCtx {
     let sit = act::situation_now(app, state, &contract.console_id, false);
     let redact = super::load_config(&state.store).active_account().redact;
@@ -268,7 +315,20 @@ pub(crate) fn build_ctx(
         }
         None => (String::new(), Vec::new(), Vec::new()),
     };
-    HostCtx { contract, authority, hard, section, refs, label: label.to_string() }
+    let mut ctx = HostCtx { contract, authority, hard, section, refs, label: label.to_string(), extra: extra.to_vec() };
+    // 多终端：告诉模型有哪几个终端、怎么指定（单终端不加，提示词与原来一字不差）
+    if !ctx.extra.is_empty() {
+        ctx.section.push_str(&terminals_section(&ctx));
+    }
+    ctx
+}
+
+/// 系统提示里的「本次托管的终端」一节（多终端托管）。
+pub(crate) fn terminals_section(ctx: &HostCtx) -> String {
+    format!(
+        "\n\n### 本次托管的终端\n{}。\n这些终端都交给你操作（用户在其中任何一个上动手，整个托管都会让路）。         对其中某个终端动手时，在工具参数里用 target 写它的 id；不写 target 就是主终端。         只能操作这几个终端；判据核验在主终端上跑。\n",
+        ctx.terminals_line()
+    )
 }
 
 /// 开始托管前起草完成判据：一次 LLM 调用，60 秒拿不到就退回人工确认。
@@ -296,15 +356,35 @@ pub(crate) fn control_target(phase: &HostPhase) -> Option<ControlState> {
     }
 }
 
-/// 启动顺序的唯一实现：先拿租约，再签契约；签约失败就把租约放回去。
-/// 抽成纯函数是为了能单测「契约对守护进程可见的那一刻，租约已经在了」。
+/// 单终端的 [`claim_all_then_sign`]（测试用）。
+#[cfg(test)]
 pub(crate) fn claim_then_sign<T>(
     control: &ControlTable,
     console_id: &str,
     run_id: &str,
     sign: impl FnOnce() -> Result<T, String>,
 ) -> Result<(T, Option<ControlState>), String> {
-    let changed = control.acquire(console_id, run_id);
+    claim_all_then_sign(control, &[console_id.to_string()], run_id, sign).map(|(v, ch)| (v, ch.into_iter().next().map(|(_, s)| s)))
+}
+
+/// 启动顺序的唯一实现：先拿租约，再签契约（签约失败就把租约放回去）。抽成纯函数是为了能单测「契约对守护进程
+/// 可见的那一刻，租约已经在了」。多终端：全部拿到或一个都不拿。任何一个终端已被别的运行驾驶着就不拿、不签，
+/// 返回 Err；签约失败把已拿的全部放回去。返回 (签约结果, 需要推事件的变化)。
+pub(crate) fn claim_all_then_sign<T>(
+    control: &ControlTable,
+    console_ids: &[String],
+    run_id: &str,
+    sign: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, Vec<(String, ControlState)>), String> {
+    if let Some(busy) = console_ids.iter().find(|c| control.holders_of(c).iter().any(|h| h != run_id)) {
+        return Err(format!("终端「{busy}」正被另一轮运行驾驶着（对话 / 技能 / 另一份托管），先停掉它再开始托管"));
+    }
+    let mut changed = Vec::new();
+    for c in console_ids {
+        if let Some(st) = control.acquire(c, run_id) {
+            changed.push((c.clone(), st));
+        }
+    }
     match sign() {
         Ok(v) => Ok((v, changed)),
         Err(e) => {
@@ -352,6 +432,7 @@ pub async fn host_start(
     console_ref: Option<ConsoleHint>,
     deny: Option<Vec<String>>,
     follow_up: Option<FollowUp>,
+    extra_consoles: Option<Vec<ConsoleHint>>,
     app: AppHandle,
     state: State<'_, AppState>,
     registry: State<'_, StewardRegistry>,
@@ -363,15 +444,33 @@ pub async fn host_start(
     if goal.is_empty() {
         return Err("托管目标不能为空".to_string());
     }
-    if !state.local.contains(&console_id) && !state.sessions.contains(&console_id) {
-        return Err(format!("没有 id 为「{console_id}」的终端"));
+    // 多终端：主终端之外一并操作的终端（去重、去掉主终端本身）
+    let mut extra_hints: Vec<ConsoleHint> = Vec::new();
+    for h in extra_consoles.unwrap_or_default() {
+        let id = h.console_id.trim();
+        if id.is_empty() || id == console_id || extra_hints.iter().any(|x| x.console_id == id) {
+            continue;
+        }
+        extra_hints.push(ConsoleHint { console_id: id.to_string(), ..h });
     }
+    let all_ids: Vec<String> =
+        std::iter::once(console_id.clone()).chain(extra_hints.iter().map(|h| h.console_id.clone())).collect();
     let rt = &state.act;
-    if rt.host.live_on_console(&console_id).is_some() {
-        return Err("这个终端已经在托管中".to_string());
-    }
-    if rt.is_running(&console_id) {
-        return Err("这个终端上有一轮对话 / 技能正在运行，请先停止".to_string());
+    for id in &all_ids {
+        let name = extra_hints
+            .iter()
+            .find(|h| &h.console_id == id)
+            .and_then(|h| nonempty(&h.label))
+            .unwrap_or_else(|| "这个终端".to_string());
+        if !state.local.contains(id) && !state.sessions.contains(id) {
+            return Err(format!("没有 id 为「{id}」的终端"));
+        }
+        if rt.host.live_on_console(id).is_some() {
+            return Err(format!("{name}已经在托管中"));
+        }
+        if rt.is_running(id) {
+            return Err(format!("{name}上有一轮对话 / 技能正在运行，请先停止"));
+        }
     }
     // 上一份 Agent 配置不可用就别签约：签了也起不来
     let cfg = super::load_config(&state.store);
@@ -380,7 +479,7 @@ pub async fn host_start(
     let contract_id = steward::new_contract_id(&console_id);
     let handle = HostHandle::new(&contract_id);
     let tier = authority_tier.unwrap_or_else(|| "auto".to_string());
-    let (contract, changed) = claim_then_sign(&rt.control, &console_id, &handle.run_id, || {
+    let (mut contract, changed) = claim_all_then_sign(&rt.control, &all_ids, &handle.run_id, || {
         steward::sign_contract(
             Some(&contract_id),
             &console_id,
@@ -393,8 +492,13 @@ pub async fn host_start(
             &core,
         )
     })?;
-    if let Some(st) = changed {
-        act::emit_control(&app, &console_id, &[handle.run_id.clone()], st);
+    for (c, st) in changed {
+        act::emit_control(&app, &c, &[handle.run_id.clone()], st);
+    }
+    if !extra_hints.is_empty() {
+        // 其余终端记进契约（前端据此为它们上报屏幕帧）
+        contract.extra_consoles = all_ids[1..].to_vec();
+        registry.restore(contract.clone());
     }
     // 开始托管时在面板上改过的禁止项（底线项总会补回）；要在落第一份现场 / 建上下文之前写进契约
     if let Some(d) = deny {
@@ -411,7 +515,9 @@ pub async fn host_start(
     let label = console.label.clone();
     // 文件工具的相对路径按它补全
     let hint_cwd = console.cwd.clone();
-    let snap = HostCheckpoint::new(contract.clone(), core.authority(&contract_id), console, now_ms());
+    let extra: Vec<ConsoleRef> = extra_hints.iter().map(|h| console_ref_of(&state, &h.console_id, h)).collect();
+    let mut snap = HostCheckpoint::new(contract.clone(), core.authority(&contract_id), console, now_ms());
+    snap.extra = extra.clone();
     let io = AppHostIo {
         app: app.clone(),
         handle: handle.clone(),
@@ -422,9 +528,9 @@ pub async fn host_start(
         attn_prev: Mutex::new(None),
     };
     let cancel = Arc::new(AtomicBool::new(false));
-    let shared = HostShared::new(handle, &console_id, &goal, cancel, Box::new(io));
+    let shared = HostShared::new_multi(handle, &console_id, &all_ids[1..], &goal, cancel, Box::new(io));
     let authority = core.authority(&contract_id);
-    shared.set_ctx(build_ctx(&app, &state, contract, authority, &label), None);
+    shared.set_ctx(build_ctx(&app, &state, contract, authority, &label, &extra), None);
     rt.host.register(Arc::clone(&shared));
     shared.announce();
     let yolo = yolo.unwrap_or(false);
@@ -432,7 +538,9 @@ pub async fn host_start(
     let req = AgentRunRequest {
         session_id: console_id.clone(),
         question: follow_up_question(&goal, follow_up.as_ref()),
-        targets: vec![AgentTarget { id: console_id, label, cwd: hint_cwd }],
+        targets: std::iter::once(AgentTarget { id: console_id, label, cwd: hint_cwd })
+            .chain(extra.iter().map(|c| AgentTarget { id: c.console_id.clone(), label: c.label.clone(), cwd: c.cwd.clone() }))
+            .collect(),
         console_text,
         console_alt: console_alt.unwrap_or(false),
         mode: Some("steward".to_string()),
@@ -450,7 +558,7 @@ pub async fn host_start(
             Some(checks) => {
                 // 判据进了契约：重渲染一次上下文（目标 / 判据 / 授权都在这一节里）
                 let c = task_host.ctx();
-                task_host.set_ctx(build_ctx(&task_app, &st, c.contract, c.authority, &c.label), None);
+                task_host.set_ctx(build_ctx(&task_app, &st, c.contract, c.authority, &c.label, &c.extra), None);
                 tracing::info!("托管 {} 判据 {} 条（YOLO：{yolo}）", task_host.contract_id(), checks.len());
                 act::run(&task_app, &st, &st.act, &cfg, &req, RunMode::Hosted(Arc::clone(&task_host))).await
             }
@@ -506,8 +614,11 @@ fn handback_if_driving(app: &AppHandle, state: &AppState, h: &HostShared) {
 
 /// 控制表那一半的「交还」：把终端从用户手里拿回来，并推控制权事件。
 fn release_user_control(app: &AppHandle, state: &AppState, h: &HostShared) {
-    if let Some(st) = state.act.control.handback(&h.console_id) {
-        act::emit_control(app, &h.console_id, &state.act.control.holders_of(&h.console_id), st);
+    // 多终端：用户可能是在其中任何一个上动的手，全部交还
+    for c in h.consoles() {
+        if let Some(st) = state.act.control.handback(&c) {
+            act::emit_control(app, &c, &state.act.control.holders_of(&c), st);
+        }
     }
 }
 
@@ -561,8 +672,11 @@ pub async fn host_answer(
 #[tauri::command]
 pub async fn host_takeover(contract_id: String, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let h = hosted(&state, &contract_id)?;
-    if let Some(st) = state.act.control.takeover(&h.console_id) {
-        act::emit_control(&app, &h.console_id, &state.act.control.holders_of(&h.console_id), st);
+    // 多终端：接管 = 整个托管让路，它的每个终端都交到用户手里
+    for c in h.consoles() {
+        if let Some(st) = state.act.control.takeover(&c) {
+            act::emit_control(&app, &c, &state.act.control.holders_of(&c), st);
+        }
     }
     h.send(HostEvent::Takeover);
     Ok(())
@@ -572,9 +686,7 @@ pub async fn host_takeover(contract_id: String, app: AppHandle, state: State<'_,
 #[tauri::command]
 pub async fn host_handback(contract_id: String, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let h = hosted(&state, &contract_id)?;
-    if let Some(st) = state.act.control.handback(&h.console_id) {
-        act::emit_control(&app, &h.console_id, &state.act.control.holders_of(&h.console_id), st);
-    }
+    release_user_control(&app, &state, &h);
     h.send(HostEvent::Handback);
     Ok(())
 }
@@ -673,6 +785,7 @@ pub async fn host_amend(
     contract.success_criteria = prev.contract.success_criteria.clone();
     contract.yolo = prev.contract.yolo;
     contract.criteria_confirmed = prev.contract.criteria_confirmed;
+    contract.extra_consoles = prev.contract.extra_consoles.clone();
     // 禁止项：用户在面板上改的那份（底线项总会补回）
     let deny = deny.map(|d| super::policy::normalize_deny(&d));
     if let Some(d) = &deny {
@@ -682,7 +795,7 @@ pub async fn host_amend(
     }
     let authority = core.authority(&contract_id);
     let note = amend_note(goal.as_deref(), tier.as_deref(), deny.as_deref());
-    h.set_ctx(build_ctx(&app, &state, contract, authority, &prev.label), Some(note));
+    h.set_ctx(build_ctx(&app, &state, contract, authority, &prev.label, &prev.extra), Some(note));
     // 用户自己定了档位：接驳时「已降为确认档」那句提示就过时了
     if tier.is_some() {
         h.set_notice(None);
@@ -764,7 +877,7 @@ pub async fn host_report_misread(
     let path = misread::write_report(&dir, &report).map_err(|e| format!("保存误判样本失败：{e}"))?;
     if !h.is_terminal() {
         let retry_ok = report.evidence.vouchable
-            && h.vouch.set(&report.evidence.screen_hash, std::time::Instant::now());
+            && h.vouch.set(&report.evidence.console_id, &report.evidence.screen_hash, std::time::Instant::now());
         h.send_user_note(misread::model_note(&report.evidence, &note, retry_ok));
     }
     Ok(path.to_string_lossy().into_owned())
@@ -772,13 +885,13 @@ pub async fn host_report_misread(
 
 #[tauri::command]
 pub fn host_status(contract_id: String, state: State<'_, AppState>) -> Option<HostStatus> {
-    state.act.host.get(&contract_id).map(|h| HostStatus::of(&h, &h.phase()))
+    state.act.host.get(&contract_id).map(|h| HostStatus::of(&h, &h.phase(), |id| act::session_alive(&state, id)))
 }
 
 /// 全部托管任务（含已结束、还没被同一 console 的新托管顶掉的）。
 #[tauri::command]
 pub fn host_list(state: State<'_, AppState>) -> Vec<HostStatus> {
-    state.act.host.all().iter().map(|h| HostStatus::of(h, &h.phase())).collect()
+    state.act.host.all().iter().map(|h| HostStatus::of(h, &h.phase(), |id| act::session_alive(&state, id))).collect()
 }
 
 // ——————————————————————— 重启恢复与重新接驳（设计 §4） ———————————————————————
@@ -865,9 +978,11 @@ fn shared_from_checkpoint(app: &AppHandle, cp: &HostCheckpoint) -> Arc<HostShare
         // 落盘时的相位当基线：接驳后再推同一张卡不重复提醒
         attn_prev: Mutex::new(Some(cp.phase.clone())),
     };
-    let h = HostShared::new(
+    let extra: Vec<String> = cp.extra.iter().map(|c| c.console_id.clone()).collect();
+    let h = HostShared::new_multi(
         handle,
         &cp.console.console_id,
+        &extra,
         &cp.contract.goal,
         Arc::new(AtomicBool::new(false)),
         Box::new(io),
@@ -876,6 +991,7 @@ fn shared_from_checkpoint(app: &AppHandle, cp: &HostCheckpoint) -> Arc<HostShare
     ctx.contract = cp.contract.clone();
     ctx.authority = cp.authority.clone();
     ctx.label = cp.console.label.clone();
+    ctx.extra = cp.extra.clone();
     h.set_ctx(ctx, None);
     h.set_spent(cp.spent);
     h.restore_watchdog(cp.watchdog.clone());
@@ -924,32 +1040,84 @@ pub(crate) fn rank_candidates(saved: &ConsoleRef, cands: &[ConsoleRef]) -> Vec<R
 pub fn host_reattach_candidates(
     contract_id: String,
     candidates: Vec<ConsoleHint>,
+    slot: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<ReattachCandidate>, String> {
     let h = hosted(&state, &contract_id)?;
-    let saved = h.saved_console().ok_or_else(|| "没有可接驳的现场".to_string())?;
+    let cp = h.checkpoint().ok_or_else(|| "没有可接驳的现场".to_string())?;
+    let slot = pick_slot(&cp, slot, |id| act::session_alive(&state, id));
+    let saved = cp.slot(&slot).cloned().ok_or_else(|| format!("这份托管里没有终端「{slot}」"))?;
+    // 本次托管已经接上的其余终端不当候选
+    let taken: Vec<String> = cp.consoles().map(|c| c.console_id.clone()).filter(|c| c != &slot).collect();
     let cands: Vec<ConsoleRef> = candidates
         .iter()
-        .filter(|c| !c.console_id.is_empty())
+        .filter(|c| !c.console_id.is_empty() && !taken.contains(&c.console_id))
         .map(|c| console_ref_of(&state, &c.console_id, c))
         .collect();
     Ok(rank_candidates(&saved, &cands))
 }
 
 /// 接驳判定：没帧 / 新开的连接都无从核对 → 按漂移处理（降到确认档），不拒绝；过期才拒绝。
+#[cfg(test)]
 pub(crate) fn reattach_plan(
     cp: &HostCheckpoint,
     console: ConsoleRef,
     current_hash: Option<&str>,
     now: i64,
 ) -> Result<(HostCheckpoint, Vec<super::host::phase::Effect>, bool), String> {
+    let slot = cp.console.console_id.clone();
+    reattach_slot_plan(cp, &slot, console, current_hash, now, false)
+}
+
+/// 接驳哪一格：前端指定的（且确实是本次托管的终端）优先；否则主终端不在就接主终端，再否则第一个不在的。
+pub(crate) fn pick_slot(cp: &HostCheckpoint, want: Option<String>, alive: impl Fn(&str) -> bool) -> String {
+    if let Some(w) = want.filter(|w| cp.slot(w).is_some()) {
+        return w;
+    }
+    cp.consoles()
+        .find(|c| !alive(&c.console_id))
+        .map(|c| c.console_id.clone())
+        .unwrap_or_else(|| cp.console.console_id.clone())
+}
+
+/// 多终端接驳的纯逻辑：把 `slot` 那一格换成 `console`。
+/// - `partial`（还有别的终端不在）：只换这一格、**相位不动**（仍挂起，模型一步也走不了），屏幕漂移照样降档；
+/// - 否则（这是最后一个缺的）：按挂起前的相位接着跑（同单终端接驳）。
+/// `current_hash` 是主终端此刻的屏幕指纹（漂移只按主终端判；接的是主终端就是新 tab 的指纹）。返回 (新现场, 副作用, 是否漂移降档)。
+pub(crate) fn reattach_slot_plan(
+    cp: &HostCheckpoint,
+    slot: &str,
+    console: ConsoleRef,
+    current_hash: Option<&str>,
+    now: i64,
+    partial: bool,
+) -> Result<(HostCheckpoint, Vec<super::host::phase::Effect>, bool), String> {
     let mut verdict = cp.reattach_verdict(current_hash, now);
     if matches!(verdict, ResumeVerdict::Suspended { .. }) {
         verdict = ResumeVerdict::Drift { downgrade_to: TIER_APPROVE.to_string() };
     }
+    // 先接上其余终端之一（主终端也还没接上）：主终端此刻没有屏幕可比，漂移留到接主终端 / 最后一个时再判，这里只看过期
+    if partial && slot != cp.console.console_id && matches!(verdict, ResumeVerdict::Drift { .. }) {
+        verdict = ResumeVerdict::Clean;
+    }
     let drifted = matches!(verdict, ResumeVerdict::Drift { .. });
     let mut next = cp.clone();
-    let mut fx = next.reattach(console, &verdict)?;
+    if partial {
+        if !matches!(next.phase, HostPhase::Suspended { .. }) {
+            return Err("这份托管没有在等重新接驳".to_string());
+        }
+        match &verdict {
+            ResumeVerdict::Expired { reason } => return Err(reason.clone()),
+            ResumeVerdict::Drift { downgrade_to } => next.authority.tier = downgrade_to.clone(),
+            _ => {}
+        }
+        if !next.replace_slot(slot, console) {
+            return Err(format!("这份托管里没有终端「{slot}」"));
+        }
+        next.contract.authority_tier = next.authority.tier.clone();
+        return Ok((next, Vec::new(), drifted));
+    }
+    let mut fx = next.reattach_slot(slot, console, &verdict)?;
     // 密码卡的请求通道随旧进程没了，没法再答：回到运行，让模型重新发起 nx_secret
     if matches!(&next.phase, HostPhase::WaitingHuman { card } if card.kind == CardKind::Secret) {
         next.phase = HostPhase::Running;
@@ -957,7 +1125,6 @@ pub(crate) fn reattach_plan(
             "（重启前等你输入的密码请求已经失效，没有写入任何东西；需要的话请重新调用 nx_secret。）".to_string(),
         ));
     }
-    next.contract.console_id = next.console.console_id.clone();
     next.contract.authority_tier = next.authority.tier.clone();
     Ok((next, fx, drifted))
 }
@@ -971,6 +1138,7 @@ pub async fn host_reattach(
     contract_id: String,
     console_id: Option<String>,
     open_new: Option<bool>,
+    slot: Option<String>,
     app: AppHandle,
     state: State<'_, AppState>,
     registry: State<'_, StewardRegistry>,
@@ -988,7 +1156,10 @@ pub async fn host_reattach(
         return Err("这份托管没有在等重新接驳".to_string());
     }
     let mut cp = old.checkpoint().ok_or_else(|| "没有可接驳的现场".to_string())?;
-    let saved = cp.console.clone();
+    // 多终端：一次接一格（保存时的 console id）；没指定就先接主终端，再按顺序接其余不在的
+    let slot = pick_slot(&cp, slot, |id| act::session_alive(&state, id));
+    let saved = cp.slot(&slot).cloned().ok_or_else(|| format!("这份托管里没有终端「{slot}」"))?;
+    let is_primary = slot == cp.console.console_id;
     let mut restore_note = None;
     let console_id = if open_new.unwrap_or(false) {
         let kind = match &saved.session_record_id {
@@ -997,7 +1168,13 @@ pub async fn host_reattach(
         };
         let spec = act::OpenSpec { kind, label: saved.label.clone(), command: None };
         let out = act::open_session(&app, &state, &saved.console_id, spec).await.map_err(|e| e.to_string())?;
-        restore_note = restore_commands_note(&saved);
+        restore_note = restore_commands_note(&saved).map(|n| {
+            if cp.extra.is_empty() {
+                n
+            } else {
+                format!("（终端「{}」，新 id {}）{n}", saved.label, out.session_id)
+            }
+        });
         out.session_id
     } else {
         console_id.filter(|c| !c.trim().is_empty()).ok_or_else(|| "请选择要接驳的终端".to_string())?
@@ -1017,6 +1194,9 @@ pub async fn host_reattach(
     if state.act.host.live_on_console(&console_id).is_some_and(|h| h.contract_id() != contract_id) {
         return Err("这个终端正被另一份托管占着".to_string());
     }
+    if console_id != slot && cp.slot(&console_id).is_some() {
+        return Err("这个终端已经是本次托管里的另一个终端了，请选别的".to_string());
+    }
     if state.act.is_running(&console_id) {
         return Err("这个终端上有一轮对话 / 技能正在运行，请先停止".to_string());
     }
@@ -1028,20 +1208,27 @@ pub async fn host_reattach(
         tmux: saved.tmux.clone(),
     };
     let console = console_ref_of(&state, &console_id, &hint);
-    let current = screen.get(&console_id).map(|s| s.hash);
+    // 漂移只按主终端判：接的是主终端就拿新 tab 的屏幕比；接的是其余终端就拿主终端此刻的屏幕比
+    let current = screen.get(if is_primary { &console_id } else { &cp.console.console_id }).map(|s| s.hash);
     // 新开的连接屏幕一定不一样：不拿它比，直接按漂移降档
-    let current = if open_new.unwrap_or(false) { None } else { current };
+    let current = if open_new.unwrap_or(false) && is_primary { None } else { current };
     // 托管任务这边的判据 / 授权以内存为准（可能被 host_amend / 判据确认改过）
     let live = old.ctx();
     cp.contract = live.contract.clone();
     cp.authority = live.authority.clone();
     let prev_tier = cp.authority.tier.clone();
-    let (next, effects, drifted) = reattach_plan(&cp, console, current.as_deref(), now_ms())?;
+    // 这一格接上之后还有别的终端不在：只换这一格，仍挂起（模型一步也走不了），等最后一个接上再接着跑
+    let still_missing: Vec<String> = cp
+        .consoles()
+        .filter(|c| c.console_id != slot && !act::session_alive(&state, &c.console_id))
+        .map(|c| c.label.clone())
+        .collect();
+    let partial = !still_missing.is_empty();
+    let (mut next, effects, drifted) = reattach_slot_plan(&cp, &slot, console, current.as_deref(), now_ms(), partial)?;
 
-    // 租约换到新 console：拿不到（别的运行占着）就不接驳、不写；拿到后撤掉旧 console 上的。
+    // 租约从这一格原来的 console 换到新 console：拿不到（别的运行占着）就不接驳、不写；拿到后撤掉旧的。
     // 这一步在契约对守护进程可见之前完成（与 host_start 同一顺序），确认的那一刻 control_owned(新) 即为真
-    let old_console = old.console_id.clone();
-    let changes = move_lease(&state.act.control, old.run_id(), &old_console, &console_id)?;
+    let changes = move_lease(&state.act.control, old.run_id(), &slot, &console_id)?;
     for (session, st) in changes {
         act::emit_control(&app, &session, &state.act.control.holders_of(&session), st);
     }
@@ -1049,6 +1236,21 @@ pub async fn host_reattach(
     let had_task = state.act.is_running(old.run_id());
     if had_task {
         old.supersede();
+    }
+    if partial {
+        // 新开连接后要恢复现场的话：这一次不起任务，记进对话（最后一个接上后模型第一步就看得到）
+        if let Some(n) = restore_note.take() {
+            next.messages.push(ChatMessage::user(n));
+        }
+        // 只换一格、不起任务：被顶替的旧任务（ConsoleGone 时挂着的那个）要先退干净，免得它的收尾摘掉新登记
+        if had_task {
+            for _ in 0..300 {
+                if old.has_exited() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
     }
     registry.restore(next.contract.clone());
     core.set_authority(&contract_id, next.authority.clone());
@@ -1061,12 +1263,21 @@ pub async fn host_reattach(
     }
     if drifted {
         h.set_notice(Some(drift_notice(&prev_tier)));
+    } else if partial {
+        h.set_notice(old.notice());
+    }
+    if partial {
+        let waiting = format!("已接上「{}」；还差 {}，全部接上后自动接着托管。", saved.label, still_missing.iter().map(|l| format!("「{l}」")).collect::<Vec<_>>().join("、"));
+        let n = h.notice().map_or(waiting.clone(), |n| format!("{n}\n{waiting}"));
+        h.set_notice(Some(n));
     }
     let c = h.ctx();
-    h.set_ctx(build_ctx(&app, &state, c.contract, c.authority, &c.label), None);
+    h.set_ctx(build_ctx(&app, &state, c.contract, c.authority, &c.label, &c.extra), None);
     state.act.host.register(Arc::clone(&h));
     h.announce();
-    spawn_resumed(app.clone(), h, had_task.then(|| Arc::clone(&old)));
+    if !partial {
+        spawn_resumed(app.clone(), h, had_task.then(|| Arc::clone(&old)));
+    }
     Ok(())
 }
 
@@ -1181,7 +1392,9 @@ fn spawn_resumed(app: AppHandle, h: Arc<HostShared>, old: Option<Arc<HostShared>
         let req = AgentRunRequest {
             session_id: h.console_id.clone(),
             question: c.contract.goal.clone(),
-            targets: vec![AgentTarget { id: h.console_id.clone(), label: c.label.clone(), cwd: h.saved_console().and_then(|c| c.cwd) }],
+            targets: std::iter::once(AgentTarget { id: h.console_id.clone(), label: c.label.clone(), cwd: h.saved_console().and_then(|c| c.cwd) })
+                .chain(c.extra.iter().map(|x| AgentTarget { id: x.console_id.clone(), label: x.label.clone(), cwd: x.cwd.clone() }))
+                .collect(),
             console_text: None,
             console_alt: false,
             mode: Some("steward".to_string()),
@@ -1253,7 +1466,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let (s, n) = (snap.clone(), notice.clone());
         std::thread::spawn(move || {
-            let st = status_of(&HostHandle::new("c1"), "t1", "目标", &s, &n, &HostPhase::Running);
+            let st = status_of(&HostHandle::new("c1"), "t1", "目标", &s, &n, &HostPhase::Running, |_| true);
             let _ = tx.send(st);
         });
         let st = rx
@@ -1555,5 +1768,116 @@ mod tests {
         let driving = HostPhase::UserDriving { resume_to: Box::new(running) };
         assert_eq!(control_target(&driving), Some(ControlState::Paused));
         assert_eq!(control_target(&HostPhase::Stopped), None);
+    }
+
+    // ——— 多终端 ———
+
+    /// 租约集合：任何一个被别的运行占着就一个都不拿、不签约；签约失败全部放回；结束时一次全放
+    #[test]
+    fn lease_set_is_all_or_nothing_and_released_together() {
+        let table = ControlTable::new();
+        let ids = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        table.acquire("B", "chat-run");
+        let mut signed = false;
+        let r = claim_all_then_sign(&table, &ids, "host:c1", || {
+            signed = true;
+            Ok(())
+        });
+        assert!(r.unwrap_err().contains("「B」"));
+        assert!(!signed, "没拿全就不签约");
+        assert!(table.holders_of("A").is_empty() && table.holders_of("C").is_empty(), "一个都没拿");
+        table.release_run("chat-run");
+
+        // 签约失败：已拿的全部放回
+        let r: Result<((), _), _> = claim_all_then_sign(&table, &ids, "host:c1", || Err("坏了".into()));
+        assert!(r.is_err());
+        assert!(ids.iter().all(|c| !control_owned(&table, c)));
+
+        // 成功：三个都拿到、都是 AgentDriving；任何一个上用户接管 → 暂停投影到全部；结束一次全放
+        let ((), changed) = claim_all_then_sign(&table, &ids, "host:c1", || Ok(())).unwrap();
+        assert_eq!(changed.len(), 3);
+        assert!(ids.iter().all(|c| table.state(c) == ControlState::AgentDriving));
+        assert_eq!(table.sessions_of("host:c1").len(), 3);
+        assert_eq!(table.pause_run("host:c1").len(), 3, "托管暂停 / 人在驾驶：每个终端都标 Paused");
+        assert_eq!(table.resume_run("host:c1").len(), 3);
+        assert_eq!(table.release_run("host:c1").len(), 3);
+        assert!(ids.iter().all(|c| !control_owned(&table, c)));
+    }
+
+    fn multi_cp(phase: HostPhase) -> HostCheckpoint {
+        let mut cp = saved_cp(phase, 1_000);
+        cp.extra = vec![saved_console("tab-b-old")];
+        cp.contract.extra_consoles = vec!["tab-b-old".into()];
+        cp
+    }
+
+    #[test]
+    fn pick_slot_prefers_requested_then_primary_then_first_missing() {
+        let cp = multi_cp(HostPhase::Running);
+        let none_alive = |_: &str| false;
+        assert_eq!(pick_slot(&cp, None, none_alive), "tab-old", "主终端优先");
+        assert_eq!(pick_slot(&cp, Some("tab-b-old".into()), none_alive), "tab-b-old");
+        assert_eq!(pick_slot(&cp, Some("bogus".into()), none_alive), "tab-old", "不是本次托管的终端：忽略");
+        assert_eq!(pick_slot(&cp, None, |id: &str| id == "tab-old"), "tab-b-old");
+    }
+
+    /// 重启后两个终端都不在：先接一个 → 只换那一格、仍挂起（模型一步也走不了）；接上最后一个才回到挂起前的相位
+    #[test]
+    fn partial_reattach_stays_suspended_until_last_slot() {
+        let now = 10_000;
+        let mut cp = multi_cp(HostPhase::WaitingHuman { card: ask_card() });
+        cp.suspend_for_restart();
+        let suspended = cp.phase.clone();
+        // 先接其余终端 B：主终端还不在、没屏幕可比 —— 不按漂移降档，只换这一格
+        let (next, fx, drifted) =
+            reattach_slot_plan(&cp, "tab-b-old", saved_console("tab-b-new"), None, now, true).unwrap();
+        assert!(!drifted && fx.is_empty());
+        assert_eq!(next.phase, suspended, "还差主终端：仍挂起");
+        assert_eq!(next.extra[0].console_id, "tab-b-new");
+        assert_eq!(next.contract.extra_consoles, vec!["tab-b-new".to_string()]);
+        assert_eq!(next.console.console_id, "tab-old");
+        assert_eq!(next.authority.tier, "auto");
+        // 再接主终端（最后一个）：屏幕一致 → 接着跑，回到等人卡
+        let (done, fx, drifted) =
+            reattach_slot_plan(&next, "tab-old", saved_console("tab-a-new"), Some("h-before"), now, false).unwrap();
+        assert!(!drifted);
+        assert_eq!(done.phase, HostPhase::WaitingHuman { card: ask_card() });
+        assert!(fx.iter().any(|e| matches!(e, super::super::host::phase::Effect::ForceScreen)));
+        assert_eq!(done.contract.console_id, "tab-a-new");
+        assert_eq!(done.consoles().map(|c| c.console_id.as_str()).collect::<Vec<_>>(), vec!["tab-a-new", "tab-b-new"]);
+    }
+
+    #[test]
+    fn partial_reattach_of_primary_with_drift_downgrades_but_stays_suspended() {
+        let mut cp = multi_cp(HostPhase::Running);
+        cp.suspend_for_restart();
+        let (next, fx, drifted) =
+            reattach_slot_plan(&cp, "tab-old", saved_console("tab-a-new"), Some("h-other"), 10_000, true).unwrap();
+        assert!(drifted && fx.is_empty());
+        assert_eq!(next.authority.tier, TIER_APPROVE);
+        assert!(matches!(next.phase, HostPhase::Suspended { .. }));
+        // 过期一样拒
+        let late = cp.saved_wall_ms + CHECKPOINT_TTL_MS + 1;
+        assert!(reattach_slot_plan(&cp, "tab-b-old", saved_console("x"), None, late, true).is_err());
+    }
+
+    #[test]
+    fn console_statuses_mark_primary_and_missing() {
+        let primary = saved_console("A");
+        let st = console_statuses(&primary, &[saved_console("B")], |id| id == "A");
+        assert_eq!(st.len(), 2);
+        assert!(st[0].primary && !st[0].missing);
+        assert!(!st[1].primary && st[1].missing);
+        assert_eq!(joined_label("web", &st[..1]), "web");
+        assert!(joined_label("web", &st).contains(" + "));
+    }
+
+    #[test]
+    fn terminals_section_only_for_multi() {
+        let mut ctx = HostCtx::bare("c1", "A", "g");
+        ctx.label = "server".into();
+        ctx.extra = vec![ConsoleRef { console_id: "B".into(), label: "client".into(), ..Default::default() }];
+        let s = terminals_section(&ctx);
+        assert!(s.contains("「server」（A，主终端）") && s.contains("「client」（B）") && s.contains("target"), "{s}");
     }
 }

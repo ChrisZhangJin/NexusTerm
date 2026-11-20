@@ -220,6 +220,7 @@ mod tests {
             ],
             yolo: false,
             criteria_confirmed: false,
+            extra_consoles: Vec::new(),
         }
     }
     fn item(id: &str, kind: &str, strength: &str, text: &str, extra: serde_json::Value) -> CtxItem {

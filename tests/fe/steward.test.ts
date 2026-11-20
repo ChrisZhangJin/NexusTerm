@@ -211,6 +211,12 @@ test("采集门控只认有契约的 console，去重", () => {
   });
   assert.deepEqual(stewardConsoleIds([]), []);
   assert.deepEqual(stewardConsoleIds([c("a", "tab-1"), c("b", "tab-2"), c("c", "tab-1")]), ["tab-1", "tab-2"]);
+  // 多终端托管：其余终端同样要上报屏幕帧
+  assert.deepEqual(stewardConsoleIds([{ ...c("m", "tab-1"), extraConsoles: ["tab-3", "tab-2"] }, c("b", "tab-2")]), [
+    "tab-1",
+    "tab-3",
+    "tab-2",
+  ]);
 });
 
 test("档位只换显示文字，值不变", () => {

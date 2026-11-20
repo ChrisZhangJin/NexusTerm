@@ -357,11 +357,11 @@ export const api = {
   hostConfirmCriteria: (contractId: string, cardId: string, checks: HostCheck[]) =>
     invoke<void>("host_confirm_criteria", { contractId, cardId, checks }),
   /** 「待重新接驳」卡的候选 tab（按相似度排好） */
-  hostReattachCandidates: (contractId: string, candidates: HostConsoleHint[]) =>
-    invoke<HostReattachCandidate[]>("host_reattach_candidates", { contractId, candidates }),
-  /** 确认接驳：接到某个 tab，或按保存的记录新开连接 */
-  hostReattach: (contractId: string, consoleId: string | null, openNew = false) =>
-    invoke<void>("host_reattach", { contractId, consoleId, openNew }),
+  hostReattachCandidates: (contractId: string, candidates: HostConsoleHint[], slot?: string | null) =>
+    invoke<HostReattachCandidate[]>("host_reattach_candidates", { contractId, candidates, slot: slot ?? null }),
+  /** 确认接驳：接到某个 tab，或按保存的记录新开连接。多终端托管用 `slot`（原来的 console id）指明接的是哪一个 */
+  hostReattach: (contractId: string, consoleId: string | null, openNew = false, slot?: string | null) =>
+    invoke<void>("host_reattach", { contractId, consoleId, openNew, slot: slot ?? null }),
   /** 改契约（目标 / 档位），不重启运行 */
   hostAmend: (contractId: string, goal?: string, authorityTier?: string, deny?: string[]) =>
     invoke<void>("host_amend", { contractId, goal: goal ?? null, authorityTier: authorityTier ?? null, deny: deny ?? null }),

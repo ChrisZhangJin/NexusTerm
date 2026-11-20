@@ -346,16 +346,16 @@ impl HostSupervisor {
         self.runs
             .lock()
             .values()
-            .find(|h| !h.is_terminal() && (h.run_id() == id || h.console_id == id))
+            .find(|h| !h.is_terminal() && (h.run_id() == id || h.owns(id)))
             .cloned()
     }
 
-    /// 这个 console 上有没有未结束的托管。
+    /// 这个 console 上有没有未结束的托管（多终端托管：它的任何一个终端都算）。
     pub fn live_on_console(&self, console_id: &str) -> Option<Arc<HostShared>> {
         self.runs
             .lock()
             .values()
-            .find(|h| !h.is_terminal() && h.console_id == console_id)
+            .find(|h| !h.is_terminal() && h.owns(console_id))
             .cloned()
     }
 

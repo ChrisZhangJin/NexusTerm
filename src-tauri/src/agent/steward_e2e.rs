@@ -154,7 +154,7 @@ fn e2e_a_question_answered_by_reflex_inside_host_task() {
     let ctx = hosted_ctx("c-a", "tab-1", "把 remember 检查关掉，最小改动", "auto");
     assert!(brain.match_playbook(&sit, &ctx.contract.host_key).is_none());
     assert!(
-        matches!(decide(None, &sit, &ctx, NOW), Reflex::Wake(_)),
+        matches!(decide(None, &sit, &ctx, &ctx.contract.console_id, NOW), Reflex::Wake(_)),
         "没有剧本 → 叫醒模型，绝不凭空编答案"
     );
 
@@ -173,7 +173,7 @@ fn e2e_a_question_answered_by_reflex_inside_host_task() {
     );
     let pb = brain.match_playbook(&sit, &ctx.contract.host_key);
     assert!(pb.is_some(), "剧本命中");
-    match decide(pb.clone(), &sit, &ctx, NOW + 200) {
+    match decide(pb.clone(), &sit, &ctx, &ctx.contract.console_id, NOW + 200) {
         Reflex::Answer { bytes, keys, record, playbook_id, .. } => {
             assert_eq!(playbook_id, "pb-remember");
             assert!(bytes.starts_with(b"2"), "选编号而不是整段文本：{bytes:?}");
@@ -191,7 +191,7 @@ fn e2e_a_question_answered_by_reflex_inside_host_task() {
 
     // 同一个剧本在「确认」档下：托管闸门不直接放行 → 叫醒模型走审批，不代答
     let strict = hosted_ctx("c-a", "tab-1", "目标", "approve");
-    assert!(matches!(decide(pb, &sit, &strict, NOW + 300), Reflex::Wake(_)));
+    assert!(matches!(decide(pb, &sit, &strict, &strict.contract.console_id, NOW + 300), Reflex::Wake(_)));
 }
 
 // ───────────── 场景 B：永久扩权选项无论哪条路径都不会被自动选中 ─────────────
@@ -214,7 +214,7 @@ fn e2e_b_permanent_grant_option_is_never_auto_selected() {
     let pb = brain.match_playbook(&sit, &ctx.contract.host_key);
     assert!(pb.is_some());
     assert!(
-        matches!(decide(pb, &sit, &ctx, NOW), Reflex::Wake(_)),
+        matches!(decide(pb, &sit, &ctx, &ctx.contract.console_id, NOW), Reflex::Wake(_)),
         "选永久扩权项不许代答"
     );
 
@@ -251,7 +251,7 @@ fn e2e_c_password_prompt_is_secret_channel_only() {
         json!({ "matchKind": "password", "answer": "hunter2", "enabled": true }),
     );
     let pb = brain.match_playbook(&sit, &ctx.contract.host_key);
-    assert!(matches!(decide(pb, &sit, &ctx, NOW), Reflex::Wake(_)));
+    assert!(matches!(decide(pb, &sit, &ctx, &ctx.contract.console_id, NOW), Reflex::Wake(_)));
 
     // 模型路径：在密码屏上发可见字符 = 拒绝；只能走 nx_secret（用户本人输入）
     let g = authorize(&ctx.policy(), &keys("hunter2<Enter>"), Some(&sit));

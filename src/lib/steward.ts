@@ -63,6 +63,8 @@ export interface StewardContract {
   intentIds: string[];
   timeboxMs: number;
   createdAt: number;
+  /** 多终端托管：主终端之外一并操作的终端 */
+  extraConsoles?: string[];
 }
 
 // ————————————————————————— P1 常驻循环 —————————————————————————
@@ -398,7 +400,7 @@ export const contractStatusLabel = (s: string): string => CONTRACT_STATUS_LABELS
 
 /** 当前有托管契约的 console —— 只有它们需要屏幕帧 / 心跳上报 */
 export const stewardConsoleIds = (contracts: StewardContract[]): string[] => [
-  ...new Set(contracts.map((c) => c.consoleId)),
+  ...new Set(contracts.flatMap((c) => [c.consoleId, ...(c.extraConsoles ?? [])])),
 ];
 
 /** 表单里逗号 / 分号分隔的列表，供 intent.constraints 与 knowledge.tags 使用。 */

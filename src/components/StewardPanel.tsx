@@ -171,6 +171,8 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
   /** 选中的那个终端的托管（别的终端上的托管不影响这里能不能开始） */
   const run = runFor(selected);
   const [goal, setGoal] = useState("");
+  /** 多终端托管：主终端（选中的这个）之外一并交给 AI 的终端 */
+  const [extra, setExtra] = useState<string[]>([]);
   /** 开始表单上的档位（预设）；用户选的记在本地，下次沿用 */
   const [tier, setTier] = useState<StewardTier>(readTierPref);
   const chooseTier = (t: StewardTier) => {
@@ -323,6 +325,16 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
   const contractId = contract?.id ?? null;
 
   const label = (id: string) => sessions?.find((s) => s.id === id)?.label ?? id;
+  /** 可以一并交给这次托管的其余终端：开着的、不是主终端、没有在别的托管里 */
+  const extraOptions = (sessions ?? []).filter((s) => {
+    if (s.id === selected) return false;
+    const h = run.hostFor(s.id);
+    return !h || isTerminal(h.phase);
+  });
+  /** 勾选里仍然可选的那些（标签关了 / 被别的托管占了 / 换成了主终端的自动剔掉） */
+  const extraChosen = extra.filter((id) => extraOptions.some((o) => o.id === id));
+  const toggleExtra = (id: string, on: boolean) =>
+    setExtra((l) => (on ? (l.includes(id) ? l : [...l, id]) : l.filter((x) => x !== id)));
   /** 契约 id 人看不懂；换成它所属终端的名字 */
   const contractName = (cid: string) => {
     const consoleId = contracts.find((c) => c.id === cid)?.consoleId;
@@ -391,7 +403,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
     if (!selected || !goal.trim() || busy || run.active || run.otherBusy || !run.ready) return;
     setBusy(true);
     try {
-      await run.start(selected, goal.trim(), budgetPref, tier, yolo, { deny });
+      await run.start(selected, goal.trim(), budgetPref, tier, yolo, { deny, extra: extraChosen });
       await refresh();
     } finally {
       setBusy(false);
@@ -469,7 +481,8 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
   };
 
   /** 托管那一轮发起在当前选中的终端上：实况与控制键才在这里显示 */
-  const runHere = run.session !== null && run.session === selected;
+  // 多终端托管：实况在主终端的频道上，选中其余终端时 session 是主终端 id，同样算「这里的托管」
+  const runHere = run.session !== null;
   const promptsPending = runHere ? pendingPrompts(run.messages) : 0;
   /** 选中终端上的托管任务（含刚结束的结局） */
   const selectedHost = selected ? run.hostFor(selected) : null;
@@ -580,6 +593,32 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
             placeholder="写下要它完成的事，例如：把 /srv/app 的依赖升级后跑完测试并汇报；或：盯着这个安装脚本跑完，遇到确认就替我答"
             rows={3}
           />
+          {extraOptions.length > 0 && (
+            <details className="hc-more hc-extra" open={extraChosen.length > 0}>
+              <summary
+                title="目标要跨几台机器时（例如在 A 上搭代理、再从 B 上测试），把其余终端也勾上：它们一起交给 AI、一起只读锁定，你在其中任何一个上动手，整个托管都会让路"
+              >
+                同时操作的终端（可选）
+                <span className="st-meta">
+                  {extraChosen.length > 0 ? ` · 主终端「${label(selected)}」+ ${extraChosen.map((id) => `「${label(id)}」`).join("")}` : " · 只操作这一个"}
+                </span>
+              </summary>
+              <div className="hc-settings-body">
+                {extraOptions.map((o) => (
+                  <label key={o.id} className="st-meta hc-row">
+                    <input
+                      type="checkbox"
+                      checked={extraChosen.includes(o.id)}
+                      disabled={busy}
+                      onChange={(e) => toggleExtra(o.id, e.target.checked)}
+                    />
+                    {o.label}
+                  </label>
+                ))}
+                <div className="hc-hint">AI 默认在主终端上动手，要操作其余终端时会指明是哪一个；完成判据在主终端上核验。</div>
+              </div>
+            </details>
+          )}
           <div className="hc-presets" role="radiogroup" aria-label="放手程度">
             {HOST_PRESETS.map((p) => (
               <button

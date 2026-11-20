@@ -3259,8 +3259,9 @@ pub(super) async fn gate_drive(
         if let Some(st) = runtime.control.acquire(target, &run) {
             emit_control(app, target, &[run.clone()], st);
         }
-        let console = h.console_id.clone();
-        let alive = || app.try_state::<AppState>().map_or(true, |st| session_alive(&st, &console));
+        // 多终端托管：任何一个终端不在就挂起（ConsoleGone），全部回来才接着写
+        let consoles = h.consoles();
+        let alive = || app.try_state::<AppState>().map_or(true, |st| consoles.iter().all(|c| session_alive(&st, c)));
         let ok = h.gate(|| runtime.control.state(target) == ControlState::Paused, alive).await;
         return if ok && !cancel.load(Ordering::Relaxed) {
             control::PauseWait::Ready
@@ -3843,7 +3844,9 @@ pub async fn run(
             }
             // 重启 / 换 console 接驳后的第一步：先读屏核对现场（结果并进这一步的反馈）
             if h.take_force_screen() {
-                feedback.push_str(&reattach_screen_feedback(&situation_now(app, state, &h.console_id, false)));
+                for c in h.consoles() {
+                    feedback.push_str(&hosted_screen_feedback(app, state, h, &c));
+                }
             }
             // 重启前挂着的审批卡在重启后被答了：等它的那次写入已经不在了，告诉模型结论让它重发
             for (_, ok) in h.take_stale_approvals() {
@@ -3854,12 +3857,15 @@ pub async fn run(
                 });
             }
             // 断线后很快又连上了（没赶上被判成 ConsoleGone）：同一个 tab，但已经是新的 shell —— 告诉模型、强制读屏
-            if h.note_reconnect() {
+            let reconnected = h.note_reconnect();
+            if !reconnected.is_empty() {
                 push_user(&mut messages, super::host::phase::RECONNECT_NOTE.to_string());
-                feedback.push_str(&reattach_screen_feedback(&situation_now(app, state, &h.console_id, false)));
+                for c in &reconnected {
+                    feedback.push_str(&hosted_screen_feedback(app, state, h, c));
+                }
             }
-            // 托管的 console 没了（tab 关了）：挂起（ConsoleGone），不再请模型往一个不存在的终端写
-            if !session_alive(state, &h.console_id) && {
+            // 托管的 console 没了（tab 关了；多终端：任何一个）：挂起（ConsoleGone），不再请模型往一个不存在的终端写
+            if h.consoles().iter().any(|c| !session_alive(state, c)) && {
                 h.flush_progress(&messages, step);
                 h.console_gone()
             } {
@@ -4275,8 +4281,8 @@ pub async fn run(
             // 托管：没有动作的回复不是结束，按 nx_ask_user(text) 处理 —— 挂起等用户答复
             if let Some(h) = &host {
                 // 看门狗：这一轮没有动作（只说话）。连续几轮这样就是空转（Thrash），提示跟着用户的答复一起给模型
-                let sit = situation_now(app, state, &h.console_id, false);
-                let obs = super::host::watchdog::StepObs { action_fp: 0, sig: sit.signature.clone(), fb_hash: fnv(&text), acted: false };
+                let (sig, _) = hosted_signature(app, state, h);
+                let obs = super::host::watchdog::StepObs { action_fp: 0, sig, fb_hash: fnv(&text), acted: false };
                 if let Some((alarm, _)) = h.watch_step(obs) {
                     feedback.push_str(&alarm.hint());
                     feedback.push('\n');
@@ -4387,11 +4393,53 @@ pub async fn run(
             if let Some(h) = &host {
                 if let Some((kind, text)) = super::host::record::describe_write(&action) {
                     let ctx = h.ctx();
+                    // 这次写落在哪个终端（多终端托管：模型用 target 指明，不写就是主终端）；nx_open 不落在已有终端上
+                    let write_tid = hosted_write_console(&action, &targets, &session);
+                    // 不在本次托管里的终端：先于契约的其余判断（一般档位直接拒；YOLO 按越过契约问人）
+                    if let Some(tid) = write_tid.as_deref().filter(|t| !h.may_write(t)) {
+                        let label = targets.iter().find(|t| t.id == tid).map(|t| t.label.clone()).unwrap_or_else(|| out_of_scope_label(tid));
+                        let g = ctx.out_of_run(&label);
+                        let reasons = match &g {
+                            Gate::Deny(why) => vec![why.clone()],
+                            Gate::Approve(r) => r.clone(),
+                            _ => Vec::new(),
+                        };
+                        emit_step(
+                            app,
+                            &session,
+                            StepPayload {
+                                target: Some(tid.to_string()),
+                                command: Some(super::redact::redact(&text)),
+                                reasons: Some(reasons.clone()),
+                                gate_verdict: Some(if matches!(g, Gate::Deny(_)) { "refused" } else { "approve" }),
+                                ..StepPayload::new("gate", step)
+                            },
+                        );
+                        let refused = match g {
+                            Gate::Deny(why) => Some(why),
+                            _ => {
+                                h.flush_progress(&messages, step);
+                                let ok = h.approve(hosted_approval_card(&text, &reasons)).await;
+                                (!ok).then(|| "用户没有批准往不在本次托管里的终端写，没有写入".to_string())
+                            }
+                        };
+                        for u in h.take_user() {
+                            push_user(&mut messages, u);
+                        }
+                        if let Some(why) = refused {
+                            feedback.push_str(&format!("「{text}」没有执行：{why}\n"));
+                            continue;
+                        }
+                        // YOLO 下人批准了这一次：并入本轮范围，下面的分支不再弹一次越界确认
+                        admit(&mut targets, tid, &label);
+                    }
+                    // 被写的终端：契约的主机范围、屏幕相关的判断都按它（不是主终端）
+                    let write_console = write_tid.clone().unwrap_or_else(|| h.console_id.clone());
                     // 门禁卡要的现场：动作落在哪个终端、当时的屏幕帧（「这是误判」存样本用）
                     let mut seen: Option<(String, Option<super::steward::ScreenSnapshot>)> = None;
                     let sit = match &action {
-                        AgentAction::Keys { target, .. } | AgentAction::Exec { target, .. } => {
-                            let tid = locate(target.as_deref(), &targets, &session).map(|(i, _)| i).unwrap_or_else(|i| i);
+                        AgentAction::Keys { .. } | AgentAction::Exec { .. } => {
+                            let tid = write_console.clone();
                             let s = situation_now(app, state, &tid, false);
                             let frame = fresh_frame(app, &tid);
                             seen = Some((tid, frame));
@@ -4399,9 +4447,10 @@ pub async fn run(
                         }
                         _ => None,
                     };
+                    let policy = ctx.policy_for(&write_console);
                     let gate_card = |g: &Gate, vouched: bool| {
-                        if let Some(ex) = super::host::gate::explain_vouched(&ctx.policy(), &action, sit.as_ref(), g, vouched) {
-                            let console = seen.as_ref().map_or(h.console_id.as_str(), |(t, _)| t.as_str());
+                        if let Some(ex) = super::host::gate::explain_vouched(&policy, &action, sit.as_ref(), g, vouched) {
+                            let console = seen.as_ref().map_or(write_console.as_str(), |(t, _)| t.as_str());
                             let frame = seen.as_ref().and_then(|(_, f)| f.as_ref());
                             let shown = super::host::gate::shown_write(&action, &text, sit.as_ref());
                             emit_gate(app, &session, step, h, console, &shown, ex, sit.as_ref(), frame);
@@ -4413,7 +4462,7 @@ pub async fn run(
                     let (verdict, refused) = if matches!(action, AgentAction::File(_)) {
                         (Gate::Allow, None)
                     } else {
-                        hosted_authorize(h, &ctx, &action, &text, sit.as_ref(), gate_card, || h.flush_progress(&messages, step)).await
+                        hosted_authorize(h, &ctx, &write_console, &action, &text, sit.as_ref(), gate_card, || h.flush_progress(&messages, step)).await
                     };
                     for u in h.take_user() {
                         push_user(&mut messages, u);
@@ -4433,7 +4482,7 @@ pub async fn run(
                         feedback.push_str(&format!("「{text}」没有执行：{why}\n"));
                         continue;
                     }
-                    host_write = Some(HostWrite { kind, text, gate: verdict, sit, rationale: reply.text.clone() });
+                    host_write = Some(HostWrite { kind, text, gate: verdict, sit, rationale: reply.text.clone(), console: write_console });
                 }
             }
             // 一轮内的多个动作共用同一个 step 号：UI 按 step 折叠，同一步归在一张卡里
@@ -4470,7 +4519,7 @@ pub async fn run(
                         .iter()
                         .find(|t| t.id == target_id)
                         .and_then(|t| t.cwd.clone())
-                        .or_else(|| host.as_ref().filter(|h| h.console_id == target_id).and_then(|h| h.saved_console()).and_then(|c| c.cwd));
+                        .or_else(|| host.as_ref().and_then(|h| h.saved_console_of(&target_id)).and_then(|c| c.cwd));
                     if let Err(why) = call.absolutize(cwd.as_deref()) {
                         emit_step(app, &session, StepPayload { command: Some(summary.clone()), reasons: Some(vec![why.clone()]), ..StepPayload::new("skip", step) });
                         feedback.push_str(&format!("{why}\n"));
@@ -4742,7 +4791,7 @@ pub async fn run(
                         .iter()
                         .find(|t| t.id == target_id)
                         .and_then(|t| t.cwd.clone())
-                        .or_else(|| host.as_ref().filter(|h| h.console_id == target_id).and_then(|h| h.saved_console()).and_then(|c| c.cwd));
+                        .or_else(|| host.as_ref().and_then(|h| h.saved_console_of(&target_id)).and_then(|c| c.cwd));
                     let fetched: Result<(RevealSource, String), RevealErr> = match &source {
                         RevealSource::Path(p) => match super::files_tool::absolutize(p, cwd.as_deref()) {
                             Err(why) => Err(RevealErr::File(why)),
@@ -4876,7 +4925,7 @@ pub async fn run(
                         .iter()
                         .find(|t| t.id == target_id)
                         .and_then(|t| t.cwd.clone())
-                        .or_else(|| host.as_ref().filter(|h| h.console_id == target_id).and_then(|h| h.saved_console()).and_then(|c| c.cwd));
+                        .or_else(|| host.as_ref().and_then(|h| h.saved_console_of(&target_id)).and_then(|c| c.cwd));
                     let secs = run_timeout(timeout_secs);
                     let card_label = format!("{label} · 旁路");
                     emit_step(
@@ -6262,6 +6311,10 @@ pub async fn run(
                             host_did!();
                             // 人点过头的新会话并入范围：之后对它 exec / tab 不再重复弹窗。
                             admit(&mut targets, &outcome.session_id, &outcome.label);
+                            // 托管：本次运行自己新开的会话可以写（按主终端的契约判）
+                            if let Some(h) = &host {
+                                h.note_opened(&outcome.session_id);
+                            }
                             // 成功也要补一条：前端确实会接出标签页，但那张卡片
                             // 留在「正在打开」上会让人以为它还没完成。
                             emit_step(
@@ -6311,10 +6364,10 @@ pub async fn run(
             h.tick_progress(&messages, step);
             // 看门狗：每步喂一次观察。L1 往反馈里加提示；L2 强制出卡（附最近 5 条决策记录）
             if !finished && !h.is_terminal() {
-                let sit = situation_now(app, state, &h.console_id, false);
+                let (sig, screen_hash) = hosted_signature(app, state, h);
                 // nx_watch 一挂就是几分钟，反馈里的计时每次都不同：只有屏幕真变了才算进展
-                let fb_hash = if round_all_watch { fnv(&sit.screen_hash) } else { fnv(&feedback) };
-                let obs = super::host::watchdog::StepObs { action_fp: round_fp, sig: sit.signature.clone(), fb_hash, acted: true };
+                let fb_hash = if round_all_watch { fnv(&screen_hash) } else { fnv(&feedback) };
+                let obs = super::host::watchdog::StepObs { action_fp: round_fp, sig, fb_hash, acted: true };
                 if let Some((alarm, level)) = h.watch_step(obs) {
                     if !watchdog_react(app, state, h, &session, step, &alarm, level, &mut messages, &mut feedback).await {
                         break;
@@ -6612,6 +6665,8 @@ struct HostWrite {
     sit: Option<super::situation::Situation>,
     /// 模型这一轮的说明，作为决策理由
     rationale: String,
+    /// 写在哪个终端（多终端托管：决策记录按它记）
+    console: String,
 }
 
 /// `nx://host/{contract_id}/notify` 的载荷：Notify 档写入后的通知卡。
@@ -7318,11 +7373,15 @@ async fn try_reflex(
     sit: &super::situation::Situation,
     cancel: &AtomicBool,
 ) -> Option<Reflexed> {
+    // 多终端托管：只替本次托管的终端代答（不在里面的交给模型，走「不在本次托管里」那道闸）
+    if !h.may_write(target) {
+        return None;
+    }
     let brain = app.try_state::<super::profile::StewardBrain>()?;
     let ctx = h.ctx();
-    let playbook = brain.match_playbook(sit, &ctx.contract.host_key);
+    let playbook = brain.match_playbook(sit, &ctx.policy_for(target).host_key);
     let super::host::reflex::Reflex::Answer { bytes, keys, record, playbook_id, notify } =
-        super::host::reflex::decide(playbook, sit, &ctx, super::steward::now_ms())
+        super::host::reflex::decide(playbook, sit, &ctx, target, super::steward::now_ms())
     else {
         return None;
     };
@@ -7376,6 +7435,24 @@ async fn try_reflex(
 }
 
 /// 接驳后强制读屏的结果（喂给模型）。屏幕尾部已脱敏（出网前还会再过一遍闸门）。
+/// 多终端托管读屏反馈：单终端与原来一字不差；多终端在前面标上是哪个终端。
+fn hosted_screen_feedback(app: &AppHandle, state: &AppState, h: &HostShared, console: &str) -> String {
+    let fb = reattach_screen_feedback(&situation_now(app, state, console, false));
+    if h.extra.is_empty() {
+        return fb;
+    }
+    let label = h.ctx().label_of(console).unwrap_or_else(|| console.to_string());
+    format!("【终端「{label}」（{console}）】{fb}")
+}
+
+/// 看门狗用的局面签名：多终端托管把每个终端的签名拼起来（任何一个终端有进展都算进展）。
+fn hosted_signature(app: &AppHandle, state: &AppState, h: &HostShared) -> (String, String) {
+    let sits: Vec<_> = h.consoles().iter().map(|c| situation_now(app, state, c, false)).collect();
+    let sig = sits.iter().map(|s| s.signature.as_str()).collect::<Vec<_>>().join("|");
+    let hash = sits.iter().map(|s| s.screen_hash.as_str()).collect::<Vec<_>>().join("|");
+    (sig, hash)
+}
+
 fn reattach_screen_feedback(sit: &super::situation::Situation) -> String {
     format!(
         "（接驳后读屏）当前局面：kind={} program={}\n屏幕尾部：\n{}\n请先核对这是不是断线 / 重启前的现场，再决定下一步。\n",
@@ -7444,11 +7521,34 @@ fn file_approval_kind(req: &super::files_tool::WriteApproval) -> &'static str {
     }
 }
 
+/// 托管写入落在哪个终端：`Some(target)`（`None` = 没写 target，落在主终端）；不落在已有终端上的写入
+/// （nx_open 新开会话）返回 `None`。与 `record::describe_write` 认的写入一一对应。
+fn hosted_write_target(a: &AgentAction) -> Option<Option<&str>> {
+    match a {
+        AgentAction::Exec { target, .. }
+        | AgentAction::Run { target, .. }
+        | AgentAction::Keys { target, .. }
+        | AgentAction::Secret { target, .. }
+        | AgentAction::Skill { target, .. }
+        | AgentAction::Reveal { target, .. }
+        | AgentAction::Tab { target, .. } => Some(target.as_deref()),
+        AgentAction::File(call) => Some(call.target()),
+        _ => None,
+    }
+}
+
+/// 托管写入落在的终端 id（不写 target = 发起会话，即主终端）。屏幕相关的判断（门禁的密码 / 授权框标签、
+/// 「这是误判」担保、写前复核）与主机范围都按它，不按主终端。
+fn hosted_write_console(a: &AgentAction, targets: &[AgentTarget], session: &str) -> Option<String> {
+    hosted_write_target(a).map(|t| locate(t, targets, session).map(|(i, _)| i).unwrap_or_else(|i| i))
+}
+
 /// 托管写入的强制点：`gate::authorize` 一次；Approve 就挂起等批准（不设超时）。
 /// 返回 (结论, 拒绝原因)：拒绝原因有值 = 不写，把它反馈给模型。
 async fn hosted_authorize(
     h: &HostShared,
     ctx: &super::host::HostCtx,
+    console: &str,
     action: &AgentAction,
     text: &str,
     sit: Option<&super::situation::Situation>,
@@ -7457,8 +7557,9 @@ async fn hosted_authorize(
 ) -> (Gate, Option<String>) {
     // 「这是误判」担保过这一屏：这次按键不按屏幕推底线标签（一次性，任何按键写入都会用掉它）
     let vouched = matches!(action, AgentAction::Keys { .. })
-        && sit.is_some_and(|s| h.vouch.take(&s.screen_hash, std::time::Instant::now()));
-    let verdict = super::host::gate::authorize_vouched(&ctx.policy(), action, sit, vouched);
+        && sit.is_some_and(|s| h.vouch.take(console, &s.screen_hash, std::time::Instant::now()));
+    // 主机范围按被写的那个终端判（多终端托管）；`sit` 也是调用方按它读的屏
+    let verdict = super::host::gate::authorize_vouched(&ctx.policy_for(console), action, sit, vouched);
     // 拒绝 / 要批准：先在实况里发门禁卡（Notify 等写成功后在 `hosted_applied` 发）
     if matches!(verdict, Gate::Deny(_) | Gate::Approve(_)) {
         gate_card(&verdict, vouched);
@@ -7482,7 +7583,7 @@ fn hosted_applied(app: &AppHandle, h: &HostShared, session: &str, step: usize, w
     let ctx = h.ctx();
     let now = super::steward::now_ms();
     let rec = super::host::record::hosted_decision(
-        &ctx, &h.console_id, w.kind, &w.text, &w.rationale, &w.gate, w.sit.as_ref(), now,
+        &ctx, &w.console, w.kind, &w.text, &w.rationale, &w.gate, w.sit.as_ref(), now,
     );
     let seq = super::host::record::persist(app, &rec);
     if let Some(brain) = app.try_state::<super::profile::StewardBrain>() {
@@ -7898,10 +7999,10 @@ mod tests {
         let (h, io) = super::super::host::driver::tests::shared();
         let mut ctx = ctx_with("auto");
         ctx.authority.deny = vec!["delete".into(), "shutdown".into()];
-        let (g, why) = hosted_authorize(&h, &ctx, &exec("rm -rf build"), "rm -rf build", None, |_, _| {}, || {}).await;
+        let (g, why) = hosted_authorize(&h, &ctx, "t1", &exec("rm -rf build"), "rm -rf build", None, |_, _| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(_)) && why.is_some());
         let keys = AgentAction::Keys { target: None, keys: "sudo shutdown -h now<Enter>".into() };
-        let (g, why) = hosted_authorize(&h, &ctx, &keys, "keys", None, |_, _| {}, || {}).await;
+        let (g, why) = hosted_authorize(&h, &ctx, "t1", &keys, "keys", None, |_, _| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(_)) && why.unwrap().contains("shutdown"));
         // 拒绝不出卡、不挂起：相位一直是 Running，也没有任何迁移
         assert_eq!(h.phase(), HostPhase::Running);
@@ -7916,7 +8017,7 @@ mod tests {
         let ctx = ctx_with("approve");
         let h2 = h.clone();
         let c2 = ctx.clone();
-        let task = tokio::spawn(async move { hosted_authorize(&h2, &c2, &exec("ls"), "ls", None, |_, _| {}, || {}).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h2, &c2, "t1", &exec("ls"), "ls", None, |_, _| {}, || {}).await });
         settle().await;
         let card_id = match h.phase() {
             HostPhase::WaitingHuman { card } => {
@@ -7935,7 +8036,7 @@ mod tests {
 
         // 拒绝 → 不写
         let h3 = h.clone();
-        let task = tokio::spawn(async move { hosted_authorize(&h3, &ctx, &exec("ls"), "ls", None, |_, _| {}, || {}).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h3, &ctx, "t1", &exec("ls"), "ls", None, |_, _| {}, || {}).await });
         settle().await;
         let card_id = match h.phase() {
             HostPhase::WaitingHuman { card } => card.id,
@@ -7965,9 +8066,9 @@ mod tests {
         };
         ctx.hard = super::super::host::gate::HardRule::from_prefs(&[pref]);
         assert_eq!(ctx.hard.len(), 1);
-        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout main"), "x", None, |_, _| {}, || {}).await;
+        let (g, _) = hosted_authorize(&h, &ctx, "t1", &exec("git checkout main"), "x", None, |_, _| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(ref w) if w.contains("p-main")), "{g:?}");
-        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout dev"), "x", None, |_, _| {}, || {}).await;
+        let (g, _) = hosted_authorize(&h, &ctx, "t1", &exec("git checkout dev"), "x", None, |_, _| {}, || {}).await;
         assert_eq!(g, Gate::Allow);
     }
 
@@ -7977,12 +8078,12 @@ mod tests {
         let mut ctx = ctx_with("auto");
         ctx.authority.host_scope = vec!["ssh:prod-db".into()];
         // 被托管的是 local:t1，不在契约的主机范围里
-        let (g, why) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None, |_, _| {}, || {}).await;
+        let (g, why) = hosted_authorize(&h, &ctx, "t1", &exec("uptime"), "uptime", None, |_, _| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(_)), "{g:?}");
         assert!(why.is_some());
         // 认不出主机（host_key 为空）同样拒
         ctx.contract.host_key = String::new();
-        let (g, _) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None, |_, _| {}, || {}).await;
+        let (g, _) = hosted_authorize(&h, &ctx, "t1", &exec("uptime"), "uptime", None, |_, _| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(_)));
     }
 
@@ -8011,7 +8112,7 @@ mod tests {
         let judged = screen(K::AwaitingInput, "Input: ");
         let keys = AgentAction::Keys { target: None, keys: "ls<Enter>".into() };
         let (h2, j2, k2) = (h.clone(), judged.clone(), keys.clone());
-        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, &k2, "ls", Some(&j2), |_, _| {}, || {}).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, "t1", &k2, "ls", Some(&j2), |_, _| {}, || {}).await });
         settle().await;
         let card_id = match h.phase() {
             HostPhase::WaitingHuman { card } => card.id,
@@ -8027,6 +8128,58 @@ mod tests {
         assert!(why.contains("等待期间屏幕局面变了"));
         // 局面没变则照发
         assert!(keys_recheck(&judged, &judged.clone()).is_none());
+    }
+
+    /// 多终端托管：发给 B 的按键按 **B 的屏幕**判（B 停在密码提示 → 拒；同样的按键发给 A 的 shell 不按密码拒），
+    /// 「这是误判」的担保也只对担保的那个终端有效
+    #[tokio::test(start_paused = true)]
+    async fn keys_to_b_are_judged_by_b_screen() {
+        use super::super::situation::SituationKind as K;
+        let (h, _io) = super::super::host::driver::tests::shared_multi("c1", "A", &["B"]);
+        let mut ctx = ctx_with("auto");
+        ctx.contract.console_id = "A".into();
+        ctx.extra = vec![super::super::host::ConsoleRef { console_id: "B".into(), label: "client".into(), host_key: "local:B".into(), ..Default::default() }];
+        let targets = vec![
+            AgentTarget { id: "A".into(), label: "server".into(), cwd: None },
+            AgentTarget { id: "B".into(), label: "client".into(), cwd: None },
+        ];
+        let screens: std::collections::HashMap<&str, super::super::situation::Situation> =
+            [("A", screen(K::AwaitingInput, "Input: ")), ("B", screen(K::Password, "Password: "))].into_iter().collect();
+
+        let to_b = AgentAction::Keys { target: Some("B".into()), keys: "hunter2<Enter>".into() };
+        let tid = hosted_write_console(&to_b, &targets, "A").unwrap();
+        assert_eq!(tid, "B", "按 target 落到 B，不是主终端");
+        let (g, why) = hosted_authorize(&h, &ctx, &tid, &to_b, "k", Some(&screens[tid.as_str()]), |_, _| {}, || {}).await;
+        assert!(matches!(&g, Gate::Deny(t) if t.contains("密码")), "{g:?}");
+        assert!(why.is_some());
+
+        // 同样的按键不写 target → 主终端 A（不是密码提示）：不按密码拒
+        let to_a = AgentAction::Keys { target: None, keys: "hunter2<Enter>".into() };
+        let tid = hosted_write_console(&to_a, &targets, "A").unwrap();
+        assert_eq!(tid, "A");
+        let (g, _) = hosted_authorize(&h, &ctx, &tid, &to_a, "k", Some(&screens[tid.as_str()]), |_, _| {}, || {}).await;
+        assert!(!matches!(&g, Gate::Deny(t) if t.contains("密码")), "{g:?}");
+
+        // 担保的是 A 上的这一屏：B 碰巧同一指纹也不放行
+        let b_hash = screens["B"].screen_hash.clone();
+        assert!(h.vouch.set("A", &b_hash, std::time::Instant::now()));
+        let (g, _) = hosted_authorize(&h, &ctx, "B", &to_b, "k", Some(&screens["B"]), |_, _| {}, || {}).await;
+        assert!(matches!(g, Gate::Deny(_)), "{g:?}");
+        // 担保 B 这一屏：放过密码标签这一次
+        assert!(h.vouch.set("B", &b_hash, std::time::Instant::now()));
+        let (g, _) = hosted_authorize(&h, &ctx, "B", &to_b, "k", Some(&screens["B"]), |_, _| {}, || {}).await;
+        assert!(!matches!(&g, Gate::Deny(t) if t.contains("密码提示")), "{g:?}");
+    }
+
+    #[test]
+    fn hosted_write_target_covers_targeted_writes() {
+        let targets = vec![AgentTarget { id: "A".into(), label: "a".into(), cwd: None }];
+        let exec = AgentAction::Exec { target: Some("Z".into()), command: "ls".into() };
+        assert_eq!(hosted_write_console(&exec, &targets, "A").as_deref(), Some("Z"), "范围外的 id 原样交出去，由「不在本次托管里」拦");
+        let open = AgentAction::Open { kind: OpenKind::Local, label: None, command: None };
+        assert_eq!(hosted_write_console(&open, &targets, "A"), None, "新开会话不落在已有终端上");
+        let secret = AgentAction::Secret { target: None, reason: None };
+        assert_eq!(hosted_write_console(&secret, &targets, "A").as_deref(), Some("A"));
     }
 
     // ——— PR7：判据核验 / 看门狗 ———
@@ -8675,7 +8828,7 @@ mod tests {
         let (h, _io) = super::super::host::driver::tests::shared();
         let ctx = ctx_with("approve");
         let h2 = h.clone();
-        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, &exec("make install"), "make install", None, |_, _| {}, || {}).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, "t1", &exec("make install"), "make install", None, |_, _| {}, || {}).await });
         settle().await;
         match h.phase() {
             HostPhase::WaitingHuman { card } => assert!(card.reasons.iter().any(|r| r == CWD_NOTE), "{:?}", card.reasons),

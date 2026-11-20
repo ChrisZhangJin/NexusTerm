@@ -430,6 +430,13 @@ export function AgentPanel({
         consoleRef: sessions.find((x) => x.id === sid)?.hint,
         deny: opts?.deny,
         followUp: opts?.followUp,
+        // 多终端托管：其余终端（同样带重启后找回用的线索）
+        extraConsoles: opts?.extra?.length
+          ? opts.extra.map((id) => {
+              const t = sessions.find((x) => x.id === id);
+              return t?.hint ?? { consoleId: id, label: t?.label ?? id };
+            })
+          : undefined,
       });
       // 契约已签：马上让前端开始为这个终端上报屏幕帧（不等托管页的轮询）
       void reconcileStewardConsoles();
@@ -497,9 +504,11 @@ export function AgentPanel({
     const hosted = hostRuns.forConsole(cid);
     const hostedLive = !!hosted && !isTerminal(hosted.phase);
     const hostedBase = hosted ? basePhase(hosted.phase) : null;
-    const feed = hostFeeds.feed(cid);
+    // 实况按托管走（发在主终端的频道上）：多终端托管在它的任何一个终端上看到的都是同一份
+    const feedId = hosted?.consoleId ?? cid;
+    const feed = hostFeeds.feed(feedId);
     return {
-      session: hosted || feed.messages.length > 0 ? cid : null,
+      session: hosted || feed.messages.length > 0 ? feedId : null,
       active: hostedLive,
       // 只有同一个终端上正跑着一轮对话 / 技能才挡（别的终端上的不相干）
       otherBusy: run.anyBusy && runSession === cid,
@@ -515,7 +524,7 @@ export function AgentPanel({
         if (hosted) await hostAct(() => api.hostStop(hosted.contractId, run.stopCtrlC));
       },
       decide: run.decide,
-      answerSecret: (req, value) => hostFeeds.answerSecret(cid, req, value),
+      answerSecret: (req, value) => hostFeeds.answerSecret(feedId, req, value),
       ready: ready.ok,
       notReadyReason: ready.reason,
       error: err,

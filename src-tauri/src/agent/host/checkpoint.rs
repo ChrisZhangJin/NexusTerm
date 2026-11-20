@@ -33,7 +33,11 @@ pub struct HostCheckpoint {
     pub contract: StewardContract,
     pub authority: Authority,
     pub phase: HostPhase,
+    /// 主终端（不写 target 的动作落在它上面；判据核验也在它上面跑）
     pub console: ConsoleRef,
+    /// 多终端托管里一并操作的其余终端；旧现场没有该字段 → 空（单终端）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra: Vec<ConsoleRef>,
     pub messages: Vec<ChatMessage>,
     pub spent: Spent,
     pub step: usize,
@@ -85,6 +89,7 @@ impl HostCheckpoint {
             authority,
             phase: HostPhase::Running,
             console,
+            extra: Vec::new(),
             messages: Vec::new(),
             spent: Spent::default(),
             step: 0,
@@ -96,6 +101,31 @@ impl HostCheckpoint {
             created_wall_ms: now_wall_ms,
             saved_wall_ms: now_wall_ms,
         }
+    }
+
+    /// 主终端在前、其余按开始时的顺序。
+    pub fn consoles(&self) -> impl Iterator<Item = &ConsoleRef> {
+        std::iter::once(&self.console).chain(self.extra.iter())
+    }
+
+    /// 按（保存时的）console id 找到那一格。
+    pub fn slot(&self, console_id: &str) -> Option<&ConsoleRef> {
+        self.consoles().find(|c| c.console_id == console_id)
+    }
+
+    /// 把 `slot`（保存的 console id）那一格换成 `console`（接驳到的新 tab）。换的是主终端就同步契约。
+    /// 返回是否找到了那一格。
+    pub fn replace_slot(&mut self, slot: &str, console: ConsoleRef) -> bool {
+        if self.console.console_id == slot {
+            self.contract.console_id = console.console_id.clone();
+            self.console = console;
+        } else if let Some(i) = self.extra.iter().position(|c| c.console_id == slot) {
+            self.extra[i] = console;
+        } else {
+            return false;
+        }
+        self.contract.extra_consoles = self.extra.iter().map(|c| c.console_id.clone()).collect();
+        true
     }
 
     /// `host_sessions.state` 列。
@@ -172,6 +202,20 @@ impl HostCheckpoint {
         console: ConsoleRef,
         verdict: &ResumeVerdict,
     ) -> Result<Vec<Effect>, String> {
+        let slot = self.console.console_id.clone();
+        self.reattach_slot(&slot, console, verdict)
+    }
+
+    /// 同 [`reattach`]，接驳的是 `slot`（保存的 console id，可以是主终端也可以是其余终端之一）。
+    pub fn reattach_slot(
+        &mut self,
+        slot: &str,
+        console: ConsoleRef,
+        verdict: &ResumeVerdict,
+    ) -> Result<Vec<Effect>, String> {
+        if self.slot(slot).is_none() {
+            return Err(format!("这份托管里没有终端「{slot}」"));
+        }
         match verdict {
             ResumeVerdict::Expired { reason } | ResumeVerdict::Suspended { reason } => return Err(reason.clone()),
             ResumeVerdict::Drift { downgrade_to } => self.authority.tier = downgrade_to.clone(),
@@ -179,7 +223,7 @@ impl HostCheckpoint {
         }
         let (p, fx) = step(&self.phase, HostEvent::Reattach(console.clone())).map_err(|e| e.to_string())?;
         self.phase = p;
-        self.console = console;
+        self.replace_slot(slot, console);
         Ok(fx)
     }
 }
@@ -220,6 +264,7 @@ mod tests {
             success_criteria: vec![Check::ScreenMatches { re: "nginx/1\\.2".into() }],
             yolo: true,
             criteria_confirmed: false,
+            extra_consoles: Vec::new(),
         }
     }
     fn console(id: &str) -> ConsoleRef {
@@ -418,5 +463,40 @@ mod tests {
         assert!(matches!(v, ResumeVerdict::Suspended { .. }));
         assert!(c.reattach(console("t9"), &v).is_err());
         assert!(matches!(c.phase, HostPhase::Suspended { .. }), "拒绝接驳时状态不变");
+    }
+
+    // ——— 多终端 ———
+
+    /// 旧现场（没有 extra / extraConsoles 字段）照样读得回来，是单终端；单终端写出去也不带这两个字段
+    #[test]
+    fn old_single_console_json_still_loads() {
+        let mut v = serde_json::to_value(cp()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("extra");
+        o["contract"].as_object_mut().unwrap().remove("extraConsoles");
+        let back = HostCheckpoint::from_json(&v.to_string()).unwrap();
+        assert!(back.extra.is_empty() && back.contract.extra_consoles.is_empty());
+        assert_eq!(back.consoles().count(), 1);
+        let j = cp().to_json(5).unwrap();
+        assert!(!j.contains("\"extra\"") && !j.contains("extraConsoles"), "单终端的落盘格式不变");
+    }
+
+    #[test]
+    fn multi_console_round_trip_and_slot_replace() {
+        let mut c = cp();
+        c.extra = vec![console("t2")];
+        c.contract.extra_consoles = vec!["t2".into()];
+        let back = HostCheckpoint::from_json(&c.to_json(9).unwrap()).unwrap();
+        assert_eq!(back.consoles().map(|x| x.console_id.as_str()).collect::<Vec<_>>(), vec!["t1", "t2"]);
+        assert_eq!(back.contract.extra_consoles, vec!["t2".to_string()]);
+        // 换其余终端那一格：主终端不动，契约里的其余终端跟着换
+        let mut m = back.clone();
+        assert!(m.replace_slot("t2", console("t9")));
+        assert_eq!(m.console.console_id, "t1");
+        assert_eq!(m.contract.extra_consoles, vec!["t9".to_string()]);
+        // 换主终端那一格：契约的 console_id 跟着换
+        assert!(m.replace_slot("t1", console("t8")));
+        assert_eq!((m.console.console_id.as_str(), m.contract.console_id.as_str()), ("t8", "t8"));
+        assert!(!m.replace_slot("nope", console("x")));
     }
 }

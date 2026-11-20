@@ -66,6 +66,11 @@ export default function HostCard({ status, label, grant, stopCtrlC, onStopCtrlC,
   const reattach = needsReattach(status.phase);
   const cid = status.contractId;
   const live = !isTerminal(status.phase);
+  // 多终端托管：全部终端（主终端在前）；接驳一次接一个，先接主终端，再按顺序接其余不在的
+  const terms = status.consoles ?? [];
+  const multi = terms.length > 1;
+  const gone = terms.filter((c) => c.missing);
+  const slot = multi ? (gone.find((c) => c.primary) ?? gone[0] ?? null) : null;
   // 待重新接驳：开着的 tab 交给后端按相似度排序（host_key → SSH 记录 → 标签 → cwd）
   const [cands, setCands] = useState<HostReattachCandidate[]>([]);
   const tabKey = tabs.map((t) => t.id).join("|");
@@ -75,7 +80,8 @@ export default function HostCard({ status, label, grant, stopCtrlC, onStopCtrlC,
     api
       .hostReattachCandidates(
         cid,
-        tabs.map((t) => t.hint ?? { consoleId: t.id, label: t.label })
+        tabs.map((t) => t.hint ?? { consoleId: t.id, label: t.label }),
+        slot?.consoleId
       )
       .then((c) => !gone && setCands(c))
       .catch(() => !gone && setCands([]));
@@ -83,7 +89,7 @@ export default function HostCard({ status, label, grant, stopCtrlC, onStopCtrlC,
       gone = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cid, reattach, tabKey]);
+  }, [cid, reattach, tabKey, slot?.consoleId]);
   // 判据草稿：一行一条，可改；换了一张卡就重置
   const draft = card?.kind.kind === "criteriaDraft" ? card.kind.draft : null;
   const [criteria, setCriteria] = useState("");
@@ -196,6 +202,17 @@ export default function HostCard({ status, label, grant, stopCtrlC, onStopCtrlC,
           </span>
         )}
       </div>
+      {multi && (
+        <div className="hc-terms st-meta" title="这次托管一起操作的终端：你在其中任何一个上动手，整个托管都会让路">
+          终端：
+          {terms.map((c, i) => (
+            <span key={c.consoleId} className={c.missing ? "hc-warn" : undefined}>
+              {i > 0 ? "、" : ""}「{c.label}」{c.primary ? "（主）" : ""}
+              {c.missing ? "（已断开）" : ""}
+            </span>
+          ))}
+        </div>
+      )}
       <div className="hc-goal" title={status.goal}>
         {status.goal}
       </div>
@@ -358,6 +375,12 @@ export default function HostCard({ status, label, grant, stopCtrlC, onStopCtrlC,
               标签页已经关掉了，才需要在下面手动接回。
             </div>
           )}
+          {slot && (
+            <div className="st-esc-why">
+              这次托管一共 {terms.length} 个终端，现在先接回「<b>{slot.label}</b>」{slot.primary ? "（主终端）" : ""}
+              {gone.length > 1 ? `，之后还要接 ${gone.length - 1} 个；全部接上后才会接着跑` : "；接上后就接着跑"}。
+            </div>
+          )}
           <div className="st-esc-why">
             选一个终端接回去（按和原来的相似度排序），或按保存的连接新开一个。接回后 AI 会先读屏核对现场；
             屏幕和原来不一样时会降为「确认」档，每次写入都先问你。
@@ -369,13 +392,13 @@ export default function HostCard({ status, label, grant, stopCtrlC, onStopCtrlC,
                 key={c.consoleId}
                 className="st-btn"
                 disabled={busy}
-                onClick={() => void act(() => api.hostReattach(cid, c.consoleId))}
+                onClick={() => void act(() => api.hostReattach(cid, c.consoleId, false, slot?.consoleId))}
                 title={`相似度 ${c.score}`}
               >
                 接到「{c.label}」
               </button>
             ))}
-            <button className="st-btn primary" disabled={busy} onClick={() => void act(() => api.hostReattach(cid, null, true))}>
+            <button className="st-btn primary" disabled={busy} onClick={() => void act(() => api.hostReattach(cid, null, true, slot?.consoleId))}>
               打开新连接
             </button>
             <button className="st-btn danger" disabled={busy} onClick={() => void act(() => api.hostStop(cid, false))}>

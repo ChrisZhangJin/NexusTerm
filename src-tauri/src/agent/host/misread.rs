@@ -155,22 +155,25 @@ pub const VOUCH_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60
 /// 于是**同一屏**上的下一次按键不按屏幕推底线标签（`gate::authorize_vouched`）。
 /// 下一次按键写入时无论结果都用掉；屏幕变了、过了 [`VOUCH_TTL`] 都不再生效。
 #[derive(Default)]
-pub struct Vouch(Mutex<Option<(String, std::time::Instant)>>);
+pub struct Vouch(Mutex<Option<(String, String, std::time::Instant)>>);
 
 impl Vouch {
-    /// 担保这一屏（指纹为空 = 没有渲染帧，没法认出「同一屏」，不担保）。返回是否担保上了。
-    pub fn set(&self, screen_hash: &str, now: std::time::Instant) -> bool {
+    /// 担保 `console` 上的这一屏（指纹为空 = 没有渲染帧，没法认出「同一屏」，不担保）。返回是否担保上了。
+    /// 多终端托管里担保只对那一个终端有效：别的终端碰巧同一屏指纹也不算。
+    pub fn set(&self, console: &str, screen_hash: &str, now: std::time::Instant) -> bool {
         if screen_hash.is_empty() {
             return false;
         }
-        *self.0.lock() = Some((screen_hash.to_string(), now));
+        *self.0.lock() = Some((console.to_string(), screen_hash.to_string(), now));
         true
     }
 
-    /// 一次性取用：此刻的屏幕正是担保的那一屏且没过期 → true。不管结果，担保都清掉。
-    pub fn take(&self, screen_hash: &str, now: std::time::Instant) -> bool {
+    /// 一次性取用：此刻 `console` 的屏幕正是担保的那一屏且没过期 → true。不管结果，担保都清掉。
+    pub fn take(&self, console: &str, screen_hash: &str, now: std::time::Instant) -> bool {
         match self.0.lock().take() {
-            Some((h, at)) => !h.is_empty() && h == screen_hash && now.saturating_duration_since(at) <= VOUCH_TTL,
+            Some((c, h, at)) => {
+                c == console && !h.is_empty() && h == screen_hash && now.saturating_duration_since(at) <= VOUCH_TTL
+            }
             None => false,
         }
     }
@@ -336,18 +339,22 @@ mod tests {
         use std::time::{Duration, Instant};
         let v = Vouch::default();
         let t0 = Instant::now();
-        assert!(!v.set("", t0), "没有指纹不担保");
-        assert!(!v.take("", t0));
+        assert!(!v.set("t1", "", t0), "没有指纹不担保");
+        assert!(!v.take("t1", "", t0));
         // 同一屏：用一次就没了
-        assert!(v.set("h1", t0));
-        assert!(v.take("h1", t0 + Duration::from_secs(1)));
-        assert!(!v.take("h1", t0 + Duration::from_secs(2)));
+        assert!(v.set("t1", "h1", t0));
+        assert!(v.take("t1", "h1", t0 + Duration::from_secs(1)));
+        assert!(!v.take("t1", "h1", t0 + Duration::from_secs(2)));
         // 屏幕变了：不放行，且担保清掉（回到原屏也不再生效）
-        v.set("h1", t0);
-        assert!(!v.take("h2", t0));
-        assert!(!v.take("h1", t0));
+        v.set("t1", "h1", t0);
+        assert!(!v.take("t1", "h2", t0));
+        assert!(!v.take("t1", "h1", t0));
         // 过期
-        v.set("h1", t0);
-        assert!(!v.take("h1", t0 + VOUCH_TTL + Duration::from_secs(1)));
+        v.set("t1", "h1", t0);
+        assert!(!v.take("t1", "h1", t0 + VOUCH_TTL + Duration::from_secs(1)));
+        // 多终端：担保的是 t1 那一屏，t2 碰巧同一屏指纹也不算（且担保用掉了）
+        v.set("t1", "h1", t0);
+        assert!(!v.take("t2", "h1", t0));
+        assert!(!v.take("t1", "h1", t0));
     }
 }

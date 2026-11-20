@@ -107,7 +107,8 @@ pub(crate) fn history_item(row: &crate::store::host::HostSessionRow, changes: Ch
     Some(HostHistoryItem {
         contract_id: row.contract_id.clone(),
         goal: cp.contract.goal.clone(),
-        label: cp.console.label.clone(),
+        // 多终端托管：「A + B」
+        label: cp.consoles().map(|c| c.label.as_str()).collect::<Vec<_>>().join(" + "),
         console_id: cp.console.console_id.clone(),
         started_at,
         ended_at,

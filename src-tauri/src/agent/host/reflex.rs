@@ -49,7 +49,8 @@ fn to_keys(bytes: &[u8]) -> Option<String> {
     Some(if enter { format!("{s}<Enter>") } else { s.to_string() })
 }
 
-pub fn decide(playbook: Option<(CtxItem, PlaybookSpec)>, sit: &Situation, ctx: &HostCtx, now_ms: i64) -> Reflex {
+/// `console` 是要代答的那个终端（多终端托管：记录与主机范围都按它）。
+pub fn decide(playbook: Option<(CtxItem, PlaybookSpec)>, sit: &Situation, ctx: &HostCtx, console: &str, now_ms: i64) -> Reflex {
     let Some((item, spec)) = playbook else {
         return Reflex::Wake("没有匹配的剧本".into());
     };
@@ -72,7 +73,7 @@ pub fn decide(playbook: Option<(CtxItem, PlaybookSpec)>, sit: &Situation, ctx: &
         seq: 0,
         ts_ms: now_ms,
         contract_id: ctx.contract.id.clone(),
-        console_id: ctx.contract.console_id.clone(),
+        console_id: console.to_string(),
         situation_signature: sit.signature.clone(),
         situation_hash: sit.screen_hash.clone(),
         ctx_refs: vec![CtxRef::of("playbook", &item.id, item.text.clone())],
@@ -90,7 +91,7 @@ pub fn decide(playbook: Option<(CtxItem, PlaybookSpec)>, sit: &Situation, ctx: &
         PolicyVerdict::Auto | PolicyVerdict::Notify { .. } => {}
         v => return Reflex::Wake(format!("策略不放行代答：{}", v.as_str())),
     }
-    match authorize(&ctx.policy(), &AgentAction::Keys { target: None, keys: keys.clone() }, Some(sit)) {
+    match authorize(&ctx.policy_for(console), &AgentAction::Keys { target: None, keys: keys.clone() }, Some(sit)) {
         Gate::Allow => Reflex::Answer { bytes, keys, record, playbook_id: item.id, notify: false },
         Gate::Notify => Reflex::Answer { bytes, keys, record, playbook_id: item.id, notify: true },
         g => Reflex::Wake(format!("托管闸门没有直接放行：{g:?}")),
@@ -159,7 +160,7 @@ mod tests {
     #[test]
     fn answers_known_prompt_without_llm() {
         let s = sit(SituationKind::Question, KNOWN_HOSTS, vec![]);
-        match decide(Some(playbook("yes", None, None)), &s, &ctx("auto"), 9) {
+        match decide(Some(playbook("yes", None, None)), &s, &ctx("auto"), "t1", 9) {
             Reflex::Answer { bytes, keys, record, playbook_id, notify } => {
                 assert!(!notify, "auto 档不发通知");
                 assert_eq!(bytes, b"yes\r");
@@ -175,7 +176,7 @@ mod tests {
     #[test]
     fn notify_tier_reflex_answers_and_notifies() {
         let s = sit(SituationKind::Question, KNOWN_HOSTS, vec![]);
-        match decide(Some(playbook("yes", None, None)), &s, &ctx("notify"), 9) {
+        match decide(Some(playbook("yes", None, None)), &s, &ctx("notify"), "t1", 9) {
             Reflex::Answer { notify, bytes, .. } => {
                 assert!(notify);
                 assert_eq!(bytes, b"yes\r");
@@ -187,9 +188,9 @@ mod tests {
     #[test]
     fn no_write_when_gate_says_approve() {
         let s = sit(SituationKind::Question, KNOWN_HOSTS, vec![]);
-        assert!(matches!(decide(Some(playbook("yes", None, None)), &s, &ctx("approve"), 9), Reflex::Wake(_)));
-        assert!(matches!(decide(Some(playbook("yes", None, Some("approve"))), &s, &ctx("auto"), 9), Reflex::Wake(_)));
-        assert!(matches!(decide(None, &s, &ctx("auto"), 9), Reflex::Wake(_)));
+        assert!(matches!(decide(Some(playbook("yes", None, None)), &s, &ctx("approve"), "t1", 9), Reflex::Wake(_)));
+        assert!(matches!(decide(Some(playbook("yes", None, Some("approve"))), &s, &ctx("auto"), "t1", 9), Reflex::Wake(_)));
+        assert!(matches!(decide(None, &s, &ctx("auto"), "t1", 9), Reflex::Wake(_)));
     }
 
     #[test]
@@ -200,17 +201,17 @@ mod tests {
         menu.evidence.push(super::super::super::situation::SUBMIT_ARROW.to_string());
         assert_eq!(submit_style(&menu), SubmitStyle::ArrowSelect);
         assert!(matches!(
-            decide(Some(playbook("x", Some("1"), None)), &menu, &ctx("auto"), 9),
+            decide(Some(playbook("x", Some("1"), None)), &menu, &ctx("auto"), "t1", 9),
             Reflex::Wake(ref w) if w.contains("方向键")
         ));
         // 同样的菜单换成按编号提交：只发数字、不加回车
         let mut digit = menu.clone();
         digit.evidence = vec![super::super::super::situation::SUBMIT_DIGIT.to_string()];
-        if let Reflex::Answer { bytes, .. } = decide(Some(playbook("x", Some("1"), None)), &digit, &ctx("auto"), 9) {
+        if let Reflex::Answer { bytes, .. } = decide(Some(playbook("x", Some("1"), None)), &digit, &ctx("auto"), "t1", 9) {
             assert_eq!(bytes, b"1");
         }
         let pw = sit(SituationKind::Password, "[sudo] password for me: ", vec![]);
-        assert!(matches!(decide(Some(playbook("hunter2", None, None)), &pw, &ctx("auto"), 9), Reflex::Wake(_)));
+        assert!(matches!(decide(Some(playbook("hunter2", None, None)), &pw, &ctx("auto"), "t1", 9), Reflex::Wake(_)));
     }
 
     #[test]

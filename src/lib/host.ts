@@ -111,7 +111,11 @@ export function hostTabBadges(map: Record<string, HostStatus>): Record<string, s
   const out: Record<string, string> = {};
   for (const st of Object.values(map)) {
     const b = hostTabBadge(st.phase);
-    if (b) out[st.consoleId] = b;
+    if (!b) continue;
+    // 多终端托管：它的每个终端都挂徽标（未结束的优先，不被同一终端上已结束的旧记录盖掉）
+    for (const id of hostConsoleIds(st)) {
+      if (!out[id] || !isTerminal(st.phase)) out[id] = b;
+    }
   }
   return out;
 }
@@ -171,6 +175,19 @@ export function upsertHost(map: Record<string, HostStatus>, st: HostStatus): Rec
   return { ...map, [st.contractId]: st };
 }
 
+/** 一份托管操作的全部终端 id（主终端在前）；旧后端没有 `consoles` 时只有 consoleId */
+export function hostConsoleIds(st: HostStatus): string[] {
+  const ids = (st.consoles ?? []).map((c) => c.consoleId);
+  return ids.includes(st.consoleId) ? ids : [st.consoleId, ...ids];
+}
+
+/** 托管是否涉及这个终端（主终端或其余终端之一） */
+export const hostHasConsole = (st: HostStatus, consoleId: string): boolean =>
+  hostConsoleIds(st).includes(consoleId);
+
+/** 多终端托管里此刻不在的终端（等重新接驳的那几个） */
+export const missingConsoles = (st: HostStatus) => (st.consoles ?? []).filter((c) => c.missing);
+
 /**
  * 某个 console 的托管：优先未结束的；都结束了就取 contractId 最大（最新）的那份结局。
  * contractId 形如 `steward-{console}-{ms}`，同一 console 下按字符串比较即按时间。
@@ -179,7 +196,8 @@ export function hostForConsole(
   map: Record<string, HostStatus>,
   consoleId: string
 ): HostStatus | null {
-  const mine = Object.values(map).filter((s) => s.consoleId === consoleId);
+  // 多终端托管：它的任何一个终端上都能看到它（托管卡 / 实况 / 胶囊）
+  const mine = Object.values(map).filter((s) => hostHasConsole(s, consoleId));
   if (mine.length === 0) return null;
   const live = mine.find((s) => !isTerminal(s.phase));
   if (live) return live;

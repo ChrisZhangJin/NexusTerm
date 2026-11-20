@@ -57,17 +57,17 @@ pub trait HostIo: Send + Sync {
     fn note_notice(&self, _notice: Option<&str>) {}
     /// 期限暂停后用户「继续」过了（随 checkpoint 落盘，接驳后不再因同一期限暂停）。默认不记。
     fn note_deadline_ack(&self, _acked: bool) {}
-    /// 被托管的 console 还在不在（tab 没关、连接没断）。挂起等人期间据此发现「tab 关了」。默认在。
-    fn console_alive(&self) -> bool {
+    /// 被托管的 console `id` 还在不在（tab 没关、连接没断）。挂起等人期间据此发现「tab 关了」。默认在。
+    fn console_alive(&self, _id: &str) -> bool {
         true
     }
     /// 待落盘的现场（接驳时从它恢复）。默认没有。
     fn snapshot(&self) -> Option<super::checkpoint::HostCheckpoint> {
         None
     }
-    /// 被托管 console 当前这条连接的代号；不在为 `None`。断线重连后同一个 console 换新代号。默认 0。
-    fn console_generation(&self) -> Option<u64> {
-        self.console_alive().then_some(0)
+    /// 被托管 console `id` 当前这条连接的代号；不在为 `None`。断线重连后同一个 console 换新代号。默认 0。
+    fn console_generation(&self, id: &str) -> Option<u64> {
+        self.console_alive(id).then_some(0)
     }
 }
 
@@ -81,8 +81,10 @@ pub struct HostCtx {
     pub section: String,
     /// 这一节引用的依据，写进 DecisionRecord.ctx_refs
     pub refs: Vec<CtxRef>,
-    /// 被托管终端的可读名字（主机备忘按它找主机）
+    /// 被托管终端（主终端）的可读名字（主机备忘按它找主机）
     pub label: String,
+    /// 多终端托管里其余的终端（id / 名字 / 主机键）；单终端为空
+    pub extra: Vec<super::ConsoleRef>,
 }
 
 impl HostCtx {
@@ -102,22 +104,74 @@ impl HostCtx {
                 success_criteria: Vec::new(),
                 yolo: false,
                 criteria_confirmed: false,
+                extra_consoles: Vec::new(),
             },
             authority: Authority::default(),
             hard: Vec::new(),
             section: String::new(),
             refs: Vec::new(),
             label: "当前会话".to_string(),
+            extra: Vec::new(),
         }
     }
 
-    /// `gate::authorize` 的输入。
+    /// 这份托管操作的终端：主终端在前。
+    pub fn console_ids(&self) -> Vec<String> {
+        std::iter::once(self.contract.console_id.clone()).chain(self.extra.iter().map(|c| c.console_id.clone())).collect()
+    }
+
+    /// `id` 是不是这份托管的终端之一。
+    pub fn owns(&self, id: &str) -> bool {
+        self.contract.console_id == id || self.extra.iter().any(|c| c.console_id == id)
+    }
+
+    /// 终端的可读名字（不是本次托管的终端返回 None）。
+    pub fn label_of(&self, id: &str) -> Option<String> {
+        if self.contract.console_id == id {
+            return Some(self.label.clone());
+        }
+        self.extra.iter().find(|c| c.console_id == id).map(|c| c.label.clone())
+    }
+
+    /// 本次托管的终端清单，给人 / 模型看的一行：「A」（主终端）、「B」。
+    pub fn terminals_line(&self) -> String {
+        let mut v = vec![format!("「{}」（{}，主终端）", self.label, self.contract.console_id)];
+        v.extend(self.extra.iter().map(|c| format!("「{}」（{}）", c.label, c.console_id)));
+        v.join("、")
+    }
+
+    /// `gate::authorize` 的输入（写主终端）。
     pub fn policy(&self) -> HostPolicy {
         HostPolicy {
             authority: self.authority.clone(),
             hard: self.hard.clone(),
             host_key: self.contract.host_key.clone(),
         }
+    }
+
+    /// 往不在本次托管里的终端「`label`」写：先于契约的其余判断。一般档位直接拒（反馈里列出本次托管的终端）；
+    /// YOLO 档按越过契约处理 —— 停下来问人，批准即放行这一次。
+    pub fn out_of_run(&self, label: &str) -> super::gate::Gate {
+        if self.authority.tier == super::super::policy::TIER_YOLO {
+            return super::gate::Gate::Approve(vec![format!(
+                "⛔ 越过契约：操作不在本次托管里的终端「{label}」。YOLO 档只在这种时候问你，批准即放行这一次"
+            )]);
+        }
+        super::gate::Gate::Deny(format!(
+            "终端「{label}」不在本次托管里，没有写入。本次托管只能操作：{}；用 target 指明其中之一（不写就是主终端）",
+            self.terminals_line()
+        ))
+    }
+
+    /// 写 `console` 时的 `gate::authorize` 输入：禁止项 / 硬偏好 / 档位相同，主机范围按**被写的那个终端**的主机判。
+    /// 其余终端用它自己的主机键（认不出 = 空，设了主机范围就 fail-closed）；主终端以及不属于本次托管的
+    /// （本次运行新开的会话、YOLO 下批准过的越界）沿用主终端的主机键 —— 与单终端托管一直以来的行为一致。
+    pub fn policy_for(&self, console: &str) -> HostPolicy {
+        let mut p = self.policy();
+        if let Some(c) = self.extra.iter().find(|c| c.console_id == console && c.console_id != self.contract.console_id) {
+            p.host_key = c.host_key.clone();
+        }
+        p
     }
 }
 
@@ -162,7 +216,10 @@ pub enum ParkEnd {
 /// 一个托管任务的共享状态：命令层（`host_*`）与运行循环各持一个 `Arc`。
 pub struct HostShared {
     pub handle: HostHandle,
+    /// 主终端（运行的发起会话：步骤事件发在它的频道上，不写 target 的动作落在它上面）
     pub console_id: String,
+    /// 多终端托管里其余的终端（开始 / 接驳时定下，运行中不变）
+    pub extra: Vec<String>,
     pub goal: String,
     pub cancel: Arc<AtomicBool>,
     tx: mpsc::UnboundedSender<HostEvent>,
@@ -194,10 +251,12 @@ pub struct HostShared {
     deadline_acked: AtomicBool,
     /// 计划清单（nx_todo，随 checkpoint 持久化）
     todo: Mutex<Vec<super::super::todo::TodoItem>>,
-    /// 上次看到的 console 连接代号（断线重连检测，见 `note_reconnect`）
-    seen_generation: Mutex<Option<u64>>,
+    /// 上次看到的各 console 连接代号（断线重连检测，见 `note_reconnect`）
+    seen_generation: Mutex<HashMap<String, u64>>,
     /// 「这是误判」的一次性担保（同一屏上的下一次按键不按屏幕推底线标签）
     pub vouch: super::misread::Vouch,
+    /// 本次运行里经 nx_open（过了门禁）新开的会话：可以写，按主终端的契约判（与单终端托管一直以来的行为一致）
+    opened: Mutex<Vec<String>>,
 }
 
 /// 进程内单调时钟（毫秒）。看门狗只认它；重启后基准变了，恢复时要 `rebase`。
@@ -214,11 +273,24 @@ impl HostShared {
         cancel: Arc<AtomicBool>,
         io: Box<dyn HostIo>,
     ) -> Arc<Self> {
+        Self::new_multi(handle, console_id, &[], goal, cancel, io)
+    }
+
+    /// 多终端托管：`console_id` 是主终端，`extra` 是一并操作的其余终端。
+    pub fn new_multi(
+        handle: HostHandle,
+        console_id: &str,
+        extra: &[String],
+        goal: &str,
+        cancel: Arc<AtomicBool>,
+        io: Box<dyn HostIo>,
+    ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let handle_cid = handle.contract_id.clone();
         Arc::new(Self {
             handle,
             console_id: console_id.to_string(),
+            extra: extra.iter().filter(|c| c.as_str() != console_id).cloned().collect(),
             goal: goal.to_string(),
             cancel,
             tx,
@@ -238,21 +310,61 @@ impl HostShared {
             watchdog: Mutex::new(super::watchdog::WatchdogState::default()),
             deadline_acked: AtomicBool::new(false),
             todo: Mutex::new(Vec::new()),
-            seen_generation: Mutex::new(None),
+            seen_generation: Mutex::new(HashMap::new()),
             vouch: Default::default(),
+            opened: Mutex::new(Vec::new()),
         })
+    }
+
+    // ——— 终端集合 ———
+
+    /// 这份托管操作的全部终端：主终端在前。
+    pub fn consoles(&self) -> Vec<String> {
+        std::iter::once(self.console_id.clone()).chain(self.extra.iter().cloned()).collect()
+    }
+
+    /// `id` 是不是这份托管的终端之一。
+    pub fn owns(&self, id: &str) -> bool {
+        self.console_id == id || self.extra.iter().any(|c| c == id)
+    }
+
+    /// 记下本次运行新开的会话（nx_open 成功后）。
+    pub fn note_opened(&self, id: &str) {
+        let mut o = self.opened.lock();
+        if !o.iter().any(|x| x == id) {
+            o.push(id.to_string());
+        }
+    }
+
+    /// 能不能往 `id` 写：本次托管的终端，或本次运行自己新开的会话。
+    pub fn may_write(&self, id: &str) -> bool {
+        self.owns(id) || self.opened.lock().iter().any(|x| x == id)
+    }
+
+    /// 此刻不在的终端（tab 关了 / 连接断了）。
+    pub fn missing_consoles(&self) -> Vec<String> {
+        self.consoles().into_iter().filter(|c| !self.io.console_alive(c)).collect()
+    }
+
+    /// 全部终端都在。
+    pub fn all_alive(&self) -> bool {
+        self.consoles().iter().all(|c| self.io.console_alive(c))
     }
 
     // ——— 断线重连 ———
 
-    /// 同一个 console 是不是换了一条新连接（断线后自动 / 手动重连了）。返回 true 一次，随即记下新代号；
-    /// console 不在时不更新（等它回来再比）。第一次调用只记基线。
-    pub fn note_reconnect(&self) -> bool {
-        let Some(g) = self.io.console_generation() else { return false };
+    /// 哪些 console 换了一条新连接（断线后自动 / 手动重连了）。每个只报一次，随即记下新代号；
+    /// console 不在时不更新（等它回来再比）。第一次见到某个 console 只记基线。
+    pub fn note_reconnect(&self) -> Vec<String> {
         let mut seen = self.seen_generation.lock();
-        let changed = seen.is_some_and(|old| old != g);
-        *seen = Some(g);
-        changed
+        let mut out = Vec::new();
+        for c in self.consoles() {
+            let Some(g) = self.io.console_generation(&c) else { continue };
+            if seen.insert(c.clone(), g).is_some_and(|old| old != g) {
+                out.push(c);
+            }
+        }
+        out
     }
 
     // ——— 计划清单 ———
@@ -351,6 +463,11 @@ impl HostShared {
     /// 重启前被托管的那个 console 的描述。
     pub fn saved_console(&self) -> Option<super::ConsoleRef> {
         self.io.snapshot().map(|c| c.console)
+    }
+
+    /// 本次托管里 `id` 那个终端（主终端或其余终端之一）保存的描述。
+    pub fn saved_console_of(&self, id: &str) -> Option<super::ConsoleRef> {
+        self.io.snapshot().and_then(|c| c.slot(id).cloned())
     }
 
     /// 追加一条给模型的用户消息（下一步前并进对话）。
@@ -686,7 +803,8 @@ impl HostShared {
                 // 等人期间（问题卡 / 人在驾驶 / 暂停）tab 被关掉：转成挂起（ConsoleGone），面板出「待重新接驳」，
                 // 而不是让一个没有终端的任务无声地占着租约
                 _ = tokio::time::sleep(LIVENESS_POLL) => {
-                    if !self.io.console_alive() {
+                    // 多终端：任何一个不在就挂起；全部都回来了才算「连回来」
+                    if !self.all_alive() {
                         self.console_gone();
                         back_polls = 0;
                     } else if matches!(self.phase(), HostPhase::Suspended { reason: super::SuspendReason::ConsoleGone, .. }) {
@@ -808,6 +926,10 @@ pub(crate) mod tests {
         pub acked: Mutex<bool>,
         /// 连接代号（断线重连后换新的）
         pub generation: Mutex<u64>,
+        /// 只有这几个 console 没了（多终端）
+        pub dead_ids: Mutex<Vec<String>>,
+        /// 单个 console 的连接代号（多终端；没写的用 `generation`）
+        pub gens: Mutex<HashMap<String, u64>>,
     }
 
     impl HostIo for Arc<FakeIo> {
@@ -823,11 +945,11 @@ pub(crate) mod tests {
         fn sync_control(&self, p: &HostPhase) {
             self.control.lock().push(p.label().into());
         }
-        fn console_alive(&self) -> bool {
-            !*self.dead.lock()
+        fn console_alive(&self, id: &str) -> bool {
+            !*self.dead.lock() && !self.dead_ids.lock().iter().any(|d| d == id)
         }
-        fn console_generation(&self) -> Option<u64> {
-            (!*self.dead.lock()).then(|| *self.generation.lock())
+        fn console_generation(&self, id: &str) -> Option<u64> {
+            self.console_alive(id).then(|| self.gens.lock().get(id).copied().unwrap_or(*self.generation.lock()))
         }
         fn note_deadline_ack(&self, acked: bool) {
             *self.acked.lock() = acked;
@@ -843,6 +965,21 @@ pub(crate) mod tests {
         let h = HostShared::new(
             HostHandle::new(cid),
             console,
+            "目标",
+            Arc::new(AtomicBool::new(false)),
+            Box::new(io.clone()),
+        );
+        (h, io)
+    }
+
+    /// 多终端托管：主终端 `console` + 其余 `extra`。
+    pub(crate) fn shared_multi(cid: &str, console: &str, extra: &[&str]) -> (Arc<HostShared>, Arc<FakeIo>) {
+        let io = Arc::new(FakeIo::default());
+        let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        let h = HostShared::new_multi(
+            HostHandle::new(cid),
+            console,
+            &extra,
             "目标",
             Arc::new(AtomicBool::new(false)),
             Box::new(io.clone()),
@@ -1116,7 +1253,7 @@ pub(crate) mod tests {
     #[tokio::test(start_paused = true)]
     async fn reconnected_console_resumes_by_itself() {
         let (h, io) = shared();
-        assert!(!h.note_reconnect(), "第一次只记基线");
+        assert!(h.note_reconnect().is_empty(), "第一次只记基线");
         h.apply(HostEvent::Suspend(SuspendReason::ConsoleGone)).unwrap();
         let h2 = h.clone();
         let task = tokio::spawn(async move { h2.park().await });
@@ -1138,21 +1275,21 @@ pub(crate) mod tests {
         assert_eq!(h.phase(), HostPhase::Running);
         assert!(h.take_force_screen(), "接着跑之前先读屏");
         assert!(h.take_user().iter().any(|u| u.contains("自动重连")));
-        assert!(!h.note_reconnect(), "代号已经记过了，运行循环不再重复提醒");
+        assert!(h.note_reconnect().is_empty(), "代号已经记过了，运行循环不再重复提醒");
         assert_eq!(*io.released.lock(), 0, "租约一直没放");
     }
 
     #[test]
     fn note_reconnect_flags_a_new_connection_once() {
         let (h, io) = shared();
-        assert!(!h.note_reconnect());
-        assert!(!h.note_reconnect());
+        assert!(h.note_reconnect().is_empty());
+        assert!(h.note_reconnect().is_empty());
         *io.dead.lock() = true;
-        assert!(!h.note_reconnect(), "断着的时候不更新");
+        assert!(h.note_reconnect().is_empty(), "断着的时候不更新");
         *io.dead.lock() = false;
         *io.generation.lock() = 2;
-        assert!(h.note_reconnect(), "同一个 tab、新连接");
-        assert!(!h.note_reconnect());
+        assert!(!h.note_reconnect().is_empty(), "同一个 tab、新连接");
+        assert!(h.note_reconnect().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1215,5 +1352,134 @@ pub(crate) mod tests {
         assert_eq!(*io.saves.lock(), vec!["user_driving", "running", "completed"]);
         assert_eq!(*io.emits.lock(), vec!["user_driving", "running", "completed"]);
         assert_eq!(*io.released.lock(), 1);
+    }
+
+    // ——— 多终端托管 ———
+
+    #[test]
+    fn multi_console_set_and_ownership() {
+        let (h, io) = shared_multi("c1", "A", &["B", "A", "C"]);
+        assert_eq!(h.consoles(), vec!["A", "B", "C"], "主终端在前，重复的主终端不再算一次");
+        assert!(h.owns("B") && h.owns("A") && !h.owns("D"));
+        assert!(!h.may_write("D"));
+        h.note_opened("D");
+        assert!(h.may_write("D") && !h.owns("D"), "本次运行新开的会话可写，但不算托管的终端");
+        assert!(h.missing_consoles().is_empty());
+        io.dead_ids.lock().push("C".into());
+        assert_eq!(h.missing_consoles(), vec!["C"]);
+        assert!(!h.all_alive());
+    }
+
+    /// 任何一个终端断开 → 挂起（ConsoleGone）；只有**全部**回来才自动接着跑
+    #[tokio::test(start_paused = true)]
+    async fn any_console_gone_suspends_and_resumes_only_when_all_back() {
+        let (h, io) = shared_multi("c1", "A", &["B", "C"]);
+        assert!(h.note_reconnect().is_empty(), "基线");
+        h.apply(HostEvent::Ask(HumanCard::ask("k1", "问一下", 0))).unwrap();
+        let h2 = h.clone();
+        let task = tokio::spawn(async move { h2.park().await });
+        settle().await;
+        // 只断了 B（主终端还在）：照样挂起
+        io.dead_ids.lock().push("B".into());
+        tokio::time::advance(LIVENESS_POLL).await;
+        settle().await;
+        assert!(matches!(h.phase(), HostPhase::Suspended { reason: SuspendReason::ConsoleGone, .. }), "{:?}", h.phase());
+        // C 也断了；B 回来（新连接）—— C 还不在：继续挂着
+        io.dead_ids.lock().retain(|d| d != "B");
+        io.dead_ids.lock().push("C".into());
+        io.gens.lock().insert("B".into(), 5);
+        for _ in 0..4 {
+            tokio::time::advance(LIVENESS_POLL).await;
+            settle().await;
+        }
+        assert!(matches!(h.phase(), HostPhase::Suspended { .. }), "还差 C，不能接着跑");
+        assert!(!task.is_finished());
+        // C 也回来了：稳住两轮后回到挂起前的相位（等人卡）
+        io.dead_ids.lock().clear();
+        for _ in 0..2 {
+            tokio::time::advance(LIVENESS_POLL).await;
+            settle().await;
+        }
+        assert!(matches!(h.phase(), HostPhase::WaitingHuman { .. }), "{:?}", h.phase());
+        assert!(h.take_force_screen());
+        assert_eq!(*io.released.lock(), 0, "租约一直没放");
+        h.send(HostEvent::Stop);
+        let _ = task.await;
+    }
+
+    #[test]
+    fn note_reconnect_names_only_the_reconnected_console() {
+        let (h, io) = shared_multi("c1", "A", &["B"]);
+        assert!(h.note_reconnect().is_empty());
+        io.gens.lock().insert("B".into(), 9);
+        assert_eq!(h.note_reconnect(), vec!["B"]);
+        assert!(h.note_reconnect().is_empty(), "每个只报一次");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_suspends_when_any_console_missing() {
+        let (h, _io) = shared_multi("c1", "A", &["B"]);
+        let h2 = h.clone();
+        // 闸口的存活检查由调用方给（真实实现查全部终端）：B 不在 → 挂起，不写
+        let task = tokio::spawn(async move { h2.gate(|| false, || false).await });
+        settle().await;
+        assert!(matches!(h.phase(), HostPhase::Suspended { reason: SuspendReason::ConsoleGone, .. }));
+        assert!(!task.is_finished());
+        h.cancel.store(true, Ordering::Relaxed);
+        assert!(!task.await.unwrap());
+    }
+
+    fn multi_ctx(tier: &str) -> HostCtx {
+        let mut c = HostCtx::bare("c1", "A", "目标");
+        c.authority = Authority::default().with_tier(tier);
+        c.contract.host_key = "ssh:root@web1:22".into();
+        c.label = "web1".into();
+        c.extra = vec![
+            super::super::ConsoleRef { console_id: "B".into(), label: "db1".into(), host_key: "ssh:root@db1:22".into(), ..Default::default() },
+            super::super::ConsoleRef { console_id: "C".into(), label: "认不出".into(), host_key: String::new(), ..Default::default() },
+        ];
+        c
+    }
+
+    /// 主机范围按**被写的那个终端**判：A（web1）在范围里，B（db1）不在，C 认不出主机 fail-closed
+    #[test]
+    fn host_scope_is_checked_per_target_console() {
+        use super::super::gate::{authorize, Gate};
+        use super::super::super::act::AgentAction;
+        let mut ctx = multi_ctx("auto");
+        ctx.authority.host_scope = vec!["web1".into()];
+        let exec = AgentAction::Exec { target: None, command: "uptime".into() };
+        assert_eq!(authorize(&ctx.policy_for("A"), &exec, None), Gate::Allow);
+        assert!(matches!(authorize(&ctx.policy_for("B"), &exec, None), Gate::Deny(t) if t.contains("契约的主机范围")));
+        assert!(matches!(authorize(&ctx.policy_for("C"), &exec, None), Gate::Deny(_)), "认不出主机：拒");
+        // 范围放宽到 db1：B 可写，A 反而不行
+        ctx.authority.host_scope = vec!["db1".into()];
+        assert_eq!(authorize(&ctx.policy_for("B"), &exec, None), Gate::Allow);
+        assert!(matches!(authorize(&ctx.policy_for("A"), &exec, None), Gate::Deny(_)));
+        // 禁止项 / 硬偏好 / 危险判断在每个终端上都一样
+        ctx.authority.host_scope.clear();
+        let rm = AgentAction::Exec { target: None, command: "rm -rf /".into() };
+        for c in ["A", "B", "C"] {
+            assert!(!matches!(authorize(&ctx.policy_for(c), &rm, None), Gate::Allow), "{c}");
+        }
+    }
+
+    #[test]
+    fn out_of_run_is_refused_or_a_breach_under_yolo() {
+        use super::super::gate::Gate;
+        let ctx = multi_ctx("auto");
+        match ctx.out_of_run("别的机器") {
+            Gate::Deny(t) => {
+                assert!(t.contains("不在本次托管里") && t.contains("「web1」") && t.contains("「db1」"), "{t}");
+            }
+            g => panic!("{g:?}"),
+        }
+        match multi_ctx("yolo").out_of_run("别的机器") {
+            Gate::Approve(r) => assert!(r[0].starts_with("⛔ 越过契约：操作不在本次托管里的终端「别的机器」"), "{r:?}"),
+            g => panic!("{g:?}"),
+        }
+        assert!(ctx.owns("B") && !ctx.owns("Z"));
+        assert_eq!(ctx.console_ids(), vec!["A", "B", "C"]);
+        assert_eq!(ctx.label_of("B").as_deref(), Some("db1"));
     }
 }

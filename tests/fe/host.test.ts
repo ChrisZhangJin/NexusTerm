@@ -267,6 +267,29 @@ test("hostTabBadges：只收正在等人的，按 console 归", () => {
   assert.deepEqual(hostTabBadges(m), { c1: "等你：部署到哪？", c3: "等你：预算暂停" });
 });
 
+import { hostConsoleIds, missingConsoles } from "../../src/lib/host";
+
+test("多终端托管：任何一个终端上都找得到它，徽标挂在每个终端上", () => {
+  const multi = {
+    contractId: "steward-a-1",
+    consoleId: "a",
+    phase: waiting,
+    consoles: [
+      { consoleId: "a", label: "server", primary: true, missing: false },
+      { consoleId: "b", label: "client", primary: false, missing: true },
+    ],
+  } as HostStatus;
+  const m = upsertHost({}, multi);
+  assert.equal(hostForConsole(m, "a")?.contractId, "steward-a-1");
+  assert.equal(hostForConsole(m, "b")?.contractId, "steward-a-1", "其余终端上也看得到同一份托管");
+  assert.equal(hostForConsole(m, "c"), null);
+  assert.deepEqual(hostTabBadges(m), { a: "等你：部署到哪？", b: "等你：部署到哪？" });
+  assert.deepEqual(hostConsoleIds(multi), ["a", "b"]);
+  assert.deepEqual(missingConsoles(multi).map((c) => c.consoleId), ["b"]);
+  // 旧后端没有 consoles：只有 consoleId 一个
+  assert.deepEqual(hostConsoleIds({ ...multi, consoles: undefined }), ["a"]);
+});
+
 // ———————————— 门禁卡按钮 ————————————
 
 import { gateActions } from "../../src/lib/host";

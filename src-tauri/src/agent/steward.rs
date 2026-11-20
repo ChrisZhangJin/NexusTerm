@@ -330,6 +330,9 @@ pub struct StewardContract {
     /// `gate::authorize` 执行；没确认过（YOLO）的只允许只读命令。旧数据没有该字段 → false（保守）
     #[serde(default)]
     pub criteria_confirmed: bool,
+    /// 同一份托管里除 `console_id`（主终端）之外一并操作的终端（多终端托管）。旧数据没有该字段 → 空
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_consoles: Vec<String>,
 }
 
 /// 新契约的 id。
@@ -378,7 +381,7 @@ impl StewardRegistry {
             intent_ids: Vec::new(),
             timebox_ms: 0,
             created_at: ts,
-            success_criteria: Vec::new(), yolo: false, criteria_confirmed: false,
+            success_criteria: Vec::new(), yolo: false, criteria_confirmed: false, extra_consoles: Vec::new(),
         };
         map.insert(contract.id.clone(), contract.clone());
         contract

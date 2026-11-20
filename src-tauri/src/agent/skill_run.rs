@@ -1627,7 +1627,8 @@ impl SkillIo for TauriIo<'_> {
                 PolicyWrite::Exec(c) => AgentAction::Exec { target: None, command: c.to_string() },
                 PolicyWrite::Keys(b) => AgentAction::Keys { target: None, keys: bytes_to_keys(b) },
             };
-            return match super::host::gate::authorize(&h.ctx().policy(), &action, Some(&sit)) {
+            // 多终端托管：主机范围按技能实际操作的那个终端判（屏幕也是它的）
+            return match super::host::gate::authorize(&h.ctx().policy_for(&self.target), &action, Some(&sit)) {
                 super::host::gate::Gate::Deny(why) => PolicyVerdict::Deny(why),
                 super::host::gate::Gate::Approve(r) => PolicyVerdict::Approve(r),
                 _ => PolicyVerdict::Allow,

@@ -968,6 +968,18 @@ export interface HostStatus {
   tier?: string;
   /** 契约级花费（步数 / 时长 / token / 钱） */
   spent?: HostSpent;
+  /** 本次托管操作的全部终端（主终端在前）；旧后端没有该字段 = 只有 consoleId 一个 */
+  consoles?: HostConsoleStatus[];
+}
+
+/** 托管里的一个终端 */
+export interface HostConsoleStatus {
+  consoleId: string;
+  label: string;
+  /** 主终端：不写 target 的动作落在它上面，判据核验也在它上面跑 */
+  primary: boolean;
+  /** 此刻不在（tab 关了 / 连接断了） */
+  missing: boolean;
 }
 
 /** 托管契约级花费（后端 `checkpoint::Spent`）。token / 钱的字段旧记录没有 */
@@ -1064,6 +1076,8 @@ export interface HostBudgetGrant {
 export interface HostStartOpts {
   deny?: string[];
   followUp?: { goal: string; summary: string };
+  /** 多终端托管：主终端之外一并交给 AI 操作的终端（tab id） */
+  extra?: string[];
 }
 
 export interface HostStartRequest {
@@ -1082,6 +1096,8 @@ export interface HostStartRequest {
   deny?: string[];
   /** 基于上一个托管任务的完成报告继续：上一个目标与报告作为新任务的开场上下文 */
   followUp?: { goal: string; summary: string };
+  /** 多终端托管：主终端之外一并操作的终端（带重启后找回用的线索） */
+  extraConsoles?: HostConsoleHint[];
 }
 
 /** `nx://host/{contractId}/notify`：通知档写入后的通知卡 */
