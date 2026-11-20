@@ -9,7 +9,6 @@
 use tauri::{AppHandle, Emitter, State};
 
 use super::recorder::{self, RecorderStatus, RecordingDraft};
-use super::timeline;
 use crate::cmd::AppState;
 
 fn publish_status(app: &AppHandle, status: &RecorderStatus) {
@@ -25,10 +24,7 @@ pub fn agent_record_start(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<RecorderStatus, String> {
-    let (status, evs) = state
-        .agent
-        .recorder_start(&session_id, host_label.as_deref().unwrap_or(""))?;
-    timeline::publish(&app, &session_id, &evs);
+    let (status, _) = state.agent.recorder_start(&session_id, host_label.as_deref().unwrap_or(""))?;
     publish_status(&app, &status);
     Ok(status)
 }
@@ -40,8 +36,7 @@ pub fn agent_record_stop(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<RecordingDraft, String> {
-    let (draft, evs) = state.agent.recorder_stop(&session_id)?;
-    timeline::publish(&app, &session_id, &evs);
+    let (draft, _) = state.agent.recorder_stop(&session_id)?;
     publish_status(&app, &state.agent.recorder_status(&session_id));
     Ok(draft)
 }
@@ -65,14 +60,12 @@ pub fn agent_record_cancel(session_id: String, state: State<'_, AppState>, app: 
 /// 前端上报一次「没有文字的用户操作」（Ctrl-C / Ctrl-D / Ctrl-Z / 空回车）。
 /// 只在录制中、且 `keys` 在白名单内才会记，其余一律忽略。fire-and-forget。
 #[tauri::command]
-pub fn agent_user_keys(session_id: String, keys: String, state: State<'_, AppState>, app: AppHandle) {
-    let evs = state.agent.recorder_user_keys(&session_id, &keys);
-    timeline::publish(&app, &session_id, &evs);
+pub fn agent_user_keys(session_id: String, keys: String, state: State<'_, AppState>) {
+    state.agent.recorder_user_keys(&session_id, &keys);
 }
 
 /// 给 `agent_user_command` 用：录制期间在用户提交一行**之前**记下「这一行是在回答什么提示」。
 /// 没在录制时只是一次 map 查询。
-pub fn capture_context(app: &AppHandle, state: &AppState, session_id: &str) {
-    let evs = state.agent.recorder_user_context(session_id);
-    timeline::publish(app, session_id, &evs);
+pub fn capture_context(state: &AppState, session_id: &str) {
+    state.agent.recorder_user_context(session_id);
 }

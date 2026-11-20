@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import ConfirmDialog, { type ConfirmOptions } from "./ConfirmDialog";
 import SkillManager from "./SkillManager";
 import { HostMemoryDialog } from "./HostMemory";
-import Timeline from "./Timeline";
+import { RecorderControls, RecorderDraftCard } from "./RecorderBar";
 import StewardPanel, { type StewardRunBridge } from "./StewardPanel";
 import HostCard from "./HostCard";
 import { RecordingBadge } from "./RecorderBar";
@@ -106,8 +106,8 @@ export function AgentPanel({
 }: AgentPanelProps) {
   const cfg = useAgentConfig();
   const ready = isAgentReady(cfg);
-  // 对话 / 时间线（2.5）视图切换。时间线只在选中时挂载（才订阅事件）；对话区只是被 CSS 藏起来，状态不丢
-  const [view, setView] = useState<"chat" | "timeline" | "steward">("chat");
+  // 对话 / 托管 视图切换（「时间线」页已删，录制按钮挪到了面板头部）
+  const [view, setView] = useState<"chat" | "steward">("chat");
   // 技能管理器（3.4）。`draft` 给了就直接弹出预填的「新建技能」编辑器（录制器 / LLM 草稿 / 宏迁移用）
   const [skillUi, setSkillUi] = useState<{ draft?: SkillInput } | null>(null);
   const [memOpen, setMemOpen] = useState(false);
@@ -541,7 +541,7 @@ export function AgentPanel({
   if (!visible || !sessionId) return null;
 
   return (
-    <div className={`ap-root${view === "timeline" ? " show-tl" : view === "steward" ? " show-steward" : ""}`}>
+    <div className={`ap-root${view === "steward" ? " show-steward" : ""}`}>
       <div className="ap-head">
         <span className="ap-title">Nexus AI Agent</span>
         <RecordingBadge sessionId={sessionId} />
@@ -556,15 +556,6 @@ export function AgentPanel({
           </button>
           <button
             role="tab"
-            aria-selected={view === "timeline"}
-            className={`ap-tab${view === "timeline" ? " on" : ""}`}
-            onClick={() => setView("timeline")}
-            title="这个终端里用户与 Agent 各做了什么"
-          >
-            时间线
-          </button>
-          <button
-            role="tab"
             aria-selected={view === "steward"}
             className={`ap-tab${view === "steward" ? " on" : ""}`}
             onClick={() => setView("steward")}
@@ -573,6 +564,8 @@ export function AgentPanel({
             托管
           </button>
         </div>
+        {/* 录制技能：原来放在「时间线」页头部，时间线页删掉后挪到这里（录制按终端记，切标签各录各的） */}
+        {sessionId && <RecorderControls sessionId={sessionId} hostLabel={sessions.find((s) => s.id === sessionId)?.label} />}
         <button className="ap-skill-btn" onClick={() => setSkillUi({})} title="管理技能（可回放的操作流程）">
           技能
         </button>
@@ -586,13 +579,6 @@ export function AgentPanel({
         </button>
       </div>
 
-      {view === "timeline" && (
-        <Timeline
-          sessionId={sessionId}
-          hostLabel={sessions.find((s) => s.id === sessionId)?.label}
-          onOpenSkillDraft={(draft) => setSkillUi({ draft })}
-        />
-      )}
 
       {view === "steward" && (
         <StewardPanel sessionId={sessionId} sessions={sessions} runFor={stewardBridgeFor} />
@@ -635,6 +621,11 @@ export function AgentPanel({
       </div>
 
       {err && <div className="ap-err">{err}</div>}
+
+      {/* 录制结束后的草稿卡：「整理为技能 / 直接编辑」打开技能管理器预填 */}
+      {view === "chat" && sessionId && (
+        <RecorderDraftCard sessionId={sessionId} onOpenSkillDraft={(draft) => setSkillUi({ draft })} />
+      )}
 
       {view === "chat" && hostedHere && !isTerminal(hostedHere.phase) && !needsReattach(hostedHere.phase) && (
         <HostCard

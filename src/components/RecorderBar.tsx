@@ -39,7 +39,7 @@ export function RecordingBadge({ sessionId }: { sessionId: string }) {
   );
 }
 
-/** 开始 / 结束 / 取消录制的按钮组，放在时间线头部。 */
+/** 开始 / 结束 / 取消录制的按钮组，放在 Agent 面板头部（「技能」按钮旁）。 */
 export function RecorderControls({
   sessionId,
   hostLabel,

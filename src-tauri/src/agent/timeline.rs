@@ -25,7 +25,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 use super::buffer::strip_ansi;
 use super::prompt::{PromptGuess, PromptKind};
@@ -525,37 +525,23 @@ pub type Timelines = HashMap<String, Timeline>;
 
 // ——————————————————————————————— 事件推送 ———————————————————————————————
 
-/// 推给前端的事件名。载荷是 `Vec<TimelineEvent>`（一次可能带好几条）。
-pub fn event_name(session_id: &str) -> String {
-    format!("nx://agent/timeline/{session_id}")
-}
-
-/// 推送新增事件；空的不推。
-pub fn publish(app: &AppHandle, session_id: &str, events: &[TimelineEvent]) {
-    if events.is_empty() {
-        return;
-    }
-    let _ = app.emit(&event_name(session_id), events);
-}
-
-/// Agent 动作开始：记一条并推送，返回它的 seq（0 = 没记，后续 [`finish`] 当作无引用）。
+/// Agent 动作开始：记一条，返回它的 seq（0 = 没记，后续 [`finish`] 当作无引用）。
+/// （「时间线」页已删，事件只进账给模型摘要与录制用，不再推给前端；`_app` 留着免得改十几处调用）
 pub fn begin(
-    app: &AppHandle,
+    _app: &AppHandle,
     mgr: &AgentManager,
     session_id: &str,
     kind: Kind,
     text: &str,
     note: Option<&str>,
 ) -> u64 {
-    let (seq, evs) = mgr.timeline_agent(session_id, kind, text, note);
-    publish(app, session_id, &evs);
-    seq
+    mgr.timeline_agent(session_id, kind, text, note).0
 }
 
-/// Agent 动作结束：记输出摘要与（值得时的）提示并推送。
+/// Agent 动作结束：记输出摘要与（值得时的）提示。
 /// `force_prompt`：调用方已确认「命令没结束、停在交互提示上」（`ExecEnd::AwaitingInput`）。
 pub fn finish(
-    app: &AppHandle,
+    _app: &AppHandle,
     mgr: &AgentManager,
     session_id: &str,
     ref_seq: u64,
@@ -564,16 +550,10 @@ pub fn finish(
     force_prompt: bool,
 ) {
     let line = mgr.last_line(session_id).unwrap_or_default();
-    let evs = mgr.timeline_result(
-        session_id,
-        ref_seq,
-        output,
-        guess.map(|g| (g, line.as_str(), force_prompt)),
-    );
-    publish(app, session_id, &evs);
+    mgr.timeline_result(session_id, ref_seq, output, guess.map(|g| (g, line.as_str(), force_prompt)));
 }
 
-/// 用户命令提交后：等输出安静下来（防抖）再把摘要落账并推送。
+/// 用户命令提交后：等输出安静下来（防抖）再把摘要落账。
 /// 下一条命令 / Agent 动作先到时会把它冲掉，这里 `expect` 校验会让晚到的任务空转。
 pub fn schedule_user_flush(app: AppHandle, session_id: String, cmd_seq: u64) {
     use tauri::Manager;
@@ -587,8 +567,7 @@ pub fn schedule_user_flush(app: AppHandle, session_id: String, cmd_seq: u64) {
             let quiet = now == last;
             last = now;
             if quiet || started.elapsed().as_millis() as u64 >= FLUSH_MAX_WAIT_MS {
-                let evs = state.agent.timeline_flush(&session_id, Some(cmd_seq));
-                publish(&app, &session_id, &evs);
+                state.agent.timeline_flush(&session_id, Some(cmd_seq));
                 return;
             }
         }

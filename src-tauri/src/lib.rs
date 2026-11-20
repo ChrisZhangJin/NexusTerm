@@ -313,7 +313,6 @@ pub fn run() {
             agent::cmd::agent_conversation_reset,
             agent::cmd::agent_stats,
             agent::cmd::agent_user_command,
-            agent::cmd::agent_timeline,
             agent::recorder_cmd::agent_record_start,
             agent::recorder_cmd::agent_record_stop,
             agent::recorder_cmd::agent_record_status,

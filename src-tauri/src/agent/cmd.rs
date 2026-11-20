@@ -155,28 +155,12 @@ pub fn agent_user_command(
         return;
     };
     // 录制中（3.2）：先记下这一行是在回答什么提示，再并入命令本身
-    super::recorder_cmd::capture_context(&app, &state, &session_id);
-    // 并入统一时间线（2.5）并推给面板；命令的输出摘要等输出安静下来再补一条
+    super::recorder_cmd::capture_context(&state, &session_id);
+    // 并入统一时间线（2.5，给模型的摘要与录制用）；命令的输出摘要等输出安静下来再补一条
     let evs = state.agent.timeline_user(&session_id, &entry);
-    timeline::publish(&app, &session_id, &evs);
     if entry.kind == UserEntryKind::Command {
         timeline::schedule_user_flush(app, session_id, evs.last().map(|e| e.seq).unwrap_or(0));
     }
-}
-
-/// 统一时间线（2.5）：`seq` 大于 `since_seq` 的事件，最多 `limit` 条（默认 200，超出保留最新的）。
-/// 返回**原文**（界面展示用）；给模型的版本走 `AgentManager::timeline_digest`，已脱敏。
-/// 增量更新走事件 `nx://agent/timeline/{session}`（载荷为同样结构的数组）。
-#[tauri::command]
-pub fn agent_timeline(
-    session_id: String,
-    since_seq: Option<u64>,
-    limit: Option<usize>,
-    state: State<'_, AppState>,
-) -> Vec<timeline::TimelineEvent> {
-    state
-        .agent
-        .timeline_since(&session_id, since_seq.unwrap_or(0), limit.unwrap_or(200).min(timeline::MAX_EVENTS))
 }
 
 // ——— 提问 / 取消 / 测试连接 ———

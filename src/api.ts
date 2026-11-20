@@ -48,7 +48,6 @@ import type {
   VaultStatus,
 } from "./types";
 import type { ControlPayload, ControlState } from "./lib/control";
-import type { TimelineEvent } from "./lib/timeline";
 import type { RecorderStatus, RecordingDraft } from "./lib/recorder";
 import type { RefinedSkillDraft } from "./lib/skillRefine";
 
@@ -289,16 +288,6 @@ export const api = {
    */
   agentUserCommand: (sessionId: string, line: string, noEcho: boolean) =>
     invoke<void>("agent_user_command", { sessionId, line, noEcho }),
-  /**
-   * 统一时间线（2.5）：`seq` 大于 `sinceSeq` 的事件，最多 `limit` 条（超出保留最新的）。
-   * 返回原文（界面展示用）。增量更新走 `onAgentTimeline`。
-   */
-  agentTimeline: (sessionId: string, sinceSeq?: number, limit?: number) =>
-    invoke<TimelineEvent[]>("agent_timeline", {
-      sessionId,
-      sinceSeq: sinceSeq ?? null,
-      limit: limit ?? null,
-    }),
   // ——— 录制器（Phase 3.2）。草稿只经 `agentRecordStop` 的返回值交给前端，后端不留存。———
   /** 开始录制这个终端。总开关未启用 / 已在录制中会 reject */
   agentRecordStart: (sessionId: string, hostLabel?: string) =>
@@ -713,17 +702,6 @@ export async function onAgentControl(
   return listen<ControlPayload>(`nx://agent/control/${id}`, (ev) => handler(ev.payload));
 }
 
-/**
- * 统一时间线（2.5）有新事件。载荷是一批新增事件（按 seq 升序，一次可能不止一条），
- * 用 `lib/timeline.mergeEvents` 并进现有列表（按 seq 去重，与 `api.agentTimeline` 首屏拉取不会重复）。
- * 事件按**被操作的终端会话**分发：Agent 动了哪个标签，事件就出现在哪个标签的时间线上。
- */
-export async function onAgentTimeline(
-  id: string,
-  handler: (events: TimelineEvent[]) => void
-): Promise<UnlistenFn> {
-  return listen<TimelineEvent[]>(`nx://agent/timeline/${id}`, (ev) => handler(ev.payload));
-}
 
 /** 录制状态变化（开始 / 结束 / 取消）。载荷是完整的 `RecorderStatus`。 */
 export async function onAgentRecorder(
