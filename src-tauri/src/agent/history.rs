@@ -46,7 +46,8 @@ const ID_KEYS: &[&str] = &[
     "secretResult", "sessionId",
 ];
 /// 即使上游出了 bug 把值塞进来，这些键也不落盘。
-const DROP_KEYS: &[&str] = &["value", "password", "passphrase", "secretValue", "apiKey"];
+/// `revealContent`：nx_reveal 交付给用户的原文（前端 toPersisted 已剥一道，这里是后端兜底）
+const DROP_KEYS: &[&str] = &["value", "password", "passphrase", "secretValue", "apiKey", "revealContent"];
 
 // ——————————————————————————————— 对话落盘前的清洗 ———————————————————————————————
 
@@ -361,6 +362,19 @@ pub fn render_prior_runs(summaries: &[RunSummary], now: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reveal_content_is_never_persisted() {
+        let msgs = vec![serde_json::json!({
+            "id": "m1", "role": "assistant", "text": "",
+            "step": { "kind": "reveal", "text": "节点链接", "revealContent": "vless://uuid@host:443?pbk=KEY" }
+        })];
+        let out = sanitize_messages(msgs);
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(!s.contains("revealContent") && !s.contains("vless://"), "{s}");
+        assert!(s.contains("节点链接"));
+    }
+
     use super::*;
     use serde_json::json;
 
