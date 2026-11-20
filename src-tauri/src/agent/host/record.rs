@@ -36,6 +36,7 @@ const RATIONALE_CAP: usize = 600;
 pub fn describe_write(a: &AgentAction) -> Option<(&'static str, String)> {
     Some(match a {
         AgentAction::Exec { command, .. } => ("exec", command.trim().to_string()),
+        AgentAction::Run { command, .. } => ("exec", format!("（旁路）{}", command.trim())),
         AgentAction::Keys { keys, .. } => ("keys", format!("发送按键：{keys}")),
         AgentAction::Secret { reason, .. } => {
             ("secret", format!("请用户输入密码（{}）", reason.as_deref().unwrap_or("未说明")))

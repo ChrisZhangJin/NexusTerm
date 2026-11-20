@@ -97,6 +97,13 @@ fn write_of(a: &AgentAction) -> Result<Option<Write>, String> {
     let w = |category, lines: Vec<String>, command| Write { category, lines, command, keys: None };
     Ok(Some(match a {
         AgentAction::Exec { command, .. } => w("exec", vec![command.trim().to_string()], Some(command.clone())),
+        // 旁路执行与 nx_exec 同一类别（allow 里写 `exec` 同样放行）、同一套 deny / 硬偏好 / 范围 / danger；
+        // 命令可以多行（heredoc），逐行匹配
+        AgentAction::Run { command, .. } => w(
+            "exec",
+            command.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect(),
+            Some(command.clone()),
+        ),
         AgentAction::Keys { keys, .. } => {
             let bytes = interact::parse_keys(keys).map_err(|e| format!("按键串解析失败，没有写入：{e}"))?;
             Write { category: "keys", lines: typed_lines(&bytes), command: None, keys: Some(bytes) }

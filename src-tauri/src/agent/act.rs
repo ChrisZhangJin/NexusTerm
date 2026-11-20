@@ -211,6 +211,9 @@ pub fn effective_budget(base: budget::RunBudget, req: &AgentRunRequest) -> budge
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentAction {
     Exec { target: Option<String>, command: String },
+    /// 旁路执行（`nx_run`）：不经可见终端，在终端当前目录下跑一条非交互命令（SSH 同连接的 exec 通道 / 本地子进程），
+    /// 拿回输出与退出码。可以多行（heredoc 原样写）；`timeout_secs` 由执行层封顶。
+    Run { target: Option<String>, command: String, timeout_secs: Option<u64> },
     Export { target: Option<String>, deep: bool },
     Open { kind: OpenKind, label: Option<String>, command: Option<String> },
     Tab { op: TabOp, target: Option<String>, name: Option<String> },
@@ -358,6 +361,9 @@ struct ExecBlock {
     /// `watch` 专用：屏幕连续多久没变化就算卡住（毫秒）。
     #[serde(default)]
     stall_ms: Option<u64>,
+    /// `run` 专用：最长等多久（秒），后端会封顶。
+    #[serde(default)]
+    timeout_secs: Option<u64>,
     /// `memory` 专用：要记的备忘文本（`op:"add"`）。类别复用 `kind`、操作复用 `op`。
     #[serde(default)]
     text: Option<String>,
@@ -380,6 +386,7 @@ struct ExecBlock {
 /// 工具参数因此可以直接补一层 `action` 后喂给同一套 `ExecBlock` 解析，
 /// 不用为工具再维护一份字段表 —— 那两份迟早会走散。
 pub const TOOL_EXEC: &str = "nx_exec";
+pub const TOOL_RUN: &str = "nx_run";
 pub const TOOL_EXPORT: &str = "nx_export";
 pub const TOOL_OPEN: &str = "nx_open_tab";
 pub const TOOL_TAB: &str = "nx_tab";
@@ -508,7 +515,10 @@ pub fn tool_specs() -> Vec<llm::ToolSpec> {
     vec![
         llm::ToolSpec {
             name: TOOL_EXEC,
-            description: "在一个终端会话里执行一条 shell 命令，并拿到它的真实输出。".into(),
+            description: "在一个终端会话里执行一条 shell 命令，并拿到它的真实输出。\
+                          命令敲进**用户看得见的那个 shell**：要改变这个 shell 的状态（cd 之后还要留在那儿、export、source）、\
+                          要进入 docker exec / ssh / tmux / 交互程序、或这一步就该让用户在终端里看见时用它。\
+                          只想拿结果的非交互命令优先用 nx_run。".into(),
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -519,6 +529,35 @@ pub fn tool_specs() -> Vec<llm::ToolSpec> {
                     "command": {
                         "type": "string",
                         "description": "单条单行命令。不要换行串联，也不要用 && 串起互不相关的操作。"
+                    }
+                },
+                "required": ["command"]
+            }),
+        },
+        llm::ToolSpec {
+            name: TOOL_RUN,
+            description: "旁路执行一条**非交互**命令：不往可见终端里敲，在终端当前目录下另开通道跑\
+                          （SSH 会话 = 同一连接上的独立 exec 通道；本地会话 = 子进程），跑完返回输出（stdout+stderr 合并，过长截取首尾）和退出码。\
+                          不受屏幕上正在跑什么影响，也不会被提示符 / 交互提示误判 —— 结果比 nx_exec 可靠。\
+                          适合：安装软件、检查状态、curl、systemctl、跑脚本、用 tee 写入、`python3 - <<'PY'` 这类多行命令（command 可以多行）。\
+                          **不适合**（请用 nx_exec）：要改变可见 shell 状态的（cd 要持续生效、export、source、激活 venv）、\
+                          进入 docker exec / ssh / tmux / vim / REPL 等交互程序、要读键盘输入或密码的（没有终端，stdin 是空的，sudo 要密码会直接失败）、\
+                          这一步就该让用户在终端里看见的。它不继承可见 shell 里临时设置的环境变量 / 别名。\
+                          写文件内容用 nx_write，不要用 heredoc。旁路通道不可用（堡垒机兼容模式等）时会如实告诉你，那时改用 nx_exec。".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "目标会话 id。省略表示用户当前所在的会话。命令在这个会话所在的机器、它的当前目录下执行。"
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "要执行的命令（sh 语法，可以多行）。会在终端当前目录下执行。"
+                    },
+                    "timeoutSecs": {
+                        "type": "integer",
+                        "description": "最长等多久（秒），默认 120，上限 600。超时只会告诉你超时（拿不到输出），命令可能仍在运行。"
                     }
                 },
                 "required": ["command"]
@@ -829,6 +868,7 @@ fn emit_skill_note(app: &AppHandle, session: &str, step: usize, ok: bool, comman
 fn tool_action_name(name: &str) -> Option<&'static str> {
     match name {
         TOOL_EXEC => Some("exec"),
+        TOOL_RUN => Some("run"),
         TOOL_EXPORT => Some("export"),
         TOOL_OPEN => Some("open"),
         TOOL_TAB => Some("tab"),
@@ -924,6 +964,7 @@ pub fn actions_from_tool_call(call: &llm::ToolCall) -> Vec<AgentAction> {
         "secret" => parse_secret(block),
         "memory" => parse_memory(block),
         "skill" => parse_skill(block),
+        "run" => parse_run(block),
         _ => parse_exec(block),
     }
 }
@@ -948,6 +989,7 @@ fn describe_tool_calls(reply: &llm::LlmReply) -> String {
 pub fn tool_label(name: &str, args: &str) -> &'static str {
     match name.trim() {
         TOOL_EXEC => "执行命令",
+        TOOL_RUN => "旁路执行",
         TOOL_EXPORT => "导出记录",
         TOOL_OPEN => "新建标签页",
         TOOL_KEYS => "发送按键",
@@ -1306,6 +1348,7 @@ fn parse_block(raw: &str) -> Vec<AgentAction> {
             "screen" => parse_screen(block),
             "secret" => parse_secret(block),
             "skill" => parse_skill(block),
+            "run" => parse_run(block),
             _ => parse_exec(block),
         },
         Err(_) => parse_raw_shell(raw),
@@ -1369,6 +1412,20 @@ fn parse_exec(block: ExecBlock) -> Vec<AgentAction> {
         }
     }
     out
+}
+
+/// `action:"run"`（`nx_run`）：旁路执行。命令原样保留（可以多行），空命令不产出动作；
+/// 多目标照 `fan_targets` 铺开，多条命令（`commands`）逐条成动作。
+fn parse_run(block: ExecBlock) -> Vec<AgentAction> {
+    let commands: Vec<String> = if block.commands.is_empty() { block.command.into_iter().collect() } else { block.commands };
+    let commands: Vec<String> = commands.into_iter().filter(|c| !c.trim().is_empty()).collect();
+    let timeout_secs = block.timeout_secs;
+    fan_targets(block.target, block.targets)
+        .into_iter()
+        .flat_map(|target| {
+            commands.iter().map(move |c| AgentAction::Run { target: target.clone(), command: c.clone(), timeout_secs })
+        })
+        .collect()
 }
 
 /// `action:"export"`：导出一个（或多个）会话迄今为止的全部输出。
@@ -1611,7 +1668,7 @@ pub const AGENTIC_SYSTEM_PROMPT_INTRO: &str = concat!(
 /// 之前自定义路径用的是压缩版说明，结果用户的提示词里写着「只给结论与必要命令」，
 /// 模型就真把 shell 直接抄进围栏 —— 协议写歪了，界面上什么都不发生。
 pub const ACTION_PROTOCOL: &str = concat!(
-    "【优先用工具】你有 nx_exec / nx_send_keys / nx_wait / nx_watch / nx_screen / nx_secret / nx_export / nx_open_tab / nx_tab / nx_memory / nx_skill / nx_read / nx_write / nx_edit / nx_glob / nx_grep / nx_todo 共十七个工具。",
+    "【优先用工具】你有 nx_exec / nx_run / nx_send_keys / nx_wait / nx_watch / nx_screen / nx_secret / nx_export / nx_open_tab / nx_tab / nx_memory / nx_skill / nx_read / nx_write / nx_edit / nx_glob / nx_grep / nx_todo 共十八个工具。",
     "能用工具调用时**直接用工具**，不要写成下面的围栏文本；",
     "只有当你确认自己无法发起工具调用时，才退化成围栏代码块。\n",
     "**绝不要把界面动作当成 shell 命令**：`new-tab`、`reconnect`、`close-tab`、",
@@ -1621,7 +1678,17 @@ pub const ACTION_PROTOCOL: &str = concat!(
     "整文件新建 / 覆盖用 nx_write，找文件用 nx_glob，搜内容用 nx_grep。路径写绝对路径或以 ~ 开头。",
     "**nx_exec 只接受单行命令**：多行脚本、配置、heredoc 一类的内容，先用 nx_write 写成文件，再 nx_exec 执行它",
     "（例如写 /tmp/fix.sh 后 nx_exec `sh /tmp/fix.sh`），不要用 printf / echo 硬拼多行。",
+    "**文件内容一律用 nx_write / nx_edit 写**：不要在终端里敲 `cat > f <<EOF`、`tee f <<EOF`、echo 串，也不要打开 vim / nano 去改 ——",
+    "在终端里逐行敲 heredoc 会被续行提示、代码行误判卡住，这类命令会被直接拦下并请你改用 nx_write。",
+    "要 sudo 才能写的系统文件：先 nx_write 到 /tmp，再 nx_run `sudo install -m 644 /tmp/x /etc/x`。",
     "写文件会按审批设置请用户确认，并展示差异。\n\n",
+    "【执行命令：nx_run 与 nx_exec】**nx_run{command, target?, timeoutSecs?}** 旁路执行：不往可见终端里敲，",
+    "在终端当前目录下另开通道跑完，返回输出和退出码，不受屏幕局面影响 —— **只要拿结果的非交互命令优先用它**",
+    "（装软件、查状态、curl、systemctl、跑脚本、`python3 - <<'PY'` 这类多行命令）。",
+    "它没有终端、stdin 为空、不继承可见 shell 里临时设置的变量；要密码的 sudo 会直接失败（那时改用 nx_exec + nx_secret）。",
+    "**nx_exec** 敲进用户看得见的 shell：要改变这个 shell 的状态（cd 要持续生效、export、source）、",
+    "进入 docker exec / ssh / tmux / 交互程序、或这一步该让用户在终端里看见时用它。",
+    "nx_run 告诉你旁路不可用时（堡垒机兼容模式等）就改用 nx_exec。nx_run 与 nx_exec 过同样的范围 / 危险命令 / 审批闸门。\n\n",
     "【计划】三步以上的任务先用 nx_todo 列出计划（每次调用整表替换），推进时更新每项状态",
     "（pending / in_progress / done）；清单会一直显示在系统提示的「当前计划」里，历史被压缩也不会丢。\n\n",
     "【要执行命令时】在回复里写且只写这样一个围栏代码块（不写 action 等同 \"exec\"）：\n",
@@ -1729,7 +1796,7 @@ pub const ACTION_PROTOCOL: &str = concat!(
     " findstr / ipconfig / tasklist / systeminfo 等 cmd 语法** —— ls、cat、grep 在 cmd 里",
     "根本不存在，发过去只会得到「不是内部或外部命令」；",
     "确有必要才做写操作，并在下达前用一句话说明为什么要做、影响面多大；\n",
-    "4) 命令的真实输出会原样回给你，**没有退出码这种参考信息**——",
+    "4) nx_exec 命令的真实输出会原样回给你，**没有退出码这种参考信息**（nx_run 会附退出码）——",
     "跟真人盯着终端一样，自己照着输出文本判断这条命令到底成没成功，不要假装没看到；\n",
     "5) 不要执行不可逆操作（rm -rf、mkfs、DROP、chmod -R 777、把未知脚本管道给 shell 等），",
     "除非用户在这一轮对话里明确要求；开新会话同理要有明确理由，不要为了好奇心乱开；\n",
@@ -4118,7 +4185,7 @@ pub async fn run(
                 );
                 feedback.push_str(
                     "你的工具调用没有产生任何动作，多半是缺了必填参数。\
-                     nx_exec 必须有 command；nx_send_keys 必须有 keys；nx_tab 必须有 op，\
+                     nx_exec / nx_run 必须有 command；nx_send_keys 必须有 keys；nx_tab 必须有 op，\
                      且除 list 外都要带 target；nx_open_tab 必须有 kind，\
                      kind=ssh 时还要带 sessionRecordId。请补齐后重新调用。\n",
                 );
@@ -4232,6 +4299,25 @@ pub async fn run(
             // 开始下一个动作之前先看控制权：用户正在终端里操作时不抢（读屏 / 等待也算，
             // 此刻的屏幕是用户在打字的屏幕）。发起会话始终是被驾驶的。
             drive_gate!(&session);
+            // heredoc 改道（对话 / 托管都管）：在可见终端里敲 `cat > f <<EOF` 这类多行输入极易被读屏误判、卡住后续，
+            // 不执行，请模型改用 nx_write（写文件）/ nx_run（其他 heredoc）
+            if let Some(why) = heredoc_refusal(app, state, &action, &targets, &session) {
+                let shown = match &action {
+                    AgentAction::Keys { keys, .. } => keys.clone(),
+                    AgentAction::Exec { command, .. } => command.trim().to_string(),
+                    _ => String::new(),
+                };
+                if trace_on {
+                    trace::record(&session, step, "heredoc", &format!("`{shown}` → 改道"));
+                }
+                emit_step(
+                    app,
+                    &session,
+                    StepPayload { command: Some(shown.clone()), reasons: Some(vec![why.clone()]), ..StepPayload::new("skip", step) },
+                );
+                feedback.push_str(&format!("「{shown}」{why}\n"));
+                continue;
+            }
             // 托管：契约的唯一强制点。每个写入动作（Exec / Keys / Secret / Skill-run / Open / Tab-close）
             // 在这里过一次 `gate::authorize`：Deny 不写、把原因反馈给模型；Approve 挂起等批准（不设超时）；
             // Notify / Allow 放行，Notify 在写成功后发通知卡。各分支里不再重复做托管的危险判断。
@@ -4532,6 +4618,110 @@ pub async fn run(
                         "命令 `{}` 已被拦下、没有下发到终端：{hint}\n",
                         command
                     ));
+                }
+                AgentAction::Run { target, command, timeout_secs } => {
+                    // 旁路执行：不碰可见终端，不等提示符；范围 / 危险命令的闸门与 nx_exec 相同
+                    // （托管的 deny / 硬偏好 / 范围 / danger 已在上面的 `gate::authorize` 里做过）
+                    let shown = command.trim().to_string();
+                    let risk = assess(&command);
+                    let scope_reasons = if risk.dangerous { risk.reasons.clone() } else { Vec::new() };
+                    let Some((target_id, label, crossed)) = gate_target(
+                        app,
+                        state,
+                        runtime,
+                        &session,
+                        step,
+                        &mut targets,
+                        target.as_deref(),
+                        |l| format!("在「{l}」旁路执行：{shown}"),
+                        &shown,
+                        scope_reasons,
+                        &mut feedback,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    // 对话 / 旧 steward：危险命令与 nx_exec 同一条审批（越界弹窗里已经并过风险原因的不再弹）
+                    if host.is_none() && (is_steward || cfg.exec_mode.is_approval()) && risk.dangerous && !crossed {
+                        let req_payload = ApprovePayload {
+                            request_id: uuid::Uuid::new_v4().simple().to_string(),
+                            kind: "danger",
+                            command: shown.clone(),
+                            target: target_id.clone(),
+                            target_label: label.clone(),
+                            reasons: with_cwd_note(risk.reasons.clone()),
+                            diff: None,
+                            preview_complete: None,
+                        };
+                        let approved = request_approval(app, runtime, &session, &req_payload).await;
+                        if trace_on {
+                            trace::record(&session, step, "approval", &format!("{} · 旁路命令 `{shown}`", if approved { "已批准" } else { "未批准" }));
+                        }
+                        if !approved {
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    target: Some(target_id.clone()),
+                                    target_label: Some(label.clone()),
+                                    command: Some(shown.clone()),
+                                    reasons: Some(risk.reasons.clone()),
+                                    ..StepPayload::new("skip", step)
+                                },
+                            );
+                            feedback.push_str(&format!(
+                                "命令 `{shown}` 未获执行（人没批准 / 等待超时）。请换个更安全的等价做法，或在结论里告诉用户需要他本人执行这一步。\n"
+                            ));
+                            continue;
+                        }
+                    }
+                    let cwd = targets
+                        .iter()
+                        .find(|t| t.id == target_id)
+                        .and_then(|t| t.cwd.clone())
+                        .or_else(|| host.as_ref().filter(|h| h.console_id == target_id).and_then(|h| h.saved_console()).and_then(|c| c.cwd));
+                    let secs = run_timeout(timeout_secs);
+                    let card_label = format!("{label} · 旁路");
+                    emit_step(
+                        app,
+                        &session,
+                        StepPayload {
+                            target: Some(target_id.clone()),
+                            target_label: Some(card_label.clone()),
+                            command: Some(shown.clone()),
+                            ..StepPayload::new("exec", step)
+                        },
+                    );
+                    let tl_seq = timeline::begin(app, &state.agent, &target_id, TlKind::Command, &shown, Some("旁路"));
+                    let res = oob_run(app, state, &session, step, &target_id, &card_label, &shown, cwd.as_deref(), secs, &cancel).await;
+                    let (out, text) = match &res {
+                        Ok(raw) => {
+                            let (out, rc) = split_rc(raw);
+                            (out.clone(), run_feedback(&shown, &label, cwd.as_deref(), &out, rc))
+                        }
+                        Err(e) => (String::new(), run_failure_feedback(&shown, &label, e, secs)),
+                    };
+                    timeline::finish(app, &state.agent, &target_id, tl_seq, &out, None, false);
+                    emit_step(
+                        app,
+                        &session,
+                        StepPayload {
+                            target: Some(target_id.clone()),
+                            target_label: Some(card_label),
+                            command: Some(shown.clone()),
+                            output: Some(if res.is_ok() { out } else { text.trim().to_string() }),
+                            ..StepPayload::new("result", step)
+                        },
+                    );
+                    if trace_on {
+                        trace::record(&session, step, "run", &format!("`{shown}` → {}", if res.is_ok() { "完成" } else { "未执行 / 失败" }));
+                    }
+                    feedback.push_str(&text);
+                    // 真跑了（含失败退出码 / 超时）才落决策记录；旁路不可用 = 什么都没发生
+                    if !matches!(res, Err(RunErr::Unavailable) | Err(RunErr::Cancelled)) {
+                        host_did!();
+                    }
                 }
                 AgentAction::Exec { target, command } => {
                     let located = locate(target.as_deref(), &targets, &session);
@@ -5984,7 +6174,10 @@ const HOSTED_ADDENDUM: &str = "\n\n## 托管运行\n\
       不要给 recommendation，任务会挂起等他回来。\n\
     - 不要用纯文本回复提问或收尾 —— 没有动作的回复第一次会被退回让你继续，再犯才会当成向用户提问。\n\
     - 目标确实达成后调用 `nx_complete`，附上总结和证据。没调用它之前任务不会结束。\n\
-    - 用户随时可能接管终端；交还后请先读屏核对现场再继续。\n";
+    - 用户随时可能接管终端；交还后请先读屏核对现场再继续。\n\
+    - **少读屏猜结果，多用可靠通道**：写文件内容用 `nx_write` / `nx_edit`（不要 heredoc、echo 串、打开编辑器）；\
+      只要结果的非交互命令（安装、检查、curl、systemctl、跑脚本）用 `nx_run`，它直接回输出和退出码；\
+      `nx_exec` 留给必须发生在可见 shell 里的事（cd 要持续生效、进入 docker exec / ssh / tmux、启动交互程序）。\n";
 
 /// 一次托管里最多替用户「按推荐作答」几次：再多就是在兜圈子，交给人。
 const SELF_ANSWER_CAP: u32 = 12;
@@ -6674,13 +6867,24 @@ fn sh_quote(s: &str) -> String {
 /// 不经终端执行一条只读检查命令，返回合并后的输出（命令里已带 `; echo __NX_CHECK_RC=$?`）。
 /// SSH：同一连接上的 exec 旁路通道；本地（Unix）：`sh -c` 子进程。工作目录 = 终端当前目录。
 async fn oob_exec(state: &AppState, console: &str, cmd: &str, cwd: Option<&str>) -> Result<String, OobErr> {
-    const SECS: u64 = 125;
+    oob_exec_with(state, console, cmd, cwd, 125, "判据核验超时").await
+}
+
+/// `oob_exec` 的通用版：超时秒数与超时文案由调用方给（`nx_run` 用自己的）。
+async fn oob_exec_with(
+    state: &AppState,
+    console: &str,
+    cmd: &str,
+    cwd: Option<&str>,
+    secs: u64,
+    timeout_msg: &'static str,
+) -> Result<String, OobErr> {
     if state.sessions.contains(console) {
         let script = match cwd.filter(|c| !c.trim().is_empty()) {
             Some(dir) => format!("cd {} 2>/dev/null || echo '[nexus] 终端目录不存在，在 ~ 下执行'; {cmd}", sh_quote(dir)),
             None => format!("echo '[nexus] 不知道终端当前目录，在 ~ 下执行'; {cmd}"),
         };
-        return match state.sessions.run_sidecar(console, &script, None, SECS, "判据核验超时").await {
+        return match state.sessions.run_sidecar(console, &script, None, secs, timeout_msg).await {
             Ok(out) => Ok(out),
             Err(crate::ssh::session::SessionError::Channel(m))
                 if m.contains(crate::ssh::session::SIDECAR_OFF) || m.contains(crate::ssh::session::SIDECAR_DENIED) =>
@@ -6692,14 +6896,19 @@ async fn oob_exec(state: &AppState, console: &str, cmd: &str, cwd: Option<&str>)
     }
     #[cfg(unix)]
     if state.local.contains(console) {
-        return local_check(cmd, cwd, SECS).await;
+        return local_check_with(cmd, cwd, secs, timeout_msg).await;
     }
     Err(OobErr::Unavailable)
 }
 
 /// 本地（Unix）旁路：`sh -c` 子进程，工作目录 = 终端当前目录（`~` 展开；不存在就退回 $HOME）。
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 async fn local_check(cmd: &str, cwd: Option<&str>, secs: u64) -> Result<String, OobErr> {
+    local_check_with(cmd, cwd, secs, "判据核验超时").await
+}
+
+#[cfg(unix)]
+async fn local_check_with(cmd: &str, cwd: Option<&str>, secs: u64, timeout_msg: &str) -> Result<String, OobErr> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
     let dir = cwd
         .map(|c| if let Some(rest) = c.strip_prefix('~') { format!("{home}{rest}") } else { c.to_string() })
@@ -6716,7 +6925,7 @@ async fn local_check(cmd: &str, cwd: Option<&str>, secs: u64) -> Result<String, 
         .kill_on_drop(true)
         .output();
     match tokio::time::timeout(std::time::Duration::from_secs(secs), child).await {
-        Err(_) => Err(OobErr::Failed("判据核验超时".to_string())),
+        Err(_) => Err(OobErr::Failed(timeout_msg.to_string())),
         Ok(Err(e)) => Err(OobErr::Failed(format!("起子进程失败：{e}"))),
         Ok(Ok(o)) => {
             let mut out = String::from_utf8_lossy(&o.stdout).into_owned();
@@ -6724,6 +6933,154 @@ async fn local_check(cmd: &str, cwd: Option<&str>, secs: u64) -> Result<String, 
             Ok(out)
         }
     }
+}
+
+// ——————————————————————————————— 旁路执行（nx_run） ———————————————————————————————
+
+/// `nx_run` 的超时：默认 / 上限（秒）
+const RUN_DEFAULT_SECS: u64 = 120;
+const RUN_MAX_SECS: u64 = 600;
+/// 旁路脚本最后一行打出的退出码标记
+const RUN_RC_MARK: &str = "__NX_RUN_RC=";
+const RUN_TIMEOUT_MSG: &str = "旁路执行超时";
+
+fn run_timeout(req: Option<u64>) -> u64 {
+    req.unwrap_or(RUN_DEFAULT_SECS).clamp(1, RUN_MAX_SECS)
+}
+
+/// 包一层：stderr 并进 stdout（SSH exec 通道的 stderr 是另一路，`run_sidecar` 只收 stdout）；
+/// 命令放进子 shell、另起一行（里面可以有 heredoc / 注释 / exit），stdin 接 /dev/null（没有终端可读），
+/// 最后一行打退出码。
+fn run_script(cmd: &str) -> String {
+    format!("exec 2>&1\n(\n{cmd}\n) </dev/null\necho \"{RUN_RC_MARK}$?\"")
+}
+
+/// 从旁路输出里摘掉退出码标记行：返回 (输出, 退出码)。标记不在（被截断 / shell 不认）就是 None。
+fn split_rc(raw: &str) -> (String, Option<i32>) {
+    let Some(at) = raw.rfind(RUN_RC_MARK).filter(|&i| i == 0 || raw[..i].ends_with('\n')) else {
+        return (raw.trim_end().to_string(), None);
+    };
+    let rc = raw[at + RUN_RC_MARK.len()..].lines().next().and_then(|l| l.trim().parse().ok());
+    (raw[..at].trim_end().to_string(), rc)
+}
+
+#[derive(Debug)]
+enum RunErr {
+    /// 没有旁路通道（兼容模式 / 堡垒机拒绝 / 平台不支持）
+    Unavailable,
+    /// 用户取消了这一轮
+    Cancelled,
+    Timeout,
+    Failed(String),
+}
+
+/// 旁路执行一条命令，期间每 5 秒报一次「还在等」、随时响应取消。返回原始输出（含退出码标记行）。
+#[allow(clippy::too_many_arguments)]
+async fn oob_run(
+    app: &AppHandle,
+    state: &AppState,
+    session: &str,
+    step: usize,
+    target_id: &str,
+    label: &str,
+    cmd: &str,
+    cwd: Option<&str>,
+    secs: u64,
+    cancel: &AtomicBool,
+) -> Result<String, RunErr> {
+    let script = run_script(cmd);
+    let mut fut = Box::pin(oob_exec_with(state, target_id, &script, cwd, secs, RUN_TIMEOUT_MSG));
+    let mut poll = tokio::time::interval(Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    let mut told = 0u64;
+    loop {
+        tokio::select! {
+            r = &mut fut => {
+                return match r {
+                    Ok(out) => Ok(out),
+                    Err(OobErr::Unavailable) => Err(RunErr::Unavailable),
+                    Err(OobErr::Failed(e)) if e.contains(RUN_TIMEOUT_MSG) => Err(RunErr::Timeout),
+                    Err(OobErr::Failed(e)) => Err(RunErr::Failed(e)),
+                };
+            }
+            _ = poll.tick() => {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(RunErr::Cancelled);
+                }
+                let el = started.elapsed().as_secs();
+                if el >= told + 5 {
+                    told = el - el % 5;
+                    emit_step(
+                        app,
+                        session,
+                        StepPayload {
+                            target: Some(target_id.into()),
+                            target_label: Some(label.into()),
+                            command: Some(cmd.into()),
+                            elapsed_secs: Some(told),
+                            ..StepPayload::new("waiting", step)
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 旁路执行结果喂回模型的文字（出网前统一过 `scrub`，与 nx_exec 一样）。
+fn run_feedback(command: &str, label: &str, cwd: Option<&str>, out: &str, rc: Option<i32>) -> String {
+    let mut s = format!(
+        "在会话「{label}」旁路执行（不经可见终端，目录：{}）：`{}`\n",
+        cwd.unwrap_or("未知，按 ~"),
+        head_tail_chars(command.trim(), 300)
+    );
+    match rc {
+        Some(0) => s.push_str("退出码：0（成功）\n"),
+        Some(n) => s.push_str(&format!("退出码：{n}（失败）\n")),
+        None => s.push_str("退出码：未知（没拿到结束标记，可能是命令让 shell 提前退出了）\n"),
+    }
+    if out.trim().is_empty() {
+        s.push_str("输出：（无）\n");
+    } else {
+        s.push_str(&format!("输出：\n{}\n", head_tail_chars(out, MAX_FEEDBACK_CHARS)));
+    }
+    s
+}
+
+fn run_failure_feedback(command: &str, label: &str, e: &RunErr, secs: u64) -> String {
+    let cmd = head_tail_chars(command.trim(), 300);
+    match e {
+        RunErr::Unavailable => format!(
+            "`{cmd}` 没有执行：会话「{label}」没有可用的旁路执行通道（SSH 兼容模式 / 堡垒机不允许并行通道 / 本平台不支持）。\
+             请改用 nx_exec 在终端里执行；多行内容先用 nx_write 写成脚本文件，再 nx_exec `sh 脚本路径`。\n"
+        ),
+        RunErr::Cancelled => format!("`{cmd}` 已被用户取消，不要重试。\n"),
+        RunErr::Timeout => format!(
+            "`{cmd}` 旁路执行超时（{secs} 秒），没有拿到结果；命令可能仍在运行。\
+             要跑很久的任务请用 nx_exec 在终端里启动、再 nx_watch 盯住，或给更大的 timeoutSecs（上限 {RUN_MAX_SECS}）。\n"
+        ),
+        RunErr::Failed(why) => format!("`{cmd}` 旁路执行失败：{why}。可以重试一次；连续失败就改用 nx_exec。\n"),
+    }
+}
+
+/// heredoc 改道：动作要在可见终端里敲 heredoc 时返回拒绝原因（话术见 `host::heredoc`）。
+/// 只有按键要看局面（前台不是 shell 时不管），先用纯文本判一遍，命中了才读屏。
+fn heredoc_refusal(
+    app: &AppHandle,
+    state: &AppState,
+    action: &AgentAction,
+    targets: &[AgentTarget],
+    session: &str,
+) -> Option<String> {
+    super::host::heredoc::redirect(action, None)?;
+    let sit = match action {
+        AgentAction::Keys { target, .. } => {
+            let tid = locate(target.as_deref(), targets, session).map(|(i, _)| i).unwrap_or_else(|i| i);
+            Some(situation_now(app, state, &tid, false))
+        }
+        _ => None,
+    };
+    super::host::heredoc::redirect(action, sit.as_ref())
 }
 
 /// 反射代答：剧本 + 策略 + 托管闸门都放行时，在同一租约下写入（写前过控制权闸与 keys_recheck），
@@ -6886,7 +7243,7 @@ async fn hosted_authorize(
         Gate::Approve(reasons) => {
             before_park();
             let reasons =
-                if matches!(action, AgentAction::Exec { .. }) { with_cwd_note(reasons.clone()) } else { reasons.clone() };
+                if matches!(action, AgentAction::Exec { .. } | AgentAction::Run { .. }) { with_cwd_note(reasons.clone()) } else { reasons.clone() };
             let ok = h.approve(hosted_approval_card(text, &reasons)).await;
             (!ok).then(|| "用户没有批准，没有写入。换一个做法，或用 nx_ask_user 问清楚".to_string())
         }
@@ -7475,6 +7832,105 @@ mod tests {
             content: content.into(),
             create_dirs: false,
         }))
+    }
+
+    // ——— 旁路执行 nx_run ———
+
+    #[test]
+    fn run_tool_is_declared_and_parsed() {
+        assert!(tool_specs().iter().any(|s| s.name == TOOL_RUN));
+        assert!(hosted_tool_specs().iter().any(|s| s.name == TOOL_RUN));
+        let call = |args: &str| llm::ToolCall { id: String::new(), name: TOOL_RUN.into(), arguments: args.into() };
+        assert_eq!(
+            actions_from_tool_call(&call(r#"{"command":"python3 - <<'PY'\nprint(1)\nPY","target":"s1","timeoutSecs":30}"#)),
+            vec![AgentAction::Run { target: Some("s1".into()), command: "python3 - <<'PY'\nprint(1)\nPY".into(), timeout_secs: Some(30) }]
+        );
+        assert_eq!(
+            actions_from_tool_call(&call(r#"{"command":"uptime"}"#)),
+            vec![AgentAction::Run { target: None, command: "uptime".into(), timeout_secs: None }]
+        );
+        assert!(actions_from_tool_call(&call(r#"{"command":"  "}"#)).is_empty());
+        assert!(actions_from_tool_call(&call("{}")).is_empty());
+        // 围栏协议同形
+        assert_eq!(
+            extract_actions(&block(r#"{"action":"run","command":"df -h"}"#)),
+            vec![AgentAction::Run { target: None, command: "df -h".into(), timeout_secs: None }]
+        );
+        assert_eq!(tool_label(TOOL_RUN, "{}"), "旁路执行");
+        // 超时：默认 120，封顶 600，至少 1
+        assert_eq!(run_timeout(None), 120);
+        assert_eq!(run_timeout(Some(100_000)), 600);
+        assert_eq!(run_timeout(Some(0)), 1);
+        // 提示词讲清分工
+        assert!(ACTION_PROTOCOL.contains("nx_run") && HOSTED_ADDENDUM.contains("nx_run") && HOSTED_ADDENDUM.contains("nx_write"));
+    }
+
+    #[test]
+    fn run_goes_through_the_same_gate_as_exec() {
+        let run = |c: &str| AgentAction::Run { target: None, command: c.into(), timeout_secs: None };
+        // 是一次托管写入（主循环据此过 `gate::authorize`），类别与 nx_exec 相同
+        let (kind, text) = super::super::host::record::describe_write(&run("apt-get install -y jq")).unwrap();
+        assert_eq!(kind, "exec");
+        assert!(text.contains("apt-get install -y jq"));
+        let mut ctx = ctx_with("auto");
+        ctx.authority.deny.push("prod-db".into());
+        let p = ctx.policy();
+        let auth = |a: &AgentAction| super::super::host::gate::authorize(&p, a, None);
+        // 自定义禁项、内置 delete 标签：与 exec 同样拒绝（多行命令逐行看）
+        assert!(matches!(auth(&run("psql -h PROD-DB.internal -c 'select 1'")), Gate::Deny(_)));
+        assert!(matches!(auth(&run("cd /srv\nrm -rf build")), Gate::Deny(t) if t.contains("delete")));
+        // 不可逆：同样停下来问人
+        assert!(matches!(auth(&run("sudo reboot")), Gate::Approve(_)));
+        assert_eq!(auth(&run("uptime")), auth(&exec("uptime")));
+        // 档位 / allow 同口径
+        let ctx = ctx_with("notify");
+        assert_eq!(super::super::host::gate::authorize(&ctx.policy(), &run("ls"), None), Gate::Notify);
+    }
+
+    #[test]
+    fn run_script_reports_exit_code_and_feedback() {
+        assert_eq!(split_rc("hello\n__NX_RUN_RC=0\n"), ("hello".to_string(), Some(0)));
+        assert_eq!(split_rc("__NX_RUN_RC=3"), (String::new(), Some(3)));
+        // 输出里恰好出现标记文字（不在行首）不算
+        assert_eq!(split_rc("x __NX_RUN_RC=9"), ("x __NX_RUN_RC=9".to_string(), None));
+        let fb = run_feedback("false", "web", Some("/srv"), "", Some(1));
+        assert!(fb.contains("退出码：1") && fb.contains("/srv") && fb.contains("旁路"), "{fb}");
+        let fb = run_failure_feedback("ls", "bastion", &RunErr::Unavailable, 120);
+        assert!(fb.contains("nx_exec") && fb.contains("没有执行"), "{fb}");
+        assert!(run_failure_feedback("sleep 999", "w", &RunErr::Timeout, 5).contains("5 秒"));
+    }
+
+    /// 本地旁路真跑一遍：stderr 并进输出、heredoc 可用、exit 不吞退出码、stdin 是空的
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_script_runs_locally_with_rc_and_stderr() {
+        let dir = std::env::temp_dir();
+        let cmd = "echo out; echo err >&2\ncat <<'EOF'\nbody\nEOF\nread x || echo no-stdin\nexit 7";
+        let Ok(raw) = local_check_with(&run_script(cmd), dir.to_str(), 10, RUN_TIMEOUT_MSG).await else {
+            panic!("本地旁路应当可用")
+        };
+        let (out, rc) = split_rc(&raw);
+        assert_eq!(rc, Some(7), "{raw}");
+        for k in ["out", "err", "body", "no-stdin"] {
+            assert!(out.contains(k), "{k}: {out}");
+        }
+        let Err(OobErr::Failed(e)) = local_check_with(&run_script("sleep 5"), dir.to_str(), 1, RUN_TIMEOUT_MSG).await else {
+            panic!("应当超时")
+        };
+        assert!(e.contains(RUN_TIMEOUT_MSG));
+    }
+
+    #[test]
+    fn heredoc_in_exec_or_keys_is_redirected_not_run() {
+        use super::super::host::heredoc::redirect;
+        let fb = redirect(&exec("cat > /tmp/gen.py <<'EOF'"), None).unwrap();
+        assert!(fb.contains("nx_write") && fb.contains("/tmp/gen.py"));
+        let keys = AgentAction::Keys { target: None, keys: "cat > /tmp/gen.py <<'EOF'\rdef gen_password():\rEOF\r".into() };
+        assert!(redirect(&keys, None).unwrap().contains("nx_write"));
+        assert!(redirect(&exec("ssh h <<EOF"), None).unwrap().contains("nx_run"));
+        assert!(redirect(&exec("cat /etc/hosts"), None).is_none());
+        // nx_run 本身接受 heredoc（不改道）
+        assert!(redirect(&AgentAction::Run { target: None, command: "cat > f <<EOF\nx\nEOF".into(), timeout_secs: None }, None).is_none());
     }
 
     #[test]

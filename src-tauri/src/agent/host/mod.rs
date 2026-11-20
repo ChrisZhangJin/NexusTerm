@@ -15,6 +15,7 @@ pub mod reflex;
 pub mod verify;
 pub mod gate;
 pub mod misread;
+pub mod heredoc;
 pub mod phase;
 pub mod watchdog;
 
