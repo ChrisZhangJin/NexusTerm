@@ -6867,10 +6867,25 @@ fn sh_quote(s: &str) -> String {
 /// 不经终端执行一条只读检查命令，返回合并后的输出（命令里已带 `; echo __NX_CHECK_RC=$?`）。
 /// SSH：同一连接上的 exec 旁路通道；本地（Unix）：`sh -c` 子进程。工作目录 = 终端当前目录。
 async fn oob_exec(state: &AppState, console: &str, cmd: &str, cwd: Option<&str>) -> Result<String, OobErr> {
-    oob_exec_with(state, console, cmd, cwd, 125, "判据核验超时").await
+    oob_exec_with(state, console, cmd, cwd, 125, "判据核验超时", false).await
 }
 
-/// `oob_exec` 的通用版：超时秒数与超时文案由调用方给（`nx_run` 用自己的）。
+/// SSH 旁路通道上的 (exec 命令, 标准输入)：脚本 = 先 cd 到终端目录（或说明不知道目录），再跑 `cmd`。
+/// `via_stdin`：exec 命令固定为 `sh -s`、脚本原样从 stdin 喂进去 —— 不经任何引号，
+/// 远端登录 shell 是 bash / fish / csh 都一样按 POSIX sh 解释（`nx_run` 用）；否则脚本直接作为 exec 命令（判据核验，行为不变）。
+fn sidecar_invocation(cmd: &str, cwd: Option<&str>, via_stdin: bool) -> (String, Option<String>) {
+    let script = match cwd.filter(|c| !c.trim().is_empty()) {
+        Some(dir) => format!("cd {} 2>/dev/null || echo '[nexus] 终端目录不存在，在 ~ 下执行'; {cmd}", sh_quote(dir)),
+        None => format!("echo '[nexus] 不知道终端当前目录，在 ~ 下执行'; {cmd}"),
+    };
+    if via_stdin {
+        ("sh -s".to_string(), Some(script))
+    } else {
+        (script, None)
+    }
+}
+
+/// `oob_exec` 的通用版：超时秒数与超时文案由调用方给（`nx_run` 用自己的）；`via_stdin` 见 `sidecar_invocation`。
 async fn oob_exec_with(
     state: &AppState,
     console: &str,
@@ -6878,13 +6893,11 @@ async fn oob_exec_with(
     cwd: Option<&str>,
     secs: u64,
     timeout_msg: &'static str,
+    via_stdin: bool,
 ) -> Result<String, OobErr> {
     if state.sessions.contains(console) {
-        let script = match cwd.filter(|c| !c.trim().is_empty()) {
-            Some(dir) => format!("cd {} 2>/dev/null || echo '[nexus] 终端目录不存在，在 ~ 下执行'; {cmd}", sh_quote(dir)),
-            None => format!("echo '[nexus] 不知道终端当前目录，在 ~ 下执行'; {cmd}"),
-        };
-        return match state.sessions.run_sidecar(console, &script, None, secs, timeout_msg).await {
+        let (command, stdin) = sidecar_invocation(cmd, cwd, via_stdin);
+        return match state.sessions.run_sidecar(console, &command, stdin.as_deref(), secs, timeout_msg).await {
             Ok(out) => Ok(out),
             Err(crate::ssh::session::SessionError::Channel(m))
                 if m.contains(crate::ssh::session::SIDECAR_OFF) || m.contains(crate::ssh::session::SIDECAR_DENIED) =>
@@ -6989,7 +7002,7 @@ async fn oob_run(
     cancel: &AtomicBool,
 ) -> Result<String, RunErr> {
     let script = run_script(cmd);
-    let mut fut = Box::pin(oob_exec_with(state, target_id, &script, cwd, secs, RUN_TIMEOUT_MSG));
+    let mut fut = Box::pin(oob_exec_with(state, target_id, &script, cwd, secs, RUN_TIMEOUT_MSG, true));
     let mut poll = tokio::time::interval(Duration::from_millis(200));
     let started = std::time::Instant::now();
     let mut told = 0u64;
@@ -7885,6 +7898,43 @@ mod tests {
         // 档位 / allow 同口径
         let ctx = ctx_with("notify");
         assert_eq!(super::super::host::gate::authorize(&ctx.policy(), &run("ls"), None), Gate::Notify);
+    }
+
+    /// nx_run：远端 exec 命令固定 `sh -s`，脚本（含 cd）原样走 stdin，不经引号；判据核验仍把脚本直接当 exec 命令（不变）
+    #[test]
+    fn sidecar_invocation_feeds_script_to_sh_via_stdin_for_run() {
+        let cmd = "echo 'it'\''s'; false; echo \"rc=$?\"";
+        let (exec, stdin) = sidecar_invocation(cmd, Some("/srv/it's"), true);
+        assert_eq!(exec, "sh -s");
+        assert_eq!(stdin.as_deref(), Some(format!("cd '/srv/it'\\''s' 2>/dev/null || echo '[nexus] 终端目录不存在，在 ~ 下执行'; {cmd}").as_str()));
+        let (exec, stdin) = sidecar_invocation("ls", None, false);
+        assert_eq!(exec, "echo '[nexus] 不知道终端当前目录，在 ~ 下执行'; ls");
+        assert!(stdin.is_none());
+    }
+
+    /// 脚本经 stdin 交给真正的 `sh -s`：引号、`$?`、cd 到带单引号的目录、退出码都按原样生效
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sidecar_script_round_trips_through_sh_stdin() {
+        use tokio::io::AsyncWriteExt;
+        let dir = std::env::temp_dir().join(format!("nx-it's-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (exec, stdin) = sidecar_invocation(&run_script("echo \"it's $(basename \"$PWD\")\"; read x || echo no-stdin; false"), dir.to_str(), true);
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&exec)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut w = child.stdin.take().unwrap();
+        w.write_all(stdin.unwrap().as_bytes()).await.unwrap();
+        drop(w);
+        let out = child.wait_with_output().await.unwrap();
+        let (out, rc) = split_rc(&String::from_utf8_lossy(&out.stdout));
+        assert_eq!(rc, Some(1), "{out}");
+        assert_eq!(out, format!("it's {}\nno-stdin", dir.file_name().unwrap().to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
