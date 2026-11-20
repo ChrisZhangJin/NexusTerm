@@ -11,6 +11,7 @@ import { fmtDuration, fmtWhen, historyStateLabel } from "../lib/hostHistory";
 import type { HostHistoryItem } from "../types";
 import HostChangesView from "./HostChangesView";
 import HostText from "./HostText";
+import { fromHostSpent, spentLine, usageTooltip } from "../lib/usage";
 
 export default function HostHistory() {
   const [items, setItems] = useState<HostHistoryItem[] | null>(null);
@@ -47,12 +48,18 @@ export default function HostHistory() {
         {items?.map((it) => {
           const st = historyStateLabel(it.state);
           const open = openId === it.contractId;
+          const usage = spentLine(it.spent);
           return (
             <div key={it.contractId} className={`host-history-item${open ? " on" : ""}`}>
               <button className="host-history-row" onClick={() => setOpenId(open ? null : it.contractId)} title={it.goal}>
                 <span className="st-ev-time">{fmtWhen(it.endedAt)}</span>
                 <span className="host-history-label">{it.label}</span>
                 <span className="host-history-goal">{it.goal}</span>
+                {usage && (
+                  <span className="hc-usage" title={usageTooltip(fromHostSpent(it.spent))}>
+                    {usage}
+                  </span>
+                )}
                 <span className={`st-badge host-pill ${st.tone}`}>{st.label}</span>
               </button>
               {open && (
@@ -61,6 +68,7 @@ export default function HostHistory() {
                     <span>{it.state === "completed" ? "完成报告" : it.state === "failed" ? "失败" : "已停止"}</span>
                     <span className="st-meta">
                       {fmtWhen(it.startedAt)} 开始 · 用时 {fmtDuration(it.durationMs)} · {it.spent.steps} 步
+                      {usage ? ` · 共 ${usage}` : ""}
                     </span>
                   </div>
                   {it.state === "completed" ? (

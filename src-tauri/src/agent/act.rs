@@ -7635,7 +7635,8 @@ fn apply_grant(mut b: budget::RunBudget, g: super::host::BudgetGrant) -> budget:
     if let Some(c) = g.max_output_chars {
         b.max_output_chars = c;
     }
-    if let Some(c) = g.max_cost_micros {
+    // 花费上限只能给 / 改，不能经「加预算继续」撤掉：没给或给 0 都沿用这一轮原来的上限（每段同额）
+    if let Some(c) = g.max_cost_micros.filter(|&c| c > 0) {
         b.max_cost_micros = c;
     }
     b.clamped()
@@ -7861,9 +7862,13 @@ mod tests {
         assert_eq!(effective_budget(budget::RunBudget::default(), &req).max_cost_micros, 500_000);
         let g = super::super::host::BudgetGrant { max_cost_micros: Some(1_000_000), ..Default::default() };
         assert_eq!(apply_grant(budget::RunBudget::default(), g).max_cost_micros, 1_000_000);
-        // 没给就不变
+        // 没给就不变；给 0（表单留空）也不撤掉开局设的上限
         let b = budget::RunBudget { max_cost_micros: 3, ..Default::default() };
         assert_eq!(apply_grant(b, Default::default()).max_cost_micros, 3);
+        let zero = super::super::host::BudgetGrant { max_cost_micros: Some(0), max_steps: Some(9), ..Default::default() };
+        let after = apply_grant(b, zero);
+        assert_eq!(after.max_cost_micros, 3);
+        assert_eq!(after.max_steps, 9, "步数照旧按给的来");
     }
 
     // ——— 托管强制（gate::authorize 接线）———

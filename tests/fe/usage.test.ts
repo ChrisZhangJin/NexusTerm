@@ -110,3 +110,21 @@ test("对话：done 带的用量与 usage 事件都落到 lastUsage", () => {
   // 旧后端的 done 没有 usage：不清掉上一轮的
   assert.deepEqual(withUsage(c, undefined).lastUsage, u);
 });
+
+import { costGrant, spentLine } from "../../src/lib/usage";
+
+test("加预算继续：花费留空不带字段（后端沿用开局上限），填了才给", () => {
+  assert.deepEqual(costGrant(0), {});
+  assert.deepEqual(costGrant(-1), {});
+  assert.deepEqual(costGrant(0.5), { maxCostMicros: 500_000 });
+});
+
+test("历史一行：有 token 给 12.3k tok · ≈$0.04，旧记录给空串", () => {
+  assert.equal(spentLine({ steps: 1, elapsedSecs: 1, outputChars: 1 }), "");
+  assert.equal(spentLine(undefined), "");
+  assert.equal(
+    spentLine({ steps: 1, elapsedSecs: 1, outputChars: 1, inputTokens: 10_000, outputTokens: 2_300, costMicros: 41_200, priced: true }),
+    "12.3k tok · ≈$0.04"
+  );
+  assert.equal(spentLine({ steps: 1, elapsedSecs: 1, outputChars: 1, inputTokens: 5, outputTokens: 0, estimated: true }), "≈5 tok");
+});

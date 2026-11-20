@@ -1028,7 +1028,8 @@ export interface HostHistoryItem {
   summary?: string | null;
   error?: string | null;
   checks: HostCheckResult[];
-  spent: { steps: number; elapsedSecs: number; outputChars: number; injections: number };
+  /** 契约级花费（含 token / 钱；旧记录没有那几项） */
+  spent: HostSpent & { injections?: number };
   changes: HostChangeSummary;
   backups: HostBackupEntry[];
 }

@@ -31,7 +31,7 @@ import { DEFAULT_DENY, addDeny, hostPill, isTerminal, needsReattach } from "../l
 import { HOST_PRESETS, HOST_TIERS, LS_HOST_TIER, TIER_HINTS, hostSettingsSummary, parseHostTier, presetOfTier } from "../lib/hostUi";
 import { pendingPrompts } from "../lib/agentRun";
 import { activeAccount, useAgentConfig } from "../lib/agent";
-import { fmtUsd, parseCostInput, priceFor, usdToMicros } from "../lib/usage";
+import { costGrant, fmtUsd, parseCostInput, priceFor } from "../lib/usage";
 import {
   LS_STEWARD_BUDGET,
   STEWARD_DURATION_OPTIONS,
@@ -542,7 +542,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
           grant={{
             maxSteps: budgetPref.maxSteps,
             maxMinutes: budgetPref.maxMinutes,
-            maxCostMicros: usdToMicros(budgetPref.maxCostUsd),
+            ...costGrant(budgetPref.maxCostUsd),
           }}
           stopCtrlC={run.stopCtrlC}
           onStopCtrlC={run.toggleStopCtrlC}

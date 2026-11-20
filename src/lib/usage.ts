@@ -104,6 +104,22 @@ export function usageTooltip(u: UsageView): string {
 
 // ———————————— 花费上限（美元 ↔ 微美元）————————————
 
+/**
+ * 「加预算继续」里的花费部分：表单留空（0）就不带这个字段 —— 后端沿用这一轮开局设的上限，
+ * 「加预算继续」永远不会把花费上限撤掉；填了才按新值给。
+ */
+export function costGrant(maxCostUsd: number): { maxCostMicros?: number } {
+  const m = usdToMicros(maxCostUsd);
+  return m > 0 ? { maxCostMicros: m } : {};
+}
+
+/** 历史 / 卡头用的一行：没有 token 记录（旧记录）返回空串 */
+export function spentLine(s: HostSpent | null | undefined): string {
+  if (!s) return "";
+  const u = fromHostSpent(s);
+  return hasUsage(u) ? usageLine(u) : "";
+}
+
 /** 美元 → 微美元；非法 / 负数 → 0（= 不限） */
 export function usdToMicros(usd: number): number {
   const v = Number(usd);
