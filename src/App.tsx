@@ -6,7 +6,8 @@ import TerminalView, { clock } from "./components/TerminalView";
 import FileManager from "./components/FileManager";
 import TabBar from "./components/TabBar";
 import StatusBar from "./components/StatusBar";
-import { consoleHintOf } from "./lib/host";
+import { consoleHintOf, hostTabBadges } from "./lib/host";
+import { useHostRuns } from "./lib/useHostRuns";
 import { AgentPanel } from "./components/AgentPanel";
 import {
   AppearanceDialog,
@@ -117,6 +118,9 @@ export default function App() {
    * 否则一轮对话的历史会随收起一起丢掉。
    */
   const [agentOpen, setAgentOpen] = useState(false);
+  // 标签栏的「等你」徽标：单独订阅一份托管总表（面板收起时也要亮）
+  const hostRunsAll = useHostRuns();
+  const hostBadges = useMemo(() => hostTabBadges(hostRunsAll.hosts), [hostRunsAll.hosts]);
   /**
    * AI 面板宽度（px），持久化到 localStorage。
    * 拖动左缘手柄改宽；clamp 在 [AGENT_MIN_W, AGENT_MAX_W]，避免拖没或把终端挤没。
@@ -1604,6 +1608,7 @@ export default function App() {
         onMove={moveTab}
         agentOpen={agentOpen}
         onToggleAgent={() => setAgentOpen((v) => !v)}
+        hostBadges={hostBadges}
       />
 
       <div className="workspace">

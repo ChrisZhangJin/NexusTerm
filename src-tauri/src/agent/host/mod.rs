@@ -5,6 +5,7 @@
 //! 也不碰 Tauri，副作用经 `HostIo` 落地。接线在 `act::run(RunMode::Hosted)` 与 `host_cmd.rs`。
 #![allow(dead_code)]
 
+pub mod attention;
 pub mod checkpoint;
 pub mod context;
 pub mod criteria;

@@ -65,6 +65,49 @@ export function hostPill(p: HostPhase): HostPill {
   }
 }
 
+/** 标签徽标文字最多多少字（tooltip 里看一眼就够） */
+const TAB_BADGE_MAX = 60;
+
+/**
+ * 标签上的「等你」徽标：托管在等人（卡片 / 预算·期限·模型暂停 / 挂起）时给一行字，否则 null。
+ * 人在驾驶时不显示（人就在终端前）；用户自己点的暂停、已结束的托管也不显示。
+ */
+export function hostTabBadge(p: HostPhase): string | null {
+  if (p.kind === "userDriving") return null;
+  // 胶囊文案里已经带「等你」的（等你批准 / 看门狗·等你看看）不再重复前缀
+  const head = (label: string) => (label.includes("等你") ? label : `等你：${label}`);
+  switch (p.kind) {
+    case "waitingHuman": {
+      const q = clip(p.card.question.replace(/\s+/g, " ").trim());
+      const k = p.card.kind.kind;
+      if (k === "ask") return q ? `等你：${q}` : "等你回答";
+      const label = head(hostPill(p).label);
+      return q && k !== "criteriaDraft" ? `${label}：${q}` : label;
+    }
+    case "paused":
+      return p.cause.kind === "user" ? null : head(hostPill(p).label);
+    case "suspended":
+      return head(hostPill(p).label);
+    default:
+      return null;
+  }
+}
+
+function clip(text: string): string {
+  const chars = Array.from(text);
+  return chars.length > TAB_BADGE_MAX ? chars.slice(0, TAB_BADGE_MAX).join("") + "…" : text;
+}
+
+/** console id → 徽标文字（只含正在等人的托管） */
+export function hostTabBadges(map: Record<string, HostStatus>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const st of Object.values(map)) {
+    const b = hostTabBadge(st.phase);
+    if (b) out[st.consoleId] = b;
+  }
+  return out;
+}
+
 /** 暂停 / 结束的一行说明（胶囊旁边的小字） */
 export function hostDetail(p: HostPhase): string | null {
   const b = basePhase(p);

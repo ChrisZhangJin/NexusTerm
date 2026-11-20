@@ -135,6 +135,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         // 浏览窗口里 HTML iframe 的页面来源（带独立 CSP，默认禁脚本）
         .register_uri_scheme_protocol("nxdoc", viewer::protocol)
         .setup(|app| {
@@ -370,6 +371,8 @@ pub fn run() {
             agent::host_cmd::host_resume,
             agent::host_cmd::host_status,
             agent::host_cmd::host_list,
+            agent::host_notify::host_notify_get,
+            agent::host_notify::host_notify_set,
             agent::host_cmd::host_confirm_criteria,
             agent::host_cmd::host_amend,
             agent::host_cmd::host_correct,

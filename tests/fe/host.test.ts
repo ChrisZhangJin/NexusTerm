@@ -12,6 +12,8 @@ import {
   hostForConsole,
   hostPauseKind,
   hostPill,
+  hostTabBadge,
+  hostTabBadges,
   pendingCard,
   upsertHost,
 } from "../../src/lib/host";
@@ -240,3 +242,43 @@ test("inlineParts：反引号与路径显示成代码", () => {
   ]);
   assert.deepEqual(inlineParts("TCP/UDP 都行"), [{ code: false, text: "TCP/UDP 都行" }]);
 });
+
+test("hostTabBadge：等人时给一行「等你：…」，不等人时 null", () => {
+  assert.equal(hostTabBadge(waiting), "等你：部署到哪？");
+  assert.equal(hostTabBadge({ kind: "waitingHuman", card: card("approve") }), "等你批准：部署到哪？");
+  assert.equal(
+    hostTabBadge({ kind: "waitingHuman", card: { ...card(), kind: { kind: "criteriaDraft", draft: [] } } }),
+    "等你确认判据"
+  );
+  assert.equal(
+    hostTabBadge({ kind: "waitingHuman", card: { ...card(), kind: { kind: "watchdog" } } }),
+    "看门狗·等你看看：部署到哪？"
+  );
+  assert.equal(hostTabBadge(budget), "等你：预算暂停");
+  assert.equal(hostTabBadge({ kind: "paused", cause: { kind: "user" } }), null);
+  assert.equal(
+    hostTabBadge({ kind: "suspended", reason: "consoleGone", resume_to: running }),
+    "等你：终端断开·等重连"
+  );
+  // 人在驾驶：人就在终端前，不亮
+  assert.equal(hostTabBadge({ kind: "userDriving", resume_to: waiting }), null);
+  assert.equal(hostTabBadge(running), null);
+  assert.equal(hostTabBadge({ kind: "completed", summary: "好了", checks: [] }), null);
+  assert.equal(hostTabBadge({ kind: "stopped" }), null);
+});
+
+test("hostTabBadge：问题压成一行并截短", () => {
+  const long: HostPhase = { kind: "waitingHuman", card: { ...card(), question: "第一行\n" + "长".repeat(100) } };
+  const b = hostTabBadge(long)!;
+  assert.ok(!b.includes("\n"));
+  assert.ok(b.startsWith("等你：第一行 长"));
+  assert.ok(b.endsWith("…"));
+  assert.equal(Array.from(b).length, "等你：".length + 60 + 1);
+});
+
+test("hostTabBadges：只收正在等人的，按 console 归", () => {
+  const st = (id: string, consoleId: string, phase: HostPhase) => ({ contractId: id, consoleId, phase }) as HostStatus;
+  const m = upsertHost(upsertHost(upsertHost({}, st("a", "c1", waiting)), st("b", "c2", running)), st("c", "c3", budget));
+  assert.deepEqual(hostTabBadges(m), { c1: "等你：部署到哪？", c3: "等你：预算暂停" });
+});
+

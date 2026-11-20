@@ -25,7 +25,9 @@ use super::host::checkpoint::LoadError;
 use super::host::driver::Seed;
 use super::policy::TIER_APPROVE;
 use super::host::context::HostContext;
+use super::host::attention::attention_for;
 use super::host::criteria;
+use super::host_notify;
 use super::host::gate::HardRule;
 use super::host::{
     BudgetGrant, CardKind, CardReply, Check, ConsoleRef, HostCtx, HostEvent, HostHandle, HostIo, HostPhase,
@@ -99,6 +101,8 @@ struct AppHostIo {
     /// 下一次落盘的现场（相位在 `save` 时填）
     snap: Mutex<HostCheckpoint>,
     notice: Mutex<Option<String>>,
+    /// 上一次推出去的相位：只在「开始需要人」的迁移上提醒一次（`None` = 还没推过，第一推只记不提醒）
+    attn_prev: Mutex<Option<HostPhase>>,
 }
 
 /// 托管状态快照（`nx://host/*` 事件的负载）。
@@ -155,6 +159,10 @@ impl HostIo for AppHostIo {
     fn emit(&self, phase: &HostPhase) {
         let st = status_of(&self.handle, &self.console_id, &self.goal, &self.snap, &self.notice, phase);
         emit_status(&self.app, &st);
+        let prev = self.attn_prev.lock().replace(phase.clone());
+        if let Some(a) = prev.and_then(|p| attention_for(&p, phase, &st.label)) {
+            host_notify::dispatch(&self.app, &a, &st.label);
+        }
     }
 
     fn release_lease(&self) {
@@ -396,6 +404,7 @@ pub async fn host_start(
         goal: goal.clone(),
         snap: Mutex::new(snap),
         notice: Mutex::new(None),
+        attn_prev: Mutex::new(None),
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let shared = HostShared::new(handle, &console_id, &goal, cancel, Box::new(io));
@@ -802,6 +811,8 @@ fn shared_from_checkpoint(app: &AppHandle, cp: &HostCheckpoint) -> Arc<HostShare
         goal: cp.contract.goal.clone(),
         snap: Mutex::new(cp.clone()),
         notice: Mutex::new(None),
+        // 落盘时的相位当基线：接驳后再推同一张卡不重复提醒
+        attn_prev: Mutex::new(Some(cp.phase.clone())),
     };
     let h = HostShared::new(
         handle,

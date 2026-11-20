@@ -976,3 +976,13 @@ export interface HostNotice {
   undoWindowMs: number;
   tsMs: number;
 }
+
+/** 托管需要人时的提醒设置（后端 settings 表 `host_notify`） */
+export interface HostNotifyConfig {
+  /** 窗口不在前台时弹系统通知 */
+  system: boolean;
+  /** 窗口不在前台时让任务栏 / Dock 图标闪烁 */
+  taskbar: boolean;
+  /** 空 = 不推；否则 POST JSON {title, body, host, state, ts} */
+  webhook: string;
+}

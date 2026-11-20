@@ -13,6 +13,7 @@ import type {
   AgentConfig,
   AgentExecMode,
   AgentProvider,
+  HostNotifyConfig,
   SweepReport,
   VaultStatus,
 } from "../types";
@@ -434,6 +435,8 @@ const CONTEXT_CHOICES: readonly { bytes: number; label: string }[] = [
   { bytes: 128 * 1024, label: "128 KB · 约 4.4 万汉字 · 最完整" },
 ];
 
+const DEFAULT_HOST_NOTIFY: HostNotifyConfig = { system: true, taskbar: true, webhook: "" };
+
 export function AgentDialog({ onClose }: { onClose: () => void }) {
   const saved = useAgentConfig();
   const [draft, setDraft] = useState<AgentConfig>(saved);
@@ -443,8 +446,21 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
   const [saveErr, setSaveErr] = useState<string | null>(null);
   /** 用户动过表单之后，后端的异步回包就不再覆盖本地草稿 */
   const editedRef = useRef(false);
+  /** 托管提醒：单独存（不进 AgentConfig，改它不需要保险库解锁）。null = 还没读到 */
+  const [notifySaved, setNotifySaved] = useState<HostNotifyConfig | null>(null);
+  const [notify, setNotify] = useState<HostNotifyConfig>(DEFAULT_HOST_NOTIFY);
 
   useEsc(onClose);
+
+  useEffect(() => {
+    api
+      .hostNotifyGet()
+      .then((c) => {
+        setNotifySaved(c);
+        setNotify(c);
+      })
+      .catch(() => {});
+  }, []);
 
   // 配置是异步从后端读的，首帧是默认值：用户没编辑过就跟随真值，否则界面会停在「假」配置上，一保存就把真值冲掉。
   useEffect(() => {
@@ -485,7 +501,8 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
     patch({ accounts: rest, activeId: rest[0].id });
   };
 
-  const dirty = JSON.stringify(draft) !== JSON.stringify(saved);
+  const notifyDirty = notifySaved !== null && JSON.stringify(notify) !== JSON.stringify(notifySaved);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(saved) || notifyDirty;
 
   // 与后端 validate 的后三项一致：地址 / 模型 / Key
   const missing = [
@@ -520,6 +537,11 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
   const save = async () => {
     setSaveErr(null);
     try {
+      // 托管提醒先存：它不依赖保险库，Agent 配置因锁定存不进去时它也不该跟着丢
+      if (notifyDirty) {
+        await api.hostNotifySet(notify);
+        setNotifySaved(notify);
+      }
       // 先写盘、后关窗：saveAgentConfig 写成功才更新内存缓存，不会出现「界面显示已保存、库里其实没变」。
       // autoAttach 恒为 true：界面已没有置 false 的入口，这里兜住旧配置里残留的 false。
       await saveAgentConfig({ ...draft, autoAttach: true, budget: normalizeBudget(draft.budget) });
@@ -792,6 +814,43 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
           一轮 Agent 运行最多做这么多步（一次 <code>nx_skill</code> 运行算 1 步）、最多跑这么久、最多读写这么多字符；
           任何一项用完都不会直接失败，而是<strong>暂停</strong>并说明已做了什么，由你点「继续」（换一份新预算接着做）或「停止」。
           运行中也可以随时手动「暂停」。
+        </p>
+
+        <div className="settings-section">托管需要我时</div>
+        <label className="settings-check">
+          <input
+            type="checkbox"
+            checked={notify.system}
+            onChange={(e) => setNotify((n) => ({ ...n, system: e.target.checked }))}
+          />
+          <span>
+            系统通知
+            <em>托管在等你回答 / 批准、暂停、挂起或结束时弹一条通知；窗口在前台时不弹（标签上的琥珀色圆点照常亮）</em>
+          </span>
+        </label>
+        <label className="settings-check">
+          <input
+            type="checkbox"
+            checked={notify.taskbar}
+            onChange={(e) => setNotify((n) => ({ ...n, taskbar: e.target.checked }))}
+          />
+          <span>
+            任务栏闪烁
+            <em>窗口不在前台时让任务栏 / Dock 图标闪一下</em>
+          </span>
+        </label>
+        <div className="row">
+          <label>Webhook（可选）</label>
+          <input
+            type="url"
+            placeholder="https://… 留空不推送"
+            value={notify.webhook}
+            onChange={(e) => setNotify((n) => ({ ...n, webhook: e.target.value }))}
+          />
+        </div>
+        <p className="ag-hint">
+          填了就在同样的时机 POST 一段 JSON <code>{"{title, body, host, state, ts}"}</code>
+          ，可接企业微信 / 飞书 / Telegram 的转发桥推到手机。只带一行原因（已脱敏），不含终端内容。
         </p>
 
         <div className="settings-section">排查</div>

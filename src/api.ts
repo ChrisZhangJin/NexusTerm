@@ -15,6 +15,7 @@ import type {
   HostNotice,
   HostStartRequest,
   HostStatus,
+  HostNotifyConfig,
   AgentScreenRequest,
   AgentSecretRequest,
   AgentStep,
@@ -339,6 +340,9 @@ export const api = {
     invoke<void>("host_resume", { contractId, budget: budget ?? null }),
   hostStatus: (contractId: string) => invoke<HostStatus | null>("host_status", { contractId }),
   hostList: () => invoke<HostStatus[]>("host_list"),
+  /** 托管提醒设置（系统通知 / 任务栏闪烁 / webhook） */
+  hostNotifyGet: () => invoke<HostNotifyConfig>("host_notify_get"),
+  hostNotifySet: (config: HostNotifyConfig) => invoke<void>("host_notify_set", { config }),
   /** 接受（编辑后的）完成判据草稿，托管随即开跑 */
   hostConfirmCriteria: (contractId: string, cardId: string, checks: HostCheck[]) =>
     invoke<void>("host_confirm_criteria", { contractId, cardId, checks }),

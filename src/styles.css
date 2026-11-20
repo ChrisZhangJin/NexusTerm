@@ -170,6 +170,19 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   70% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 0%, transparent); }
   100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
 }
+/* 托管在等人（卡片 / 预算暂停 / 挂起）：标题前一个琥珀色小圆点，悬停看「等你：…」。
+   不看侧栏也能注意到；状态离开「等人」就消失。 */
+.tab-host-dot {
+  flex: none; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--warn, #d9a441);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--warn, #d9a441) 60%, transparent);
+  animation: nx-host-dot 1.8s ease-out infinite;
+}
+.tab.tab-host-wait .tab-title { color: var(--warn, #d9a441); }
+@keyframes nx-host-dot {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--warn, #d9a441) 60%, transparent); }
+  70%, 100% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--warn, #d9a441) 0%, transparent); }
+}
 /* 连接出错：状态点已去掉，用标题变色兜底 */
 .tab.tab-error .tab-title { color: var(--danger); }
 

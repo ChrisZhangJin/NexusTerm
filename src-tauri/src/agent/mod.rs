@@ -52,6 +52,7 @@ pub mod policy;
 pub mod checkpoint;
 pub mod host;
 pub mod host_cmd;
+pub mod host_notify;
 // P5 学习闭环 / LLM 兜底
 pub mod learning;
 // P3–P5 共享运行时状态

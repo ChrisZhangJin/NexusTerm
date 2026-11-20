@@ -13,6 +13,8 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+# 托管需要人时发系统通知（从 Rust 端发，前端不需要额外的 JS 包）
+tauri-plugin-notification = "2"
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 # 只要 PNG 编码：剪贴板粘贴图片落盘成临时文件就靠它，别的格式用不上
 image = { version = "0.25", default-features = false, features = ["png"] }
