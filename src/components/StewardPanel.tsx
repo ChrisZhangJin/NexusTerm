@@ -682,9 +682,11 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
         </div>
       )}
 
-      {/* 托管实况：运行中默认展开（密码卡也在这里面）；换终端时按新终端重置 */}
+      {/* 托管实况：运行中默认展开（密码卡也在这里面）；换终端时按新终端重置。
+          有密码 / 批准卡等你时换个 key 重新挂载：用户先前手动收起过的话，`open` 表达式没变（运行中恒为 true），
+          React 不会重新应用，密码输入框就藏在收起的实况里了 */}
       {runHere && (run.active || run.messages.length > 0) && (
-        <details key={selected} className="hc-feed" open={run.active || promptsPending > 0}>
+        <details key={`${selected}${promptsPending > 0 ? ":pending" : ""}`} className="hc-feed" open={run.active || promptsPending > 0}>
           <summary>
             托管实况 · {label(selected)}
             <span className={promptsPending > 0 ? "hc-warn" : "st-meta"}>
