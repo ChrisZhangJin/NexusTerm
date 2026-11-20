@@ -29,7 +29,7 @@ mod steward;
 pub use steward::CtxRow;
 
 /// 统一托管引擎：每份契约一行可接驳的现场。
-mod host;
+pub(crate) mod host;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

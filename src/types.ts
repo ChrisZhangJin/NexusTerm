@@ -935,6 +935,56 @@ export interface HostStatus {
   tier?: string;
 }
 
+/** 一次托管的「实际改动」：从真正执行了的命令 / 文件写入里提取（后端 `host::changes`），不是模型的说法 */
+export interface HostChangeSummary {
+  /** 写过 / 改过的文件（nx_write / nx_edit 的写法，可能是相对路径或 ~ 开头；含 tee / > 重定向、sed -i） */
+  filesWritten: string[];
+  /** 执行过的命令条数 */
+  commands: number;
+  packages: string[];
+  services: string[];
+  ports: string[];
+  containers: string[];
+  downloads: string[];
+}
+
+/** 托管改文件前留的原文备份（「还原」用） */
+export interface HostBackupEntry {
+  id: string;
+  /** 解析后的绝对路径 */
+  path: string;
+  consoleId: string;
+  tsMs: number;
+  size: number;
+  sha256: string;
+  restoredAt?: number | null;
+}
+
+/** `host_changes` 的返回 */
+export interface HostChanges {
+  changes: HostChangeSummary;
+  backups: HostBackupEntry[];
+}
+
+/** `host_history` 的一条：结束了的托管 */
+export interface HostHistoryItem {
+  contractId: string;
+  goal: string;
+  label: string;
+  consoleId: string;
+  startedAt: number;
+  endedAt: number;
+  durationMs: number;
+  /** completed / failed / stopped */
+  state: string;
+  summary?: string | null;
+  error?: string | null;
+  checks: HostCheckResult[];
+  spent: { steps: number; elapsedSecs: number; outputChars: number; injections: number };
+  changes: HostChangeSummary;
+  backups: HostBackupEntry[];
+}
+
 /** 前端给的 console 线索：后端据此存 ConsoleRef，重启后按它给候选 tab 排序 */
 export interface HostConsoleHint {
   consoleId: string;

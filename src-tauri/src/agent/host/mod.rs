@@ -6,6 +6,8 @@
 #![allow(dead_code)]
 
 pub mod attention;
+pub mod backup;
+pub mod changes;
 pub mod checkpoint;
 pub mod context;
 pub mod criteria;

@@ -213,6 +213,8 @@ pub struct FileOutcome {
     pub diff: Option<String>,
     /// 已落盘的修改
     pub change: Option<FileChange>,
+    /// 覆盖 / 修改已有文件时改之前的原文（托管拿去做「还原」备份）。**不进 feedback，绝不给模型**
+    pub original: Option<Vec<u8>>,
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -488,7 +490,8 @@ async fn write<A: Approver>(
             if !done.atomic {
                 fb.push_str("（落盘不是原子的：中间有极短窗口目标文件不存在。）\n");
             }
-            FileOutcome { ok: true, feedback: fb, summary, diff: Some(diff), change: Some(done) }
+            let original = if done.created { None } else { pending.original().map(<[u8]>::to_vec) };
+            FileOutcome { ok: true, feedback: fb, summary, diff: Some(diff), change: Some(done), original }
         }
         Err(FileError::Conflict(p)) => FileOutcome {
             ok: false,
@@ -547,6 +550,28 @@ mod tests {
         assert!(a.asked[0].diff.contains("+echo hi"), "卡上带 diff：{}", a.asked[0].diff);
         assert_eq!(t.get("/home/me/run.sh").unwrap(), b"#!/bin/sh\necho hi\n");
         assert!(out.feedback.contains("已新建"));
+    }
+
+    #[tokio::test]
+    async fn overwrite_and_edit_hand_back_the_original_but_never_to_the_model() {
+        let t = FakeTransport::new("/home/me");
+        t.add_file("/home/me/app.conf", b"secret_marker=1\n");
+        let ops = FileOps::new(&t, FileOpsConfig::default());
+        let out = run(&ops, &write_call("/home/me/app.conf", "x=2\n"), WriteGate::Auto, &mut ask(true), false).await;
+        assert!(out.ok, "{}", out.feedback);
+        assert_eq!(out.original.as_deref(), Some(b"secret_marker=1\n".as_slice()));
+        let edit = FileCall::Edit(EditArgs {
+            target: None,
+            path: "/home/me/app.conf".into(),
+            old_string: "x=2".into(),
+            new_string: "x=3".into(),
+            replace_all: false,
+        });
+        let out = run(&ops, &edit, WriteGate::Auto, &mut ask(true), false).await;
+        assert_eq!(out.original.as_deref(), Some(b"x=2\n".as_slice()));
+        // 新建文件没有原文
+        let out = run(&ops, &write_call("/home/me/new.txt", "n"), WriteGate::Auto, &mut ask(true), false).await;
+        assert!(out.ok && out.original.is_none());
     }
 
     #[tokio::test]

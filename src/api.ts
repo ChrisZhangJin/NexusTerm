@@ -15,6 +15,8 @@ import type {
   HostNotice,
   HostStartRequest,
   HostStatus,
+  HostChanges,
+  HostHistoryItem,
   HostNotifyConfig,
   AgentScreenRequest,
   AgentSecretRequest,
@@ -340,6 +342,13 @@ export const api = {
     invoke<void>("host_resume", { contractId, budget: budget ?? null }),
   hostStatus: (contractId: string) => invoke<HostStatus | null>("host_status", { contractId }),
   hostList: () => invoke<HostStatus[]>("host_list"),
+  /** 历史托管：最近结束的（完成 / 失败 / 已停止），新的在前 */
+  hostHistory: (limit?: number) => invoke<HostHistoryItem[]>("host_history", { limit: limit ?? null }),
+  /** 一次托管的「实际改动」+ 可还原的原文备份 */
+  hostChanges: (contractId: string) => invoke<HostChanges>("host_changes", { contractId }),
+  /** 把托管改动前的原文写回去（经原来那个终端的文件通道） */
+  hostRestoreBackup: (contractId: string, backupId: string) =>
+    invoke<string>("host_restore_backup", { contractId, backupId }),
   /** 托管提醒设置（系统通知 / 任务栏闪烁 / webhook） */
   hostNotifyGet: () => invoke<HostNotifyConfig>("host_notify_get"),
   hostNotifySet: (config: HostNotifyConfig) => invoke<void>("host_notify_set", { config }),

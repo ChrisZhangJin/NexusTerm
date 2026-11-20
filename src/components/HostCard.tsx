@@ -30,6 +30,7 @@ import type {
 } from "../types";
 import DenyEditor from "./DenyEditor";
 import HostText from "./HostText";
+import HostChangesView from "./HostChangesView";
 import { TIER_LABELS } from "../lib/steward";
 
 export interface HostCardProps {
@@ -392,6 +393,7 @@ export default function HostCard({ status, label, grant, stopCtrlC, onStopCtrlC,
           ) : (
             <div className="host-report-body">（AI 没有写完成报告）</div>
           )}
+          <HostChangesView contractId={cid} />
           {status.phase.checks.length > 0 && (
             <details className="host-report-checks">
               <summary>核验依据（{status.phase.checks.length} 条）</summary>

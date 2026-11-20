@@ -2565,6 +2565,28 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   padding: 8px 10px; font-size: 12.5px; line-height: 1.6; color: var(--text);
   white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow: auto; user-select: text;
 }
+/* 完成报告里的「实际改动」：按执行过的命令 / 文件写入整理 */
+.host-changes { padding: 0 10px 8px; font-size: 11.5px; color: var(--text-dim); }
+.host-changes-head { font-weight: 600; color: var(--text); margin-bottom: 2px; }
+.host-changes-none { color: var(--text-dim); }
+.host-changes-group { display: flex; gap: 6px; align-items: flex-start; }
+.host-changes-label { flex: 0 0 auto; min-width: 6em; color: var(--text-dim); padding-top: 2px; }
+.host-changes-group ul { margin: 0; padding-left: 14px; flex: 1; min-width: 0; color: var(--text); }
+.host-changes-group li { word-break: break-all; line-height: 1.6; }
+.host-changes-group code { font-size: 11.5px; }
+.host-changes-restore { margin-left: 6px; padding: 0 6px; font-size: 11px; }
+
+/* 历史托管：一行一条，点开展开报告 */
+.host-history-body { display: flex; flex-direction: column; gap: 4px; padding: 6px 0; }
+.host-history-row {
+  display: flex; gap: 8px; align-items: center; width: 100%; text-align: left;
+  background: none; border: 1px solid transparent; border-radius: var(--radius);
+  color: var(--text); padding: 3px 6px; cursor: pointer; font-size: 12px;
+}
+.host-history-row:hover, .host-history-item.on > .host-history-row { border-color: var(--border); }
+.host-history-label { flex: 0 0 auto; max-width: 30%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
+.host-history-goal { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 .host-report-checks { padding: 0 10px 8px; }
 .host-report-checks > summary { cursor: pointer; font-size: 11.5px; color: var(--text-dim); }
 .host-checks { margin: 4px 0; padding-left: 18px; font-size: 11.5px; color: var(--text-dim); }

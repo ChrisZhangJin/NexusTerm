@@ -867,6 +867,15 @@ pub struct PendingChange {
     create_dirs: bool,
     /// 预览时文件是否存在 / 当时的完整哈希（原文件过大时为 None，不复核）
     existed: bool,
+    /// 改之前的原文（读过的才有：原文件过大没读时为 None）。托管用它做「还原」备份，绝不给模型
+    before: Option<Vec<u8>>,
+}
+
+impl PendingChange {
+    /// 改之前的原文：新建文件 / 原文件过大没读时为 None
+    pub fn original(&self) -> Option<&[u8]> {
+        self.before.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1287,6 +1296,7 @@ impl<'a> FileOps<'a> {
             mode,
             create_dirs: opts.create_dirs,
             existed: st.is_some(),
+            before,
         })
     }
 
@@ -1372,6 +1382,7 @@ impl<'a> FileOps<'a> {
             mode: st.mode,
             create_dirs: false,
             existed: true,
+            before: Some(bytes),
         })
     }
 

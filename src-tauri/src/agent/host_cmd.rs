@@ -151,6 +151,10 @@ impl HostIo for AppHostIo {
                 if let Err(e) = st.store.host_session_upsert(&self.handle.contract_id, c.state(), &json, now) {
                     tracing::warn!("托管现场落盘失败：{e}");
                 }
+                // 结束了：把「实际改动」定格下来（历史托管用，决策表会被裁剪）
+                if phase.is_terminal() {
+                    super::host_history_cmd::snapshot_changes(&st.store, &self.handle.contract_id);
+                }
             }
             Err(e) => tracing::warn!("托管现场序列化失败：{e}"),
         }
@@ -883,6 +887,7 @@ pub fn boot_scan(app: &AppHandle) {
     if !expired.is_empty() {
         tracing::info!("托管现场过期 {} 份：{:?}", expired.len(), expired);
     }
+    super::host_history_cmd::prune_backups(app, &state.store);
 }
 
 /// 一个接驳候选：打分越高越像重启前那个 console。

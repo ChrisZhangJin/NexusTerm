@@ -25,6 +25,7 @@ import type {
   HostStatus,
 } from "../types";
 import HostCard from "./HostCard";
+import HostHistory from "./HostHistory";
 import DenyEditor from "./DenyEditor";
 import { DEFAULT_DENY, addDeny, hostPill, isTerminal, needsReattach } from "../lib/host";
 import { HOST_PRESETS, HOST_TIERS, LS_HOST_TIER, TIER_HINTS, hostSettingsSummary, parseHostTier, presetOfTier } from "../lib/hostUi";
@@ -742,6 +743,9 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
           );
         })}
       </div>
+
+      {/* 历史托管：结束了的托管，点开回看报告与实际改动 */}
+      <HostHistory />
 
       {/* 当前局面：屏幕识别的结论，调试用，默认收起 */}
       <details className="st-diag">

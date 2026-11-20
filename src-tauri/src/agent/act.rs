@@ -4511,6 +4511,10 @@ pub async fn run(
                     let mut approver = FileApprover { app, runtime, session: &session, target: &target_id, label: &label, host: host.as_deref(), unattended };
                     let out = super::files_tool::run(&ops, &call, wgate, &mut approver, acct.redact).await;
                     drop(ops);
+                    // 托管覆盖 / 修改了已有文件：原文存一份到本机（「还原」用），不给模型
+                    if let (Some(h), Some(orig), Some(ch)) = (&host, out.original.as_deref(), out.change.as_ref()) {
+                        super::host_history_cmd::back_up_original(app, h.contract_id(), &target_id, &ch.path, orig);
+                    }
                     if let Some(h) = &host {
                         for u in h.take_user() {
                             push_user(&mut messages, u);

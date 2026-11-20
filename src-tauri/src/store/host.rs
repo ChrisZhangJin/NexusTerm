@@ -16,6 +16,10 @@ use super::Store;
 /// 终态标签：这些行不再接驳。`expired` 由 [`Store::host_sessions_expire`] 打上。
 pub const TERMINAL_STATES: &[&str] = &["completed", "failed", "stopped", "expired"];
 pub const STATE_EXPIRED: &str = "expired";
+/// 「历史托管」：结束了的（completed / failed / stopped）至少留最近这么多行，不受 TTL 清理
+pub const HISTORY_KEEP: usize = 100;
+/// 进历史的终态（expired 是没收尾的过期现场，不算历史）
+pub const HISTORY_STATES: &[&str] = &["completed", "failed", "stopped"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostSessionRow {
@@ -35,6 +39,11 @@ pub(super) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             updated_at  INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_host_sessions_state ON host_sessions(state);
+        CREATE TABLE IF NOT EXISTS host_changes (
+            contract_id TEXT PRIMARY KEY,
+            json        TEXT NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );
         "#,
     )
 }
@@ -46,6 +55,10 @@ fn row_to_session(r: &Row<'_>) -> rusqlite::Result<HostSessionRow> {
 /// `state NOT IN (...)` 的占位串，与 [`TERMINAL_STATES`] 同步。
 fn terminal_list() -> String {
     TERMINAL_STATES.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", ")
+}
+
+fn history_list() -> String {
+    HISTORY_STATES.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", ")
 }
 
 impl Store {
@@ -110,16 +123,30 @@ impl Store {
 
     /// TTL 清理：`updated_at` 早于 `now - ttl` 的
     /// - 非终态行标为 `expired`（保留 JSON，面板还能看到发生过什么），返回它们的 contract_id；
-    /// - 终态行（含早先标过的 expired）直接删除。
+    /// - 终态行（含早先标过的 expired）直接删除 —— 但最近 [`HISTORY_KEEP`] 条结束了的
+    ///   （completed / failed / stopped）留作「历史托管」，不删；
+    /// - 跟着删掉已经没有托管行的 `host_changes`。
     pub fn host_sessions_expire(&self, now_ms: i64, ttl_ms: i64) -> Result<Vec<String>, String> {
+        self.host_sessions_expire_keeping(now_ms, ttl_ms, HISTORY_KEEP)
+    }
+
+    pub fn host_sessions_expire_keeping(&self, now_ms: i64, ttl_ms: i64, keep: usize) -> Result<Vec<String>, String> {
         let cutoff = now_ms.saturating_sub(ttl_ms);
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         tx.execute(
-            &format!("DELETE FROM host_sessions WHERE updated_at < ?1 AND state IN ({})", terminal_list()),
-            params![cutoff],
+            &format!(
+                "DELETE FROM host_sessions WHERE updated_at < ?1 AND state IN ({}) AND contract_id NOT IN (
+                   SELECT contract_id FROM host_sessions WHERE state IN ({})
+                   ORDER BY updated_at DESC, contract_id DESC LIMIT ?2)",
+                terminal_list(),
+                history_list()
+            ),
+            params![cutoff, keep as i64],
         )
         .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM host_changes WHERE contract_id NOT IN (SELECT contract_id FROM host_sessions)", [])
+            .map_err(|e| e.to_string())?;
         let ids: Vec<String> = {
             let mut stmt = tx
                 .prepare(&format!(
@@ -144,6 +171,65 @@ impl Store {
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(ids)
+    }
+}
+
+/// 「历史托管」与「实际改动」用的查询。
+impl Store {
+    /// 最近结束的托管（completed / failed / stopped），新的在前。
+    pub fn host_history_rows(&self, limit: usize) -> Vec<HostSessionRow> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+        let Ok(mut stmt) = conn.prepare(&format!(
+            "SELECT contract_id, state, json, updated_at FROM host_sessions WHERE state IN ({})
+             ORDER BY updated_at DESC, contract_id DESC LIMIT ?1",
+            history_list()
+        )) else {
+            return Vec::new();
+        };
+        let rows = stmt
+            .query_map([limit.clamp(1, 500) as i64], row_to_session)
+            .map(|it| it.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        rows
+    }
+
+    /// 结束时定格的改动摘要（JSON）。决策表只留最近 500 条，老托管靠它。
+    pub fn host_changes_put(&self, contract_id: &str, json: &str, now_ms: i64) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO host_changes (contract_id, json, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(contract_id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at",
+            params![contract_id, json, now_ms],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn host_changes_get(&self, contract_id: &str) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+        conn.query_row("SELECT json FROM host_changes WHERE contract_id = ?1", params![contract_id], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// 某份契约的全部决策记录 JSON，按 seq 升序。
+    pub fn steward_decisions_for(&self, contract_id: &str) -> Vec<String> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+        let Ok(mut stmt) =
+            conn.prepare("SELECT record_json FROM steward_decisions WHERE contract_id = ?1 ORDER BY seq")
+        else {
+            return Vec::new();
+        };
+        let rows = stmt
+            .query_map(params![contract_id], |r| r.get(0))
+            .map(|it| it.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        rows
     }
 }
 
@@ -199,17 +285,57 @@ mod tests {
         store.host_session_upsert("old-done", "completed", "{}", 1_000).unwrap();
         store.host_session_upsert("new-live", "running", "{}", 9_500).unwrap();
         store.host_session_upsert("new-done", "stopped", "{}", 9_500).unwrap();
-        let expired = store.host_sessions_expire(10_000, 5_000).unwrap();
+        let expired = store.host_sessions_expire_keeping(10_000, 5_000, 0).unwrap();
         assert_eq!(expired, vec!["old-live".to_string()]);
         let r = store.host_session_get("old-live").unwrap();
         assert_eq!((r.state.as_str(), r.json.as_str()), (STATE_EXPIRED, r#"{"keep":1}"#));
         assert!(store.host_session_get("old-done").is_none());
         assert_eq!(ids(&store.host_sessions_non_terminal()), vec!["new-live"]);
         // 再过一个 TTL：expired 行也被清掉，新行按自己的时间判
-        let expired = store.host_sessions_expire(20_000, 5_000).unwrap();
+        let expired = store.host_sessions_expire_keeping(20_000, 5_000, 0).unwrap();
         assert_eq!(expired, vec!["new-live".to_string()]);
         assert!(store.host_session_get("old-live").is_none());
         assert!(store.host_session_get("new-done").is_none());
+    }
+
+    #[test]
+    fn expire_keeps_latest_finished_rows_as_history() {
+        let (store, _) = temp_store_at("host-history");
+        // 三条很老的结束行 + 一条老的 expired + 一条老的非终态
+        store.host_session_upsert("done-1", "completed", "{}", 100).unwrap();
+        store.host_session_upsert("done-2", "failed", "{}", 200).unwrap();
+        store.host_session_upsert("done-3", "stopped", "{}", 300).unwrap();
+        store.host_session_upsert("exp", "expired", "{}", 50).unwrap();
+        store.host_session_upsert("live", "running", "{}", 60).unwrap();
+        store.host_changes_put("done-1", "{}", 1).unwrap();
+        store.host_changes_put("exp", "{}", 1).unwrap();
+        // 只留最近 2 条结束了的：done-1 超出名额、过了 TTL → 删；expired 不算历史 → 删
+        let expired = store.host_sessions_expire_keeping(100_000, 1_000, 2).unwrap();
+        assert_eq!(expired, vec!["live".to_string()]);
+        assert!(store.host_session_get("done-1").is_none());
+        assert!(store.host_session_get("exp").is_none());
+        assert_eq!(ids(&store.host_history_rows(10)), vec!["done-3", "done-2"]);
+        assert!(store.host_changes_get("done-1").is_none() && store.host_changes_get("exp").is_none());
+        assert_eq!(store.host_session_get("live").unwrap().state, STATE_EXPIRED);
+        // 默认名额（100）：结束了的都留着；上一轮标成 expired 的这一轮被删，不进历史
+        store.host_session_upsert("done-4", "completed", "{}", 400).unwrap();
+        store.host_sessions_expire(200_000, 1_000).unwrap();
+        assert_eq!(ids(&store.host_history_rows(10)), vec!["done-4", "done-3", "done-2"]);
+        assert_eq!(ids(&store.host_history_rows(1)), vec!["done-4"]);
+        assert!(store.host_session_get("live").is_none());
+    }
+
+    #[test]
+    fn decisions_for_contract_and_changes_roundtrip() {
+        let (store, _) = temp_store_at("host-dec-for");
+        store.steward_decision_insert(1, "c1", "t", "", r#"{"a":1}"#, "applied").unwrap();
+        store.steward_decision_insert(2, "c2", "t", "", r#"{"b":1}"#, "applied").unwrap();
+        store.steward_decision_insert(3, "c1", "t", "", r#"{"a":2}"#, "applied").unwrap();
+        assert_eq!(store.steward_decisions_for("c1"), vec![r#"{"a":1}"#.to_string(), r#"{"a":2}"#.to_string()]);
+        assert!(store.host_changes_get("c1").is_none());
+        store.host_changes_put("c1", "x", 1).unwrap();
+        store.host_changes_put("c1", "y", 2).unwrap();
+        assert_eq!(store.host_changes_get("c1").as_deref(), Some("y"));
     }
 
     #[test]

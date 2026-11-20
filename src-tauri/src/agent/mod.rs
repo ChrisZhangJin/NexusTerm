@@ -53,6 +53,7 @@ pub mod policy;
 pub mod checkpoint;
 pub mod host;
 pub mod host_cmd;
+pub mod host_history_cmd;
 pub mod host_notify;
 // P5 学习闭环 / LLM 兜底
 pub mod learning;
