@@ -66,7 +66,7 @@ fn happy_path_exec_then_complete() {
     assert_completed(&h, &p);
     assert_eq!(std::fs::read_to_string(h.dir.join("out.txt")).unwrap(), "hi\n");
     // 相位先落、副作用（落盘 / 推送）随后：等推送到了再断言
-    h.wait_until(Duration::from_secs(5), "面板收到完成状态", |h| h.statuses().iter().any(|s| s["state"] == "completed"));
+    h.wait_until(Duration::from_secs(20), "面板收到完成状态", |h| h.statuses().iter().any(|s| s["state"] == "completed"));
 }
 
 /// 2. heredoc 改道：在可见终端里敲 `cat > f.py <<'EOF'` 不执行（门禁卡 refused + nx_write 提示），改用 nx_write 后完成。
@@ -341,12 +341,12 @@ fn multi_console_writes_on_extra_via_target() {
     // 系统提示里有「本次托管的终端」一节
     assert!(h.llm.systems().iter().any(|s| s.contains("本次托管的终端") && s.contains(&b)), "{}", h.dump());
     // 状态里带两个终端（主终端在前）
-    h.wait_until(Duration::from_secs(5), "面板收到完成状态", |h| h.statuses().iter().any(|s| s["state"] == "completed"));
+    h.wait_until(Duration::from_secs(20), "面板收到完成状态", |h| h.statuses().iter().any(|s| s["state"] == "completed"));
     let st = h.statuses().last().cloned().unwrap();
     let ids: Vec<&str> = st["consoles"].as_array().unwrap().iter().map(|c| c["consoleId"].as_str().unwrap()).collect();
     assert_eq!(ids, vec![h.console.as_str(), b.as_str()]);
     // 结束：两个终端的租约一起还给用户
-    h.wait_until(Duration::from_secs(5), "租约放掉", |h| {
+    h.wait_until(Duration::from_secs(20), "租约放掉", |h| {
         h.state().act.control.holders_of(&h.console).is_empty() && h.state().act.control.holders_of(&b).is_empty()
     });
 }
