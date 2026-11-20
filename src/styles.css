@@ -1628,11 +1628,6 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column;
   gap: 10px; padding: 12px; overflow-y: auto; color: var(--text); font-size: 12px;
 }
-.st-note {
-  flex: none; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius);
-  background: var(--bg-elev); color: var(--text-dim); line-height: 1.6;
-}
-.st-note strong { color: var(--accent); font-weight: 500; }
 .st-err { flex: none; padding: 6px 10px; color: var(--danger); }
 .st-head { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
 /* 按钮组窄面板下换行，别把「刷新」挤出右边 */
@@ -2377,19 +2372,11 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
   padding: 5px 8px; border-radius: 6px; border-left: 3px solid var(--border);
   background: var(--bg-panel); color: var(--text-dim); font-size: 11.5px; line-height: 1.5;
 }
-.st-status.active { border-left-color: var(--accent); color: var(--text); }
 .st-num { width: 64px; margin: 0 4px; padding: 2px 4px; background: var(--bg, transparent); color: inherit; border: 1px solid var(--border, #444); border-radius: 4px; }
-.st-budget-banner {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  margin-top: 8px; padding: 10px 12px; border-radius: 6px;
-  border: 1px solid #e5c07b; border-left-width: 4px;
-  background: rgba(229, 192, 123, 0.12); color: #e5c07b; font-weight: 600;
-}
-.st-budget-banner > span { flex: 1 1 220px; }
 .st-status.warn { border-left-color: #e5c07b; color: #e5c07b; }
+.st-status.bad { border-left-color: var(--danger); color: var(--danger); }
 
 /* AI 托管实况：运行卡片流（与「对话」同一套 .ap-step / .ap-approve 卡片），限高、内部滚动 */
-.st-run { flex: none; display: flex; flex-direction: column; gap: 6px; }
 .st-feed {
   max-height: 46vh; min-height: 60px; overflow-y: auto; padding: 8px;
   border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel);
@@ -2404,16 +2391,56 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 }
 
 /* ——— 统一托管：状态胶囊 + 问题 / 审批卡（HostCard） ——— */
-.host-card { margin: 6px 0; }
+.host-card { flex: none; display: flex; flex-direction: column; gap: 6px; margin: 6px 0; padding: 8px 10px; }
+/* 卡内用 gap 排间距，自带的上下外边距收掉 */
+.host-card > .host-criteria, .host-card > .host-report, .host-card > .deny-editor { margin: 0; }
+/* 卡头：胶囊 + 标题 + 唯一一行控制；窄面板下按钮整组换到下一行 */
+.hc-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 12.5px; }
+.hc-title { flex: 1 1 80px; min-width: 0; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hc-acts { flex: none; display: flex; gap: 5px; margin-left: auto; }
+.hc-goal {
+  color: var(--text-dim); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+/* 计划：运行中一直在，但限高 */
+.hc-plan { max-height: 150px; overflow-y: auto; }
+.hc-plan .ap-step { margin: 0; }
+/* 契约 / 设置（托管卡）、更多设置（开始表单）：收起时一行摘要 */
+.hc-settings > summary, .hc-more > summary {
+  cursor: pointer; font-size: 11.5px; color: var(--text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.hc-settings-label { color: var(--text); margin-right: 6px; }
+.hc-yolo { color: var(--danger); font-weight: 600; }
+.hc-settings-body { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; padding-left: 10px; border-left: 2px solid var(--border); }
+.hc-settings-body .deny-editor { margin: 0; }
+.hc-row { display: flex; align-items: center; gap: 6px; font-size: 11.5px; }
+/* 开始表单：一行提示 / 「?」说明 / 放手程度预设 */
+.hc-hint { color: var(--text-dim); font-size: 11.5px; line-height: 1.5; }
+.hc-help {
+  flex: none; width: 16px; height: 16px; border-radius: 50%; border: 1px solid var(--border);
+  color: var(--text-dim); font-size: 10.5px; line-height: 14px; text-align: center; cursor: help;
+}
+.hc-presets { display: flex; gap: 4px; flex-wrap: wrap; }
+.hc-preset {
+  flex: 1 1 0; min-width: 64px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg-panel); color: var(--text-dim); cursor: pointer; font-size: 12px; white-space: nowrap;
+}
+.hc-preset:hover:not(:disabled) { border-color: var(--accent); }
+.hc-preset.on { color: var(--accent); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--bg-panel)); font-weight: 600; }
+.hc-preset.yolo:hover:not(:disabled) { border-color: var(--danger); }
+.hc-preset.yolo.on { color: var(--danger); border-color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, var(--bg-panel)); }
+/* 托管实况：可折叠，运行中默认展开 */
+.hc-feed { flex: none; }
+.hc-feed > summary { cursor: pointer; font-size: 11.5px; padding: 2px 0 6px; }
+.hc-warn { color: #e5c07b; font-weight: 600; }
+.hc-sit { margin-top: 6px; color: var(--text); }
 .host-pill { border-radius: 999px; padding: 0 8px; }
 .host-pill.active { color: var(--accent); border-color: var(--accent); }
 .host-pill.warn { color: #e5c07b; border-color: color-mix(in srgb, #e5c07b 55%, transparent); }
 .host-pill.done { color: var(--accent); }
 .host-pill.bad { color: var(--danger); border-color: var(--danger); }
 .host-pill.idle { color: var(--text-dim); }
-.host-goal { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
 .host-question { white-space: pre-wrap; word-break: break-word; margin-bottom: 6px; }
-.host-yolo.on { color: var(--danger); font-weight: 600; }
 .host-notice .st-esc-head { color: var(--accent); }
 /* 确认完成判据：挡着托管开始的那一步 —— 醒目、编辑区大 */
 .host-criteria {
@@ -2485,8 +2512,7 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .host-answer-row { display: flex; gap: 6px; align-items: flex-end; }
 .host-answer { resize: none; line-height: 1.5; padding: 5px 8px; font-family: inherit; }
 .host-report-body.host-text { white-space: normal; }
-/* YOLO 档：选中时下拉框与提示条标红 */
-.host-tier-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; font-size: 11.5px; }
+/* YOLO 档：选中时下拉框 / 预设 / 摘要与提示条标红 */
 .st-select-yolo { color: var(--danger); border-color: var(--danger); font-weight: 600; }
 .st-yolo-warn {
   margin: 4px 0; padding: 6px 9px; border-radius: 6px; font-size: 11.5px; line-height: 1.5;

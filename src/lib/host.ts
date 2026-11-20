@@ -1,9 +1,8 @@
 /**
- * 统一托管（host_*）的纯逻辑：相位 → 胶囊文案、当前要处理的卡片、哪些按钮可点、按 console 归并。
+ * 统一托管（host_*）的纯逻辑：相位 → 胶囊文案、当前要处理的卡片、按 console 归并（卡头按钮见 hostUi）。
  * 不碰 Tauri，便于 node:test 直接测。
  */
 
-import type { PauseKind } from "./agentBudget";
 import type {
   AgentStep,
   HostCheck,
@@ -133,9 +132,9 @@ export function hostDetail(p: HostPhase): string | null {
         case "deadline":
           return "到了约定的期限。点「加预算继续」恢复，或「停止」结束。";
         case "llmDown":
-          return `模型服务暂不可用（${b.cause.error}）。恢复后点「加预算继续」。`;
+          return `模型服务暂不可用（${b.cause.error}）。恢复后点「继续」。`;
         default:
-          return "已暂停，点「加预算继续」接着做。";
+          return "已暂停，点「继续」接着做。";
       }
     case "completed":
       return b.summary;
@@ -152,31 +151,6 @@ export function pendingCard(p: HostPhase): HostHumanCard | null {
   return b.kind === "waitingHuman" ? b.card : null;
 }
 
-export interface HostButtons {
-  /** 待重新接驳：显示候选 / 打开新连接 */
-  reattach: boolean;
-  takeover: boolean;
-  handback: boolean;
-  resume: boolean;
-  pause: boolean;
-  stop: boolean;
-}
-
-/** 哪些按钮此刻有意义 */
-export function hostButtons(p: HostPhase): HostButtons {
-  const b = basePhase(p);
-  const live = !isTerminal(p);
-  const suspended = b.kind === "suspended";
-  return {
-    takeover: live && !suspended && p.kind !== "userDriving",
-    handback: p.kind === "userDriving",
-    resume: b.kind === "paused",
-    pause: p.kind === "running",
-    stop: live,
-    reattach: suspended,
-  };
-}
-
 /** 等重新接驳（重启后 / 终端关了） */
 export const needsReattach = (p: HostPhase): boolean => basePhase(p).kind === "suspended";
 
@@ -190,22 +164,6 @@ export function consoleHintOf(tab: TerminalTab): HostConsoleHint {
     cwd: nz(tab.ctx?.cwd),
     tmux: nz(tab.ctx?.tmux),
   };
-}
-
-/** 暂停原因映射到旧的 PauseKind（托管页那条预算横幅沿用它） */
-export function hostPauseKind(p: HostPhase): PauseKind | undefined {
-  const b = basePhase(p);
-  if (b.kind !== "paused") return undefined;
-  switch (b.cause.kind) {
-    case "budget":
-      return "steps";
-    case "deadline":
-      return "time";
-    case "llmDown":
-      return "llm";
-    default:
-      return "user";
-  }
 }
 
 /** 收一条状态进总表（按 contractId） */

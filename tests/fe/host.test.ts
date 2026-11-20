@@ -7,16 +7,15 @@ import assert from "node:assert/strict";
 
 import {
   basePhase,
-  hostButtons,
   hostDetail,
   hostForConsole,
-  hostPauseKind,
   hostPill,
   hostTabBadge,
   hostTabBadges,
   pendingCard,
   upsertHost,
 } from "../../src/lib/host";
+import { hostHeadActions } from "../../src/lib/hostUi";
 import type { HostHumanCard, HostPhase, HostStatus } from "../../src/types";
 
 const card = (kind: "ask" | "approve" = "ask"): HostHumanCard => ({
@@ -53,24 +52,12 @@ test("人在驾驶时卡片仍可见，按钮只给交还", () => {
   const p = drive(waiting);
   assert.equal(basePhase(p).kind, "waitingHuman");
   assert.equal(pendingCard(p)?.id, "k1");
-  const b = hostButtons(p);
-  assert.equal(b.handback, true);
-  assert.equal(b.takeover, false);
-  assert.equal(b.stop, true);
+  assert.deepEqual(hostHeadActions(p).map((a) => a.kind), ["handback", "stop"]);
   assert.match(hostDetail(p) ?? "", /交还后回到「等你回答」/);
 });
 
-test("预算暂停时按键再交还：仍可加预算继续", () => {
-  const b = hostButtons(drive(budget));
-  assert.equal(b.resume, true);
-  assert.equal(hostPauseKind(drive(budget)), "steps");
-  assert.equal(hostButtons(running).resume, false);
-  assert.equal(hostButtons(running).pause, true);
-});
-
 test("终态没有可点的按钮", () => {
-  const b = hostButtons({ kind: "stopped" });
-  assert.deepEqual(b, { takeover: false, handback: false, resume: false, pause: false, stop: false, reattach: false });
+  assert.deepEqual(hostHeadActions({ kind: "stopped" }), []);
 });
 
 test("按 console 取托管：未结束优先，否则最新结局", () => {
@@ -143,10 +130,8 @@ test("挂起（重启 / 终端关了）只给接驳与放弃", () => {
   const p: HostPhase = { kind: "suspended", reason: "consoleGone", resume_to: { kind: "running" } };
   assert.equal(hostPill(p).label, "终端断开·等重连");
   assert.equal(needsReattach(p), true);
-  const b = hostButtons(p);
-  assert.equal(b.reattach, true);
-  assert.equal(b.takeover, false);
-  assert.equal(b.stop, true);
+  // 卡头不给按钮：接驳卡里有候选 / 打开新连接 / 放弃
+  assert.deepEqual(hostHeadActions(p), []);
   assert.equal(needsReattach({ kind: "running" }), false);
 });
 

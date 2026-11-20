@@ -23,7 +23,7 @@ import { useAgentHistory } from "../lib/useAgentHistory";
 import { useAgentRun } from "../lib/useAgentRun";
 import { useHostRuns } from "../lib/useHostRuns";
 import { useHostFeeds } from "../lib/useHostFeeds";
-import { basePhase, hostDetail, hostPauseKind, isTerminal, needsReattach } from "../lib/host";
+import { basePhase, hostDetail, isTerminal, needsReattach } from "../lib/host";
 import { stewardApi, stewardConsoleIds } from "../lib/steward";
 import { setStewardConsoles } from "../lib/termRegistry";
 import type { AgentTarget, HostStartOpts, Skill, SkillInput } from "../types";
@@ -503,10 +503,6 @@ export function AgentPanel({
       messages: feed.messages,
       paused: hostedLive && hostedBase?.kind === "paused",
       pauseText: hosted ? (hostDetail(hosted.phase) ?? undefined) : undefined,
-      pauseKind: hosted ? hostPauseKind(hosted.phase) : undefined,
-      userPaused: hostedLive && hosted?.phase.kind === "userDriving",
-      driving: hostedLive && (hosted?.phase.kind === "running" || hosted?.phase.kind === "waitingHuman"),
-      host: hosted,
       hostFor: hostRuns.forConsole,
       awaitingReattach: hostRuns.awaitingReattach,
       stopCtrlC: run.stopCtrlC,
@@ -514,21 +510,6 @@ export function AgentPanel({
       start: runSteward,
       cancel: async () => {
         if (hosted) await hostAct(() => api.hostStop(hosted.contractId, run.stopCtrlC));
-      },
-      pause: async () => {
-        if (hosted) await hostAct(() => api.hostPause(hosted.contractId));
-      },
-      resume: async (b?: StewardBudgetPref) => {
-        if (hosted)
-          await hostAct(() =>
-            api.hostResume(hosted.contractId, b ? { maxSteps: b.maxSteps, maxMinutes: b.maxMinutes } : undefined)
-          );
-      },
-      takeover: () => {
-        if (hosted) void hostAct(() => api.hostTakeover(hosted.contractId));
-      },
-      handback: () => {
-        if (hosted) void hostAct(() => api.hostHandback(hosted.contractId));
       },
       decide: run.decide,
       answerSecret: (req, value) => hostFeeds.answerSecret(cid, req, value),
@@ -632,6 +613,7 @@ export function AgentPanel({
           status={hostedHere}
           label={sessions.find((s) => s.id === hostedHere.consoleId)?.label}
           stopCtrlC={run.stopCtrlC}
+          onStopCtrlC={run.toggleStopCtrlC}
         />
       )}
       {/* 等重新接驳的托管（重启后 / 终端关了）：不管在哪个 tab 都摆出来，接驳要你确认 */}

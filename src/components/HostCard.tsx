@@ -1,6 +1,11 @@
 /**
- * 一个托管任务的状态卡：胶囊（运行中 / 等你回答 / 你在驾驶 / 预算暂停 / 完成 / 失败 / 已停止）、
- * 等人处理的卡片（问题 + 选项 + 自由答复 / 审批），以及 接管 / 交还 / 加预算继续 / 暂停 / 停止。
+ * 一个托管任务的状态卡，状态优先，从上到下：
+ * 1. 卡头：胶囊（运行中 / 等你回答 / 你在驾驶 / 预算暂停 / 完成 / 失败 / 已停止）+ 此刻该点的按钮
+ *    （交还 / 继续 / 暂停 / 接管 / 停止，见 `hostHeadActions`；全卡只有这一行控制）；
+ * 2. 需要你的卡片紧跟卡头：确认判据 / 密码 / 问题 + 选项 + 自由答复 / 审批 / 看门狗；
+ *    待重新接驳的候选；完成报告与「基于此报告继续」；
+ * 3. 计划（紧凑）；
+ * 4. 「契约 / 设置」折叠：档位、禁止项、改目标、停止时发 Ctrl-C、预算，收起时一行摘要。
  *
  * 卡片**永远等下去**：没有倒计时、没有默认动作（设计 §2 已定）。AgentPanel 与 StewardPanel 共用。
  */
@@ -11,7 +16,9 @@ import { DiffView } from "./DiffView";
 import { needsIncompleteBanner } from "../lib/diff";
 import { TodoList } from "./TodoList";
 import { toFriendlyError } from "../lib/errors";
-import { checkLines, criteriaSummary, formatReport, checksToText, hostButtons, hostDetail, hostPill, isTerminal, pendingCard, textToChecks } from "../lib/host";
+import { checkLines, criteriaSummary, formatReport, checksToText, hostDetail, hostPill, isTerminal, needsReattach, pendingCard, textToChecks } from "../lib/host";
+import { HOST_TIERS, hostHeadActions, hostSettingsSummary, type HostHeadAction } from "../lib/hostUi";
+import { STEWARD_DURATION_OPTIONS } from "../lib/agentBudget";
 import type {
   AgentTarget,
   HostBudgetGrant,
@@ -33,13 +40,20 @@ export interface HostCardProps {
   grant?: HostBudgetGrant;
   /** 停止时同时发 Ctrl-C */
   stopCtrlC?: boolean;
+  /** 给了就在「契约 / 设置」里显示「停止时同时发 Ctrl-C」开关 */
+  onStopCtrlC?: (on: boolean) => void;
+  /** 「停止」的实际动作（托管页还要一并停契约）；不给 = 直接 host_stop */
+  onStop?: () => Promise<void>;
   /** 开着的 tab（待重新接驳时给候选排序用） */
   tabs?: AgentTarget[];
   /** 完成后「基于此报告继续」：用新目标在同一个终端上起下一个托管，上一个目标与报告作开场上下文 */
   onFollowUp?: (goal: string, prev: HostStartOpts["followUp"]) => Promise<void>;
 }
 
-export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], onFollowUp }: HostCardProps) {
+const durationLabel = (m?: number) =>
+  m === undefined ? "—" : (STEWARD_DURATION_OPTIONS.find((o) => o.minutes === m)?.label ?? `${m} 分钟`);
+
+export default function HostCard({ status, label, grant, stopCtrlC, onStopCtrlC, onStop, tabs = [], onFollowUp }: HostCardProps) {
   const [text, setText] = useState("");
   const [nextGoal, setNextGoal] = useState("");
   const [busy, setBusy] = useState(false);
@@ -47,14 +61,14 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], o
   const pill = hostPill(status.phase);
   const detail = hostDetail(status.phase);
   const card = pendingCard(status.phase);
-  const btn = hostButtons(status.phase);
+  const reattach = needsReattach(status.phase);
   const cid = status.contractId;
   const live = !isTerminal(status.phase);
   // 待重新接驳：开着的 tab 交给后端按相似度排序（host_key → SSH 记录 → 标签 → cwd）
   const [cands, setCands] = useState<HostReattachCandidate[]>([]);
   const tabKey = tabs.map((t) => t.id).join("|");
   useEffect(() => {
-    if (!btn.reattach) return;
+    if (!reattach) return;
     let gone = false;
     api
       .hostReattachCandidates(
@@ -67,7 +81,7 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], o
       gone = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cid, btn.reattach, tabKey]);
+  }, [cid, reattach, tabKey]);
   // 判据草稿：一行一条，可改；换了一张卡就重置
   const draft = card?.kind.kind === "criteriaDraft" ? card.kind.draft : null;
   const [criteria, setCriteria] = useState("");
@@ -132,195 +146,56 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], o
       setNotices((l) => l.filter((x) => x.seq !== n.seq));
     });
 
+  const acts = hostHeadActions(status.phase);
+  const runAct = (a: HostHeadAction) => {
+    switch (a.kind) {
+      case "resume":
+        return act(() => api.hostResume(cid, grant));
+      case "handback":
+        return act(() => api.hostHandback(cid));
+      case "takeover":
+        return act(() => api.hostTakeover(cid));
+      case "pause":
+        return act(() => api.hostPause(cid));
+      case "stop":
+        return act(() => (onStop ? onStop() : api.hostStop(cid, stopCtrlC)));
+    }
+  };
+  const summary = hostSettingsSummary(status.tier, status.deny);
+  const settings = live && !reattach;
+
   return (
     <div className="st-card host-card">
-      <div className="st-main-head">
+      {/* 卡头：一句话状态 + 此刻该点的按钮（全卡只有这一行控制） */}
+      <div className="hc-head">
         <span className={`st-badge host-pill ${pill.tone}`}>{pill.label}</span>
-        <span className="st-name">{label ? `托管 · ${label}` : "托管"}</span>
-        <span className="st-meta host-goal" title={status.goal}>
-          {status.goal}
-        </span>
-      </div>
-      {detail && status.phase.kind !== "completed" && <div className="st-esc-why">{detail}</div>}
-      {status.phase.kind === "completed" && (
-        <div className="host-report">
-          <div className="host-report-head">
-            <span>完成报告</span>
-            <button
-              className="st-btn"
-              disabled={!status.phase.summary}
-              onClick={() => void api.clipboardWrite(status.phase.kind === "completed" ? status.phase.summary : "").catch(() => {})}
-            >
-              复制
-            </button>
-          </div>
-          {status.phase.summary.trim() ? (
-            <HostText className="host-report-body" text={formatReport(status.phase.summary)} />
-          ) : (
-            <div className="host-report-body">（AI 没有写完成报告）</div>
-          )}
-          {status.phase.checks.length > 0 && (
-            <details className="host-report-checks">
-              <summary>核验依据（{status.phase.checks.length} 条）</summary>
-              <ul className="host-checks">
-                {checkLines(status.phase.checks).map((l, i) => (
-                  <li key={i} className={l.startsWith("✓") ? "ok" : l.startsWith("·") ? "info" : "no"}>
-                    {l}
-                  </li>
-                ))}
-              </ul>
-            </details>
-          )}
-          {onFollowUp && (
-            <div className="host-followup">
-              <textarea
-                className="st-goal"
-                rows={2}
-                value={nextGoal}
-                disabled={busy}
-                placeholder="基于这份报告接着做什么？例如：按方案执行 A 到 D 项，每项执行前后报告释放的空间"
-                onChange={(e) => setNextGoal(e.target.value)}
-              />
+        <span className="hc-title">{label ? `托管 · ${label}` : "托管"}</span>
+        {acts.length > 0 && (
+          <span className="hc-acts">
+            {acts.map((a) => (
               <button
-                className="st-btn primary"
-                disabled={busy || !nextGoal.trim()}
-                title="在同一个终端上开始下一个托管；上一个目标与这份完成报告会作为它的开场上下文"
-                onClick={() =>
-                  void act(async () => {
-                    if (status.phase.kind !== "completed") return;
-                    await onFollowUp(nextGoal.trim(), { goal: status.goal, summary: status.phase.summary });
-                    setNextGoal("");
-                  })
-                }
+                key={a.kind}
+                className={`st-btn${a.tone === "plain" ? "" : ` ${a.tone}`}`}
+                disabled={busy}
+                title={a.title}
+                onClick={() => void runAct(a)}
               >
-                基于此报告继续
+                {a.label}
               </button>
-            </div>
-          )}
-        </div>
+            ))}
+          </span>
+        )}
+      </div>
+      <div className="hc-goal" title={status.goal}>
+        {status.goal}
+      </div>
+      {detail && status.phase.kind !== "completed" && (
+        <div className={`st-status ${status.phase.kind === "failed" ? "bad" : "warn"}`}>{detail}</div>
       )}
       {status.notice && <div className="st-status warn">{status.notice}</div>}
-      {live && !btn.reattach && status.tier && (
-        <div className="host-tier-row">
-          <span className="deny-title">授权档位</span>
-          <select
-            className={`st-select${status.tier === "yolo" ? " st-select-yolo" : ""}`}
-            value={status.tier}
-            disabled={busy}
-            title="运行中也能改，下一步起生效"
-            onChange={(e) => void act(() => api.hostAmend(cid, undefined, e.target.value))}
-          >
-            {(["auto", "notify", "approve", "yolo"] as const).map((t) => (
-              <option key={t} value={t}>
-                {TIER_LABELS[t]}
-              </option>
-            ))}
-          </select>
-          {status.tier === "yolo" && <span className="st-meta host-yolo on">只有越过禁止项才会停下来问你</span>}
-        </div>
-      )}
-      {live && !btn.reattach && (
-        <DenyEditor
-          value={status.deny ?? []}
-          disabled={busy}
-          onChange={(next) => void act(() => api.hostAmend(cid, undefined, undefined, next))}
-        />
-      )}
-      {status.todo && status.todo.length > 0 && <TodoList items={status.todo} />}
+      {err && <div className="st-err">{err}</div>}
 
-      {btn.reattach && (
-        <div className="st-esc host-ask">
-          <div className="st-esc-head">
-            {status.phase.kind === "suspended" && status.phase.reason === "consoleGone"
-              ? "被托管的终端断开了"
-              : "应用重启了，托管停在这里"}
-          </div>
-          {status.phase.kind === "suspended" && status.phase.reason === "consoleGone" && (
-            <div className="st-esc-why">
-              如果是网络断了：这个标签页重连成功后，托管会在几秒内<b>自动接着跑</b>（AI 先读屏核对现场），不用做任何事。
-              标签页已经关掉了，才需要在下面手动接回。
-            </div>
-          )}
-          <div className="st-esc-why">
-            选一个终端接回去（按和原来的相似度排序），或按保存的连接新开一个。接回后 AI 会先读屏核对现场；
-            屏幕和原来不一样时会降为「确认」档，每次写入都先问你。
-          </div>
-          {cands.length === 0 && <div className="st-esc-why">没有找到相似的终端。</div>}
-          <div className="st-form-row st-center">
-            {cands.map((c) => (
-              <button
-                key={c.consoleId}
-                className="st-btn"
-                disabled={busy}
-                onClick={() => void act(() => api.hostReattach(cid, c.consoleId))}
-                title={`相似度 ${c.score}`}
-              >
-                接到「{c.label}」
-              </button>
-            ))}
-            <button className="st-btn primary" disabled={busy} onClick={() => void act(() => api.hostReattach(cid, null, true))}>
-              打开新连接
-            </button>
-            <button className="st-btn danger" disabled={busy} onClick={() => void act(() => api.hostStop(cid, false))}>
-              放弃
-            </button>
-          </div>
-        </div>
-      )}
-
-      {live && (
-        <div className="st-form-row st-center">
-          {goalDraft === null ? (
-            <button className="st-btn" disabled={busy} onClick={() => setGoalDraft(status.goal)} title="改目标：不重启，AI 下一步就按新目标做">
-              改目标
-            </button>
-          ) : (
-            <>
-              <input className="st-input" value={goalDraft} disabled={busy} onChange={(e) => setGoalDraft(e.target.value)} />
-              <button
-                className="st-btn primary"
-                disabled={busy || !goalDraft.trim()}
-                onClick={() =>
-                  void act(async () => {
-                    await api.hostAmend(cid, goalDraft.trim());
-                    setGoalDraft(null);
-                  })
-                }
-              >
-                保存
-              </button>
-              <button className="st-btn" disabled={busy} onClick={() => setGoalDraft(null)}>
-                取消
-              </button>
-            </>
-          )}
-        </div>
-      )}
-
-      {notices.map((n) => (
-        <div key={n.seq} className="st-esc host-notice">
-          <div className="st-esc-head">已执行（通知档）</div>
-          <div className="host-question">{n.text}</div>
-          {live && (
-            <div className="st-form-row st-center">
-              <input
-                className="st-input"
-                value={correction}
-                disabled={busy}
-                onChange={(e) => setCorrection(e.target.value)}
-                placeholder="可选：哪里不对、下次该怎么做（会记成偏好）"
-              />
-              <button className="st-btn warn" disabled={busy} onClick={() => void undo(n)} title="AI 立刻让路，由你处理现场；纠正记成偏好">
-                撤销（接管）
-              </button>
-              <button className="st-btn" disabled={busy} onClick={() => setNotices((l) => l.filter((x) => x.seq !== n.seq))}>
-                知道了
-              </button>
-            </div>
-          )}
-        </div>
-      ))}
-
+      {/* 需要你的时候：卡片紧跟卡头 */}
       {card && draft && (
         <div className="host-criteria" ref={criteriaRef}>
           <div className="host-criteria-head">
@@ -460,41 +335,206 @@ export default function HostCard({ status, label, grant, stopCtrlC, tabs = [], o
         </div>
       )}
 
-      {(btn.takeover || btn.handback || btn.resume || btn.pause || btn.stop) && (
-        <div className="st-form-row st-center">
-          {btn.resume && (
-            <button className="st-btn primary" disabled={busy} onClick={() => void act(() => api.hostResume(cid, grant))}>
-              加预算继续
-            </button>
+      {reattach && (
+        <div className="st-esc host-ask">
+          <div className="st-esc-head">
+            {status.phase.kind === "suspended" && status.phase.reason === "consoleGone"
+              ? "被托管的终端断开了"
+              : "应用重启了，托管停在这里"}
+          </div>
+          {status.phase.kind === "suspended" && status.phase.reason === "consoleGone" && (
+            <div className="st-esc-why">
+              如果是网络断了：这个标签页重连成功后，托管会在几秒内<b>自动接着跑</b>（AI 先读屏核对现场），不用做任何事。
+              标签页已经关掉了，才需要在下面手动接回。
+            </div>
           )}
-          {btn.handback && (
-            <button className="st-btn primary" disabled={busy} onClick={() => void act(() => api.hostHandback(cid))}>
-              交还
+          <div className="st-esc-why">
+            选一个终端接回去（按和原来的相似度排序），或按保存的连接新开一个。接回后 AI 会先读屏核对现场；
+            屏幕和原来不一样时会降为「确认」档，每次写入都先问你。
+          </div>
+          {cands.length === 0 && <div className="st-esc-why">没有找到相似的终端。</div>}
+          <div className="st-form-row st-center">
+            {cands.map((c) => (
+              <button
+                key={c.consoleId}
+                className="st-btn"
+                disabled={busy}
+                onClick={() => void act(() => api.hostReattach(cid, c.consoleId))}
+                title={`相似度 ${c.score}`}
+              >
+                接到「{c.label}」
+              </button>
+            ))}
+            <button className="st-btn primary" disabled={busy} onClick={() => void act(() => api.hostReattach(cid, null, true))}>
+              打开新连接
             </button>
-          )}
-          {btn.takeover && (
+            <button className="st-btn danger" disabled={busy} onClick={() => void act(() => api.hostStop(cid, false))}>
+              放弃
+            </button>
+          </div>
+        </div>
+      )}
+
+      {status.phase.kind === "completed" && (
+        <div className="host-report">
+          <div className="host-report-head">
+            <span>完成报告</span>
             <button
               className="st-btn"
-              disabled={busy}
-              title="让 AI 立刻让路（你在终端里敲键也会自动触发），直到你点「交还」"
-              onClick={() => void act(() => api.hostTakeover(cid))}
+              disabled={!status.phase.summary}
+              onClick={() => void api.clipboardWrite(status.phase.kind === "completed" ? status.phase.summary : "").catch(() => {})}
             >
-              接管
+              复制
             </button>
+          </div>
+          {status.phase.summary.trim() ? (
+            <HostText className="host-report-body" text={formatReport(status.phase.summary)} />
+          ) : (
+            <div className="host-report-body">（AI 没有写完成报告）</div>
           )}
-          {btn.pause && (
-            <button className="st-btn" disabled={busy} onClick={() => void act(() => api.hostPause(cid))}>
-              暂停
-            </button>
+          {status.phase.checks.length > 0 && (
+            <details className="host-report-checks">
+              <summary>核验依据（{status.phase.checks.length} 条）</summary>
+              <ul className="host-checks">
+                {checkLines(status.phase.checks).map((l, i) => (
+                  <li key={i} className={l.startsWith("✓") ? "ok" : l.startsWith("·") ? "info" : "no"}>
+                    {l}
+                  </li>
+                ))}
+              </ul>
+            </details>
           )}
-          {btn.stop && !btn.reattach && (
-            <button className="st-btn danger" disabled={busy} onClick={() => void act(() => api.hostStop(cid, stopCtrlC))}>
-              停止
-            </button>
+          {onFollowUp && (
+            <div className="host-followup">
+              <textarea
+                className="st-goal"
+                rows={2}
+                value={nextGoal}
+                disabled={busy}
+                placeholder="基于这份报告接着做什么？例如：按方案执行 A 到 D 项，每项执行前后报告释放的空间"
+                onChange={(e) => setNextGoal(e.target.value)}
+              />
+              <button
+                className="st-btn primary"
+                disabled={busy || !nextGoal.trim()}
+                title="在同一个终端上开始下一个托管；上一个目标与这份完成报告会作为它的开场上下文"
+                onClick={() =>
+                  void act(async () => {
+                    if (status.phase.kind !== "completed") return;
+                    await onFollowUp(nextGoal.trim(), { goal: status.goal, summary: status.phase.summary });
+                    setNextGoal("");
+                  })
+                }
+              >
+                基于此报告继续
+              </button>
+            </div>
           )}
         </div>
       )}
-      {err && <div className="st-err">{err}</div>}
+      {notices.map((n) => (
+        <div key={n.seq} className="st-esc host-notice">
+          <div className="st-esc-head">已执行（通知档）</div>
+          <div className="host-question">{n.text}</div>
+          {live && (
+            <div className="st-form-row st-center">
+              <input
+                className="st-input"
+                value={correction}
+                disabled={busy}
+                onChange={(e) => setCorrection(e.target.value)}
+                placeholder="可选：哪里不对、下次该怎么做（会记成偏好）"
+              />
+              <button className="st-btn warn" disabled={busy} onClick={() => void undo(n)} title="AI 立刻让路，由你处理现场；纠正记成偏好">
+                撤销（接管）
+              </button>
+              <button className="st-btn" disabled={busy} onClick={() => setNotices((l) => l.filter((x) => x.seq !== n.seq))}>
+                知道了
+              </button>
+            </div>
+          )}
+        </div>
+      ))}
+
+      {status.todo && status.todo.length > 0 && (
+        <div className="hc-plan">
+          <TodoList items={status.todo} />
+        </div>
+      )}
+
+      {/* 契约 / 设置：档位、禁止项、改目标、停止时发 Ctrl-C、预算 —— 平时收起，只露一行摘要 */}
+      {settings && (
+        <details className="hc-settings">
+          <summary>
+            <span className="hc-settings-label">契约 / 设置</span>
+            <span className={summary.yolo ? "hc-yolo" : undefined}>{summary.tier}</span>
+            <span className="hc-settings-deny"> · {summary.deny}</span>
+          </summary>
+          <div className="hc-settings-body">
+            {status.tier && (
+              <div className="hc-row">
+                <span className="deny-title">授权档位</span>
+                <select
+                  className={`st-select${status.tier === "yolo" ? " st-select-yolo" : ""}`}
+                  value={status.tier}
+                  disabled={busy}
+                  title="运行中也能改，下一步起生效"
+                  onChange={(e) => void act(() => api.hostAmend(cid, undefined, e.target.value))}
+                >
+                  {HOST_TIERS.map((t) => (
+                    <option key={t} value={t}>
+                      {TIER_LABELS[t]}
+                    </option>
+                  ))}
+                </select>
+                {status.tier === "yolo" && <span className="st-meta hc-yolo">只有越过禁止项才会停下来问你</span>}
+              </div>
+            )}
+            <DenyEditor
+              value={status.deny ?? []}
+              disabled={busy}
+              onChange={(next) => void act(() => api.hostAmend(cid, undefined, undefined, next))}
+            />
+            <div className="st-form-row st-center">
+              {goalDraft === null ? (
+                <button className="st-btn" disabled={busy} onClick={() => setGoalDraft(status.goal)} title="改目标：不重启，AI 下一步就按新目标做">
+                  改目标
+                </button>
+              ) : (
+                <>
+                  <input className="st-input" value={goalDraft} disabled={busy} onChange={(e) => setGoalDraft(e.target.value)} />
+                  <button
+                    className="st-btn primary"
+                    disabled={busy || !goalDraft.trim()}
+                    onClick={() =>
+                      void act(async () => {
+                        await api.hostAmend(cid, goalDraft.trim());
+                        setGoalDraft(null);
+                      })
+                    }
+                  >
+                    保存
+                  </button>
+                  <button className="st-btn" disabled={busy} onClick={() => setGoalDraft(null)}>
+                    取消
+                  </button>
+                </>
+              )}
+            </div>
+            {onStopCtrlC && (
+              <label className="st-meta hc-row" title="停止时同时往被驾驶的终端发送 Ctrl-C，打断它正在跑的命令">
+                <input type="checkbox" checked={!!stopCtrlC} onChange={(e) => onStopCtrlC(e.target.checked)} />
+                停止时同时发 Ctrl-C
+              </label>
+            )}
+            {grant && (
+              <div className="st-meta">
+                预算：最长 {durationLabel(grant.maxMinutes)} · 最多 {grant.maxSteps ?? "—"} 步（「加预算继续」时按这份给）
+              </div>
+            )}
+          </div>
+        </details>
+      )}
     </div>
   );
 }
