@@ -71,6 +71,9 @@ impl Default for Authority {
 
 /// 用户关不掉的禁止项：替用户输密码（`secret`）与选「不再询问 / 永久允许」（`permanent_grant`）。
 /// 这两条是 fail-closed 的底线，面板上只读展示，任何契约编辑都会把它们补回来。
+/// 契约 deny 里的内置标签：由动作推出（见 `host::gate::derive_tags`），只精确匹配、不当关键字。
+pub const DENY_TAGS: [&str; 5] = ["secret", "permanent_grant", "force_push", "delete", "file_write"];
+
 pub const LOCKED_DENY: [&str; 2] = ["secret", "permanent_grant"];
 
 /// 用户在面板上编辑过的禁止项 → 落进契约的版本：去空白、去重、限长，并补回 `LOCKED_DENY`。
@@ -112,6 +115,16 @@ impl Authority {
 
     pub fn denies(&self, token: &str) -> bool {
         self.deny.iter().any(|d| d == token)
+    }
+
+    /// deny 里的**自定义关键字**（出现在要提交的文本里就拒）。内置标签（`secret` / `delete` / `force_push` /
+    /// `permanent_grant` / `file_write`）只按动作推出的标签精确匹配，不当关键字 —— 否则一份配置里写着
+    /// 「secret」、一段脚本里提到「delete」就被整段拒掉（截图：生成 sing-box 配置的脚本连续三次被拦）。
+    pub fn deny_keywords(&self) -> impl Iterator<Item = &str> {
+        self.deny
+            .iter()
+            .map(|d| d.trim())
+            .filter(|d| !d.is_empty() && !DENY_TAGS.iter().any(|t| t.eq_ignore_ascii_case(d)))
     }
 
     pub fn allows(&self, token: &str) -> bool {
@@ -333,10 +346,7 @@ pub fn evaluate(
 
     // 1. deny 是硬禁，allow 不能覆盖：标签精确命中，或自定义关键字出现在真正生效的文本里
     if tags.iter().any(|t| auth.denies(t))
-        || auth
-            .deny
-            .iter()
-            .any(|d| !d.is_empty() && payload.contains(&d.to_lowercase()))
+        || auth.deny_keywords().any(|d| payload.contains(&d.to_lowercase()))
     {
         return PolicyVerdict::Deny {
             reason: format!("命中 Authority.deny（{}）", risk.as_str()),

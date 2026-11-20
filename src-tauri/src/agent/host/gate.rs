@@ -196,7 +196,7 @@ pub fn authorize(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>) -> Ga
         return Gate::Deny(format!("契约禁止此类操作（{t}），没有写入。换一个不触及禁项的做法；这一步确实是目标必需的，就用 nx_ask_user 请用户放开（不要给 recommendation，契约只有用户能改）"));
     }
     let payload = w.lines.join("\n").to_lowercase();
-    if let Some(d) = auth.deny.iter().map(|d| d.trim()).find(|d| !d.is_empty() && payload.contains(&d.to_lowercase())) {
+    if let Some(d) = auth.deny_keywords().find(|d| payload.contains(&d.to_lowercase())) {
         return Gate::Deny(format!("命中契约禁项「{d}」，没有写入"));
     }
 
@@ -518,6 +518,25 @@ mod tests {
                 assert!(matches!(g, Gate::Allow | Gate::Notify), "{tier} {k}: {g:?}");
             }
         }
+    }
+
+    /// 截图回归：写一个生成 sing-box 配置的脚本（内容里有 secret / delete 字样）被「secret」禁项拦了三次。
+    /// 内置标签只按动作推出的标签匹配；自定义关键字照旧按文本匹配
+    #[test]
+    fn builtin_tags_are_not_matched_as_keywords() {
+        let p = policy("auto");
+        for c in [
+            "python3 /tmp/gen-sb.py --secret-out /etc/sing-box",
+            "echo '{\"password\": \"x\", \"secret\": \"y\"}' | jq .",
+            "grep -n delete_after config.yaml",
+            "cat notes_on_force_push.md",
+        ] {
+            let g = authorize(&p, &exec(c), None);
+            assert!(!is_deny(&g), "{c}: {g:?}");
+        }
+        let mut p = policy("auto");
+        p.authority.deny.push("systemctl".into());
+        assert!(is_deny(&authorize(&p, &exec("sudo systemctl stop nginx"), None)), "自定义关键字仍按文本拒");
     }
 
     #[test]
