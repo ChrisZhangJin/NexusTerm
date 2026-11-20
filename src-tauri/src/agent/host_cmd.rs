@@ -748,7 +748,9 @@ pub async fn host_report_misread(
     let dir = crate::app_data_dir(&app).join("misreads");
     let path = misread::write_report(&dir, &report).map_err(|e| format!("保存误判样本失败：{e}"))?;
     if !h.is_terminal() {
-        h.send_user_note(misread::model_note(&report.evidence, &note));
+        let retry_ok = report.evidence.vouchable
+            && h.vouch.set(&report.evidence.screen_hash, std::time::Instant::now());
+        h.send_user_note(misread::model_note(&report.evidence, &note, retry_ok));
     }
     Ok(path.to_string_lossy().into_owned())
 }

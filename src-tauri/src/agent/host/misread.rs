@@ -75,6 +75,12 @@ pub struct GateEvidence {
     pub reason: String,
     pub screen: ScreenFrame,
     pub classified: Classified,
+    /// 决策时的屏幕指纹（`Situation::screen_hash`；没有渲染帧时为空）
+    #[serde(default)]
+    pub screen_hash: String,
+    /// 拒绝是按屏幕推出的底线标签（替你输密码 / 永久允许）引起的：「这是误判」可以担保这一屏重试一次
+    #[serde(default, skip_serializing)]
+    pub vouchable: bool,
 }
 
 /// 写进 `misreads/` 的文件
@@ -137,6 +143,36 @@ pub fn capture(
             evidence: sit.evidence.clone(),
             confidence: sit.confidence,
         },
+        screen_hash: sit.screen_hash.clone(),
+        vouchable: false,
+    }
+}
+
+/// 担保的有效期：过了就当没担保过
+pub const VOUCH_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// 「这是误判」的一次性担保（挂在 `HostShared` 上）：用户说这一屏不是密码提示 / 授权框，
+/// 于是**同一屏**上的下一次按键不按屏幕推底线标签（`gate::authorize_vouched`）。
+/// 下一次按键写入时无论结果都用掉；屏幕变了、过了 [`VOUCH_TTL`] 都不再生效。
+#[derive(Default)]
+pub struct Vouch(Mutex<Option<(String, std::time::Instant)>>);
+
+impl Vouch {
+    /// 担保这一屏（指纹为空 = 没有渲染帧，没法认出「同一屏」，不担保）。返回是否担保上了。
+    pub fn set(&self, screen_hash: &str, now: std::time::Instant) -> bool {
+        if screen_hash.is_empty() {
+            return false;
+        }
+        *self.0.lock() = Some((screen_hash.to_string(), now));
+        true
+    }
+
+    /// 一次性取用：此刻的屏幕正是担保的那一屏且没过期 → true。不管结果，担保都清掉。
+    pub fn take(&self, screen_hash: &str, now: std::time::Instant) -> bool {
+        match self.0.lock().take() {
+            Some((h, at)) => !h.is_empty() && h == screen_hash && now.saturating_duration_since(at) <= VOUCH_TTL,
+            None => false,
+        }
     }
 }
 
@@ -173,7 +209,8 @@ pub fn write_report(dir: &Path, r: &MisreadReport) -> std::io::Result<PathBuf> {
 }
 
 /// 告诉模型：用户说屏幕被认错了。同一屏幕上原样重试仍会被同一条规则拦下，所以要换路子。
-pub fn model_note(ev: &GateEvidence, note: &str) -> String {
+/// `retry_ok`：这一屏已经担保过（见 [`Vouch`]），同一屏上可以原样再试一次。
+pub fn model_note(ev: &GateEvidence, note: &str, retry_ok: bool) -> String {
     let seen = ev.classified.label.trim_start_matches("屏幕被识别为：");
     let mut s = if ev.action.trim().is_empty() {
         format!("用户反馈：系统对屏幕的判断是**误判** —— 把屏幕认成了「{seen}」，用户说不是。")
@@ -183,10 +220,18 @@ pub fn model_note(ev: &GateEvidence, note: &str) -> String {
     if !note.trim().is_empty() {
         s.push_str(&format!("用户补充：{}。", note.trim()));
     }
-    s.push_str(
-        "请先 nx_screen 重新读屏、看清现场再继续。屏幕没变的话同样的按键还会被同一条规则拦下：\
-         换一种做法（例如按 <C-c> 回到 shell 提示符，或改用 nx_write 直接写文件）。这不是契约问题，不要请用户改契约",
-    );
+    if retry_ok {
+        s.push_str(
+            "用户已担保这一屏：屏幕不变的前提下，你的**下一次** nx_send_keys 不会再因为「密码提示」被拦下（只此一次，5 分钟内有效）。\
+             先 nx_screen 确认屏幕还是这一屏，再重试；之后屏幕若又被认错，换一种做法（例如按 <C-c> 回到 shell 提示符，或改用 nx_write 直接写文件）。\
+             这不是契约问题，不要请用户改契约",
+        );
+    } else {
+        s.push_str(
+            "请先 nx_screen 重新读屏、看清现场再继续。屏幕没变的话同样的按键还会被同一条规则拦下：\
+             换一种做法（例如按 <C-c> 回到 shell 提示符，或改用 nx_write 直接写文件）。这不是契约问题，不要请用户改契约",
+        );
+    }
     s
 }
 
@@ -278,10 +323,31 @@ mod tests {
         sit.kind = SituationKind::Password;
         sit.program = Program::Unknown;
         let ev = capture("k", "c", None, &sit, "发送按键：…", "", 0);
-        let n = model_note(&ev, " 这是 heredoc ");
+        let n = model_note(&ev, " 这是 heredoc ", false);
         assert!(n.contains("误判") && n.contains("「密码 / 口令提示」") && n.contains("用户补充：这是 heredoc。"));
         assert!(n.contains("nx_screen") && !n.contains("secret"));
         let ev = capture("k", "c", None, &sit, "", "", 0);
-        assert!(model_note(&ev, "").starts_with("用户反馈：系统对屏幕的判断是**误判**"));
+        assert!(model_note(&ev, "", true).contains("下一次"));
+        assert!(model_note(&ev, "", false).starts_with("用户反馈：系统对屏幕的判断是**误判**"));
+    }
+
+    #[test]
+    fn vouch_is_one_shot_same_screen_and_expires() {
+        use std::time::{Duration, Instant};
+        let v = Vouch::default();
+        let t0 = Instant::now();
+        assert!(!v.set("", t0), "没有指纹不担保");
+        assert!(!v.take("", t0));
+        // 同一屏：用一次就没了
+        assert!(v.set("h1", t0));
+        assert!(v.take("h1", t0 + Duration::from_secs(1)));
+        assert!(!v.take("h1", t0 + Duration::from_secs(2)));
+        // 屏幕变了：不放行，且担保清掉（回到原屏也不再生效）
+        v.set("h1", t0);
+        assert!(!v.take("h2", t0));
+        assert!(!v.take("h1", t0));
+        // 过期
+        v.set("h1", t0);
+        assert!(!v.take("h1", t0 + VOUCH_TTL + Duration::from_secs(1)));
     }
 }

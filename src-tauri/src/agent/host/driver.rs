@@ -194,6 +194,8 @@ pub struct HostShared {
     todo: Mutex<Vec<super::super::todo::TodoItem>>,
     /// 上次看到的 console 连接代号（断线重连检测，见 `note_reconnect`）
     seen_generation: Mutex<Option<u64>>,
+    /// 「这是误判」的一次性担保（同一屏上的下一次按键不按屏幕推底线标签）
+    pub vouch: super::misread::Vouch,
 }
 
 /// 进程内单调时钟（毫秒）。看门狗只认它；重启后基准变了，恢复时要 `rebase`。
@@ -235,6 +237,7 @@ impl HostShared {
             deadline_acked: AtomicBool::new(false),
             todo: Mutex::new(Vec::new()),
             seen_generation: Mutex::new(None),
+            vouch: Default::default(),
         })
     }
 

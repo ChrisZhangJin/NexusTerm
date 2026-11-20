@@ -262,6 +262,17 @@ pub fn notify_reason(tier: &str) -> String {
 
 /// 把一次 `authorize` 的结论解释成门禁卡。纯函数：命中的禁止项按 `authorize` 第 1 步同一口径重算。
 pub fn explain(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>, g: &Gate) -> Option<GateExplain> {
+    explain_vouched(p, a, sit, g, false)
+}
+
+/// 同 [`explain`]，`vouched` 与 [`authorize_vouched`] 的那次取值一致（担保过的屏幕不按屏幕推禁止项）。
+pub fn explain_vouched(
+    p: &HostPolicy,
+    a: &AgentAction,
+    sit: Option<&Situation>,
+    g: &Gate,
+    vouched: bool,
+) -> Option<GateExplain> {
     let verdict = match g {
         Gate::Allow => return None,
         Gate::Notify => "notified",
@@ -270,7 +281,7 @@ pub fn explain(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>, g: &Gat
     };
     // 只有 Deny / YOLO 越界的 Approve 可能由禁止项引起；命中的话它一定是第一个拦下来的（第 1 步最先查）
     let hit = match (g, write_of(a)) {
-        (Gate::Deny(_) | Gate::Approve(_), Ok(Some(w))) => contract_hit(&p.authority, &w, sit),
+        (Gate::Deny(_) | Gate::Approve(_), Ok(Some(w))) => contract_hit(&p.authority, &w, if vouched { None } else { sit }),
         _ => None,
     };
     let reason = match (g, &hit) {
@@ -298,6 +309,13 @@ pub fn explain(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>, g: &Gat
 
 /// 授权一次写入。见模块注释的六步顺序。
 pub fn authorize(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>) -> Gate {
+    authorize_vouched(p, a, sit, false)
+}
+
+/// 同 [`authorize`]；`vouched` = 用户刚在门禁卡上点了「这是误判」、担保的正是这一屏（一次性，见 `misread::Vouch`）：
+/// 这一次不按屏幕推「替你输密码 / 永久允许」两个标签，`assess_keys` 也不按「密码提示」拒。
+/// 其余照旧：命令文本里的禁止项 / 关键字、硬偏好、主机范围、危险判断、授权框选「永久允许」的拒绝。
+pub fn authorize_vouched(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>, vouched: bool) -> Gate {
     let w = match write_of(a) {
         Ok(Some(w)) => w,
         Ok(None) => return Gate::Allow,
@@ -315,7 +333,7 @@ pub fn authorize(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>) -> Ga
             Gate::Deny(why)
         }
     };
-    let hit = contract_hit(auth, &w, sit);
+    let hit = contract_hit(auth, &w, if vouched { None } else { sit });
     if let Some(Hit::Tag(t)) = &hit {
         // 「替你输密码」底线：说清楚是**屏幕被认成了密码提示**，以及模型自己怎么脱困 ——
         // 只说「契约禁止 secret」，模型会以为生成凭据被禁了，转头去请用户「移除 secret 禁项」（放不开的底线）
@@ -358,8 +376,13 @@ pub fn authorize(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>) -> Ga
     // 其余「危险但可恢复」或「看不清提交的那一行」的，只有「确认」档问人，通知 / 自动档照常执行并发通知卡
     // —— 托管的主旨是少打扰人，契约禁止项（第 1 步）才是用户划的红线。
     let mut risky = false;
+    // 担保过的屏幕：密码提示按「认不出」看，其余（授权框 / 菜单的规则）不变
+    let unpw = sit.filter(|s| vouched && s.kind == SituationKind::Password).map(|s| Situation {
+        kind: SituationKind::Unknown,
+        ..s.clone()
+    });
     if let Some(bytes) = &w.keys {
-        match assess_keys(bytes, sit) {
+        match assess_keys(bytes, unpw.as_ref().or(sit)) {
             KeysVerdict::Allow => {}
             KeysVerdict::Approve(r) if !yolo && (has_critical(&r) || auth.tier == TIER_APPROVE) => return Gate::Approve(r),
             KeysVerdict::Approve(_) => risky = true,
@@ -800,5 +823,29 @@ mod tests {
         s.kind = SituationKind::AwaitingInput;
         s.program = Program::Script;
         assert_eq!(screen_line(&s), "屏幕被识别为：等待输入（交互脚本）");
+    }
+
+    #[test]
+    fn vouched_screen_skips_screen_tags_only() {
+        let p = policy("auto");
+        let pw = sit(SituationKind::Password, "Password:", vec![]);
+        let k = keys("print(1)\\r");
+        assert!(is_deny(&authorize(&p, &k, Some(&pw))));
+        assert_eq!(authorize_vouched(&p, &k, Some(&pw), true), Gate::Allow);
+        assert_eq!(explain_vouched(&p, &k, Some(&pw), &Gate::Allow, true), None);
+        // 文本里的关键字照样拦，门禁卡也不把它说成「替你输密码」
+        let mut p2 = policy("auto");
+        p2.authority.deny.push("PROD".into());
+        let k2 = keys("psql prod\\r");
+        let g = authorize_vouched(&p2, &k2, Some(&pw), true);
+        assert!(is_deny(&g));
+        assert_eq!(explain_vouched(&p2, &k2, Some(&pw), &g, true).unwrap().deny_item.as_deref(), Some("PROD"));
+        // 授权框里选「永久允许」：assess_keys 的拒绝仍在
+        let opts = vec![
+            Choice { index: Some("1".into()), text: "Yes".into(), grants_permanent: false },
+            Choice { index: Some("2".into()), text: "Yes, and don't ask again".into(), grants_permanent: true },
+        ];
+        let perm = sit(SituationKind::Permission, "Do you want to proceed?", opts);
+        assert!(is_deny(&authorize_vouched(&p, &keys("2"), Some(&perm), true)));
     }
 }

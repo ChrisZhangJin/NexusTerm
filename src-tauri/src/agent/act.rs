@@ -4345,8 +4345,8 @@ pub async fn run(
                         }
                         _ => None,
                     };
-                    let gate_card = |g: &Gate| {
-                        if let Some(ex) = super::host::gate::explain(&ctx.policy(), &action, sit.as_ref(), g) {
+                    let gate_card = |g: &Gate, vouched: bool| {
+                        if let Some(ex) = super::host::gate::explain_vouched(&ctx.policy(), &action, sit.as_ref(), g, vouched) {
                             let console = seen.as_ref().map_or(h.console_id.as_str(), |(t, _)| t.as_str());
                             let frame = seen.as_ref().and_then(|(_, f)| f.as_ref());
                             let shown = super::host::gate::shown_write(&action, &text, sit.as_ref());
@@ -6619,9 +6619,12 @@ fn emit_gate(
     let gate_id = match sit {
         Some(s) if ex.verdict != "notified" => {
             let id = uuid::Uuid::new_v4().simple().to_string();
-            let ev = super::host::misread::capture(
+            let mut ev = super::host::misread::capture(
                 h.contract_id(), console, frame, s, shown, &ex.reason, super::steward::now_ms(),
             );
+            // 屏幕被认成密码提示而拦下的：「这是误判」可以担保这一屏重试一次。
+            // （「永久允许」那条还有 assess_keys 的拒绝兜底，担保了也放不过去，所以不担保）
+            ev.vouchable = ex.verdict == "refused" && ex.deny_item.as_deref() == Some(super::host::gate::TAG_SECRET);
             super::host::misread::stash(&id, ev);
             Some(id)
         }
@@ -7251,13 +7254,16 @@ async fn hosted_authorize(
     action: &AgentAction,
     text: &str,
     sit: Option<&super::situation::Situation>,
-    gate_card: impl FnOnce(&Gate),
+    gate_card: impl FnOnce(&Gate, bool),
     before_park: impl FnOnce(),
 ) -> (Gate, Option<String>) {
-    let verdict = super::host::gate::authorize(&ctx.policy(), action, sit);
+    // 「这是误判」担保过这一屏：这次按键不按屏幕推底线标签（一次性，任何按键写入都会用掉它）
+    let vouched = matches!(action, AgentAction::Keys { .. })
+        && sit.is_some_and(|s| h.vouch.take(&s.screen_hash, std::time::Instant::now()));
+    let verdict = super::host::gate::authorize_vouched(&ctx.policy(), action, sit, vouched);
     // 拒绝 / 要批准：先在实况里发门禁卡（Notify 等写成功后在 `hosted_applied` 发）
     if matches!(verdict, Gate::Deny(_) | Gate::Approve(_)) {
-        gate_card(&verdict);
+        gate_card(&verdict, vouched);
     }
     let refused = match &verdict {
         Gate::Deny(why) => Some(why.clone()),
@@ -7594,10 +7600,10 @@ mod tests {
         let (h, io) = super::super::host::driver::tests::shared();
         let mut ctx = ctx_with("auto");
         ctx.authority.deny = vec!["delete".into(), "shutdown".into()];
-        let (g, why) = hosted_authorize(&h, &ctx, &exec("rm -rf build"), "rm -rf build", None, |_| {}, || {}).await;
+        let (g, why) = hosted_authorize(&h, &ctx, &exec("rm -rf build"), "rm -rf build", None, |_, _| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(_)) && why.is_some());
         let keys = AgentAction::Keys { target: None, keys: "sudo shutdown -h now<Enter>".into() };
-        let (g, why) = hosted_authorize(&h, &ctx, &keys, "keys", None, |_| {}, || {}).await;
+        let (g, why) = hosted_authorize(&h, &ctx, &keys, "keys", None, |_, _| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(_)) && why.unwrap().contains("shutdown"));
         // 拒绝不出卡、不挂起：相位一直是 Running，也没有任何迁移
         assert_eq!(h.phase(), HostPhase::Running);
@@ -7612,7 +7618,7 @@ mod tests {
         let ctx = ctx_with("approve");
         let h2 = h.clone();
         let c2 = ctx.clone();
-        let task = tokio::spawn(async move { hosted_authorize(&h2, &c2, &exec("ls"), "ls", None, |_| {}, || {}).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h2, &c2, &exec("ls"), "ls", None, |_, _| {}, || {}).await });
         settle().await;
         let card_id = match h.phase() {
             HostPhase::WaitingHuman { card } => {
@@ -7631,7 +7637,7 @@ mod tests {
 
         // 拒绝 → 不写
         let h3 = h.clone();
-        let task = tokio::spawn(async move { hosted_authorize(&h3, &ctx, &exec("ls"), "ls", None, |_| {}, || {}).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h3, &ctx, &exec("ls"), "ls", None, |_, _| {}, || {}).await });
         settle().await;
         let card_id = match h.phase() {
             HostPhase::WaitingHuman { card } => card.id,
@@ -7661,9 +7667,9 @@ mod tests {
         };
         ctx.hard = super::super::host::gate::HardRule::from_prefs(&[pref]);
         assert_eq!(ctx.hard.len(), 1);
-        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout main"), "x", None, |_| {}, || {}).await;
+        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout main"), "x", None, |_, _| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(ref w) if w.contains("p-main")), "{g:?}");
-        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout dev"), "x", None, |_| {}, || {}).await;
+        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout dev"), "x", None, |_, _| {}, || {}).await;
         assert_eq!(g, Gate::Allow);
     }
 
@@ -7673,12 +7679,12 @@ mod tests {
         let mut ctx = ctx_with("auto");
         ctx.authority.host_scope = vec!["ssh:prod-db".into()];
         // 被托管的是 local:t1，不在契约的主机范围里
-        let (g, why) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None, |_| {}, || {}).await;
+        let (g, why) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None, |_, _| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(_)), "{g:?}");
         assert!(why.is_some());
         // 认不出主机（host_key 为空）同样拒
         ctx.contract.host_key = String::new();
-        let (g, _) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None, |_| {}, || {}).await;
+        let (g, _) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None, |_, _| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(_)));
     }
 
@@ -7707,7 +7713,7 @@ mod tests {
         let judged = screen(K::AwaitingInput, "Input: ");
         let keys = AgentAction::Keys { target: None, keys: "ls<Enter>".into() };
         let (h2, j2, k2) = (h.clone(), judged.clone(), keys.clone());
-        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, &k2, "ls", Some(&j2), |_| {}, || {}).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, &k2, "ls", Some(&j2), |_, _| {}, || {}).await });
         settle().await;
         let card_id = match h.phase() {
             HostPhase::WaitingHuman { card } => card.id,
@@ -8371,7 +8377,7 @@ mod tests {
         let (h, _io) = super::super::host::driver::tests::shared();
         let ctx = ctx_with("approve");
         let h2 = h.clone();
-        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, &exec("make install"), "make install", None, |_| {}, || {}).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, &exec("make install"), "make install", None, |_, _| {}, || {}).await });
         settle().await;
         match h.phase() {
             HostPhase::WaitingHuman { card } => assert!(card.reasons.iter().any(|r| r == CWD_NOTE), "{:?}", card.reasons),
