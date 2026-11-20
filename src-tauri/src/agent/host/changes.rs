@@ -1582,6 +1582,8 @@ mod tests {
             assert_eq!(s.packages, vec!["安装 nginx（apt）"], "{script}");
             assert!(s.files_written.is_empty(), "{script}");
         }
+        // 写文件检测（files_written）同样受益
+        assert_eq!(files_written("echo $[1<<2]\necho x > /etc/motd"), vec!["/etc/motd"]);
         // 真 heredoc 照旧
         assert!(sum("cat <<EOF\napt install evil\nEOF").packages.is_empty());
         assert_eq!(sum("((n++)) && apt install a").packages, vec!["安装 a（apt）"]);
