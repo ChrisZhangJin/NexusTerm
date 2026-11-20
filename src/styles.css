@@ -1922,11 +1922,22 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 }
 .ap-step.pending { border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
 .ap-step.danger { border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
-/* 托管门禁卡：拒绝偏红、要批准偏琥珀、通知中性 */
+/* 要你批准的门禁：实况里只有一行（审批卡在托管卡上） */
+.ap-gate-line {
+  display: flex; align-items: baseline; gap: 6px; margin: 0 0 8px; padding: 3px 8px;
+  border-left: 3px solid var(--warn, #d9a441); border-radius: 4px; font-size: 11.5px; color: var(--warn, #d9a441);
+  background: color-mix(in srgb, var(--warn, #d9a441) 7%, transparent);
+}
+.ap-gate-line-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ap-gate-line-btn {
+  flex: none; border: 0; background: none; padding: 0; cursor: pointer;
+  color: var(--text-dim); font-size: 11px; text-decoration: underline;
+}
+.ap-gate-line-btn:hover:not(:disabled) { color: var(--text); }
+.ap-gate-line-done { flex: none; color: var(--text-dim); font-size: 11px; }
+/* 托管门禁卡：拒绝偏红、通知中性（要批准的只有一行，见上面 .ap-gate-line） */
 .ap-step.gate.refused { border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
 .ap-step.gate.refused .ap-step-tag { color: var(--danger); }
-.ap-step.gate.asked { border-color: color-mix(in srgb, var(--warn, #d9a441) 55%, transparent); }
-.ap-step.gate.asked .ap-step-tag { color: var(--warn, #d9a441); }
 .ap-step.gate.notified .ap-step-tag { color: var(--text-dim); }
 .ap-step.gate .ap-step-where { white-space: normal; }
 /* 工具调用卡：与「执行卡」区分开，边框走品牌色，一眼能看出这步是模型动的手 */

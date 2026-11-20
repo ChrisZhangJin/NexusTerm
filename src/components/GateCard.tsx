@@ -1,6 +1,7 @@
 /**
  * 托管门禁卡（kind:"gate"）：一次写入被拒绝 / 要你批准 / 执行后通知时，说清想做什么、为什么、
  * 当时屏幕被识别成什么。被拒的卡上可以一键「这是误判」（存回归样本并告诉 AI）或「放开这一类」（改契约）。
+ * 「要你批准」的只渲染成一行：批准 / 拒绝在托管卡（HostCard）的审批卡上做。
  */
 
 import { useState } from "react";
@@ -50,6 +51,23 @@ export function GateCard({ step, host }: { step: AgentStep; host?: GateHost | nu
       await api.hostAmend(host!.contractId, undefined, undefined, acts.release!);
       return `已放开「${acts.item?.label ?? step.denyItem}」，AI 会在下一步收到契约更新`;
     });
+
+  // 要你批准的那一次：能操作的是托管卡上的审批卡，实况里只留一行，免得同一件事出现两张卡
+  if (verdict === "asked") {
+    const what = step.command?.trim() || step.text || "一次写入";
+    return (
+      <div className="ap-gate-line" title={[step.text, step.command, step.reasons?.join("；")].filter(Boolean).join("\n")}>
+        <span className="ap-gate-line-text">⏸ 等你批准：{what}（见上方托管卡）</span>
+        {host && acts.misread && !done ? (
+          <button className="ap-gate-line-btn" disabled={busy} onClick={() => void misread()} title="屏幕其实不是这样：存下这一屏做回归样本，并告诉 AI">
+            这是误判
+          </button>
+        ) : null}
+        {done ? <span className="ap-gate-line-done">{done}</span> : null}
+        {err ? <span className="ap-secret-err">{err}</span> : null}
+      </div>
+    );
+  }
 
   return (
     <div className={`ap-step gate ${verdict}`}>
