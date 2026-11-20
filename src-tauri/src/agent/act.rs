@@ -4546,7 +4546,8 @@ pub async fn run(
                             None => None,
                         };
                         let alts: Vec<&str> = resolved.iter().chain(real.iter()).map(String::as_str).collect();
-                        let policy = h.ctx().policy();
+                        // 主机范围按**这次写到的终端**判（多终端托管时可能不是主终端；评审发现这里曾用主终端的策略）
+                        let policy = h.ctx().policy_for(&target_id);
                         let gate = hosted_file_gate(&policy, &call, &alts);
                         if matches!(gate, Gate::Deny(_) | Gate::Approve(_)) {
                             if let Some(ex) = file_gate_explain(&policy, &call, &alts, &gate) {

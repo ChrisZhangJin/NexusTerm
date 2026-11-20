@@ -247,9 +247,10 @@ fn check_password(line: &str, lower: &str) -> Option<PromptGuess> {
         return None;
     }
 
-    const EN_WORDS: [&str; 7] = [
+    const EN_WORDS: [&str; 8] = [
         "password",
         "passphrase",
+        "pass phrase", // OpenSSL：`Enter pass phrase for server.key:`
         "passcode",
         "verification code",
         "security code",
@@ -290,22 +291,25 @@ fn looks_like_code(lower: &str) -> bool {
     if t.starts_with('>') {
         return true;
     }
-    const KW: [&str; 12] =
-        ["def ", "async def ", "if ", "elif ", "else", "for ", "while ", "class ", "with ", "try", "except", "lambda"];
-    if KW.iter().any(|k| t.starts_with(k)) {
+    // 代码行几乎都以关键字开头（`def gen_password():` / `if not password:` / `while …:`）。
+    // `for ` 要带 ` in ` 才算（Python 的 for 循环），否则「For security, enter your password:」这类真提示会被放过
+    const KW: [&str; 11] =
+        ["def ", "async def ", "if ", "elif ", "else", "while ", "class ", "with ", "try", "except", "lambda"];
+    if KW.iter().any(|k| t.starts_with(k)) || (t.starts_with("for ") && t.contains(" in ")) {
         return true;
     }
-    let end = t.trim_end();
-    // `name(args):` 是函数定义 / 调用；`word (说明):` 是给人看的提示（`Enter passphrase (empty for …):`）
-    let call_colon = end.ends_with("):")
-        && end.rfind('(').is_some_and(|i| i > 0 && end[..i].chars().last().is_some_and(|c| c.is_alphanumeric() || c == '_'));
-    call_colon
-        || t.contains(" = ")
+    // 代码标点：赋值 / 比较、注释、花括号、下标 / 调用里的引号（`cfg["password"]:`、`get("pw"):`）。
+    // 单独的双引号不算 —— `Enter password for user "admin":`、PuTTY 的 `Passphrase for key "rsa-key":` 都是真提示；
+    // `name(…):` 也不单独算 —— `Password(again):`、`请输入密码(至少8位):` 是真提示，而带冒号的调用在代码里总是跟着关键字
+    t.contains(" = ")
         || t.contains("==")
         || t.contains('#')
         || t.contains('{')
         || t.contains('}')
-        || t.contains('"')
+        || t.contains("[\"")
+        || t.contains("\"]")
+        || t.contains("(\"")
+        || t.contains("\")")
 }
 
 // ───────────────────────────── 是 / 否 ─────────────────────────────
@@ -729,8 +733,21 @@ mod tests {
         ] {
             assert_ne!(k(l), PromptKind::Password, "{l}");
         }
-        // 真的密码提示照旧
-        for l in ["Password:", "Enter SS password:", "[sudo] password for root:", "alice@10.0.0.5's password: ", "(alice@host) Password: "] {
+        // 真的密码提示照旧（含评审发现被代码过滤误放的那些）
+        for l in [
+            "Password:",
+            "Enter SS password:",
+            "[sudo] password for root:",
+            "alice@10.0.0.5's password: ",
+            "(alice@host) Password: ",
+            "Enter pass phrase for server.key:",
+            "Enter PEM pass phrase:",
+            "Passphrase for key \"rsa-key-2024\":",
+            "Enter password for user \"admin\":",
+            "请输入密码(至少8位):",
+            "Password(again):",
+            "For security, enter your password:",
+        ] {
             assert_eq!(k(l), PromptKind::Password, "{l}");
         }
     }
