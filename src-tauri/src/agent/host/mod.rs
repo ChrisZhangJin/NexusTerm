@@ -14,6 +14,7 @@ pub mod record;
 pub mod reflex;
 pub mod verify;
 pub mod gate;
+pub mod misread;
 pub mod phase;
 pub mod watchdog;
 

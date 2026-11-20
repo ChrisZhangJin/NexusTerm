@@ -19,7 +19,7 @@ use regex::Regex;
 use super::super::act::{AgentAction, OpenKind, TabOp};
 use super::super::danger;
 use super::super::interact;
-use super::super::policy::{Authority, LOCKED_DENY, TIER_APPROVE, TIER_AUTO, TIER_YOLO};
+use super::super::policy::{Authority, LOCKED_DENY, TIER_APPROVE, TIER_AUTO, TIER_NOTIFY, TIER_YOLO};
 use super::super::profile::CtxItem;
 use super::super::situation::{Situation, SituationKind};
 use super::super::skill::HostScope;
@@ -181,6 +181,114 @@ fn scope_of(auth: &Authority) -> HostScope {
     }
 }
 
+/// 契约禁止项命中的那一项：动作推出的内置标签，或出现在提交文本里的自定义关键字（原文）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Hit {
+    Tag(&'static str),
+    Keyword(String),
+}
+
+/// 第 1 步的判定（`authorize` 与 `explain` 共用同一口径）：标签优先，其次自定义关键字。
+fn contract_hit(auth: &Authority, w: &Write, sit: Option<&Situation>) -> Option<Hit> {
+    let tags = if w.category == TAG_FILE_WRITE { vec![TAG_FILE_WRITE] } else { derive_tags(w, sit) };
+    if let Some(t) = tags.into_iter().find(|t| auth.denies(t)) {
+        return Some(Hit::Tag(t));
+    }
+    let payload = w.lines.join("\n").to_lowercase();
+    auth.deny_keywords().find(|d| payload.contains(&d.to_lowercase())).map(|d| Hit::Keyword(d.to_string()))
+}
+
+/// 禁止项给人看的名字（与前端 `host.ts` 的 `denyLabel` 同口径）；自定义关键字写成「含「…」」。
+pub fn deny_label(tag: &str) -> String {
+    match tag {
+        TAG_SECRET => "替你输密码".into(),
+        TAG_PERMANENT_GRANT => "选「不再询问 / 永久允许」".into(),
+        TAG_FORCE_PUSH => "强制推送（git push -f）".into(),
+        TAG_DELETE => "删除类操作（rm / prune / drop …）".into(),
+        TAG_FILE_WRITE => "写 / 改文件".into(),
+        other => format!("含「{other}」"),
+    }
+}
+
+/// 「屏幕被识别为：密码 / 口令提示（Claude Code）」—— 门禁卡上给人看决策时的屏幕分类。
+pub fn screen_line(sit: &Situation) -> String {
+    use super::super::situation::Program;
+    // 程序认不出、或者就是空闲的 shell（「Shell 提示符（Shell）」是废话）时不写程序
+    if sit.program == Program::Unknown || (sit.program == Program::Shell && sit.kind == SituationKind::Idle) {
+        format!("屏幕被识别为：{}", sit.kind.label())
+    } else {
+        format!("屏幕被识别为：{}（{}）", sit.kind.label(), sit.program.label())
+    }
+}
+
+/// 门禁卡上显示的「想做的那一步」：脱敏；屏幕被认成密码提示时不显示按键内容（真是密码提示的话那就是口令）。
+pub fn shown_write(a: &AgentAction, text: &str, sit: Option<&Situation>) -> String {
+    if matches!(a, AgentAction::Keys { .. }) && sit.is_some_and(|s| s.kind == SituationKind::Password) {
+        return "发送按键（屏幕被认成密码提示，按键内容不显示）".to_string();
+    }
+    super::super::redact::redact(text)
+}
+
+/// 门禁卡（托管写入被拒 / 要批准 / 执行后通知）上的说明。`Allow` 不出卡。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateExplain {
+    /// `refused` | `asked` | `notified`
+    pub verdict: &'static str,
+    /// 一句人话：为什么
+    pub reason: String,
+    /// 决策时屏幕被识别成什么（动作没看屏幕时为空）
+    pub screen: Option<String>,
+    /// 命中的契约禁止项：内置标签或自定义关键字原文（前端据此给「放开这一类」）
+    pub deny_item: Option<String>,
+    /// 命中的是底线项（`LOCKED_DENY`），用户也放不开
+    pub locked: bool,
+}
+
+/// Notify（执行后通知）的说明：通知档本来就这样；其他档位是因为这一步有风险但可恢复。
+pub fn notify_reason(tier: &str) -> String {
+    if tier == TIER_NOTIFY {
+        "契约档位为「通知」：先执行，再告诉你；不对可以「接管」并写下纠正".to_string()
+    } else {
+        "有风险但可恢复：先执行，再告诉你；不对可以「接管」并写下纠正".to_string()
+    }
+}
+
+/// 把一次 `authorize` 的结论解释成门禁卡。纯函数：命中的禁止项按 `authorize` 第 1 步同一口径重算。
+pub fn explain(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>, g: &Gate) -> Option<GateExplain> {
+    let verdict = match g {
+        Gate::Allow => return None,
+        Gate::Notify => "notified",
+        Gate::Approve(_) => "asked",
+        Gate::Deny(_) => "refused",
+    };
+    // 只有 Deny / YOLO 越界的 Approve 可能由禁止项引起；命中的话它一定是第一个拦下来的（第 1 步最先查）
+    let hit = match (g, write_of(a)) {
+        (Gate::Deny(_) | Gate::Approve(_), Ok(Some(w))) => contract_hit(&p.authority, &w, sit),
+        _ => None,
+    };
+    let reason = match (g, &hit) {
+        (Gate::Deny(_), Some(Hit::Tag(TAG_SECRET))) => {
+            "屏幕被识别为密码 / 口令提示，替你往里输入是底线（替你输密码），这些按键没有发出去。\
+             如果屏幕上其实不是密码提示，点「这是误判」"
+                .to_string()
+        }
+        (Gate::Deny(_), Some(Hit::Tag(TAG_PERMANENT_GRANT))) => {
+            "这一步会在授权框里选「不再询问 / 永久允许」，这是底线，没有执行".to_string()
+        }
+        (Gate::Deny(_), Some(Hit::Tag(t))) => format!("契约禁止「{}」，没有执行", deny_label(t)),
+        (Gate::Deny(_), Some(Hit::Keyword(d))) => format!("命令或写入的内容里出现了契约禁止的「{d}」，没有执行"),
+        (Gate::Deny(why), None) => why.clone(),
+        (Gate::Approve(r), _) => r.join("；"),
+        _ => notify_reason(&p.authority.tier),
+    };
+    let (deny_item, locked) = match hit {
+        Some(Hit::Tag(t)) => (Some(t.to_string()), LOCKED_DENY.contains(&t)),
+        Some(Hit::Keyword(d)) => (Some(d), false),
+        None => (None, false),
+    };
+    Some(GateExplain { verdict, reason, screen: sit.map(screen_line), deny_item, locked })
+}
+
 /// 授权一次写入。见模块注释的六步顺序。
 pub fn authorize(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>) -> Gate {
     let w = match write_of(a) {
@@ -200,8 +308,8 @@ pub fn authorize(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>) -> Ga
             Gate::Deny(why)
         }
     };
-    let tags = if w.category == TAG_FILE_WRITE { vec![TAG_FILE_WRITE] } else { derive_tags(&w, sit) };
-    if let Some(t) = tags.iter().find(|t| auth.denies(t)) {
+    let hit = contract_hit(auth, &w, sit);
+    if let Some(Hit::Tag(t)) = &hit {
         // 「替你输密码」底线：说清楚是**屏幕被认成了密码提示**，以及模型自己怎么脱困 ——
         // 只说「契约禁止 secret」，模型会以为生成凭据被禁了，转头去请用户「移除 secret 禁项」（放不开的底线）
         if *t == TAG_SECRET {
@@ -214,12 +322,11 @@ pub fn authorize(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>) -> Ga
             );
         }
         if LOCKED_DENY.contains(t) || !yolo {
-            return Gate::Deny(format!("契约禁止此类操作（{t}），没有写入。换一个不触及禁项的做法；这一步确实是目标必需的，就用 nx_ask_user 请用户放开（不要给 recommendation，契约只有用户能改）"));
+            return Gate::Deny(format!("契约禁止此类操作：{}（{t}），没有写入。换一个不触及禁项的做法；这一步确实是目标必需的，就用 nx_ask_user 请用户放开（不要给 recommendation，契约只有用户能改）", deny_label(t)));
         }
-        return breach(format!("命中契约禁止项「{t}」"));
+        return breach(format!("命中契约禁止项「{}」", deny_label(t)));
     }
-    let payload = w.lines.join("\n").to_lowercase();
-    if let Some(d) = auth.deny_keywords().find(|d| payload.contains(&d.to_lowercase())) {
+    if let Some(Hit::Keyword(d)) = &hit {
         return breach(format!("命中契约禁项「{d}」，没有写入"));
     }
 
@@ -408,7 +515,7 @@ mod tests {
         p.authority.allow = vec!["exec".into(), "git push".into()];
         for c in ["git push -f origin main", "git push --force", "git push origin +main", "git push -uf origin x"] {
             assert_eq!(authorize(&p, &exec(c), None), Gate::Deny(format!(
-                "契约禁止此类操作（force_push），没有写入。换一个不触及禁项的做法；这一步确实是目标必需的，就用 nx_ask_user 请用户放开（不要给 recommendation，契约只有用户能改）"
+                "契约禁止此类操作：强制推送（git push -f）（force_push），没有写入。换一个不触及禁项的做法；这一步确实是目标必需的，就用 nx_ask_user 请用户放开（不要给 recommendation，契约只有用户能改）"
             )), "{c}");
         }
         for c in ["rm -rf build", "cd x && rm a.txt", "kubectl delete pod web", "find . -name '*.o' -delete", "git clean -fdx"] {
@@ -617,5 +724,74 @@ mod tests {
         let mut p = policy("notify");
         p.authority.allow = vec!["skill".into()];
         assert_eq!(authorize(&p, &run, None), Gate::Allow);
+    }
+
+    fn explained(p: &HostPolicy, a: &AgentAction, s: Option<&Situation>) -> Option<GateExplain> {
+        explain(p, a, s, &authorize(p, a, s))
+    }
+
+    #[test]
+    fn explain_secret_deny_names_the_screen_and_is_locked() {
+        let s = sit(SituationKind::Password, "Password:", vec![]);
+        let e = explained(&policy("auto"), &keys("print(1)\\r"), Some(&s)).unwrap();
+        assert_eq!(e.verdict, "refused");
+        assert_eq!(e.deny_item.as_deref(), Some("secret"));
+        assert!(e.locked);
+        assert_eq!(e.screen.as_deref(), Some("屏幕被识别为：密码 / 口令提示（Claude Code）"));
+        assert!(e.reason.contains("这是误判") && !e.reason.contains("secret"), "{}", e.reason);
+    }
+
+    #[test]
+    fn explain_removable_tag_and_keyword() {
+        let e = explained(&policy("auto"), &exec("rm -rf build"), None).unwrap();
+        assert_eq!((e.verdict, e.deny_item.as_deref(), e.locked, e.screen.as_deref()), ("refused", Some("delete"), false, None));
+        assert!(e.reason.contains("删除类操作") && !e.reason.contains("delete"), "{}", e.reason);
+        let mut p = policy("auto");
+        p.authority.deny.push("PROD-DB".into());
+        let e = explained(&p, &exec("psql -h prod-db"), None).unwrap();
+        assert_eq!(e.deny_item.as_deref(), Some("PROD-DB"));
+        assert!(!e.locked);
+    }
+
+    #[test]
+    fn explain_other_verdicts() {
+        assert_eq!(explained(&policy("auto"), &exec("ls"), None), None);
+        let e = explained(&policy("notify"), &exec("ls"), None).unwrap();
+        assert_eq!((e.verdict, e.deny_item.clone()), ("notified", None));
+        assert!(e.reason.contains("通知"));
+        let e = explained(&policy("approve"), &exec("ls"), None).unwrap();
+        assert_eq!(e.verdict, "asked");
+        assert!(e.reason.contains("确认"));
+        // YOLO 越界：问人，并指出是哪条禁止项
+        let e = explained(&policy("yolo"), &exec("git push -f"), None).unwrap();
+        assert_eq!((e.verdict, e.deny_item.as_deref()), ("asked", Some("force_push")));
+        assert!(!e.reason.contains("force_push"), "{}", e.reason);
+        // 非契约原因（硬偏好以外的按键拒绝等）原样说明，没有禁止项
+        let e = explain(&policy("auto"), &keys("<Bogus>"), None, &authorize(&policy("auto"), &keys("<Bogus>"), None)).unwrap();
+        assert_eq!(e.deny_item, None);
+        assert!(e.reason.contains("按键串解析失败"));
+    }
+
+    #[test]
+    fn shown_write_hides_keys_on_password_screen() {
+        let pw = sit(SituationKind::Password, "Password:", vec![]);
+        let shown = shown_write(&keys("hunter2\\r"), "发送按键：hunter2\\r", Some(&pw));
+        assert!(!shown.contains("hunter2"), "{shown}");
+        let idle = sit(SituationKind::Idle, "$ ", vec![]);
+        assert_eq!(shown_write(&keys("ls\\r"), "发送按键：ls\\r", Some(&idle)), "发送按键：ls\\r");
+        let cmd = "curl -H 'Authorization: Bearer sk-abcdefgh12345678' x";
+        assert!(!shown_write(&exec(cmd), cmd, None).contains("sk-abcdefgh"));
+    }
+
+    #[test]
+    fn screen_line_omits_unknown_program() {
+        let mut s = sit(SituationKind::Idle, "$ ", vec![]);
+        s.program = Program::Unknown;
+        assert_eq!(screen_line(&s), "屏幕被识别为：Shell 提示符（空闲）");
+        s.program = Program::Shell;
+        assert_eq!(screen_line(&s), "屏幕被识别为：Shell 提示符（空闲）");
+        s.kind = SituationKind::AwaitingInput;
+        s.program = Program::Script;
+        assert_eq!(screen_line(&s), "屏幕被识别为：等待输入（交互脚本）");
     }
 }

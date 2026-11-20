@@ -57,6 +57,20 @@ impl Program {
             Self::Unknown => "unknown",
         }
     }
+
+    /// 给人看的名字（与前端 `steward.ts` 的 PROGRAM_LABELS 同口径）
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Shell => "Shell",
+            Self::ClaudeCode => "Claude Code",
+            Self::Vim => "Vim",
+            Self::Pager => "分页器",
+            Self::Tui => "全屏程序",
+            Self::Script => "交互脚本",
+            Self::Ssh => "SSH",
+            Self::Unknown => "未知程序",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -103,6 +117,24 @@ impl SituationKind {
             Self::Error => "error",
             Self::AltScreen => "alt_screen",
             Self::Unknown => "unknown",
+        }
+    }
+
+    /// 给人看的名字：门禁卡上「屏幕被识别为：…」用
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Question => "在问一个问题",
+            Self::Permission => "授权确认框",
+            Self::Password => "密码 / 口令提示",
+            Self::Menu => "选择菜单",
+            Self::Pager => "分页器（less / more）",
+            Self::Progress => "任务进行中",
+            Self::SubagentStatus => "子任务状态",
+            Self::AwaitingInput => "等待输入",
+            Self::Idle => "Shell 提示符（空闲）",
+            Self::Error => "报错停住",
+            Self::AltScreen => "全屏程序（认不出具体局面）",
+            Self::Unknown => "认不出",
         }
     }
 }

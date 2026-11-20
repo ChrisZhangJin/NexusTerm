@@ -1927,6 +1927,13 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 }
 .ap-step.pending { border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
 .ap-step.danger { border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+/* 托管门禁卡：拒绝偏红、要批准偏琥珀、通知中性 */
+.ap-step.gate.refused { border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+.ap-step.gate.refused .ap-step-tag { color: var(--danger); }
+.ap-step.gate.asked { border-color: color-mix(in srgb, var(--warn, #d9a441) 55%, transparent); }
+.ap-step.gate.asked .ap-step-tag { color: var(--warn, #d9a441); }
+.ap-step.gate.notified .ap-step-tag { color: var(--text-dim); }
+.ap-step.gate .ap-step-where { white-space: normal; }
 /* 工具调用卡：与「执行卡」区分开，边框走品牌色，一眼能看出这步是模型动的手 */
 .ap-step.tool { border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
 .ap-step-tool {

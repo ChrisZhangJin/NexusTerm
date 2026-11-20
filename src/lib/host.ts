@@ -4,7 +4,16 @@
  */
 
 import type { PauseKind } from "./agentBudget";
-import type { HostCheck, HostCheckResult, HostConsoleHint, HostHumanCard, HostPhase, HostStatus, TerminalTab } from "../types";
+import type {
+  AgentStep,
+  HostCheck,
+  HostCheckResult,
+  HostConsoleHint,
+  HostHumanCard,
+  HostPhase,
+  HostStatus,
+  TerminalTab,
+} from "../types";
 
 export type HostPillTone = "active" | "warn" | "idle" | "done" | "bad";
 
@@ -342,6 +351,28 @@ const DENY_HINTS: Record<string, string> = {
 
 export function denyHint(tag: string): string {
   return DENY_HINTS[tag] ?? `命令或写入的内容里出现「${tag}」就拒绝。点 ✕ 放开`;
+}
+
+/** 门禁卡（kind:"gate"）上能做什么 */
+export interface GateActions {
+  /** 「这是误判」：只有看过屏幕、被拒 / 要批准的卡才有 */
+  misread: boolean;
+  /** 「放开这一类」后的禁止项列表；命中的不是可放开的契约禁止项（或已经放开）时为 null */
+  release: string[] | null;
+  /** 命中的禁止项给人看的名字与说明（没命中禁止项时为 null） */
+  item: { label: string; hint: string } | null;
+}
+
+/** 门禁卡上的按钮：纯函数，`deny` 是契约当前的禁止项 */
+export function gateActions(step: AgentStep, deny: readonly string[] | null | undefined): GateActions {
+  const misread = step.gateVerdict !== "notified" && !!step.gateId;
+  const tag = step.denyItem;
+  if (!tag) return { misread, release: null, item: null };
+  const item = { label: denyLabel(tag), hint: denyHint(tag) };
+  const locked = step.denyLocked || isLockedDeny(tag);
+  const list = deny ?? [];
+  const release = !locked && step.gateVerdict === "refused" && list.includes(tag) ? removeDeny(list, tag) : null;
+  return { misread, release, item };
 }
 
 /** 去掉一项（底线项去不掉） */

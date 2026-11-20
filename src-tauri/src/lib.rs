@@ -376,6 +376,7 @@ pub fn run() {
             agent::host_cmd::host_confirm_criteria,
             agent::host_cmd::host_amend,
             agent::host_cmd::host_correct,
+            agent::host_cmd::host_report_misread,
             agent::host_cmd::host_reattach,
             agent::host_cmd::host_reattach_candidates,
             agent::steward::steward_stop,

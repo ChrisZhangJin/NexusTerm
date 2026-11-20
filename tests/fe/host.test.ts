@@ -282,3 +282,42 @@ test("hostTabBadges：只收正在等人的，按 console 归", () => {
   assert.deepEqual(hostTabBadges(m), { c1: "等你：部署到哪？", c3: "等你：预算暂停" });
 });
 
+// ———————————— 门禁卡按钮 ————————————
+
+import { gateActions } from "../../src/lib/host";
+import { withStep, EMPTY_CONV } from "../../src/lib/agentRun";
+import type { AgentStep } from "../../src/types";
+
+const gate = (over: Partial<AgentStep>): AgentStep => ({ kind: "gate", step: 1, gateVerdict: "refused", ...over });
+
+test("门禁卡：底线项（替你输密码）只给「这是误判」，不给放开，并带说明", () => {
+  const a = gateActions(gate({ denyItem: "secret", denyLocked: true, gateId: "g1" }), ["secret", "permanent_grant", "delete"]);
+  assert.equal(a.misread, true);
+  assert.equal(a.release, null);
+  assert.equal(a.item?.label, "替你输密码");
+  assert.match(a.item?.hint ?? "", /不能放开/);
+});
+
+test("门禁卡：可放开的禁止项给出去掉它之后的列表；不在当前契约里（已放开）就不给", () => {
+  const deny = ["secret", "permanent_grant", "delete", "PROD"];
+  assert.deepEqual(gateActions(gate({ denyItem: "delete" }), deny).release, ["secret", "permanent_grant", "PROD"]);
+  assert.deepEqual(gateActions(gate({ denyItem: "PROD" }), deny).release, ["secret", "permanent_grant", "delete"]);
+  assert.equal(gateActions(gate({ denyItem: "force_push" }), deny).release, null);
+  // 没看屏幕（命令 / 写文件）就没有「这是误判」
+  assert.equal(gateActions(gate({ denyItem: "delete" }), deny).misread, false);
+});
+
+test("门禁卡：要批准 / 通知的卡不给放开；通知卡没有误判按钮", () => {
+  const deny = ["secret", "permanent_grant", "force_push"];
+  const asked = gateActions(gate({ gateVerdict: "asked", denyItem: "force_push", gateId: "g" }), deny);
+  assert.equal(asked.release, null);
+  assert.equal(asked.misread, true);
+  const n = gateActions(gate({ gateVerdict: "notified", gateId: "g" }), deny);
+  assert.deepEqual(n, { misread: false, release: null, item: null });
+});
+
+test("门禁步骤在实况里单独成卡", () => {
+  const c = withStep(EMPTY_CONV, gate({ command: "rm -rf build", denyItem: "delete" }));
+  assert.equal(c.messages.length, 1);
+  assert.equal(c.messages[0].step?.kind, "gate");
+});

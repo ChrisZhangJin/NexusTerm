@@ -1046,6 +1046,19 @@ pub struct StepPayload {
     /// `kind:"todo"` 专用：整张计划清单
     #[serde(skip_serializing_if = "Option::is_none")]
     pub todo: Option<Vec<super::todo::TodoItem>>,
+    /// `kind:"gate"` 专用（托管门禁卡）：`refused` | `asked` | `notified`。
+    /// `command` 是想做的那一步（已脱敏），`reasons[0]` 是人话原因，`text` 是「屏幕被识别为：…」
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_verdict: Option<&'static str>,
+    /// `kind:"gate"`：命中的契约禁止项（内置标签或自定义关键字原文），前端据此给「放开这一类」
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deny_item: Option<String>,
+    /// `kind:"gate"`：命中的禁止项是底线（放不开）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deny_locked: Option<bool>,
+    /// `kind:"gate"`：这张卡的现场暂存 id（`host_report_misread` 用）；动作没看屏幕时没有
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_id: Option<String>,
 }
 
 impl StepPayload {
@@ -1069,6 +1082,10 @@ impl StepPayload {
             skill_status: None,
             pause_kind: None,
             todo: None,
+            gate_verdict: None,
+            deny_item: None,
+            deny_locked: None,
+            gate_id: None,
         }
     }
 }
@@ -4222,12 +4239,25 @@ pub async fn run(
             if let Some(h) = &host {
                 if let Some((kind, text)) = super::host::record::describe_write(&action) {
                     let ctx = h.ctx();
+                    // 门禁卡要的现场：动作落在哪个终端、当时的屏幕帧（「这是误判」存样本用）
+                    let mut seen: Option<(String, Option<super::steward::ScreenSnapshot>)> = None;
                     let sit = match &action {
                         AgentAction::Keys { target, .. } | AgentAction::Exec { target, .. } => {
                             let tid = locate(target.as_deref(), &targets, &session).map(|(i, _)| i).unwrap_or_else(|i| i);
-                            Some(situation_now(app, state, &tid, false))
+                            let s = situation_now(app, state, &tid, false);
+                            let frame = fresh_frame(app, &tid);
+                            seen = Some((tid, frame));
+                            Some(s)
                         }
                         _ => None,
+                    };
+                    let gate_card = |g: &Gate| {
+                        if let Some(ex) = super::host::gate::explain(&ctx.policy(), &action, sit.as_ref(), g) {
+                            let console = seen.as_ref().map_or(h.console_id.as_str(), |(t, _)| t.as_str());
+                            let frame = seen.as_ref().and_then(|(_, f)| f.as_ref());
+                            let shown = super::host::gate::shown_write(&action, &text, sit.as_ref());
+                            emit_gate(app, &session, step, h, console, &shown, ex, sit.as_ref(), frame);
+                        }
                     };
                     // 写文件的审批要带差异预览，在分支里算好 diff 之后再问；这里只拿结论（Deny 直接拦）
                     // 写文件：路径要先补全（相对路径 / ~ 展开）才能按契约 deny / Hard 规则匹配，
@@ -4235,7 +4265,7 @@ pub async fn run(
                     let (verdict, refused) = if matches!(action, AgentAction::File(_)) {
                         (Gate::Allow, None)
                     } else {
-                        hosted_authorize(h, &ctx, &action, &text, sit.as_ref(), || h.flush_progress(&messages, step)).await
+                        hosted_authorize(h, &ctx, &action, &text, sit.as_ref(), gate_card, || h.flush_progress(&messages, step)).await
                     };
                     for u in h.take_user() {
                         push_user(&mut messages, u);
@@ -4244,11 +4274,14 @@ pub async fn run(
                         trace::record(&session, step, "authorize", &format!("{kind} `{text}` → {verdict:?}"));
                     }
                     if let Some(why) = refused {
-                        emit_step(
-                            app,
-                            &session,
-                            StepPayload { command: Some(text.clone()), reasons: Some(vec![why.clone()]), ..StepPayload::new("skip", step) },
-                        );
+                        // 被门禁拒的已经发过门禁卡；这里只剩「用户没批准」
+                        if !matches!(verdict, Gate::Deny(_)) {
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload { command: Some(text.clone()), reasons: Some(vec![why.clone()]), ..StepPayload::new("skip", step) },
+                            );
+                        }
                         feedback.push_str(&format!("「{text}」没有执行：{why}\n"));
                         continue;
                     }
@@ -4316,9 +4349,15 @@ pub async fn run(
                             None => None,
                         };
                         let alts: Vec<&str> = resolved.iter().chain(real.iter()).map(String::as_str).collect();
-                        let gate = hosted_file_gate(&h.ctx().policy(), &call, &alts);
+                        let policy = h.ctx().policy();
+                        let gate = hosted_file_gate(&policy, &call, &alts);
+                        if matches!(gate, Gate::Deny(_) | Gate::Approve(_)) {
+                            if let Some(ex) = file_gate_explain(&policy, &call, &alts, &gate) {
+                                let shown = super::redact::redact(&call.summary());
+                                emit_gate(app, &session, step, h, &target_id, &shown, ex, None, None);
+                            }
+                        }
                         if let Gate::Deny(why) = &gate {
-                            emit_step(app, &session, StepPayload { command: Some(call.summary()), reasons: Some(vec![why.clone()]), ..StepPayload::new("skip", step) });
                             feedback.push_str(&format!("「{}」没有执行：{why}\n", call.summary()));
                             continue;
                         }
@@ -6344,6 +6383,67 @@ pub(super) fn hosted_file_gate(
     best
 }
 
+/// 写文件门禁卡的说明：命中的禁止项可能是按解析后的路径匹配上的，逐个路径找到那一项。
+fn file_gate_explain(
+    policy: &super::host::gate::HostPolicy,
+    call: &super::files_tool::FileCall,
+    alternates: &[&str],
+    gate: &Gate,
+) -> Option<super::host::gate::GateExplain> {
+    let first = super::host::gate::explain(policy, &AgentAction::File(call.clone()), None, gate)?;
+    if first.deny_item.is_some() {
+        return Some(first);
+    }
+    alternates
+        .iter()
+        .filter_map(|r| super::host::gate::explain(policy, &AgentAction::File(with_path(call.clone(), r)), None, gate))
+        .find(|e| e.deny_item.is_some())
+        .or(Some(first))
+}
+
+/// 门禁卡（`kind:"gate"`）：托管写入被拒 / 要批准 / 执行后通知时，说清想做什么、为什么、屏幕当时被认成什么。
+/// 看过屏幕的拒绝 / 批准卡顺手把现场暂存起来：用户点「这是误判」时存成回归样本（`host::misread`）。
+#[allow(clippy::too_many_arguments)]
+fn emit_gate(
+    app: &AppHandle,
+    session: &str,
+    step: usize,
+    h: &HostShared,
+    console: &str,
+    shown: &str,
+    ex: super::host::gate::GateExplain,
+    sit: Option<&super::situation::Situation>,
+    frame: Option<&super::steward::ScreenSnapshot>,
+) {
+    let gate_id = match sit {
+        Some(s) if ex.verdict != "notified" => {
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let ev = super::host::misread::capture(
+                h.contract_id(), console, frame, s, shown, &ex.reason, super::steward::now_ms(),
+            );
+            super::host::misread::stash(&id, ev);
+            Some(id)
+        }
+        _ => None,
+    };
+    let locked = ex.deny_item.is_some().then_some(ex.locked);
+    emit_step(
+        app,
+        session,
+        StepPayload {
+            target: Some(console.to_string()),
+            command: Some(shown.to_string()),
+            reasons: Some(vec![ex.reason]),
+            text: ex.screen,
+            gate_verdict: Some(ex.verdict),
+            deny_item: ex.deny_item,
+            deny_locked: locked,
+            gate_id,
+            ..StepPayload::new("gate", step)
+        },
+    );
+}
+
 /// 换掉文件调用的路径（解析后的真实路径）。
 fn with_path(call: super::files_tool::FileCall, path: &str) -> super::files_tool::FileCall {
     use super::files_tool::FileCall as F;
@@ -6684,7 +6784,7 @@ async fn try_reflex(
             contract_id: h.contract_id().to_string(),
             seq,
             kind: "keys",
-            text: format!("[reflex] 按剧本 [P:{playbook_id}] 回答了「{keys}」"),
+            text: format!("自动代答（按剧本 [P:{playbook_id}]）：回答了「{keys}」"),
             undo_window_ms: ctx.authority.undo_window_ms,
             ts_ms: super::steward::now_ms(),
         };
@@ -6773,9 +6873,14 @@ async fn hosted_authorize(
     action: &AgentAction,
     text: &str,
     sit: Option<&super::situation::Situation>,
+    gate_card: impl FnOnce(&Gate),
     before_park: impl FnOnce(),
 ) -> (Gate, Option<String>) {
     let verdict = super::host::gate::authorize(&ctx.policy(), action, sit);
+    // 拒绝 / 要批准：先在实况里发门禁卡（Notify 等写成功后在 `hosted_applied` 发）
+    if matches!(verdict, Gate::Deny(_) | Gate::Approve(_)) {
+        gate_card(&verdict);
+    }
     let refused = match &verdict {
         Gate::Deny(why) => Some(why.clone()),
         Gate::Approve(reasons) => {
@@ -6811,12 +6916,21 @@ fn hosted_applied(app: &AppHandle, h: &HostShared, session: &str, step: usize, w
             ts_ms: now,
         };
         let _ = app.emit(&format!("nx://host/{}/notify", h.contract_id()), notice);
+        let shown = match &w.sit {
+            Some(s) if s.kind == super::situation::SituationKind::Password && w.kind == "keys" => {
+                "发送按键（屏幕被认成密码提示，按键内容不显示）".to_string()
+            }
+            _ => super::redact::redact(&w.text),
+        };
         emit_step(
             app,
             session,
             StepPayload {
-                text: Some(format!("已执行（通知档）：{}。不对的话可以「接管」并写下纠正。", w.text)),
-                ..StepPayload::new("note", step)
+                command: Some(shown),
+                reasons: Some(vec![super::host::gate::notify_reason(&ctx.authority.tier)]),
+                text: w.sit.as_ref().map(super::host::gate::screen_line),
+                gate_verdict: Some("notified"),
+                ..StepPayload::new("gate", step)
             },
         );
     }
@@ -7102,10 +7216,10 @@ mod tests {
         let (h, io) = super::super::host::driver::tests::shared();
         let mut ctx = ctx_with("auto");
         ctx.authority.deny = vec!["delete".into(), "shutdown".into()];
-        let (g, why) = hosted_authorize(&h, &ctx, &exec("rm -rf build"), "rm -rf build", None, || {}).await;
+        let (g, why) = hosted_authorize(&h, &ctx, &exec("rm -rf build"), "rm -rf build", None, |_| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(_)) && why.is_some());
         let keys = AgentAction::Keys { target: None, keys: "sudo shutdown -h now<Enter>".into() };
-        let (g, why) = hosted_authorize(&h, &ctx, &keys, "keys", None, || {}).await;
+        let (g, why) = hosted_authorize(&h, &ctx, &keys, "keys", None, |_| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(_)) && why.unwrap().contains("shutdown"));
         // 拒绝不出卡、不挂起：相位一直是 Running，也没有任何迁移
         assert_eq!(h.phase(), HostPhase::Running);
@@ -7120,7 +7234,7 @@ mod tests {
         let ctx = ctx_with("approve");
         let h2 = h.clone();
         let c2 = ctx.clone();
-        let task = tokio::spawn(async move { hosted_authorize(&h2, &c2, &exec("ls"), "ls", None, || {}).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h2, &c2, &exec("ls"), "ls", None, |_| {}, || {}).await });
         settle().await;
         let card_id = match h.phase() {
             HostPhase::WaitingHuman { card } => {
@@ -7139,7 +7253,7 @@ mod tests {
 
         // 拒绝 → 不写
         let h3 = h.clone();
-        let task = tokio::spawn(async move { hosted_authorize(&h3, &ctx, &exec("ls"), "ls", None, || {}).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h3, &ctx, &exec("ls"), "ls", None, |_| {}, || {}).await });
         settle().await;
         let card_id = match h.phase() {
             HostPhase::WaitingHuman { card } => card.id,
@@ -7169,9 +7283,9 @@ mod tests {
         };
         ctx.hard = super::super::host::gate::HardRule::from_prefs(&[pref]);
         assert_eq!(ctx.hard.len(), 1);
-        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout main"), "x", None, || {}).await;
+        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout main"), "x", None, |_| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(ref w) if w.contains("p-main")), "{g:?}");
-        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout dev"), "x", None, || {}).await;
+        let (g, _) = hosted_authorize(&h, &ctx, &exec("git checkout dev"), "x", None, |_| {}, || {}).await;
         assert_eq!(g, Gate::Allow);
     }
 
@@ -7181,12 +7295,12 @@ mod tests {
         let mut ctx = ctx_with("auto");
         ctx.authority.host_scope = vec!["ssh:prod-db".into()];
         // 被托管的是 local:t1，不在契约的主机范围里
-        let (g, why) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None, || {}).await;
+        let (g, why) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None, |_| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(_)), "{g:?}");
         assert!(why.is_some());
         // 认不出主机（host_key 为空）同样拒
         ctx.contract.host_key = String::new();
-        let (g, _) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None, || {}).await;
+        let (g, _) = hosted_authorize(&h, &ctx, &exec("uptime"), "uptime", None, |_| {}, || {}).await;
         assert!(matches!(g, Gate::Deny(_)));
     }
 
@@ -7215,7 +7329,7 @@ mod tests {
         let judged = screen(K::AwaitingInput, "Input: ");
         let keys = AgentAction::Keys { target: None, keys: "ls<Enter>".into() };
         let (h2, j2, k2) = (h.clone(), judged.clone(), keys.clone());
-        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, &k2, "ls", Some(&j2), || {}).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, &k2, "ls", Some(&j2), |_| {}, || {}).await });
         settle().await;
         let card_id = match h.phase() {
             HostPhase::WaitingHuman { card } => card.id,
@@ -7739,7 +7853,7 @@ mod tests {
         let (h, _io) = super::super::host::driver::tests::shared();
         let ctx = ctx_with("approve");
         let h2 = h.clone();
-        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, &exec("make install"), "make install", None, || {}).await });
+        let task = tokio::spawn(async move { hosted_authorize(&h2, &ctx, &exec("make install"), "make install", None, |_| {}, || {}).await });
         settle().await;
         match h.phase() {
             HostPhase::WaitingHuman { card } => assert!(card.reasons.iter().any(|r| r == CWD_NOTE), "{:?}", card.reasons),

@@ -684,7 +684,7 @@ pub(crate) fn amend_note(goal: Option<&str>, tier: Option<&str>, deny: Option<&[
         parts.push(format!("目标改为「{g}」"));
     }
     if let Some(t) = tier {
-        parts.push(format!("授权档位改为 {t}"));
+        parts.push(format!("授权档位改为 {}", super::host::context::tier_text(t)));
     }
     if let Some(d) = deny {
         parts.push(format!("禁止项改为 [{}]（之前被禁止的操作现在可以重试）", d.join(", ")));
@@ -717,6 +717,40 @@ pub async fn host_correct(
         state.store.steward_ctx_upsert(&item.to_row())?;
     }
     Ok(())
+}
+
+/// 门禁卡上的「这是误判」：把决策时的屏幕（找不到就取此刻的屏幕）脱敏后存进 `<应用数据目录>/misreads/`，
+/// 作为分类器的回归样本（怎么变成测试见 `host::misread` 模块注释）；再告诉模型屏幕被认错了、换个做法重试。
+/// 返回写下的文件路径。
+#[tauri::command]
+pub async fn host_report_misread(
+    contract_id: String,
+    gate_id: Option<String>,
+    note: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use super::host::misread;
+    let h = hosted(&state, &contract_id)?;
+    let stashed = gate_id.as_deref().and_then(misread::find).filter(|e| e.contract_id == contract_id);
+    let from_gate = stashed.is_some();
+    let evidence = match stashed {
+        Some(e) => e,
+        None => {
+            let console = h.console_id.clone();
+            let sit = act::situation_now(&app, &state, &console, false);
+            let frame = app.try_state::<ScreenStore>().and_then(|s| s.get(&console));
+            misread::capture(&contract_id, &console, frame.as_ref(), &sit, "", "", now_ms())
+        }
+    };
+    let note = note.unwrap_or_default().trim().chars().take(500).collect::<String>();
+    let report = misread::MisreadReport { version: 1, reported_at_ms: now_ms(), note: note.clone(), from_gate, evidence };
+    let dir = crate::app_data_dir(&app).join("misreads");
+    let path = misread::write_report(&dir, &report).map_err(|e| format!("保存误判样本失败：{e}"))?;
+    if !h.is_terminal() {
+        h.send_user_note(misread::model_note(&report.evidence, &note));
+    }
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]

@@ -716,6 +716,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
             pauseText={run.pauseText}
             onDecide={(req, ok) => void run.decide(req, ok)}
             onAnswerSecret={run.answerSecret}
+            host={selectedHost ? { contractId: selectedHost.contractId, deny: selectedHost.deny ?? [] } : null}
           />
         </div>
       )}

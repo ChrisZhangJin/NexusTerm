@@ -355,6 +355,9 @@ export const api = {
   /** 改契约（目标 / 档位），不重启运行 */
   hostAmend: (contractId: string, goal?: string, authorityTier?: string, deny?: string[]) =>
     invoke<void>("host_amend", { contractId, goal: goal ?? null, authorityTier: authorityTier ?? null, deny: deny ?? null }),
+  /** 门禁卡「这是误判」：把当时的屏幕存成回归样本（返回文件路径），并告诉模型屏幕被认错了 */
+  hostReportMisread: (contractId: string, gateId?: string, note?: string) =>
+    invoke<string>("host_report_misread", { contractId, gateId: gateId ?? null, note: note ?? null }),
   /** 通知档的纠正：记成 Learned 偏好，并把那条决策标为 rejected */
   hostCorrect: (contractId: string, seq: number, topic: string, correction: string) =>
     invoke<void>("host_correct", { contractId, seq, topic, correction }),

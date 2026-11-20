@@ -457,6 +457,17 @@ export interface AgentStep {
   pauseKind?: string;
   /** kind=todo：整张计划清单 */
   todo?: TodoItem[];
+  /**
+   * kind:"gate"（托管门禁卡）：refused（拒绝）| asked（要你批准）| notified（执行后通知）。
+   * `command` 是想做的那一步（已脱敏），`reasons[0]` 是人话原因，`text` 是「屏幕被识别为：…」
+   */
+  gateVerdict?: "refused" | "asked" | "notified";
+  /** kind:"gate"：命中的契约禁止项（内置标签或自定义关键字原文） */
+  denyItem?: string;
+  /** kind:"gate"：命中的是底线项（放不开） */
+  denyLocked?: boolean;
+  /** kind:"gate"：现场暂存 id，「这是误判」时交给 host_report_misread */
+  gateId?: string;
 }
 
 /** 计划清单的一项（nx_todo） */

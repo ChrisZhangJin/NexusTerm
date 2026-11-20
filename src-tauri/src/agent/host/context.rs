@@ -154,7 +154,7 @@ impl HostContext {
     }
 }
 
-fn tier_text(t: &str) -> &'static str {
+pub(crate) fn tier_text(t: &str) -> &'static str {
     match t {
         "auto" => "auto（自动执行）",
         "approve" => "approve（每次写入都要用户批准）",

@@ -11,6 +11,7 @@ import { needsIncompleteBanner } from "../lib/diff";
 import { TodoList } from "./TodoList";
 import { useEffect, useRef, useState } from "react";
 import { MemoryStepCard } from "./HostMemory";
+import { GateCard, type GateHost } from "./GateCard";
 import { isHandEyeKind } from "../lib/agentRun";
 import type {
   AgentApproveRequest,
@@ -25,12 +26,17 @@ export function RunCard({
   busy,
   onDecide,
   onAnswerSecret,
+  host,
 }: {
   message: AgentMessage;
   busy: boolean;
   onDecide: (req: AgentApproveRequest, approved: boolean) => void;
   onAnswerSecret: (req: AgentSecretRequest, value?: string) => Promise<string | null>;
+  /** 托管上下文（门禁卡上的「这是误判 / 放开这一类」要它）；对话页不给 */
+  host?: GateHost | null;
 }) {
+  // 托管门禁卡：被拒 / 要批准 / 执行后通知，带原因与屏幕分类
+  if (m.step?.kind === "gate") return <GateCard step={m.step} host={host} />;
   // 过程卡片不是对话泡：整幅宽度更能排得下命令与输出
   if (m.step) return <StepCard step={m.step} />;
   if (m.approve) {
@@ -64,6 +70,7 @@ export function RunFeed({
   pauseText,
   onDecide,
   onAnswerSecret,
+  host,
 }: {
   messages: AgentMessage[];
   busy: boolean;
@@ -72,6 +79,8 @@ export function RunFeed({
   pauseText?: string;
   onDecide: (req: AgentApproveRequest, approved: boolean) => void;
   onAnswerSecret: (req: AgentSecretRequest, value?: string) => Promise<string | null>;
+  /** 被托管的契约（门禁卡按钮用） */
+  host?: GateHost | null;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   // 贴底时才跟随：用户往上翻看历史就别把他拽回去
@@ -92,7 +101,9 @@ export function RunFeed({
       {messages.length === 0 && !busy && <div className="st-empty">还没有运行记录。</div>}
       {messages.map((m) => {
         if (isRunCard(m)) {
-          return <RunCard key={m.id} message={m} busy={busy} onDecide={onDecide} onAnswerSecret={onAnswerSecret} />;
+          return (
+            <RunCard key={m.id} message={m} busy={busy} onDecide={onDecide} onAnswerSecret={onAnswerSecret} host={host} />
+          );
         }
         if (m.role === "user" || !m.text) return null;
         return (
