@@ -3675,15 +3675,22 @@ pub async fn run(
         emit_control(app, &req.session_id, &[run_key.clone()], st);
     }
     // 此前几轮的摘要要在 `runlog.start` 之前取（本轮自己还没落库，但保持顺序更直观）
-    let prior_runs = super::history::render_prior_runs(
-        &state.store.agent_summaries_recent_in(req.conversation_key(), super::history::PRIOR_RUNS_IN_CONTEXT),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
-    );
+    // 托管不带「此前几轮摘要」：它有自己的目标（以及显式的「基于此报告继续」），而对话分段键为空时取到的是旧的全局一份 ——
+    // 别的终端 / 主机上无关的运行摘要会混进托管的第一条消息（e2e 夹具发现）。托管自己的摘要也单独记在 `host` 名下，不回流进对话
+    let prior_runs = if host.is_some() {
+        String::new()
+    } else {
+        super::history::render_prior_runs(
+            &state.store.agent_summaries_recent_in(req.conversation_key(), super::history::PRIOR_RUNS_IN_CONTEXT),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        )
+    };
     runtime.runlog.start(&req.session_id, &req.question);
-    let _runlog = RunLogGuard { state, run: req.session_id.clone(), conversation: req.conversation_key().to_string() };
+    let summary_key = if host.is_some() { HOSTED_SUMMARY_KEY.to_string() } else { req.conversation_key().to_string() };
+    let _runlog = RunLogGuard { state, run: req.session_id.clone(), conversation: summary_key };
     let acct = cfg.active_account();
     let max_bytes = if acct.max_context_bytes == 0 {
         super::DEFAULT_MAX_CONTEXT_BYTES
@@ -6352,6 +6359,9 @@ pub enum RunMode {
     /// 统一托管：由 `host_start` 起的任务，只有 nx_complete / 停止 / 失败才结束（设计 §2）
     Hosted(Arc<HostShared>),
 }
+
+/// 托管运行的摘要记在这个分段名下：不进任何对话的「此前几轮」，也不读别人的。
+const HOSTED_SUMMARY_KEY: &str = "host";
 
 /// 托管模式追加在系统提示词后面的约定。
 const HOSTED_ADDENDUM: &str = "\n\n## 托管运行\n\
