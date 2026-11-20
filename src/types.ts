@@ -468,6 +468,12 @@ export interface AgentStep {
   denyLocked?: boolean;
   /** kind:"gate"：现场暂存 id，「这是误判」时交给 host_report_misread */
   gateId?: string;
+  /**
+   * kind:"reveal"（交付通道 `nx_reveal`）：交给用户的内容（密码 / 密钥 / 节点链接…），模型看不到它。
+   * **只在内存里**：落盘前 `toPersisted` 会删掉，读回来的卡片没有这个字段（显示「已交付的内容不保存」）。
+   * 同一张卡上 `text` 是标题，`command` 是来源（文件 / 命令），`output` 是「N 行，M 字节」。
+   */
+  revealContent?: string;
 }
 
 /** 计划清单的一项（nx_todo） */

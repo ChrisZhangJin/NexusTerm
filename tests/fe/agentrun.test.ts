@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import {
   EMPTY_CONV,
   isHandEyeKind,
+  maskReveal,
   pendingPrompts,
   sliceFromMessage,
   withApprove,
@@ -116,4 +117,30 @@ test("isBudgetPause：预算三项是，手动暂停 / 未暂停不是", () => {
   assert.equal(isBudgetPause("output"), true);
   assert.equal(isBudgetPause("user"), false);
   assert.equal(isBudgetPause(undefined), false);
+});
+
+// ——————————————— 交付给你（nx_reveal） ———————————————
+
+test("交付卡：每次交付各占一张卡，内容原样留在内存里的步骤上", () => {
+  const reveal = (title: string, content: string): AgentStep => ({
+    kind: "reveal",
+    step: 3,
+    target: "t1",
+    command: "文件 /etc/sing-box/links.txt",
+    text: title,
+    output: "1 行，20 字节",
+    revealContent: content,
+  });
+  let c = withStep(EMPTY_CONV, reveal("节点链接", "vless://secret-a\n"));
+  c = withStep(c, reveal("节点链接", "vless://secret-b\n"));
+  assert.equal(c.messages.length, 2, "同标题同来源也不合并：两次交付是两份内容");
+  assert.equal(c.messages[0].step?.revealContent, "vless://secret-a\n");
+  assert.equal(c.messages[1].step?.revealContent, "vless://secret-b\n");
+});
+
+test("maskReveal：按非空行打码，不泄露原文与长度", () => {
+  const m = maskReveal("password=hunter2\n\nuuid=1b6f3c2e-9d1a-4c8e-b0f2-7a3d5e9c1f42\n");
+  assert.equal(m, "••••••••\n••••••••");
+  assert.ok(!m.includes("hunter2"));
+  assert.equal(maskReveal(""), "••••••••");
 });

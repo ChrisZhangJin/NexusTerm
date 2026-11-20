@@ -12,7 +12,9 @@ import { TodoList } from "./TodoList";
 import { useEffect, useRef, useState } from "react";
 import { MemoryStepCard } from "./HostMemory";
 import { GateCard, type GateHost } from "./GateCard";
-import { isHandEyeKind } from "../lib/agentRun";
+import { isHandEyeKind, maskReveal } from "../lib/agentRun";
+import { REVEAL_NOT_SAVED } from "../lib/agentHistory";
+import { api } from "../api";
 import type {
   AgentApproveRequest,
   AgentMessage,
@@ -195,6 +197,8 @@ function StepCard({ step }: { step: AgentStep }) {
     return <div className="ap-note ap-paused">{step.text ?? ""}</div>;
   }
   if (step.kind === "memory") return <MemoryStepCard step={step} />;
+  // 交付给你（nx_reveal）：只给用户的内容，默认打码
+  if (step.kind === "reveal") return <RevealCard step={step} />;
   // 计划清单：整表替换，每次都画最新一版
   if (step.kind === "todo") return <TodoList items={step.todo ?? []} />;
   // 文件工具：读 / 查找 / 搜索一行带过；写 / 改带差异预览
@@ -615,6 +619,69 @@ function SecretCard({
             <span className="ap-secret-left">{dead ? "已失效" : unlimited ? "不限时" : `${left} 秒后超时`}</span>
           </div>
         </form>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 「交付给你」卡（`nx_reveal`）：Agent 生成、只交给用户的内容（密码 / 密钥 / 节点链接…），模型看不到。
+ * 默认打码，点「显示」/「复制」才用到原文；原文只在内存里，重载后卡上只剩占位。
+ */
+function RevealCard({ step }: { step: AgentStep }) {
+  const [shown, setShown] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const content = step.revealContent;
+  const copy = async () => {
+    if (content === undefined) return;
+    try {
+      await api.clipboardWrite(content);
+      setNote("已复制到剪贴板");
+    } catch (e) {
+      setNote(`复制失败：${String(e)}`);
+    }
+  };
+  return (
+    <div className="ap-step ap-reveal">
+      <div className="ap-step-head">
+        <span className="ap-step-tag">交付给你</span>
+        <span className="ap-reveal-title">{step.text || "交付内容"}</span>
+        {step.targetLabel ? (
+          <span className="ap-step-where" title={step.target}>
+            {step.targetLabel}
+          </span>
+        ) : null}
+      </div>
+      {step.command ? (
+        <div className="ap-step-why">
+          来源：{step.command}
+          {step.output ? `（${step.output}）` : ""}
+        </div>
+      ) : null}
+      {content === undefined ? (
+        <div className="ap-step-why">{REVEAL_NOT_SAVED}</div>
+      ) : (
+        <>
+          <pre className={`ap-code ap-out-plain ap-reveal-body${shown ? "" : " masked"}`}>
+            {shown ? content : maskReveal(content)}
+          </pre>
+          <div className="ap-approve-row">
+            {shown ? (
+              <button className="btn" type="button" onClick={() => setShown(false)}>
+                隐藏
+              </button>
+            ) : (
+              <button className="btn primary" type="button" onClick={() => setShown(true)}>
+                显示
+              </button>
+            )}
+            <button className="btn" type="button" onClick={() => void copy()}>
+              复制
+            </button>
+            {note ? <span className="ap-reveal-note">{note}</span> : null}
+          </div>
+          <div className="ap-step-why">内容只给你，没有经过助手；不会写进聊天记录，重启后就看不到了，请及时妥善保存。</div>
+        </>
       )}
     </div>
   );

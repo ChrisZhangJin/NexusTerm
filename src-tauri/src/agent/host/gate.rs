@@ -104,6 +104,13 @@ fn write_of(a: &AgentAction) -> Result<Option<Write>, String> {
             command.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect(),
             Some(command.clone()),
         ),
+        // 交付通道的命令来源：与 nx_run 同类（旁路执行），同一套 deny / 硬偏好 / 范围 / danger；
+        // 文件来源只是读（受保护文件由 files 的禁读清单 + 批准卡管），不算写入
+        AgentAction::Reveal { source: super::super::reveal::RevealSource::Command(command), .. } => w(
+            "exec",
+            command.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect(),
+            Some(command.clone()),
+        ),
         AgentAction::Keys { keys, .. } => {
             let bytes = interact::parse_keys(keys).map_err(|e| format!("按键串解析失败，没有写入：{e}"))?;
             Write { category: "keys", lines: typed_lines(&bytes), command: None, keys: Some(bytes) }

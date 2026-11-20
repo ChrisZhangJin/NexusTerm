@@ -257,6 +257,9 @@ pub enum AgentAction {
     File(super::files_tool::FileCall),
     /// 计划清单（`nx_todo`，整表替换，见 `todo`）
     Todo(Vec<super::todo::TodoItem>),
+    /// 交付通道（`nx_reveal`，见 `reveal`）：把文件 / 命令输出直接交给用户，模型只拿回执。
+    /// 动作里只有标题与来源，**没有内容**（内容在执行时才取，只进前端卡片）。
+    Reveal { target: Option<String>, title: String, source: super::reveal::RevealSource },
 }
 
 /// 对标签页能做些什么。
@@ -826,6 +829,7 @@ pub fn tool_specs() -> Vec<llm::ToolSpec> {
     // 文件工具（读 / 写 / 改 / 查找 / 搜索），对话与托管都有
     .chain(super::files::file_tool_specs())
     .chain(std::iter::once(super::todo::tool_spec()))
+    .chain(std::iter::once(super::reveal::tool_spec()))
     .collect()
 }
 
@@ -887,6 +891,7 @@ fn tool_action_name(name: &str) -> Option<&'static str> {
         super::files::TOOL_GLOB => Some("glob"),
         super::files::TOOL_GREP => Some("grep"),
         super::todo::TOOL_TODO => Some("todo"),
+        super::reveal::TOOL_REVEAL => Some("reveal"),
         _ => None,
     }
 }
@@ -939,6 +944,9 @@ pub fn actions_from_tool_call(call: &llm::ToolCall) -> Vec<AgentAction> {
     if action == "todo" {
         return super::todo::parse(&args).map(AgentAction::Todo).into_iter().collect();
     }
+    if action == "reveal" {
+        return vec![reveal_action(&args)];
+    }
     if let Some(c) = super::files_tool::FileCall::parse(call.name.trim(), &args) {
         return vec![AgentAction::File(c)];
     }
@@ -985,6 +993,12 @@ fn describe_tool_calls(reply: &llm::LlmReply) -> String {
     out
 }
 
+/// `nx_reveal` 的参数 → 动作（参数不合法也产出动作，`RevealSource::Invalid` 由执行层把原因告诉模型）。
+fn reveal_action(args: &serde_json::Value) -> AgentAction {
+    let (target, title, source) = super::reveal::parse(args);
+    AgentAction::Reveal { target, title, source }
+}
+
 /// 工具名（+ 参数）在界面上给人看的说法。
 pub fn tool_label(name: &str, args: &str) -> &'static str {
     match name.trim() {
@@ -997,6 +1011,7 @@ pub fn tool_label(name: &str, args: &str) -> &'static str {
         TOOL_WATCH => "盯住任务",
         TOOL_SCREEN => "读取屏幕",
         TOOL_SECRET => "请求输入密码",
+        super::reveal::TOOL_REVEAL => "交付给你",
         TOOL_MEMORY => "主机备忘",
         TOOL_ASK_USER => "向你提问",
         TOOL_COMPLETE => "宣告完成",
@@ -1101,6 +1116,11 @@ pub struct StepPayload {
     /// `kind:"gate"`：这张卡的现场暂存 id（`host_report_misread` 用）；动作没看屏幕时没有
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_id: Option<String>,
+    /// `kind:"reveal"` 专用（交付通道 `nx_reveal`）：交给用户的内容。**只经这个事件到前端**：
+    /// 运行摘要（`history::RunLog::record`）不认 `reveal`，前端落盘前（`toPersisted`）丢掉它。
+    /// `text` 是标题，`command` 是来源，`output` 是「N 行，M 字节」
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reveal_content: Option<String>,
 }
 
 impl StepPayload {
@@ -1128,6 +1148,7 @@ impl StepPayload {
             deny_item: None,
             deny_locked: None,
             gate_id: None,
+            reveal_content: None,
         }
     }
 }
@@ -1332,6 +1353,10 @@ fn parse_block(raw: &str) -> Vec<AgentAction> {
         }
         if v.get("action").and_then(|a| a.as_str()) == Some("todo") {
             return super::todo::parse(&v).map(AgentAction::Todo).into_iter().collect();
+        }
+        // 交付通道：围栏里写的也不能落到 parse_exec（那会把命令敲进可见终端、输出进模型）
+        if v.get("action").and_then(|a| a.as_str()) == Some("reveal") {
+            return vec![reveal_action(&v)];
         }
         if let Some(a @ ("read" | "write" | "edit" | "glob" | "grep")) = v.get("action").and_then(|a| a.as_str()) {
             return super::files_tool::FileCall::parse(&format!("nx_{a}"), &v).map(AgentAction::File).into_iter().collect();
@@ -1668,7 +1693,7 @@ pub const AGENTIC_SYSTEM_PROMPT_INTRO: &str = concat!(
 /// 之前自定义路径用的是压缩版说明，结果用户的提示词里写着「只给结论与必要命令」，
 /// 模型就真把 shell 直接抄进围栏 —— 协议写歪了，界面上什么都不发生。
 pub const ACTION_PROTOCOL: &str = concat!(
-    "【优先用工具】你有 nx_exec / nx_run / nx_send_keys / nx_wait / nx_watch / nx_screen / nx_secret / nx_export / nx_open_tab / nx_tab / nx_memory / nx_skill / nx_read / nx_write / nx_edit / nx_glob / nx_grep / nx_todo 共十八个工具。",
+    "【优先用工具】你有 nx_exec / nx_run / nx_send_keys / nx_wait / nx_watch / nx_screen / nx_secret / nx_export / nx_open_tab / nx_tab / nx_memory / nx_skill / nx_read / nx_write / nx_edit / nx_glob / nx_grep / nx_todo / nx_reveal 共十九个工具。",
     "能用工具调用时**直接用工具**，不要写成下面的围栏文本；",
     "只有当你确认自己无法发起工具调用时，才退化成围栏代码块。\n",
     "**绝不要把界面动作当成 shell 命令**：`new-tab`、`reconnect`、`close-tab`、",
@@ -1689,6 +1714,11 @@ pub const ACTION_PROTOCOL: &str = concat!(
     "**nx_exec** 敲进用户看得见的 shell：要改变这个 shell 的状态（cd 要持续生效、export、source）、",
     "进入 docker exec / ssh / tmux / 交互程序、或这一步该让用户在终端里看见时用它。",
     "nx_run 告诉你旁路不可用时（堡垒机兼容模式等）就改用 nx_exec。nx_run 与 nx_exec 过同样的范围 / 危险命令 / 审批闸门。\n\n",
+    "【交付秘密结果 nx_reveal】生成了用户需要的密码 / UUID / 密钥 / 令牌 / 节点链接 / 订阅地址时，",
+    "先写进权限收紧的文件（`umask 077` 或 chmod 600），再调用 **nx_reveal{title, path}**（或 **nx_reveal{title, command}** 用一条只打印它们的命令）",
+    "把内容交到用户面板上的「交付给你」卡片里 —— 内容不会经过你，你只收到一句回执。",
+    "**绝不要**用 nx_exec / nx_run / nx_read 把这些秘密打印给自己看，也不要写进回复或总结；",
+    "之后提到它们只用标题，例如「节点链接已通过『交付给你』卡片交付」。\n\n",
     "【计划】三步以上的任务先用 nx_todo 列出计划（每次调用整表替换），推进时更新每项状态",
     "（pending / in_progress / done）；清单会一直显示在系统提示的「当前计划」里，历史被压缩也不会丢。\n\n",
     "【要执行命令时】在回复里写且只写这样一个围栏代码块（不写 action 等同 \"exec\"）：\n",
@@ -4627,6 +4657,136 @@ pub async fn run(
                         command
                     ));
                 }
+                AgentAction::Reveal { target, title, source } => {
+                    // 交付通道：内容只进 `kind:"reveal"` 步骤卡（前端「交付给你」）；喂回模型的只有
+                    // `reveal::receipt`（行数 / 字节数）或 `reveal::failure_feedback`（原因），两者都拿不到内容。
+                    // 托管的 deny / 硬偏好 / 范围 / danger 已在上面的 `gate::authorize` 里做过（command 与 nx_run 同类）
+                    use super::reveal::{RevealErr, RevealSource};
+                    let shown = super::reveal::decision_text(&title, &source);
+                    if let RevealSource::Invalid(why) = &source {
+                        emit_step(app, &session, StepPayload { command: Some(shown.clone()), reasons: Some(vec![why.clone()]), ..StepPayload::new("skip", step) });
+                        feedback.push_str(&format!("nx_reveal 没有执行：{why}。请给 title，并在 path 与 command 里二选一。\n"));
+                        continue;
+                    }
+                    let risk = match &source {
+                        RevealSource::Command(c) => Some(assess(c)),
+                        _ => None,
+                    };
+                    let scope_reasons = risk.as_ref().filter(|r| r.dangerous).map(|r| r.reasons.clone()).unwrap_or_default();
+                    let Some((target_id, label, crossed)) = gate_target(
+                        app,
+                        state,
+                        runtime,
+                        &session,
+                        step,
+                        &mut targets,
+                        target.as_deref(),
+                        |l| format!("在「{l}」上{shown}"),
+                        &shown,
+                        scope_reasons,
+                        &mut feedback,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    // 对话 / 旧 steward：命令来源的危险命令与 nx_run 同一条审批
+                    if let Some(r) = risk.as_ref().filter(|r| r.dangerous) {
+                        if host.is_none() && (is_steward || cfg.exec_mode.is_approval()) && !crossed {
+                            let req_payload = ApprovePayload {
+                                request_id: uuid::Uuid::new_v4().simple().to_string(),
+                                kind: "danger",
+                                command: shown.clone(),
+                                target: target_id.clone(),
+                                target_label: label.clone(),
+                                reasons: with_cwd_note(r.reasons.clone()),
+                                diff: None,
+                                preview_complete: None,
+                            };
+                            if !request_approval(app, runtime, &session, &req_payload).await {
+                                emit_step(app, &session, StepPayload { command: Some(shown.clone()), reasons: Some(r.reasons.clone()), ..StepPayload::new("skip", step) });
+                                feedback.push_str(&format!("「{title}」没有交付：命令未获批准（人没批准 / 等待超时）。\n"));
+                                continue;
+                            }
+                        }
+                    }
+                    let cwd = targets
+                        .iter()
+                        .find(|t| t.id == target_id)
+                        .and_then(|t| t.cwd.clone())
+                        .or_else(|| host.as_ref().filter(|h| h.console_id == target_id).and_then(|h| h.saved_console()).and_then(|c| c.cwd));
+                    let fetched: Result<(RevealSource, String), RevealErr> = match &source {
+                        RevealSource::Path(p) => match super::files_tool::absolutize(p, cwd.as_deref()) {
+                            Err(why) => Err(RevealErr::File(why)),
+                            Ok(abs) => match super::files::transport_for(state, &target_id).await {
+                                Err(e) => Err(RevealErr::File(format!("文件通道在「{label}」上不可用：{e}"))),
+                                Ok(transport) => {
+                                    let ops = super::files::FileOps::new(&*transport, super::files::FileOpsConfig::default());
+                                    let unattended = host.as_ref().is_some_and(|h| h.ctx().authority.tier == super::policy::TIER_YOLO);
+                                    let mut approver = FileApprover { app, runtime, session: &session, target: &target_id, label: &label, host: host.as_deref(), unattended };
+                                    super::reveal::fetch_file(&ops, &abs, &mut approver).await.map(|(rp, c)| (RevealSource::Path(rp), c))
+                                }
+                            },
+                        },
+                        RevealSource::Command(c) => {
+                            let res = oob_run(app, state, &session, step, &target_id, &label, c, cwd.as_deref(), super::reveal::CMD_TIMEOUT_SECS, &cancel).await;
+                            match res {
+                                Ok(raw) => {
+                                    let (out, rc) = split_rc(&raw);
+                                    super::reveal::command_content(&out, rc).map(|t| (source.clone(), t))
+                                }
+                                Err(RunErr::Unavailable) => Err(RevealErr::Unavailable),
+                                Err(RunErr::Cancelled) => Err(RevealErr::Cancelled),
+                                Err(RunErr::Timeout) => Err(RevealErr::Timeout),
+                                Err(RunErr::Failed(e)) => Err(RevealErr::Failed(e)),
+                            }
+                        }
+                        RevealSource::Invalid(_) => unreachable!("上面已经 continue"),
+                    };
+                    if let Some(h) = &host {
+                        for u in h.take_user() {
+                            push_user(&mut messages, u);
+                        }
+                    }
+                    if trace_on {
+                        // trace 只记标题 / 来源 / 成败，没有内容
+                        trace::record(&session, step, "reveal", &format!("{shown} → {}", if fetched.is_ok() { "已交付" } else { "未交付" }));
+                    }
+                    match fetched {
+                        Ok((src, content)) => {
+                            let (lines, bytes) = (content.lines().count(), content.len());
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    target: Some(target_id.clone()),
+                                    target_label: Some(label.clone()),
+                                    command: Some(src.describe()),
+                                    text: Some(title.clone()),
+                                    output: Some(super::reveal::size_note(&content)),
+                                    reveal_content: Some(content),
+                                    ..StepPayload::new("reveal", step)
+                                },
+                            );
+                            feedback.push_str(&super::reveal::receipt(&title, lines, bytes));
+                            host_did!();
+                        }
+                        Err(e) => {
+                            emit_step(
+                                app,
+                                &session,
+                                StepPayload {
+                                    target: Some(target_id.clone()),
+                                    target_label: Some(label.clone()),
+                                    command: Some(shown.clone()),
+                                    reasons: Some(vec![e.for_user()]),
+                                    ..StepPayload::new("skip", step)
+                                },
+                            );
+                            feedback.push_str(&super::reveal::failure_feedback(&title, &source, &e));
+                        }
+                    }
+                }
                 AgentAction::Run { target, command, timeout_secs } => {
                     // 旁路执行：不碰可见终端，不等提示符；范围 / 危险命令的闸门与 nx_exec 相同
                     // （托管的 deny / 硬偏好 / 范围 / danger 已在上面的 `gate::authorize` 里做过）
@@ -6185,7 +6345,10 @@ const HOSTED_ADDENDUM: &str = "\n\n## 托管运行\n\
     - 用户随时可能接管终端；交还后请先读屏核对现场再继续。\n\
     - **少读屏猜结果，多用可靠通道**：写文件内容用 `nx_write` / `nx_edit`（不要 heredoc、echo 串、打开编辑器）；\
       只要结果的非交互命令（安装、检查、curl、systemctl、跑脚本）用 `nx_run`，它直接回输出和退出码；\
-      `nx_exec` 留给必须发生在可见 shell 里的事（cd 要持续生效、进入 docker exec / ssh / tmux、启动交互程序）。\n";
+      `nx_exec` 留给必须发生在可见 shell 里的事（cd 要持续生效、进入 docker exec / ssh / tmux、启动交互程序）。\n\
+    - **用户要的凭据走交付通道**：生成的密码 / UUID / Reality 密钥 / 节点链接等，写进权限收紧的文件（chmod 600）后\
+      用 `nx_reveal`（path 指向该文件，或给一条只打印它们的 command）交给用户；不要用 nx_exec / nx_run 把它们打印出来，\
+      `nx_complete` 的总结与证据里也不要出现它们的值 —— 用标题指代，如「节点链接已通过『交付给你』卡片交付」。\n";
 
 /// 一次托管里最多替用户「按推荐作答」几次：再多就是在兜圈子，交给人。
 const SELF_ANSWER_CAP: u32 = 12;
@@ -9813,7 +9976,7 @@ mod tests {
         for spec in tool_specs() {
             assert!(first.contains(spec.name), "工具清单漏了 {}：{first}", spec.name);
         }
-        assert!(first.contains(&format!("共{}个工具", ["", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八"][tool_specs().len()])), "{first}");
+        assert!(first.contains(&format!("共{}个工具", ["", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九"][tool_specs().len()])), "{first}");
     }
 
     #[test]

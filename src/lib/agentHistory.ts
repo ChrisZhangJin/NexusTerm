@@ -18,9 +18,22 @@ export const MAX_PERSISTED_MESSAGES = 200;
 /** 重载前被打断的步骤卡上补的说明 */
 export const INTERRUPTED_NOTE = "（面板重载前被中断，没有拿到结果）";
 
-/** 选出要落盘的消息：去掉还在流式追加的半截回答，只留最近 N 条。 */
+/** 交付卡（`nx_reveal`）读回来时的占位：内容只在内存里，从不落盘 */
+export const REVEAL_NOT_SAVED = "（已交付的内容不保存）";
+
+/** 去掉交付卡的内容（其余字段原样）。没有内容的消息原样返回（同一个引用）。 */
+function withoutRevealContent(m: AgentMessage): AgentMessage {
+  if (!m.step || m.step.revealContent === undefined) return m;
+  const { revealContent: _dropped, ...step } = m.step;
+  return { ...m, step };
+}
+
+/**
+ * 选出要落盘的消息：去掉还在流式追加的半截回答，只留最近 N 条。
+ * 交付卡（`kind:"reveal"`）的内容一律剥掉 —— 它是给用户的秘密，不进磁盘上的聊天记录。
+ */
 export function toPersisted(messages: AgentMessage[]): AgentMessage[] {
-  const kept = messages.filter((m) => !m.streaming);
+  const kept = messages.filter((m) => !m.streaming).map(withoutRevealContent);
   return kept.length > MAX_PERSISTED_MESSAGES
     ? kept.slice(kept.length - MAX_PERSISTED_MESSAGES)
     : kept;
@@ -50,7 +63,8 @@ export function fromPersisted(raw: unknown): AgentMessage[] {
   const out: AgentMessage[] = [];
   for (const item of raw) {
     if (!isMessage(item)) continue;
-    let m: AgentMessage = { ...item };
+    // 交付卡的内容不该在库里；万一（旧版本 / 别处写入）带着，读回来也丢掉
+    let m: AgentMessage = withoutRevealContent({ ...item });
     delete m.streaming;
     if (m.approve && m.approveResult === undefined) {
       m = { ...m, approveResult: false };

@@ -1190,6 +1190,25 @@ impl<'a> FileOps<'a> {
         })
     }
 
+    /// 原样读出整份文件（**不脱敏**、不编行号），给 `nx_reveal` 交付给用户用 —— 内容只去用户的卡片，
+    /// 永远不进模型。禁读清单、目录、超过 `cap` 照样报错（`allow_sensitive` 语义同 [`Self::read_with`]）。
+    /// 返回 (规整后的路径, 字节)。
+    pub async fn read_raw(&self, path: &str, cap: usize, allow_sensitive: bool) -> Result<(String, Vec<u8>), FileError> {
+        let path = self.resolve(path).await?;
+        let st = self.t.stat(&path).await?.ok_or_else(|| FileError::NotFound(path.clone()))?;
+        if st.is_dir {
+            return Err(FileError::IsDirectory(path));
+        }
+        if !allow_sensitive && self.is_read_denied(&path).await? {
+            return Err(FileError::ReadDenied { path, size: st.size });
+        }
+        if st.size > cap as u64 {
+            return Err(FileError::TooLarge { path, size: st.size, cap });
+        }
+        let bytes = self.t.read(&path, cap).await?;
+        Ok((path, bytes))
+    }
+
     // —— write / edit ——
 
     /// 读现有文件做对比用。过大返回 None（不读，也就没有 before_hash）。

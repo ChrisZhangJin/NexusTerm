@@ -38,6 +38,10 @@ pub fn describe_write(a: &AgentAction) -> Option<(&'static str, String)> {
         AgentAction::Exec { command, .. } => ("exec", command.trim().to_string()),
         AgentAction::Run { command, .. } => ("exec", format!("（旁路）{}", command.trim())),
         AgentAction::Keys { keys, .. } => ("keys", format!("发送按键：{keys}")),
+        // 交付通道：只记标题 + 来源（路径 / 命令），内容永远不进决策记录
+        AgentAction::Reveal { title, source, .. } if !matches!(source, super::super::reveal::RevealSource::Invalid(_)) => {
+            ("reveal", super::super::reveal::decision_text(title, source))
+        }
         AgentAction::Secret { reason, .. } => {
             ("secret", format!("请用户输入密码（{}）", reason.as_deref().unwrap_or("未说明")))
         }

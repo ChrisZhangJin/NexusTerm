@@ -11,6 +11,7 @@ import {
   INTERRUPTED_NOTE,
   MAX_PERSISTED_MESSAGES,
   mergeRestored,
+  REVEAL_NOT_SAVED,
   toPersisted,
 } from "../../src/lib/agentHistory";
 import type { AgentMessage } from "../../src/types";
@@ -166,4 +167,24 @@ test("convKeyOf：按保存的连接分段，本地终端共用一段", () => {
   assert.equal(convKeyOf({ id: "tab-3", hint: { sessionRecordId: null } }), "local");
   assert.equal(convKeyOf({ id: "tab-4" }), "local");
   assert.equal(convKeyOf(undefined), "local");
+});
+
+test("交付卡（nx_reveal）：内容不落盘，读回来只剩元数据（卡片显示占位）", () => {
+  const secret = "vless://1b6f3c2e-9d1a-4c8e-b0f2-7a3d5e9c1f42@203.0.113.7:443";
+  const card = msg("r", {
+    step: { kind: "reveal", step: 2, command: "文件 /root/links.txt", text: "节点链接", output: "1 行，60 字节", revealContent: secret },
+  });
+  const other = msg("o", { text: "好了" });
+  const live = [card, other];
+  const saved = toPersisted(live);
+  assert.ok(!JSON.stringify(saved).includes("1b6f3c2e"), "落盘的数据里不能有交付内容");
+  assert.equal(saved[0].step?.text, "节点链接");
+  assert.equal(saved[0].step?.revealContent, undefined);
+  assert.equal(saved[1], other, "别的消息原样（同一引用）");
+  assert.equal(live[0].step?.revealContent, secret, "内存里的那份不受影响");
+  // 万一库里带着内容（旧数据），读回来也丢掉
+  const back = fromPersisted(JSON.parse(JSON.stringify(live)));
+  assert.equal(back[0].step?.revealContent, undefined);
+  assert.equal(back[0].step?.kind, "reveal");
+  assert.ok(REVEAL_NOT_SAVED.includes("不保存"));
 });

@@ -67,6 +67,14 @@ export function pendingPrompts(messages: AgentMessage[]): number {
   return n;
 }
 
+/**
+ * 「交付给你」卡打码后的样子：每个非空行一串圆点（不按原文长度，免得从长度猜出内容）。
+ */
+export function maskReveal(content: string): string {
+  const n = content.split("\n").filter((l) => l.trim() !== "").length;
+  return Array.from({ length: Math.max(1, n) }, () => "••••••••").join("\n");
+}
+
 /** 收到一个增量文本块：追加到当前正在流的那条助手消息上 */
 export function withToken(c: Conversation, chunk: string): Conversation {
   const msgs = c.messages.slice();

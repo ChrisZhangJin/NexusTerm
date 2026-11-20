@@ -33,6 +33,7 @@ pub mod prompt;
 pub mod recorder;
 pub mod recorder_cmd;
 pub mod redact;
+pub mod reveal;
 pub mod secret;
 pub mod skill;
 pub mod skill_cmd;
