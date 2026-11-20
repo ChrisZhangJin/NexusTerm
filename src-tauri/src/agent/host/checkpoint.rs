@@ -53,6 +53,10 @@ pub struct HostCheckpoint {
     /// 意向期限到了、用户已经「继续」过（接驳后不再因同一期限暂停）
     #[serde(default)]
     pub deadline_acked: bool,
+    /// 本次托管生效的运行预算（含开始时的覆盖与「加预算继续」放宽过的）；接驳 / 重启后按它接着跑。
+    /// 旧现场没有该字段 → None（按配置 / 托管默认）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<super::super::budget::RunBudget>,
     pub created_wall_ms: i64,
     pub saved_wall_ms: i64,
 }
@@ -98,6 +102,7 @@ impl HostCheckpoint {
             watchdog: WatchdogState::default(),
             todo: Vec::new(),
             deadline_acked: false,
+            limits: None,
             created_wall_ms: now_wall_ms,
             saved_wall_ms: now_wall_ms,
         }
@@ -310,6 +315,21 @@ mod tests {
         assert_eq!(back.contract.success_criteria, contract().success_criteria);
         assert!(back.contract.yolo);
         assert_eq!(back.state(), "paused");
+    }
+
+    #[test]
+    fn run_limits_round_trip_and_old_checkpoints_load_without_them() {
+        use super::super::super::budget::RunBudget;
+        let mut c = cp();
+        assert!(!c.to_json(0).unwrap().contains("\"limits\""), "没设就不写");
+        let l = RunBudget { max_steps: 300, max_minutes: 90, max_output_chars: 0, max_cost_micros: 2_000_000 };
+        c.limits = Some(l);
+        let back = HostCheckpoint::from_json(&c.to_json(0).unwrap()).unwrap();
+        assert_eq!(back.limits, Some(l));
+        // 旧现场没有 limits 字段
+        let mut v: Value = serde_json::from_str(&c.to_json(0).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("limits");
+        assert_eq!(HostCheckpoint::from_json(&v.to_string()).unwrap().limits, None);
     }
 
     #[test]

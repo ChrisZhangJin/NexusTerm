@@ -4,7 +4,7 @@
 //! - `host_changes(contract_id)`：一次托管的「实际改动」（按决策记录提取，见 `host::changes`）+ 可还原的备份；
 //! - `host_restore_backup(contract_id, backup_id)`：把备份的原文经同一个终端的文件通道（本地 / SFTP）写回去。
 //!
-//! 改动摘要在托管结束时定格进 `host_changes` 表（决策表只留最近 500 条，老托管靠它）。
+//! 改动摘要在托管每次落盘时增量并进 `host_changes` 表（决策表全局只留最近 500 条，早期改动 / 老托管靠它）。
 
 use serde::Serialize;
 use tauri::{AppHandle, State};
@@ -13,7 +13,7 @@ use crate::cmd::AppState;
 
 use super::checkpoint::Spent;
 use super::host::backup::{self, BackupEntry};
-use super::host::changes::{self, ChangeSummary};
+use super::host::changes::ChangeSummary;
 use super::host::checkpoint::HostCheckpoint;
 use super::host::{CheckResult, HostPhase};
 use super::steward::now_ms;
@@ -54,19 +54,30 @@ fn backup_root(app: &AppHandle) -> std::path::PathBuf {
     backup::root(&crate::app_data_dir(app))
 }
 
-/// 定格过的优先；没有就按决策记录现算。
-pub(crate) fn changes_for(store: &crate::store::Store, contract_id: &str) -> ChangeSummary {
-    if let Some(s) = store.host_changes_get(contract_id).and_then(|j| serde_json::from_str(&j).ok()) {
-        return s;
-    }
-    let rows = store.steward_decisions_for(contract_id);
-    changes::from_json_rows(contract_id, rows.iter().map(String::as_str))
+/// 存下的摘要（没有就从空的开始）+ 它之后的新决策记录。不落盘。
+fn merged_changes(store: &crate::store::Store, contract_id: &str) -> (ChangeSummary, bool) {
+    let mut s = store
+        .host_changes_get(contract_id)
+        .and_then(|j| serde_json::from_str::<ChangeSummary>(&j).ok())
+        .unwrap_or_else(|| ChangeSummary { merged_seq: Some(0), ..Default::default() });
+    let Some(after) = s.merged_seq else { return (s, false) };
+    let rows = store.steward_decisions_since(contract_id, after);
+    let changed = s.absorb_rows(contract_id, rows.iter().map(|(q, j)| (*q, j.as_str())));
+    (s, changed)
 }
 
-/// 托管结束时调用：把改动摘要定格下来。
+/// 存下的摘要并上之后的新记录（旧版本结束时定格的原样返回）。
+pub(crate) fn changes_for(store: &crate::store::Store, contract_id: &str) -> ChangeSummary {
+    merged_changes(store, contract_id).0
+}
+
+/// 托管每次落盘时调用：把新的决策记录增量并进存下的改动摘要（决策表全局只留最近 500 条，
+/// 早期的改动靠这份摘要留住）。只读 seq 之后的新记录；没有新记录不写。
 pub(crate) fn snapshot_changes(store: &crate::store::Store, contract_id: &str) {
-    let rows = store.steward_decisions_for(contract_id);
-    let s = changes::from_json_rows(contract_id, rows.iter().map(String::as_str));
+    let (s, changed) = merged_changes(store, contract_id);
+    if !changed {
+        return;
+    }
     match serde_json::to_string(&s) {
         Ok(j) => {
             if let Err(e) = store.host_changes_put(contract_id, &j, now_ms()) {
@@ -77,17 +88,20 @@ pub(crate) fn snapshot_changes(store: &crate::store::Store, contract_id: &str) {
     }
 }
 
-/// act.rs 写文件成功后调用：原文存一份。失败只记日志，不影响托管。
-pub(crate) fn back_up_original(app: &AppHandle, contract_id: &str, console_id: &str, path: &str, original: &[u8]) {
-    if let Err(e) = backup::save(&backup_root(app), contract_id, console_id, path, original, now_ms()) {
+/// act.rs 写文件成功后调用：本次托管第一次碰这个文件时记一条（原文能备份就存一份）。失败只记日志，不影响托管。
+pub(crate) fn back_up_original(app: &AppHandle, contract_id: &str, console_id: &str, path: &str, touch: backup::Touch<'_>) {
+    if let Err(e) = backup::record(&backup_root(app), contract_id, console_id, path, touch, now_ms()) {
         // 不带内容、不带路径以外的东西
         tracing::warn!("托管改文件前的原文备份失败（{path}）：{e}");
     }
 }
 
-/// 启动时调用：托管行已被清理掉的，备份目录一并删掉。
+/// 启动时调用：托管行已被清理掉的，备份目录一并删掉；再按保留上限删掉最旧的（见 `backup` 模块文档）。
 pub(crate) fn prune_backups(app: &AppHandle, store: &crate::store::Store) {
-    let n = backup::prune(&backup_root(app), |id| store.host_session_get(id).is_some());
+    let live = |id: &str| {
+        store.host_session_get(id).is_some_and(|r| !matches!(r.state.as_str(), "completed" | "failed" | "stopped" | "expired"))
+    };
+    let n = backup::prune(&backup_root(app), |id| store.host_session_get(id).is_some(), live);
     if n > 0 {
         tracing::info!("清理托管原文备份 {n} 份");
     }
@@ -231,5 +245,46 @@ mod tests {
         store.steward_decisions_clear().unwrap();
         assert_eq!(changes_for(&store, "c1"), live, "决策被裁掉后仍能读到定格的摘要");
         assert!(changes_for(&store, "c2").is_empty());
+    }
+
+    #[test]
+    fn periodic_snapshots_merge_incrementally_and_survive_trimming() {
+        let (store, _) = crate::store::tests::temp_store_at("host-changes-merge");
+        let mut rec = super::super::host::record::hosted_decision(
+            &super::super::host::HostCtx::bare("c1", "t1", "g"),
+            "t1",
+            "exec",
+            "apt-get install -y nginx",
+            "",
+            &super::super::host::gate::Gate::Allow,
+            None,
+            1,
+        );
+        let put = |rec: &super::super::decision::DecisionRecord| {
+            store.steward_decision_insert(1, &rec.contract_id, "t1", "", &serde_json::to_string(rec).unwrap(), "applied").unwrap()
+        };
+        put(&rec);
+        snapshot_changes(&store, "c1");
+        snapshot_changes(&store, "c1"); // 没有新记录：不重复计数
+        // 早期记录被裁掉，之后又有新动作
+        store.steward_decisions_clear().unwrap();
+        rec.chosen.text = "systemctl restart nginx && apt-get install -y nginx".into();
+        put(&rec);
+        // 进行中读：存下的 + 之后的新记录
+        let live = changes_for(&store, "c1");
+        assert_eq!(live.commands, 2);
+        assert_eq!(live.packages, vec!["安装 nginx（apt-get）"]);
+        assert_eq!(live.services, vec!["重启 nginx"]);
+        snapshot_changes(&store, "c1");
+        snapshot_changes(&store, "c1");
+        let s = changes_for(&store, "c1");
+        assert_eq!((s.commands, s.packages.len(), s.services.len()), (2, 1, 1));
+        // 旧版本结束时定格的（没有 merged_seq）：原样返回，不再并
+        let legacy = ChangeSummary { commands: 7, ..Default::default() };
+        store.host_changes_put("old", &serde_json::to_string(&legacy).unwrap(), 1).unwrap();
+        rec.contract_id = "old".into();
+        put(&rec);
+        snapshot_changes(&store, "old");
+        assert_eq!(changes_for(&store, "old"), legacy);
     }
 }

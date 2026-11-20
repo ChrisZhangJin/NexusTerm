@@ -17,6 +17,7 @@ export function changeGroups(c: HostChangeSummary): ChangeGroup[] {
     { label: "端口 / 防火墙", items: c.ports },
     { label: "容器", items: c.containers },
     { label: "下载", items: c.downloads },
+    { label: "删除", items: c.removals ?? [] },
   ];
   return groups.filter((g) => g.items.length > 0);
 }
@@ -52,6 +53,18 @@ export function fileRows(files: string[], backups: HostBackupEntry[]): FileRow[]
     if (!used.has(b.id)) rows.push({ path: b.path, backup: b });
   }
   return rows;
+}
+
+/** 这条记录能不能「还原」；不能的话给人看的说明 */
+export function backupInfo(b: HostBackupEntry): { restorable: boolean; note: string } {
+  switch (b.status ?? "backedUp") {
+    case "created":
+      return { restorable: false, note: "这个文件是托管新建的" };
+    case "skipped":
+      return { restorable: false, note: `没有备份原文：${b.note || "原因不明"}` };
+    default:
+      return { restorable: true, note: `原文已备份 ${fmtSize(b.size)}` };
+  }
 }
 
 /** 72_000 → 「1 分 12 秒」 */

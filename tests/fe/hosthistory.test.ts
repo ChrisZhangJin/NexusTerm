@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { changeGroups, changesEmpty, fileRows, fmtDuration, fmtSize, fmtWhen, historyStateLabel } from "../../src/lib/hostHistory";
+import { backupInfo, changeGroups, changesEmpty, fileRows, fmtDuration, fmtSize, fmtWhen, historyStateLabel } from "../../src/lib/hostHistory";
 import type { HostBackupEntry, HostChangeSummary } from "../../src/types";
 
 const empty: HostChangeSummary = {
@@ -16,6 +16,7 @@ const empty: HostChangeSummary = {
   ports: [],
   containers: [],
   downloads: [],
+  removals: [],
 };
 
 const bk = (id: string, path: string): HostBackupEntry => ({ id, path, consoleId: "t1", tsMs: 0, size: 3, sha256: "x" });
@@ -30,6 +31,25 @@ test("空组不出现，什么都没有时 changesEmpty", () => {
     ["软件包", "端口 / 防火墙"]
   );
   assert.equal(changesEmpty({ ...empty, commands: 1 }), false);
+  // 删除一组；旧存档没有 removals 字段也不出错
+  assert.deepEqual(
+    changeGroups({ ...empty, removals: ["删除 /tmp/x"] }).map((g) => g.label),
+    ["删除"]
+  );
+  const { removals: _r, ...legacy } = empty;
+  assert.deepEqual(changeGroups(legacy as HostChangeSummary), []);
+});
+
+test("备份记录：已备份可还原；托管新建 / 没备份的只给说明", () => {
+  assert.deepEqual(backupInfo(bk("1", "/a")), { restorable: true, note: "原文已备份 3 B" });
+  assert.deepEqual(backupInfo({ ...bk("2", "/b"), status: "created", size: 0 }), {
+    restorable: false,
+    note: "这个文件是托管新建的",
+  });
+  const skipped = backupInfo({ ...bk("3", "/c"), status: "skipped", note: "原文件超过 1 MB，没有备份" });
+  assert.equal(skipped.restorable, false);
+  assert.match(skipped.note, /超过 1 MB/);
+  assert.equal(backupInfo({ ...bk("4", "/d"), status: "skipped" }).note, "没有备份原文：原因不明");
 });
 
 test("文件与备份对上号：绝对路径相同 / 相对写法是后缀；没对上的备份补在后面", () => {

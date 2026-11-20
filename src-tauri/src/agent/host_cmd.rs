@@ -201,10 +201,8 @@ impl HostIo for AppHostIo {
                 if let Err(e) = st.store.host_session_upsert(&self.handle.contract_id, c.state(), &json, now) {
                     tracing::warn!("托管现场落盘失败：{e}");
                 }
-                // 结束了：把「实际改动」定格下来（历史托管用，决策表会被裁剪）
-                if phase.is_terminal() {
-                    super::host_history_cmd::snapshot_changes(&st.store, &self.handle.contract_id);
-                }
+                // 「实际改动」增量并进存下的摘要（历史托管用；决策表全局只留最近 500 条，会被裁剪）
+                super::host_history_cmd::snapshot_changes(&st.store, &self.handle.contract_id);
             }
             Err(e) => tracing::warn!("托管现场序列化失败：{e}"),
         }
@@ -260,6 +258,10 @@ impl HostIo for AppHostIo {
 
     fn note_deadline_ack(&self, acked: bool) {
         self.snap.lock().deadline_acked = acked;
+    }
+
+    fn note_limits(&self, limits: &super::budget::RunBudget) {
+        self.snap.lock().limits = Some(*limits);
     }
 
     fn console_alive(&self, id: &str) -> bool {
@@ -1364,6 +1366,28 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+/// 接驳 / 重启后接着跑的那一轮请求：目标、终端照旧；预算沿用重启前生效的那份（含开始时的覆盖、
+/// 「加预算继续」放宽过的、花费上限），旧现场没记就按托管默认。
+pub(crate) fn resumed_request(
+    console_id: &str,
+    c: &super::host::HostCtx,
+    cwd: Option<String>,
+    limits: Option<super::budget::RunBudget>,
+) -> AgentRunRequest {
+    AgentRunRequest {
+        session_id: console_id.to_string(),
+        question: c.contract.goal.clone(),
+        targets: std::iter::once(AgentTarget { id: console_id.to_string(), label: c.label.clone(), cwd })
+            .chain(c.extra.iter().map(|x| AgentTarget { id: x.console_id.clone(), label: x.label.clone(), cwd: x.cwd.clone() }))
+            .collect(),
+        console_text: None,
+        console_alt: false,
+        mode: Some("steward".to_string()),
+        budget: limits.map(RunBudgetOverride::from),
+        conversation: None,
+    }
+}
+
 /// 起接驳后的运行任务：等旧任务（若有）退出、腾出运行登记，再接着跑。
 fn spawn_resumed(app: AppHandle, h: Arc<HostShared>, old: Option<Arc<HostShared>>) {
     tauri::async_runtime::spawn(async move {
@@ -1388,19 +1412,7 @@ fn spawn_resumed(app: AppHandle, h: Arc<HostShared>, old: Option<Arc<HostShared>
             }
         }
         let cfg = super::load_config(&st.store);
-        let c = h.ctx();
-        let req = AgentRunRequest {
-            session_id: h.console_id.clone(),
-            question: c.contract.goal.clone(),
-            targets: std::iter::once(AgentTarget { id: h.console_id.clone(), label: c.label.clone(), cwd: h.saved_console().and_then(|c| c.cwd) })
-                .chain(c.extra.iter().map(|x| AgentTarget { id: x.console_id.clone(), label: x.label.clone(), cwd: x.cwd.clone() }))
-                .collect(),
-            console_text: None,
-            console_alt: false,
-            mode: Some("steward".to_string()),
-            budget: None,
-            conversation: None,
-        };
+        let req = resumed_request(&h.console_id, &h.ctx(), h.saved_console().and_then(|c| c.cwd), h.saved_limits());
         let res = act::run(&app, &st, &st.act, &cfg, &req, RunMode::Hosted(Arc::clone(&h))).await;
         finish_hosted(&app, &h, res);
     });
@@ -1649,6 +1661,23 @@ mod tests {
         let (next, fx, _) = reattach_plan(&cp, saved_console("t2"), Some("h-before"), 2_000).unwrap();
         assert_eq!(next.phase, HostPhase::Running);
         assert!(fx.iter().any(|e| matches!(e, super::super::host::phase::Effect::Feedback(t) if t.contains("nx_secret"))));
+    }
+
+    #[test]
+    fn resumed_request_keeps_saved_limits_including_cost_cap() {
+        use super::super::budget::RunBudget;
+        let ctx = super::super::host::HostCtx::bare("c1", "t1", "装好 nginx");
+        // 开始时覆盖了步数，后来「加预算继续」放宽了时长、设了花费上限
+        let saved = RunBudget { max_steps: 40, max_minutes: 200, max_output_chars: 0, max_cost_micros: 1_500_000 };
+        let req = resumed_request("t1", &ctx, Some("/srv".into()), Some(saved));
+        assert!(req.is_steward());
+        assert_eq!(req.targets[0].cwd.as_deref(), Some("/srv"));
+        let cfg_budget = RunBudget { max_cost_micros: 0, ..RunBudget::default() };
+        assert_eq!(act::effective_budget(cfg_budget, &req), saved.clamped());
+        // 旧现场没记：照旧按托管默认
+        let req = resumed_request("t1", &ctx, None, None);
+        assert!(req.budget.is_none());
+        assert_eq!(act::effective_budget(cfg_budget, &req).max_cost_micros, 0);
     }
 
     #[test]

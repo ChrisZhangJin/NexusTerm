@@ -1006,7 +1006,15 @@ export interface HostChangeSummary {
   ports: string[];
   containers: string[];
   downloads: string[];
+  /** 删除：rm / rmdir 的目标、docker rm / rmi / prune、iptables -F / -X、userdel（旧存档可能没有） */
+  removals?: string[];
 }
+
+/**
+ * 托管第一次写这个文件时的情况：backedUp = 原文已备份（可还原）；created = 托管新建的文件；
+ * skipped = 原文没备份（原因在 note）。旧索引没有该字段 = backedUp
+ */
+export type HostBackupStatus = "backedUp" | "created" | "skipped";
 
 /** 托管改文件前留的原文备份（「还原」用） */
 export interface HostBackupEntry {
@@ -1018,6 +1026,9 @@ export interface HostBackupEntry {
   size: number;
   sha256: string;
   restoredAt?: number | null;
+  status?: HostBackupStatus;
+  /** skipped 的原因 */
+  note?: string | null;
 }
 
 /** `host_changes` 的返回 */

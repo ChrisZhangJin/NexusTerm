@@ -2,15 +2,18 @@
 //!
 //! 只看动作本身（`chosen.kind` + `chosen.text`），**不看模型怎么说**。纯函数，可单测：
 //! - 文件：nx_write / nx_edit 的路径、`tee` / `>` / `>>` 重定向的目标、`sed -i` 的文件；
-//! - 软件包：apt / apt-get / yum / dnf / apk / brew / snap / pip / npm / pnpm / yarn / cargo 的装 / 卸；
+//! - 软件包：apt / apt-get / yum / dnf / apk / brew / snap / pip / npm / pnpm / yarn / cargo 的装 / 卸（名字过一遍脱敏，
+//!   `git+https://user:TOKEN@…` 这类安装串不原样留）；
 //! - 服务：systemctl / service 的 start / stop / restart / reload / enable / disable / mask；
 //! - 端口：ufw allow / deny / delete、firewall-cmd --add-port / --remove-port / --add-service、
-//!   iptables -A / -I / -D … --dport、docker -p；
-//! - 容器：docker / podman run / rm / stop / start / restart / pull / build、compose up / down；
+//!   iptables -A / -I / -D … --dport、-P 默认策略、docker -p；
+//! - 容器：docker / podman run / stop / start / restart / pull / build、compose up / down；
+//! - 删除：rm / rmdir 的目标（去重、最多 [`MAX_REMOVALS`] 条）、docker rm / rmi / prune、iptables -F / -X、userdel
+//!   （apt / yum 的 remove / purge 仍归软件包）；
 //! - 下载：curl -o / -O / 重定向，wget（默认存成远端文件名，-O 指定）。
 //!
 //! 一行里的 `&&` `||` `;` `|` `&`、换行（nx_run 的多行脚本）都会拆开；heredoc 正文不当命令；
-//! `sudo` / `env` / 变量赋值等前缀剥掉；`sh -c '…'` 递归解析。
+//! `sudo` / `env` / 变量赋值等前缀剥掉；`sh -c '…'` 递归解析；`$[ ]` `(( ))` `[[ ]]` 里的 `<<` / `<` 不当重定向。
 
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +36,13 @@ pub struct ChangeSummary {
     pub containers: Vec<String>,
     /// 「https://x/y.tar.gz → /tmp/y.tar.gz」
     pub downloads: Vec<String>,
+    /// 「删除 /var/www/old（递归）」「删除容器 web（docker）」「清空 iptables 规则（全部链）」「删除用户 bob」
+    #[serde(default)]
+    pub removals: Vec<String>,
+    /// 合并到了哪条决策记录（`steward_decisions.seq`）。托管进行中每次落盘把新记录增量并进来，
+    /// 决策表裁剪掉的早期改动因此不丢。旧版本在结束时一次定格的摘要没有它（None = 已定格，不再并）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_seq: Option<i64>,
 }
 
 impl ChangeSummary {
@@ -44,12 +54,78 @@ impl ChangeSummary {
             && self.ports.is_empty()
             && self.containers.is_empty()
             && self.downloads.is_empty()
+            && self.removals.is_empty()
+    }
+}
+
+impl ChangeSummary {
+    /// 并进另一份摘要：各列表取并集（保持先后、去重），命令条数相加。
+    pub fn merge(&mut self, o: ChangeSummary) {
+        for (dst, src) in [
+            (&mut self.files_written, o.files_written),
+            (&mut self.packages, o.packages),
+            (&mut self.services, o.services),
+            (&mut self.ports, o.ports),
+            (&mut self.containers, o.containers),
+            (&mut self.downloads, o.downloads),
+        ] {
+            for x in src {
+                push(dst, x);
+            }
+        }
+        for x in o.removals {
+            push_removal(&mut self.removals, x);
+        }
+        self.commands = self.commands.saturating_add(o.commands);
+    }
+
+    /// 把 seq 大于 `merged_seq` 的决策记录 `(seq, JSON)` 增量并进来（同一条不会算两次）。
+    /// 返回有没有新记录。`merged_seq` 为 None（旧版本定格的）时不动。
+    pub fn absorb_rows<'a>(&mut self, contract_id: &str, rows: impl IntoIterator<Item = (i64, &'a str)>) -> bool {
+        let Some(mut upto) = self.merged_seq else { return false };
+        let start = upto;
+        let mut recs = Vec::new();
+        for (seq, j) in rows {
+            if seq <= start {
+                continue;
+            }
+            upto = upto.max(seq);
+            if let Ok(r) = serde_json::from_str::<DecisionRecord>(j) {
+                if r.contract_id == contract_id {
+                    recs.push(r);
+                }
+            }
+        }
+        self.merge(summarize(&recs));
+        self.merged_seq = Some(upto);
+        upto != start
     }
 }
 
 fn push(v: &mut Vec<String>, s: String) {
     if !s.is_empty() && !v.contains(&s) {
         v.push(s);
+    }
+}
+
+/// 「删除」最多列多少条（`rm` 一大串路径时只列前面的）
+pub const MAX_REMOVALS: usize = 30;
+const MORE_REMOVALS: &str = "……还有更多删除，未全部列出";
+
+fn push_removal(v: &mut Vec<String>, s: String) {
+    if s == MORE_REMOVALS || v.contains(&s) {
+        if s == MORE_REMOVALS && !v.iter().any(|x| x == MORE_REMOVALS) {
+            v.push(s);
+        }
+        return;
+    }
+    let n = v.iter().filter(|x| *x != MORE_REMOVALS).count();
+    if n < MAX_REMOVALS {
+        // 「还有更多」始终在最后
+        let at = v.iter().position(|x| x == MORE_REMOVALS).unwrap_or(v.len());
+        v.insert(at, s);
+    } else if !v.iter().any(|x| x == MORE_REMOVALS) {
+        v.push(MORE_REMOVALS.to_string());
     }
 }
 
@@ -197,6 +273,34 @@ fn lex(src: &str) -> Vec<Tok> {
                     i += 1;
                 }
             }
+            '(' if !in_word && i + 1 < n && chars[i + 1] == '(' => {
+                // `(( … ))` 算术命令：整段跳过（里面的 `<<` / `>` 是运算符）
+                let mut depth = 0;
+                while i < n {
+                    match chars[i] {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        '\n' => break,
+                        _ => {}
+                    }
+                    i += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                out.push(Tok::Sep);
+            }
+            '[' if !in_word && i + 2 < n && chars[i + 1] == '[' && matches!(chars[i + 2], ' ' | '\t') => {
+                // `[[ … ]]` 条件测试：没有副作用，整段跳过（里面的 `<` `>` 是比较）
+                i += 2;
+                while i < n && !(chars[i] == ']' && i + 1 < n && chars[i + 1] == ']') && chars[i] != '\n' {
+                    i += 1;
+                }
+                if i < n && chars[i] == ']' {
+                    i += 2;
+                }
+                out.push(Tok::Sep);
+            }
             ';' | '(' | ')' => {
                 flush!();
                 out.push(Tok::Sep);
@@ -307,6 +411,24 @@ fn lex(src: &str) -> Vec<Tok> {
                     i += 2;
                 } else {
                     i += 1;
+                }
+            }
+            '$' if i + 1 < n && chars[i + 1] == '[' => {
+                // `$[ … ]` 旧式算术：整个当成词的一部分（里面的 `<<` 是移位，不是 heredoc）
+                in_word = true;
+                let mut depth = 0;
+                while i < n {
+                    let ch = chars[i];
+                    word.push(ch);
+                    i += 1;
+                    if ch == '[' {
+                        depth += 1;
+                    } else if ch == ']' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
                 }
             }
             '$' if i + 1 < n && chars[i + 1] == '(' => {
@@ -456,9 +578,7 @@ fn strip_prefix(words: &[String]) -> &[String] {
             "sudo" | "doas" => {
                 i += 1;
                 while i < words.len() && words[i].starts_with('-') {
-                    // 带值的选项
-                    let takes = matches!(words[i].as_str(), "-u" | "-g" | "-C" | "-h" | "-p" | "-U" | "-r" | "-t" | "-D");
-                    i += if takes { 2 } else { 1 };
+                    i += sudo_opt_width(&words[i]);
                 }
             }
             "env" => {
@@ -488,6 +608,28 @@ fn strip_prefix(words: &[String]) -> &[String] {
     &words[i.min(words.len())..]
 }
 
+/// sudo / doas 的一个选项词占几个词：带值的（`-u root`、`--user root`）占 2，值贴着写的
+/// （`-uroot`、`--user=root`）和不带值的占 1；短选项可以成串（`-iu root`、`-Eu root`：值给串里最后那个）。
+fn sudo_opt_width(w: &str) -> usize {
+    const SHORT: &[char] = &['u', 'g', 'C', 'h', 'p', 'U', 'r', 't', 'D', 'R', 'T'];
+    if w == "--" {
+        return 1;
+    }
+    if let Some(long) = w.strip_prefix("--") {
+        let takes = matches!(
+            long,
+            "user" | "group" | "close-from" | "host" | "prompt" | "other-user" | "role" | "type" | "chdir" | "chroot" | "command-timeout"
+        );
+        return if takes { 2 } else { 1 };
+    }
+    let flags: Vec<char> = w.chars().skip(1).collect();
+    match flags.iter().position(|c| SHORT.contains(c)) {
+        // 带值的那个后面没东西了：值是下一个词
+        Some(p) if p + 1 == flags.len() => 2,
+        _ => 1,
+    }
+}
+
 /// 第一个不以 `-` 开头的参数及其位置（跳过 `takes_value` 里列出的带值选项）
 fn positionals<'a>(args: &'a [String], takes_value: &[&str]) -> Vec<&'a str> {
     let mut v = Vec::new();
@@ -512,7 +654,8 @@ fn positionals<'a>(args: &'a [String], takes_value: &[&str]) -> Vec<&'a str> {
 fn pkg_line(s: &mut ChangeSummary, install: bool, tool: &str, names: &[&str]) {
     let verb = if install { "安装" } else { "卸载" };
     for n in names {
-        push(&mut s.packages, format!("{verb} {n}（{tool}）"));
+        // 安装串里可能带凭据（`git+https://user:TOKEN@host/…`）
+        push(&mut s.packages, format!("{verb} {}（{tool}）", super::super::redact::redact(n)));
     }
 }
 
@@ -661,17 +804,84 @@ fn analyze_cmd(prog: &str, args: &[String], s: &mut ChangeSummary, depth: u8) {
             }
         }
         "sed" => {
-            if args.iter().any(|a| a == "-i" || a.starts_with("-i") || a == "--in-place" || a.starts_with("--in-place=")) {
-                let p = positionals(args, &["-e", "-f", "--expression", "--file"]);
-                // 没有 -e / -f 时第一个位置参数是脚本
-                let has_script_opt = args.iter().any(|a| matches!(a.as_str(), "-e" | "-f" | "--expression" | "--file"));
-                for f in p.iter().skip(if has_script_opt { 0 } else { 1 }) {
-                    push(&mut s.files_written, f.to_string());
-                }
+            for f in sed_in_place_files(args) {
+                push(&mut s.files_written, f.to_string());
+            }
+        }
+        "rm" | "rmdir" | "unlink" => {
+            let recursive = prog == "rm"
+                && args.iter().any(|a| {
+                    a == "--recursive" || (a.starts_with('-') && !a.starts_with("--") && a.contains(['r', 'R']))
+                });
+            for t in positionals(args, &[]) {
+                let line = if recursive { format!("删除 {t}（递归）") } else { format!("删除 {t}") };
+                push_removal(&mut s.removals, line);
+            }
+        }
+        "userdel" | "deluser" => {
+            let p = positionals(args, &["-R", "--root", "-P", "--prefix", "--conf"]);
+            if let Some(u) = p.first() {
+                let home = args.iter().any(|a| matches!(a.as_str(), "-r" | "--remove" | "--remove-home"));
+                push_removal(&mut s.removals, format!("删除用户 {u}{}", if home { "（连同主目录）" } else { "" }));
             }
         }
         _ => {}
     }
+}
+
+/// `sed` 原地改写（`-i` / `-i.bak` / `-Ei` / `-ri` / `-ni` / `--in-place[=SUF]`）时改到的文件；不是原地改写为空。
+/// 短选项成串时 `i` 之后的都是备份后缀；`e` / `f` / `l` 带值（贴着写或下一个词）。
+fn sed_in_place_files(args: &[String]) -> Vec<&str> {
+    let mut in_place = false;
+    let mut script_opt = false;
+    let mut pos = Vec::new();
+    let mut opts_done = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if opts_done || a == "-" || !a.starts_with('-') {
+            pos.push(a);
+        } else if a == "--" {
+            opts_done = true;
+        } else if let Some(long) = a.strip_prefix("--") {
+            let key = long.split_once('=').map_or(long, |(k, _)| k);
+            match key {
+                "in-place" => in_place = true,
+                "expression" | "file" => {
+                    script_opt = true;
+                    if !long.contains('=') {
+                        i += 1;
+                    }
+                }
+                "line-length" if !long.contains('=') => i += 1,
+                _ => {}
+            }
+        } else {
+            let flags: Vec<char> = a.chars().skip(1).collect();
+            for (k, c) in flags.iter().enumerate() {
+                match c {
+                    'i' => {
+                        in_place = true;
+                        break;
+                    }
+                    'e' | 'f' | 'l' => {
+                        script_opt |= *c != 'l';
+                        if k + 1 == flags.len() {
+                            i += 1;
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        i += 1;
+    }
+    if !in_place {
+        return Vec::new();
+    }
+    // 没有 -e / -f 时第一个位置参数是脚本
+    pos.into_iter().skip(if script_opt { 0 } else { 1 }).collect()
 }
 
 fn service_verb(sub: &str) -> Option<&'static str> {
@@ -703,6 +913,7 @@ fn pip(tool: &str, args: &[String], s: &mut ChangeSummary) {
         match a {
             "-r" | "--requirement" => {
                 if let Some(f) = rest.get(i + 1) {
+                    let f = super::super::redact::redact(f);
                     push(&mut s.packages, format!("{} {f} 里的依赖（{tool}）", if install { "安装" } else { "卸载" }));
                 }
                 i += 1;
@@ -728,6 +939,7 @@ fn ufw(args: &[String], s: &mut ChangeSummary) {
     let Some((sub, rest)) = p.split_first() else { return };
     let (verb, rest, deleted) = match *sub {
         "delete" => match rest.split_first() {
+            Some((n, _)) if n.chars().all(|c| c.is_ascii_digit()) => return push(&mut s.ports, format!("删除 ufw 规则 {n}")),
             Some((v, r)) => (*v, r, true),
             None => return,
         },
@@ -747,18 +959,37 @@ fn ufw(args: &[String], s: &mut ChangeSummary) {
         "limit" => "限速",
         _ => return,
     };
-    // `ufw allow from x to any port 22 proto tcp` / `ufw allow 80/tcp` / `ufw allow OpenSSH`
-    let spec = match rest.iter().position(|w| *w == "port") {
-        Some(i) => {
-            let port = rest.get(i + 1).copied().unwrap_or("?");
-            match rest.iter().position(|w| *w == "proto").and_then(|j| rest.get(j + 1)) {
-                Some(pr) => format!("{port}/{pr}"),
-                None => port.to_string(),
+    // `ufw allow from x to any port 22 proto tcp` / `ufw allow 80/tcp` / `ufw allow OpenSSH` / `ufw allow from 10.0.0.0/8`
+    let after = |key: &str| rest.iter().position(|w| *w == key).and_then(|i| rest.get(i + 1)).copied();
+    let from = after("from").filter(|v| *v != "any");
+    let to = after("to").filter(|v| *v != "any");
+    let full = rest.iter().any(|w| matches!(*w, "from" | "to" | "port"));
+    let port = match after("port") {
+        Some(p) => Some(match after("proto") {
+            Some(pr) => format!("{p}/{pr}"),
+            None => p.to_string(),
+        }),
+        // 简单写法：`ufw allow 80/tcp`、`ufw allow in on eth0 80`；`on` 后面是网卡名
+        None if !full => {
+            let mut it = rest.iter().copied().filter(|w| !matches!(*w, "in" | "out" | "log" | "log-all"));
+            let mut spec = None;
+            while let Some(w) = it.next() {
+                if w == "on" {
+                    it.next();
+                    continue;
+                }
+                spec = Some(w.to_string());
+                break;
             }
+            spec
         }
-        None => rest.iter().find(|w| !matches!(**w, "in" | "out" | "on")).map(|w| w.to_string()).unwrap_or_default(),
+        None => None,
     };
-    if spec.is_empty() {
+    let mut spec = port.unwrap_or_else(|| "全部端口".to_string());
+    let peers: Vec<String> = [from.map(|f| format!("来源 {f}")), to.map(|t| format!("目标 {t}"))].into_iter().flatten().collect();
+    if !peers.is_empty() {
+        spec = format!("{spec}，{}", peers.join("，"));
+    } else if spec == "全部端口" {
         return;
     }
     let line = if deleted { format!("删除规则：{word} {spec}（ufw）") } else { format!("{word} {spec}（ufw）") };
@@ -798,11 +1029,39 @@ fn iptables(prog: &str, args: &[String], s: &mut ChangeSummary) {
     let mut port = None;
     let mut proto = None;
     let mut target = None;
+    let mut table = None;
     let mut i = 0;
+    // 选项后面的链名（可省；下一个词是选项就没给）
+    let chain_arg = |next: Option<&str>| next.filter(|n| !n.starts_with('-')).map(str::to_string);
     while i < args.len() {
         let a = args[i].as_str();
         let next = args.get(i + 1).map(String::as_str);
         match a {
+            "-t" | "--table" => {
+                table = next.filter(|t| *t != "filter");
+                i += 1;
+            }
+            "-F" | "--flush" | "-X" | "--delete-chain" => {
+                let what = if matches!(a, "-F" | "--flush") { "清空规则" } else { "删除自定义链" };
+                let chain = chain_arg(next);
+                if chain.is_some() {
+                    i += 1;
+                }
+                let scope = match (&chain, table) {
+                    (Some(c), Some(t)) => format!("{t} 表 {c} 链"),
+                    (Some(c), None) => format!("{c} 链"),
+                    (None, Some(t)) => format!("{t} 表全部"),
+                    (None, None) => "全部".to_string(),
+                };
+                push_removal(&mut s.removals, format!("{what}（{scope}，{prog}）"));
+            }
+            "-P" | "--policy" => {
+                if let (Some(c), Some(p)) = (next, args.get(i + 2)) {
+                    push(&mut s.ports, format!("默认策略 {c} → {p}（{prog}）"));
+                    i += 1;
+                }
+                i += 1;
+            }
             "-A" | "--append" | "-I" | "--insert" | "-D" | "--delete" => {
                 op = Some(if matches!(a, "-D" | "--delete") { "删除" } else { "添加" });
                 chain = next.unwrap_or("");
@@ -855,11 +1114,35 @@ fn docker(prog: &str, args: &[String], s: &mut ChangeSummary) {
     let mut rest = &args[(i + 1).min(args.len())..];
     // `docker container run` / `docker image pull` 等管理命令写法
     let mut sub = sub.as_str();
-    if matches!(sub, "container" | "image") {
+    let group = sub;
+    if matches!(sub, "container" | "image" | "system" | "volume" | "network") {
         if let Some((inner, r)) = rest.split_first() {
             sub = inner.as_str();
             rest = r;
         }
+    }
+    let expanded = expand_short_clusters(rest, DOCKER_VALUE_OPTS);
+    let rest = expanded.as_slice();
+    match (group, sub) {
+        ("image", "rm" | "remove") => sub = "rmi",
+        ("system" | "volume" | "network" | "image" | "container", "prune") | ("volume" | "network", "rm" | "remove") => {
+            let what = match group {
+                "system" => "未用的容器 / 镜像 / 网络",
+                "image" => "未用的镜像",
+                "volume" => "数据卷",
+                "network" => "网络",
+                _ => "已停止的容器",
+            };
+            if sub == "prune" {
+                return push_removal(&mut s.removals, format!("清理{what}（{prog} {group} prune）"));
+            }
+            for n in positionals(rest, &[]) {
+                push_removal(&mut s.removals, format!("删除{what} {n}（{prog}）"));
+            }
+            return;
+        }
+        ("volume" | "network" | "system", _) => return,
+        _ => {}
     }
     match sub {
         "compose" => compose(&format!("{prog} compose"), rest, s),
@@ -877,9 +1160,13 @@ fn docker(prog: &str, args: &[String], s: &mut ChangeSummary) {
                 push(&mut s.ports, format!("{p}（{prog} 映射）"));
             }
         }
-        "rm" | "stop" | "start" | "restart" | "kill" | "pause" | "unpause" => {
+        "rm" => {
+            for n in positionals(rest, &["-t", "--time", "-s", "--signal"]) {
+                push_removal(&mut s.removals, format!("删除容器 {n}（{prog}）"));
+            }
+        }
+        "stop" | "start" | "restart" | "kill" | "pause" | "unpause" => {
             let verb = match sub {
-                "rm" => "删除",
                 "stop" => "停止",
                 "start" => "启动",
                 "restart" => "重启",
@@ -893,7 +1180,7 @@ fn docker(prog: &str, args: &[String], s: &mut ChangeSummary) {
         }
         "rmi" => {
             for n in positionals(rest, &[]) {
-                push(&mut s.containers, format!("删除镜像 {n}"));
+                push_removal(&mut s.removals, format!("删除镜像 {n}（{prog}）"));
             }
         }
         "pull" => {
@@ -910,6 +1197,33 @@ fn docker(prog: &str, args: &[String], s: &mut ChangeSummary) {
         }
         _ => {}
     }
+}
+
+/// 把成串的短选项拆开：`-dp 80:80` → `-d -p 80:80`，`-p80:80` → `-p 80:80`（`takes_value` 里的短选项吃掉串里剩下的当值）。
+fn expand_short_clusters(args: &[String], takes_value: &[&str]) -> Vec<String> {
+    let mut v = Vec::with_capacity(args.len());
+    for (k, a) in args.iter().enumerate() {
+        let cluster = a.len() > 2 && a.starts_with('-') && !a.starts_with("--") && a[1..].starts_with(|c: char| c.is_ascii_alphabetic());
+        // 前一个词是带值选项：这个词是它的值，不拆
+        let is_value = k > 0 && takes_value.contains(&args[k - 1].as_str());
+        if !cluster || is_value {
+            v.push(a.clone());
+            continue;
+        }
+        for (j, c) in a[1..].char_indices() {
+            let flag = format!("-{c}");
+            let takes = takes_value.contains(&flag.as_str());
+            v.push(flag);
+            let tail = &a[1 + j + c.len_utf8()..];
+            if takes {
+                if !tail.is_empty() {
+                    v.push(tail.to_string());
+                }
+                break;
+            }
+        }
+    }
+    v
 }
 
 fn compose(prog: &str, args: &[String], s: &mut ChangeSummary) {
@@ -1160,8 +1474,16 @@ mod tests {
         let s = sum("sudo ufw allow 80/tcp && ufw allow from 10.0.0.0/8 to any port 22 proto tcp && ufw deny 3306 && ufw delete allow 8080 && ufw enable");
         assert_eq!(
             s.ports,
-            vec!["放行 80/tcp（ufw）", "放行 22/tcp（ufw）", "拒绝 3306（ufw）", "删除规则：放行 8080（ufw）", "启用防火墙（ufw）"]
+            vec!["放行 80/tcp（ufw）", "放行 22/tcp，来源 10.0.0.0/8（ufw）", "拒绝 3306（ufw）", "删除规则：放行 8080（ufw）", "启用防火墙（ufw）"]
         );
+        let s = sum("ufw allow from 10.0.0.0/8; ufw delete 3; ufw allow in on eth0 to any port 80; ufw allow in on eth0 443; ufw deny from 1.2.3.4 to 10.0.0.5");
+        assert_eq!(
+            s.ports,
+            vec!["放行 全部端口，来源 10.0.0.0/8（ufw）", "删除 ufw 规则 3", "放行 80（ufw）", "放行 443（ufw）", "拒绝 全部端口，来源 1.2.3.4，目标 10.0.0.5（ufw）"]
+        );
+        let s = sum("iptables -P INPUT DROP; iptables -F; iptables -t nat -F POSTROUTING; iptables -X MYCHAIN");
+        assert_eq!(s.ports, vec!["默认策略 INPUT → DROP（iptables）"]);
+        assert_eq!(s.removals, vec!["清空规则（全部，iptables）", "清空规则（nat 表 POSTROUTING 链，iptables）", "删除自定义链（MYCHAIN 链，iptables）"]);
         let s = sum("firewall-cmd --permanent --add-port=8080/tcp && firewall-cmd --remove-port 9000/udp --permanent && firewall-cmd --reload");
         assert_eq!(s.ports, vec!["放行 8080/tcp（firewalld）", "关闭 9000/udp（firewalld）"]);
         let s = sum("iptables -A INPUT -p tcp --dport 443 -j ACCEPT; iptables -D INPUT -p tcp --dport 23 -j DROP; iptables -L");
@@ -1175,7 +1497,21 @@ mod tests {
         assert_eq!(s.containers, vec!["运行 nginx:1.25（名为 web）"]);
         assert_eq!(s.ports, vec!["8080:80（docker 映射）"]);
         let s = sum("docker rm -f web old && docker compose -f deploy/compose.yml up -d && docker-compose down && docker pull redis:7");
-        assert_eq!(s.containers, vec!["删除 web", "删除 old", "docker compose up（deploy/compose.yml）", "docker-compose down", "拉取镜像 redis:7"]);
+        assert_eq!(s.containers, vec!["docker compose up（deploy/compose.yml）", "docker-compose down", "拉取镜像 redis:7"]);
+        assert_eq!(s.removals, vec!["删除容器 web（docker）", "删除容器 old（docker）"]);
+        // 成串的短选项带值：`-dp 80:80`、`-itp8080:80`
+        let s = sum("docker run -dp 80:80 nginx; docker run -itp8080:80 --rm httpd:2 sh");
+        assert_eq!(s.containers, vec!["运行 nginx", "运行 httpd:2"]);
+        assert_eq!(s.ports, vec!["80:80（docker 映射）", "8080:80（docker 映射）"]);
+        // 镜像删除不算容器
+        let s = sum("docker image rm nginx:old && docker rmi a && docker container rm -f c1 && docker system prune -af && docker image prune");
+        assert!(s.containers.is_empty());
+        assert_eq!(
+            s.removals,
+            vec!["删除镜像 nginx:old（docker）", "删除镜像 a（docker）", "删除容器 c1（docker）", "清理未用的容器 / 镜像 / 网络（docker system prune）", "清理未用的镜像（docker image prune）"]
+        );
+        let s = sum("docker system df; docker image ls");
+        assert!(s.containers.is_empty() && s.removals.is_empty());
         let s = sum("docker ps -a; docker logs web; docker build -t app:dev .");
         assert_eq!(s.containers, vec!["构建镜像 app:dev"]);
     }
@@ -1201,6 +1537,9 @@ mod tests {
         assert_eq!(s.files_written, vec!["/etc/sysctl.conf", "/tmp/ls.txt", "err.log"]);
         let s = sum("sed -i 's/a/b/' /etc/nginx/nginx.conf && sed -i.bak -e 's/x/y/' f1 f2 && sed 's/a/b/' g");
         assert_eq!(s.files_written, vec!["/etc/nginx/nginx.conf", "f1", "f2"]);
+        // 成串的短选项里带 i（含贴着的备份后缀）、-e 在串尾带值、--in-place=SUF
+        let s = sum("sed -Ei 's/a/b/' h1; sed -ri.orig 's/a/b/' h2; sed -ni -e '1p' h3; sed -Ee 's/x/y/' -i h4; sed --in-place=.b --expression=s/a/b/ h5; sed -n 's/a/b/p' nope");
+        assert_eq!(s.files_written, vec!["h1", "h2", "h3", "h4", "h5"]);
         // 比较运算 / 引号里的 > 不是重定向
         assert!(sum("test 1 -gt 0 && echo \"a>b\" && awk '$1 > 3'").files_written.is_empty());
     }
@@ -1230,6 +1569,22 @@ mod tests {
         assert_eq!(s.services, vec!["停止 x"]);
         let s = sum("sudo -u deploy env A=1 nohup npm install express");
         assert_eq!(s.packages, vec!["安装 express（npm）"]);
+        // sudo 成串的短选项带值 / 值贴着写 / 长选项
+        for cmd in ["sudo -iu root apt install x", "sudo -u root apt install x", "sudo -g grp apt install x", "sudo -uroot apt install x", "sudo -E -H --user=root apt install x", "sudo --user root -- apt install x"] {
+            assert_eq!(sum(cmd).packages, vec!["安装 x（apt）"], "{cmd}");
+        }
+    }
+
+    #[test]
+    fn arithmetic_shift_is_not_a_heredoc() {
+        for script in ["echo $[1<<2]\napt install nginx", "(( x = 1 << 2 ))\napt install nginx", "if [[ a < b ]]; then echo; fi\napt install nginx", "echo $((1<<2))\napt install nginx"] {
+            let s = sum(script);
+            assert_eq!(s.packages, vec!["安装 nginx（apt）"], "{script}");
+            assert!(s.files_written.is_empty(), "{script}");
+        }
+        // 真 heredoc 照旧
+        assert!(sum("cat <<EOF\napt install evil\nEOF").packages.is_empty());
+        assert_eq!(sum("((n++)) && apt install a").packages, vec!["安装 a（apt）"]);
     }
 
     #[test]
@@ -1262,6 +1617,59 @@ mod tests {
         // 序列化成 camelCase
         let v = serde_json::to_value(&s).unwrap();
         assert!(v.get("filesWritten").is_some());
+    }
+
+    #[test]
+    fn package_specs_are_redacted() {
+        let s = sum("pip install git+https://bob:ghp_SECRETTOKEN123@github.com/org/repo.git && pip install -r https://u:pw123@h/req.txt");
+        assert!(s.packages.iter().all(|p| !p.contains("ghp_SECRETTOKEN123") && !p.contains("pw123")), "{:?}", s.packages);
+        assert_eq!(s.packages.len(), 2);
+        assert_eq!(sum("npm i lodash").packages, vec!["安装 lodash（npm）"]);
+    }
+
+    #[test]
+    fn removals_rm_userdel_and_cap() {
+        let s = sum("rm -rf /var/www/old && rm /tmp/a.sh /tmp/a.sh && rmdir /srv/empty && sudo userdel -r bob && apt purge nginx");
+        assert_eq!(s.removals, vec!["删除 /var/www/old（递归）", "删除 /tmp/a.sh", "删除 /srv/empty", "删除用户 bob（连同主目录）"]);
+        assert_eq!(s.packages, vec!["卸载 nginx（apt）"], "apt purge 仍归软件包");
+        let many: Vec<String> = (0..40).map(|i| format!("/tmp/f{i}")).collect();
+        let s = sum(&format!("rm -f {}", many.join(" ")));
+        assert_eq!(s.removals.len(), MAX_REMOVALS + 1);
+        assert_eq!(s.removals.last().unwrap(), MORE_REMOVALS);
+        // 合并时上限照旧、「还有更多」留在最后
+        let mut a = s.clone();
+        a.merge(sum("rm /x"));
+        assert_eq!(a.removals.len(), MAX_REMOVALS + 1);
+        assert_eq!(a.removals.last().unwrap(), MORE_REMOVALS);
+    }
+
+    #[test]
+    fn merge_unions_in_order_and_absorbs_only_new_rows() {
+        let mut a = sum("apt install a; systemctl restart x; echo > f1");
+        a.commands = 2;
+        let mut b = sum("apt install b; apt install a; echo > f2; echo > f1");
+        b.commands = 3;
+        a.merge(b);
+        assert_eq!(a.packages, vec!["安装 a（apt）", "安装 b（apt）"]);
+        assert_eq!(a.files_written, vec!["f1", "f2"]);
+        assert_eq!(a.services, vec!["重启 x"]);
+        assert_eq!(a.commands, 5);
+        // 按 seq 增量：已并过的不再算
+        let r1 = serde_json::to_string(&rec("c1", "exec", "apt install a")).unwrap();
+        let r2 = serde_json::to_string(&rec("c1", "exec", "apt install b")).unwrap();
+        let other = serde_json::to_string(&rec("c2", "exec", "apt install z")).unwrap();
+        let mut s = ChangeSummary { merged_seq: Some(0), ..Default::default() };
+        assert!(s.absorb_rows("c1", [(1, r1.as_str()), (2, other.as_str())]));
+        assert!(!s.absorb_rows("c1", [(1, r1.as_str())]));
+        assert!(s.absorb_rows("c1", [(1, r1.as_str()), (5, r2.as_str())]));
+        assert_eq!((s.commands, s.packages.len(), s.merged_seq), (2, 2, Some(5)));
+        // 旧版本定格的（没有 merged_seq）不动
+        let mut legacy = ChangeSummary::default();
+        assert!(!legacy.absorb_rows("c1", [(9, r2.as_str())]));
+        assert!(legacy.is_empty());
+        // 旧的存档（没有 removals / mergedSeq 字段）能读
+        let old: ChangeSummary = serde_json::from_str(r#"{"filesWritten":[],"commands":1,"packages":[],"services":[],"ports":[],"containers":[],"downloads":[]}"#).unwrap();
+        assert_eq!((old.commands, old.merged_seq), (1, None));
     }
 
     #[test]

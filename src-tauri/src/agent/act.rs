@@ -167,6 +167,21 @@ pub struct RunBudgetOverride {
     /// 最多花费（微美元）。`Some(0)` = 不限。
     #[serde(default)]
     pub max_cost_micros: Option<u64>,
+    /// 喂回模型 + 模型回复的累计字符上限。`Some(0)` = 不限。
+    #[serde(default)]
+    pub max_output_chars: Option<u64>,
+}
+
+impl From<budget::RunBudget> for RunBudgetOverride {
+    /// 把一份完整的预算原样当覆盖（托管接驳 / 重启后沿用重启前生效的那份）
+    fn from(b: budget::RunBudget) -> Self {
+        Self {
+            max_steps: Some(b.max_steps),
+            max_minutes: Some(b.max_minutes),
+            max_cost_micros: Some(b.max_cost_micros),
+            max_output_chars: Some(b.max_output_chars),
+        }
+    }
 }
 
 impl AgentRunRequest {
@@ -197,6 +212,9 @@ pub fn effective_budget(base: budget::RunBudget, req: &AgentRunRequest) -> budge
         }
         if let Some(c) = o.max_cost_micros {
             b.max_cost_micros = c;
+        }
+        if let Some(c) = o.max_output_chars {
+            b.max_output_chars = c;
         }
     }
     b.clamped()
@@ -3754,6 +3772,10 @@ pub async fn run(
     let mut feedback = String::new();
     // 运行预算（4.6）：自本轮开始 / 最近一次「继续」起累计；用尽即暂停等用户，不是收场。
     let mut limits = effective_budget(cfg.budget, req);
+    if let Some(h) = &host {
+        // 随现场落盘：重启 / 接驳后按这份接着跑（含开始时的覆盖）
+        h.note_limits(&limits);
+    }
     // 对话：每段（开局 / 最近一次「继续」起）从零算；托管：契约级累计（随 checkpoint 持久化），段从最近一次「继续」算
     let mut meter = match &host {
         Some(h) => Meter::cumulative(h.spent()),
@@ -4593,9 +4615,16 @@ pub async fn run(
                     let mut approver = FileApprover { app, runtime, session: &session, target: &target_id, label: &label, host: host.as_deref(), unattended };
                     let out = super::files_tool::run(&ops, &call, wgate, &mut approver, acct.redact).await;
                     drop(ops);
-                    // 托管覆盖 / 修改了已有文件：原文存一份到本机（「还原」用），不给模型
-                    if let (Some(h), Some(orig), Some(ch)) = (&host, out.original.as_deref(), out.change.as_ref()) {
-                        super::host_history_cmd::back_up_original(app, h.contract_id(), &target_id, &ch.path, orig);
+                    // 托管第一次写这个文件：原文存一份到本机（「还原」用），不给模型；新建的 / 备份不了的也记下，
+                    // 免得后面再改时把托管自己写的版本当成原文
+                    if let (Some(h), Some(ch)) = (&host, out.change.as_ref()) {
+                        use super::host::backup::Touch;
+                        let touch = match (ch.created, out.original.as_deref()) {
+                            (true, _) => Touch::Created,
+                            (false, Some(orig)) => Touch::Original(orig),
+                            (false, None) => Touch::Unread,
+                        };
+                        super::host_history_cmd::back_up_original(app, h.contract_id(), &target_id, &ch.path, touch);
                     }
                     if let Some(h) = &host {
                         for u in h.take_user() {
@@ -6660,6 +6689,7 @@ fn absorb_host_pending(
     let Some(grant) = h.take_resume() else { return false };
     if let Some(g) = grant {
         *limits = apply_grant(*limits, g);
+        h.note_limits(limits);
     }
     meter.new_segment();
     feedback.push_str(budget::RESUME_FEEDBACK);
@@ -10262,11 +10292,11 @@ mod tests {
         r.mode = Some("steward".into());
         let b = effective_budget(base, &r);
         assert_eq!((b.max_steps, b.max_minutes), (400, 360));
-        r.budget = Some(RunBudgetOverride { max_steps: Some(30), max_minutes: None, max_cost_micros: None });
+        r.budget = Some(RunBudgetOverride { max_steps: Some(30), max_minutes: None, max_cost_micros: None, max_output_chars: None });
         let b = effective_budget(base, &r);
         assert_eq!((b.max_steps, b.max_minutes), (30, 360));
         // 越界被夹紧
-        r.budget = Some(RunBudgetOverride { max_steps: Some(u32::MAX), max_minutes: Some(u32::MAX), max_cost_micros: None });
+        r.budget = Some(RunBudgetOverride { max_steps: Some(u32::MAX), max_minutes: Some(u32::MAX), max_cost_micros: None, max_output_chars: None });
         let b = effective_budget(base, &r);
         assert!(b.max_steps <= budget::MAX_STEPS_CEIL && b.max_minutes <= budget::MAX_MINUTES_CEIL);
     }

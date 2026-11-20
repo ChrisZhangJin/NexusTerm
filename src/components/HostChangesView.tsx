@@ -1,6 +1,7 @@
 /**
  * 「实际改动」：一次托管真正做了什么（按执行过的命令 / 文件写入提取，不是模型的说法）。
- * 托管覆盖 / 修改过的已有文件留了原文备份的，行尾有「还原」：确认后经原来那个终端的文件通道写回。
+ * 托管覆盖 / 修改过的已有文件留了原文备份的，行尾有「还原」：确认后经原来那个终端的文件通道写回；
+ * 托管新建的文件、原文没备份的（过大 / 二进制等）只注明原因，不给「还原」。
  *
  * 完成报告（HostCard）里不给 `data`，自己按契约 id 拉；历史托管里直接给。
  */
@@ -8,7 +9,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import { toFriendlyError } from "../lib/errors";
-import { changeGroups, changesEmpty, fileRows, fmtSize, fmtWhen } from "../lib/hostHistory";
+import { backupInfo, changeGroups, changesEmpty, fileRows, fmtWhen } from "../lib/hostHistory";
 import type { HostBackupEntry, HostChanges } from "../types";
 import ConfirmDialog, { type ConfirmOptions } from "./ConfirmDialog";
 
@@ -72,13 +73,15 @@ export default function HostChangesView({ contractId, data }: { contractId: stri
           <ul>
             {files.map((f) => {
               const b = f.backup;
+              const info = b ? backupInfo(b) : null;
               const at = b ? (restored[b.id] ?? b.restoredAt ?? null) : null;
               return (
                 <li key={`${f.path}-${b?.id ?? ""}`}>
                   <code>{f.path}</code>
-                  {b && (
+                  {info && !info.restorable && <span className="st-meta"> · {info.note}</span>}
+                  {b && info?.restorable && (
                     <>
-                      <span className="st-meta"> · 原文已备份 {fmtSize(b.size)}</span>
+                      <span className="st-meta"> · {info.note}</span>
                       {at ? (
                         <span className="st-meta"> · 已于 {fmtWhen(at)} 还原</span>
                       ) : null}

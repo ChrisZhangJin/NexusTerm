@@ -57,6 +57,8 @@ pub trait HostIo: Send + Sync {
     fn note_notice(&self, _notice: Option<&str>) {}
     /// 期限暂停后用户「继续」过了（随 checkpoint 落盘，接驳后不再因同一期限暂停）。默认不记。
     fn note_deadline_ack(&self, _acked: bool) {}
+    /// 生效的运行预算变了（开跑、加预算继续），下一次 `save` 一并落盘。默认不记。
+    fn note_limits(&self, _limits: &super::super::budget::RunBudget) {}
     /// 被托管的 console `id` 还在不在（tab 没关、连接没断）。挂起等人期间据此发现「tab 关了」。默认在。
     fn console_alive(&self, _id: &str) -> bool {
         true
@@ -478,6 +480,16 @@ impl HostShared {
     /// 重启前被托管的那个 console 的描述。
     pub fn saved_console(&self) -> Option<super::ConsoleRef> {
         self.io.snapshot().map(|c| c.console)
+    }
+
+    /// 记下生效的运行预算（随 checkpoint 落盘）。
+    pub fn note_limits(&self, limits: &super::super::budget::RunBudget) {
+        self.io.note_limits(limits);
+    }
+
+    /// 重启 / 接驳前生效的运行预算（旧现场没有为 None）。
+    pub fn saved_limits(&self) -> Option<super::super::budget::RunBudget> {
+        self.io.snapshot().and_then(|c| c.limits)
     }
 
     /// 本次托管里 `id` 那个终端（主终端或其余终端之一）保存的描述。

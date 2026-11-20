@@ -215,6 +215,23 @@ impl Store {
             .flatten()
     }
 
+    /// 某份契约 seq 大于 `after_seq` 的决策记录 `(seq, JSON)`，按 seq 升序（改动摘要增量合并用）。
+    pub fn steward_decisions_since(&self, contract_id: &str, after_seq: i64) -> Vec<(i64, String)> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT seq, record_json FROM steward_decisions WHERE contract_id = ?1 AND seq > ?2 ORDER BY seq",
+        ) else {
+            return Vec::new();
+        };
+        let rows = stmt
+            .query_map(params![contract_id, after_seq], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map(|it| it.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        rows
+    }
+
     /// 某份契约的全部决策记录 JSON，按 seq 升序。
     pub fn steward_decisions_for(&self, contract_id: &str) -> Vec<String> {
         let Ok(conn) = self.conn.lock() else {
@@ -330,8 +347,10 @@ mod tests {
         let (store, _) = temp_store_at("host-dec-for");
         store.steward_decision_insert(1, "c1", "t", "", r#"{"a":1}"#, "applied").unwrap();
         store.steward_decision_insert(2, "c2", "t", "", r#"{"b":1}"#, "applied").unwrap();
-        store.steward_decision_insert(3, "c1", "t", "", r#"{"a":2}"#, "applied").unwrap();
+        let s3 = store.steward_decision_insert(3, "c1", "t", "", r#"{"a":2}"#, "applied").unwrap();
         assert_eq!(store.steward_decisions_for("c1"), vec![r#"{"a":1}"#.to_string(), r#"{"a":2}"#.to_string()]);
+        assert_eq!(store.steward_decisions_since("c1", 1), vec![(s3, r#"{"a":2}"#.to_string())]);
+        assert!(store.steward_decisions_since("c1", s3).is_empty());
         assert!(store.host_changes_get("c1").is_none());
         store.host_changes_put("c1", "x", 1).unwrap();
         store.host_changes_put("c1", "y", 2).unwrap();
