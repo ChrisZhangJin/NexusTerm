@@ -55,6 +55,9 @@
 //! `nx://agent/step/*`，字段 camelCase，如 `gateVerdict`）、`h.statuses()`（`nx://host/all`）、
 //! `h.screen()`（模拟器当前屏）、`h.llm.feedback()`（模型每一步看到的反馈）、`h.llm.cursor()`（剧本走到哪）。
 //! 交互：`h.answer("...")`（= 面板答卡，走 `host_answer`）、`h.type_raw("...")`（= 用户直接敲终端）。
+//! 多终端托管：`let b = h.add_console("b")` 再起一个 bash（cwd = `dir/b`），剧本里用占位符 `{b}` 写 target、
+//! `h.llm.substitute("{b}", &b)` 换成真 id，`h.start_with(goal, tier, &[&b])` 开始；`h.screen_of(&b)` /
+//! `h.paint_on(&b, ..)` / `h.type_raw_on(&b, ..)` 看 / 布置那个终端（见 `multi_console_*` 场景）。
 //! 失败时断言信息里带 `h.dump()`：屏幕 + 步骤 + 模型每一步看到的反馈。
 //!
 //! ## 把误读样本变成屏幕夹具

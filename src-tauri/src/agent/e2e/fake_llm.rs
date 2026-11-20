@@ -124,6 +124,36 @@ impl FakeLlm {
         self.inner.lock().feedback.clone()
     }
 
+    /// 剧本里工具参数中的占位符（如 `{b}`）换成运行时才知道的值（如另起终端的 console id）。
+    pub fn substitute(&self, placeholder: &str, value: &str) {
+        fn walk(v: &Value, p: &str, x: &str) -> Value {
+            match v {
+                Value::String(s) => Value::String(s.replace(p, x)),
+                Value::Array(a) => Value::Array(a.iter().map(|i| walk(i, p, x)).collect()),
+                Value::Object(o) => Value::Object(o.iter().map(|(k, i)| (k.clone(), walk(i, p, x))).collect()),
+                other => other.clone(),
+            }
+        }
+        for t in &mut self.inner.lock().turns {
+            if let Reply::Tools(calls) = &mut t.reply {
+                for (_, args) in calls.iter_mut() {
+                    *args = walk(args, placeholder, value);
+                }
+            }
+        }
+    }
+
+    /// 托管主循环每次请求的系统提示词（判据起草请求除外）。
+    pub fn systems(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .requests
+            .iter()
+            .filter_map(|r| r["messages"].as_array()?.first().filter(|m| m["role"] == "system")?["content"].as_str().map(str::to_string))
+            .filter(|s| !is_criteria_draft(s))
+            .collect()
+    }
+
     /// 全部请求的可读摘要（失败时打印）。
     pub fn transcript(&self) -> String {
         let g = self.inner.lock();

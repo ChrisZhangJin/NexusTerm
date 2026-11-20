@@ -309,3 +309,72 @@ fn nested_shell_with_custom_prompt_hands_over() {
     let p = h.wait_terminal(Duration::from_secs(30));
     assert_completed(&h, &p);
 }
+
+/// 7. 多终端托管：主终端 A + 其余终端 B 一份托管。两个终端都被租下（只读锁定）；模型用 `target` 在 B 上写文件，
+/// 判据在主终端上核验；托管状态带两个终端；结束时两个终端的租约一起放掉。
+#[test]
+fn multi_console_writes_on_extra_via_target() {
+    let mut h = harness!(
+        vec![
+            // 第 1 步之前模型就该知道有哪几个终端、怎么指定
+            turn(None, "nx_exec", json!({ "target": "{b}", "command": "echo from-b > b.txt" })),
+            complete(Some("已确认执行完毕")),
+        ],
+        vec![],
+        json!([{ "kind": "fileExists", "path": "{dir}/b/b.txt" }])
+    );
+    let b = h.add_console("b");
+    h.llm.substitute("{b}", &b);
+    h.start_with("在 B 上写一个 b.txt", "auto", &[&b]);
+    // 开跑后两个终端都在这份托管的租约下
+    let run = h.host().run_id().to_string();
+    for c in [h.console.clone(), b.clone()] {
+        assert!(h.state().act.control.holders_of(&c).contains(&run), "{c} 没被租下");
+    }
+    assert_eq!(h.host().consoles(), vec![h.console.clone(), b.clone()]);
+    let p = h.wait_terminal(Duration::from_secs(30));
+    assert_completed(&h, &p);
+    assert_eq!(std::fs::read_to_string(h.dir_of(&b).join("b.txt")).unwrap(), "from-b\n");
+    assert!(!h.dir.join("b.txt").exists(), "写在了主终端上");
+    assert!(h.screen_of(&b).contains("echo from-b"), "命令是在 B 的终端里敲的：\n{}", h.screen_of(&b));
+    assert!(!h.screen().contains("echo from-b"), "主终端上不该出现：\n{}", h.screen());
+    // 系统提示里有「本次托管的终端」一节
+    assert!(h.llm.systems().iter().any(|s| s.contains("本次托管的终端") && s.contains(&b)), "{}", h.dump());
+    // 状态里带两个终端（主终端在前）
+    h.wait_until(Duration::from_secs(5), "面板收到完成状态", |h| h.statuses().iter().any(|s| s["state"] == "completed"));
+    let st = h.statuses().last().cloned().unwrap();
+    let ids: Vec<&str> = st["consoles"].as_array().unwrap().iter().map(|c| c["consoleId"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec![h.console.as_str(), b.as_str()]);
+    // 结束：两个终端的租约一起还给用户
+    h.wait_until(Duration::from_secs(5), "租约放掉", |h| {
+        h.state().act.control.holders_of(&h.console).is_empty() && h.state().act.control.holders_of(&b).is_empty()
+    });
+}
+
+/// 8. 多终端托管：发给 B 的按键按 **B 的屏幕**判。B 停在密码提示上 → 门禁拒（替你输密码），按键没进 B；
+/// 同样的按键发给主终端 A（普通 shell 提示符）照常执行。不在本次托管里的终端一律拒。
+#[test]
+fn multi_console_keys_judged_by_target_screen() {
+    let mut h = harness!(
+        vec![
+            turn(None, "nx_send_keys", json!({ "target": "{b}", "keys": "hunter2<Enter>" })),
+            turn(Some("密码"), "nx_send_keys", json!({ "keys": "echo a-ok-hunter2<Enter>" })),
+            turn(None, "nx_exec", json!({ "target": "e2e-ghost", "command": "uptime" })),
+            complete(Some("不在本次托管里")),
+        ],
+        vec![],
+        always_ok()
+    );
+    let b = h.add_console("b");
+    h.llm.substitute("{b}", &b);
+    h.paint_on(&b, &["[sudo] password for e2e: ".to_string()]);
+    h.start_with("在 A 上执行一下，B 先别动", "auto", &[&b]);
+    let p = h.wait_terminal(Duration::from_secs(40));
+    assert_completed(&h, &p);
+    let refused = refused_gates(&h);
+    assert_eq!(refused.len(), 2, "B 的密码提示一张 + 范围外终端一张：{refused:?}\n{}", h.dump());
+    assert_eq!(refused[0]["target"], b.as_str(), "拒的是 B 上的按键：{refused:?}");
+    assert!(refused[1]["target"] == "e2e-ghost", "{refused:?}");
+    assert!(!h.screen_of(&b).contains("hunter2"), "按键不该进 B：\n{}", h.screen_of(&b));
+    assert!(h.screen().contains("a-ok-hunter2"), "A 上照常执行：\n{}", h.screen());
+}

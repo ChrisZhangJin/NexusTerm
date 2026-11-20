@@ -174,7 +174,61 @@ pub struct Harness {
     events: Arc<Mutex<Vec<Captured>>>,
     listeners: Vec<EventId>,
     stop: Arc<AtomicBool>,
+    /// 多终端场景里另起的终端（[`add_console`](Self::add_console)）
+    extras: Vec<Rig>,
     _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+/// 一个真 bash + 它自己的模拟器与帧泵（多终端场景的其余终端）。
+struct Rig {
+    id: String,
+    dir: PathBuf,
+    vt: Arc<Mutex<Vt>>,
+    listener: EventId,
+    stop: Arc<AtomicBool>,
+}
+
+/// 帧泵：PTY 字节 → 模拟器 → 全量帧，外加心跳帧。返回 (监听, 停止旗)。
+fn pump(app: &AppHandle, console: &str, vt: &Arc<Mutex<Vt>>) -> (EventId, Arc<AtomicBool>) {
+    let frame_id = Arc::new(AtomicU64::new(1));
+    let listener = {
+        let (vt, fid, a, c) = (Arc::clone(vt), Arc::clone(&frame_id), app.clone(), console.to_string());
+        app.listen_any(format!("nx://local/data/{console}"), move |e| {
+            let raw: String = serde_json::from_str(e.payload()).unwrap_or_default();
+            let bytes = base64::engine::general_purpose::STANDARD.decode(raw).unwrap_or_default();
+            let mut g = vt.lock();
+            g.feed(&bytes);
+            push_frame(&a, &c, &g, fid.fetch_add(1, Ordering::Relaxed));
+        })
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let (vt, fid, a, c, stop) = (Arc::clone(vt), frame_id, app.clone(), console.to_string(), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(HEARTBEAT);
+                let g = vt.lock();
+                push_frame(&a, &c, &g, fid.fetch_add(1, Ordering::Relaxed));
+            }
+        });
+    }
+    (listener, stop)
+}
+
+/// 起本地 bash，固定提示符、进 `dir`、清屏，等提示符那一帧落进 ScreenStore。
+fn boot_shell(app: &AppHandle, console: &str, dir: &Path, vt: &Arc<Mutex<Vt>>) {
+    let state = app.state::<AppState>();
+    state.local.spawn(console, COLS as u16, ROWS as u16, app).expect("起本地 shell");
+    let cmd = format!(" unset HISTFILE PROMPT_COMMAND; export PS1='\\u@e2e:\\w\\$ '; cd '{}'; clear\n", dir.display());
+    state.local.write(console, cmd.as_bytes()).expect("写 PTY");
+    let t0 = Instant::now();
+    while !vt.lock().text().lines().next().is_some_and(|l| l.contains("@e2e:")) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "等提示符超时，当前屏幕：\n{}", vt.lock().text());
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // 清屏后再等一个心跳，让提示符那一帧落进 ScreenStore。
+    // 旁路缓冲**不清**：nx_exec 拿它的最后一行当「提示符基线」判命令结束（清了就只剩静默判定）
+    std::thread::sleep(HEARTBEAT * 2);
 }
 
 /// 把模拟器当前这一屏作为全量帧推进 `ScreenStore`（等同前端 `steward_screen_push`）。
@@ -230,21 +284,11 @@ impl Harness {
         state.agent.apply_config(&cfg);
 
         let vt = Arc::new(Mutex::new(Vt::new(COLS, ROWS)));
-        let frame_id = Arc::new(AtomicU64::new(1));
         let events: Arc<Mutex<Vec<Captured>>> = Arc::default();
         let t0 = Instant::now();
         let mut listeners = Vec::new();
-        // 帧泵：PTY 字节 → 模拟器 → 全量帧
-        {
-            let (vt, fid, a, c) = (Arc::clone(&vt), Arc::clone(&frame_id), app.clone(), console.clone());
-            listeners.push(app.listen_any(format!("nx://local/data/{console}"), move |e| {
-                let raw: String = serde_json::from_str(e.payload()).unwrap_or_default();
-                let bytes = base64::engine::general_purpose::STANDARD.decode(raw).unwrap_or_default();
-                let mut g = vt.lock();
-                g.feed(&bytes);
-                push_frame(&a, &c, &g, fid.fetch_add(1, Ordering::Relaxed));
-            }));
-        }
+        let (pl, stop) = pump(&app, &console, &vt);
+        listeners.push(pl);
         for ch in [format!("nx://agent/step/{console}"), crate::agent::host_cmd::HOST_ALL_EVENT.to_string()] {
             let (ev, chan) = (Arc::clone(&events), ch.clone());
             listeners.push(app.listen_any(ch, move |e| {
@@ -252,18 +296,7 @@ impl Harness {
                 ev.lock().push(Captured { at: t0.elapsed(), channel: chan.clone(), payload });
             }));
         }
-        let stop = Arc::new(AtomicBool::new(false));
-        {
-            let (vt, fid, a, c, stop) = (Arc::clone(&vt), Arc::clone(&frame_id), app.clone(), console.clone(), Arc::clone(&stop));
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(HEARTBEAT);
-                    let g = vt.lock();
-                    push_frame(&a, &c, &g, fid.fetch_add(1, Ordering::Relaxed));
-                }
-            });
-        }
-        state.local.spawn(&console, COLS as u16, ROWS as u16, &app).expect("起本地 shell");
+        boot_shell(&app, &console, &dir, &vt);
         let h = Self {
             app: app.clone(),
             console,
@@ -274,18 +307,65 @@ impl Harness {
             events,
             listeners,
             stop,
+            extras: Vec::new(),
             _serial: serial,
         };
-        // 固定提示符、进临时目录、清屏：之后屏幕上只有场景自己的东西
-        h.type_raw(&format!(
-            " unset HISTFILE PROMPT_COMMAND; export PS1='\\u@e2e:\\w\\$ '; cd '{}'; clear\n",
-            h.dir.display()
-        ));
-        h.wait_screen(Duration::from_secs(10), |s| s.lines().next().is_some_and(|l| l.contains("@e2e:")));
-        // 清屏后再等一个心跳，让提示符那一帧落进 ScreenStore。
-        // 旁路缓冲**不清**：nx_exec 拿它的最后一行当「提示符基线」判命令结束（清了就只剩静默判定）
-        std::thread::sleep(HEARTBEAT * 2);
         Some(h)
+    }
+
+    /// 多终端场景：再起一个本地 bash（cwd = 工作目录下的子目录 `name`），返回它的 console id。
+    pub fn add_console(&mut self, name: &str) -> String {
+        let id = format!("{}-{name}", self.console);
+        let dir = self.dir.join(name);
+        std::fs::create_dir_all(&dir).expect("建子目录");
+        let vt = Arc::new(Mutex::new(Vt::new(COLS, ROWS)));
+        let (listener, stop) = pump(&self.app, &id, &vt);
+        boot_shell(&self.app, &id, &dir, &vt);
+        self.extras.push(Rig { id: id.clone(), dir, vt, listener, stop });
+        id
+    }
+
+    fn rig(&self, id: &str) -> &Rig {
+        self.extras.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("没有终端 {id}"))
+    }
+
+    /// 终端的工作目录（主终端 = `dir`）。
+    pub fn dir_of(&self, id: &str) -> PathBuf {
+        if id == self.console {
+            return self.dir.clone();
+        }
+        self.rig(id).dir.clone()
+    }
+
+    /// 终端的当前屏（主终端或其余终端之一）。
+    pub fn screen_of(&self, id: &str) -> String {
+        if id == self.console {
+            return self.screen();
+        }
+        self.rig(id).vt.lock().text()
+    }
+
+    /// 绕过托管直接往某个终端的 PTY 写。
+    pub fn type_raw_on(&self, id: &str, s: &str) {
+        self.state().local.write(id, s.as_bytes()).expect("写 PTY");
+    }
+
+    /// 同 [`paint`](Self::paint)，画在终端 `id` 上（主终端或其余终端之一）。
+    pub fn paint_on(&self, id: &str, lines: &[String]) {
+        let fixture = self.dir_of(id).join(".nx-screen");
+        std::fs::write(&fixture, lines.join("\n")).expect("写屏幕夹具");
+        let last = lines.last().cloned().unwrap_or_default();
+        self.type_raw_on(id, " clear; printf '%s' \"$(cat .nx-screen)\"; read -r _nx_answer\n");
+        let t0 = Instant::now();
+        loop {
+            let s = self.screen_of(id);
+            if !s.contains("_nx_answer") && s.lines().any(|l| l.trim_end() == last.trim_end()) {
+                break;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(10), "等屏幕超时，当前屏幕：\n{s}");
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        std::thread::sleep(HEARTBEAT * 2);
     }
 
     pub fn state(&self) -> tauri::State<'_, AppState> {
@@ -305,14 +385,7 @@ impl Harness {
     /// 终端此刻在 `read` 里等输入 —— 和真程序停在提示符上一样。模型随后发的按键进 `read`，回车后 shell 提示符回来。
     /// 只是**文本**还原：颜色 / 光标位置 / alt screen 不还原（见 `vt.rs` 的局限）。
     pub fn paint(&self, lines: &[String]) {
-        let fixture = self.dir.join(".nx-screen");
-        std::fs::write(&fixture, lines.join("\n")).expect("写屏幕夹具");
-        let last = lines.last().cloned().unwrap_or_default();
-        self.type_raw(" clear; printf '%s' \"$(cat .nx-screen)\"; read -r _nx_answer\n");
-        self.wait_screen(Duration::from_secs(10), |s| {
-            !s.contains("_nx_answer") && s.lines().any(|l| l.trim_end() == last.trim_end())
-        });
-        std::thread::sleep(HEARTBEAT * 2);
+        self.paint_on(&self.console, lines);
     }
 
     pub fn wait_screen(&self, timeout: Duration, cond: impl Fn(&str) -> bool) {
@@ -325,7 +398,22 @@ impl Harness {
 
     /// 走真实入口 `host_cmd::host_start`（YOLO：判据草稿直接采用，不弹确认卡）。
     pub fn start(&mut self, goal: &str, tier: &str) -> String {
+        self.start_with(goal, tier, &[])
+    }
+
+    /// 多终端托管：主终端 = 本场景的 console，`extra` = [`add_console`](Self::add_console) 起的其余终端。
+    pub fn start_with(&mut self, goal: &str, tier: &str, extra: &[&str]) -> String {
         let app = self.app.clone();
+        let extra = (!extra.is_empty()).then(|| {
+            extra
+                .iter()
+                .map(|id| crate::agent::host_cmd::ConsoleHint {
+                    console_id: id.to_string(),
+                    label: Some(format!("e2e-{id}")),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>()
+        });
         let fut = crate::agent::host_cmd::host_start(
             self.console.clone(),
             goal.to_string(),
@@ -338,6 +426,7 @@ impl Harness {
             None,
             None,
             None,
+            extra,
             app.clone(),
             app.state(),
             app.state(),
@@ -469,6 +558,14 @@ impl Drop for Harness {
             self.app.unlisten(l);
         }
         let _ = self.state().local.close(&self.console);
+        for r in self.extras.drain(..) {
+            r.stop.store(true, Ordering::Relaxed);
+            self.app.unlisten(r.listener);
+            let _ = self.app.state::<AppState>().local.close(&r.id);
+            if let Some(s) = self.app.try_state::<ScreenStore>() {
+                s.drop(&r.id);
+            }
+        }
         if let Some(s) = self.app.try_state::<ScreenStore>() {
             s.drop(&self.console);
         }
