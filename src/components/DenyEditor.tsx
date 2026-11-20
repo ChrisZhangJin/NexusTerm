@@ -5,7 +5,7 @@
  * 还能加自定义关键字（命中即拒绝）。改动立即回调，由调用方决定落到哪（本地偏好 / host_amend）。
  */
 import { useState } from "react";
-import { addDeny, denyLabel, isLockedDeny, removeDeny } from "../lib/host";
+import { addDeny, denyHint, denyLabel, isLockedDeny, removeDeny } from "../lib/host";
 
 interface DenyEditorProps {
   value: readonly string[];
@@ -33,7 +33,7 @@ export default function DenyEditor({ value, onChange, disabled, highlight }: Den
           <span
             key={tag}
             className={`deny-chip${locked ? " locked" : ""}${highlight === tag ? " hit" : ""}`}
-            title={locked ? "底线：不能放开" : "点 ✕ 放开这一类操作"}
+            title={denyHint(tag)}
           >
             {locked ? "🔒 " : ""}
             {denyLabel(tag)}

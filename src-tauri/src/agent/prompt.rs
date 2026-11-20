@@ -240,6 +240,12 @@ fn check_password(line: &str, lower: &str) -> Option<PromptGuess> {
     if !ends_colon(lower) || char_count(lower) > 160 {
         return None;
     }
+    // 屏幕上的**代码**也常常「含 password、以冒号结尾」：`def gen_password():`、`if not password:`、
+    // heredoc 续行 `> def make_password():`。把它们当成密码提示，Agent 之后的每个按键都会被当成
+    // 「替用户输密码」拒掉（截图：生成 sing-box 配置的脚本被 secret 底线连拦数次）。
+    if looks_like_code(lower) {
+        return None;
+    }
 
     const EN_WORDS: [&str; 7] = [
         "password",
@@ -273,6 +279,33 @@ fn check_password(line: &str, lower: &str) -> Option<PromptGuess> {
     let indented = line.starts_with("  ") || line.starts_with('\t');
     let conf = if indented { 0.5 } else { 0.95 };
     Some(guess(PromptKind::Password, conf, HINT_PASSWORD))
+}
+
+/// 一行像源码 / heredoc 续行，而不是程序在等人输入：
+/// - `> ` 开头：shell 的续行提示（PS2），真正的密码提示从不这样开头；
+/// - 以 Python / shell 关键字开头（`def ` / `if ` / `for ` / `while ` / `elif ` / `else` / `class ` / `with ` / `try` / `except`）；
+/// - 以 `name(...):` 结尾（函数定义 / 调用；`word (说明):` 不算），或含赋值 / 比较（` = ` / `==`）、注释 `#`、花括号、双引号。
+fn looks_like_code(lower: &str) -> bool {
+    let t = lower.trim_start();
+    if t.starts_with('>') {
+        return true;
+    }
+    const KW: [&str; 12] =
+        ["def ", "async def ", "if ", "elif ", "else", "for ", "while ", "class ", "with ", "try", "except", "lambda"];
+    if KW.iter().any(|k| t.starts_with(k)) {
+        return true;
+    }
+    let end = t.trim_end();
+    // `name(args):` 是函数定义 / 调用；`word (说明):` 是给人看的提示（`Enter passphrase (empty for …):`）
+    let call_colon = end.ends_with("):")
+        && end.rfind('(').is_some_and(|i| i > 0 && end[..i].chars().last().is_some_and(|c| c.is_alphanumeric() || c == '_'));
+    call_colon
+        || t.contains(" = ")
+        || t.contains("==")
+        || t.contains('#')
+        || t.contains('{')
+        || t.contains('}')
+        || t.contains('"')
 }
 
 // ───────────────────────────── 是 / 否 ─────────────────────────────
@@ -681,6 +714,26 @@ mod tests {
     }
 
     // ——— 密码 ———
+
+    /// 截图回归：屏幕上的 Python 代码 / heredoc 续行不是密码提示
+    #[test]
+    fn code_on_screen_is_not_a_password_prompt() {
+        for l in [
+            "> def make_password():",
+            "def gen_password():",
+            "> if not args.password:",
+            "if not password:",
+            "password = gen()  # ss password:",
+            "for password in passwords:",
+            "cfg[\"password\"]:",
+        ] {
+            assert_ne!(k(l), PromptKind::Password, "{l}");
+        }
+        // 真的密码提示照旧
+        for l in ["Password:", "Enter SS password:", "[sudo] password for root:", "alice@10.0.0.5's password: ", "(alice@host) Password: "] {
+            assert_eq!(k(l), PromptKind::Password, "{l}");
+        }
+    }
 
     #[test]
     fn password_plain() {

@@ -202,6 +202,17 @@ pub fn authorize(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation>) -> Ga
     };
     let tags = if w.category == TAG_FILE_WRITE { vec![TAG_FILE_WRITE] } else { derive_tags(&w, sit) };
     if let Some(t) = tags.iter().find(|t| auth.denies(t)) {
+        // 「替你输密码」底线：说清楚是**屏幕被认成了密码提示**，以及模型自己怎么脱困 ——
+        // 只说「契约禁止 secret」，模型会以为生成凭据被禁了，转头去请用户「移除 secret 禁项」（放不开的底线）
+        if *t == TAG_SECRET {
+            return Gate::Deny(
+                "没有写入：屏幕此刻被识别为**密码 / 口令提示**，往里替用户输入是底线（契约里的「替你输密码」）。\
+                 如果真是密码提示，请用 nx_secret 让用户本人输入；如果不是（屏幕上其实是代码、配置或 heredoc 续行），\
+                 先 nx_screen 看清现场，按 <C-c> 回到 shell 提示符，或改用 nx_write 直接写文件。\
+                 这条底线与生成密钥、写带密码的配置无关，不需要也没法请用户改契约"
+                    .to_string(),
+            );
+        }
         if LOCKED_DENY.contains(t) || !yolo {
             return Gate::Deny(format!("契约禁止此类操作（{t}），没有写入。换一个不触及禁项的做法；这一步确实是目标必需的，就用 nx_ask_user 请用户放开（不要给 recommendation，契约只有用户能改）"));
         }

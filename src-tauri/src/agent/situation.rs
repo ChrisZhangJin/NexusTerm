@@ -872,8 +872,9 @@ fn rule(
     // 光标停在 shell 提示符上：上面不管残留着什么对话框文字，都已经是历史
     let at_shell = guess.kind == PromptKind::ShellPrompt;
 
-    // 1) 密码：沿用 prompt.rs 的判据，绝不代填，也不把内容写进 tail
-    if guess.kind == PromptKind::Password {
+    // 1) 密码：沿用 prompt.rs 的判据，绝不代填，也不把内容写进 tail。
+    //    低置信（缩进的 `  password:` 多半是 `cat` 出来的配置键）不算：判成密码提示会让之后的每个按键都被拒
+    if guess.kind == PromptKind::Password && guess.confidence >= 0.8 {
         return draft(
             SituationKind::Password,
             0.95,

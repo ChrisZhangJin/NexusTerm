@@ -288,6 +288,19 @@ export function denyLabel(tag: string): string {
   return DENY_LABELS[tag] ?? `含「${tag}」`;
 }
 
+/** 禁止项的说明（chip 悬停提示）：内置项具体管什么，别让人以为「生成密钥 / 写配置」也被禁了 */
+const DENY_HINTS: Record<string, string> = {
+  secret: "底线，不能放开（契约里叫 secret）：只指屏幕停在密码提示上时，AI 不替你输入密码（要你本人输入）。生成密钥、写带密码的配置文件都不受它限制",
+  permanent_grant: "底线，不能放开（契约里叫 permanent_grant）：AI 不会在授权框里选「不再询问 / 永久允许」",
+  force_push: "git push --force 一类改写远端历史的推送。点 ✕ 放开",
+  delete: "删除类操作：rm / prune / drop / kubectl delete 等。点 ✕ 放开",
+  file_write: "AI 用文件工具写 / 改文件。点 ✕ 放开",
+};
+
+export function denyHint(tag: string): string {
+  return DENY_HINTS[tag] ?? `命令或写入的内容里出现「${tag}」就拒绝。点 ✕ 放开`;
+}
+
 /** 去掉一项（底线项去不掉） */
 export function removeDeny(list: readonly string[], tag: string): string[] {
   if (isLockedDeny(tag)) return [...list];
