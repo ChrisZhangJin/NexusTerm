@@ -289,16 +289,14 @@ fn misread_sample_replays_as_screen_fixture() {
     assert_completed(&h, &p);
 }
 
-/// 4b. 自定义的短提示符（`inner$ `）：分类器认不出是 shell 提示符（置信度不够 Handover），
-/// 原提示符又不会回来 → nx_exec 等满 120s 才 Timeout。**已知问题**，默认不跑（耗时 2 分钟）；
-/// `cargo test --lib agent::e2e -- --ignored` 复现。修好后去掉 ignore、把上限收紧。
+/// 4b. 自定义的短提示符（`inner$ `）：分类器认不出是 shell 提示符（置信度不到 Handover 的门槛），
+/// 原提示符又不会回来 —— 曾经让 nx_exec 等满 120s 才 Timeout。现在按提示符形状（`executor::looks_like_custom_prompt`）交接。
 #[test]
-#[ignore = "已知问题：自定义短提示符的嵌套 shell 要等满 120s"]
 fn nested_shell_with_custom_prompt_hands_over() {
     let mut h = harness!(
         vec![
             turn(None, "nx_exec", json!({ "command": "PS1='inner$ ' bash --norc --noprofile" })),
-            turn(None, "nx_exec", json!({ "command": "exit" })),
+            turn(Some("交给了另一个程序"), "nx_exec", json!({ "command": "exit" })),
             complete(None),
         ],
         vec![],
@@ -306,7 +304,8 @@ fn nested_shell_with_custom_prompt_hands_over() {
     );
     let t0 = Instant::now();
     h.start("进一个子 shell 看看再出来", "auto");
-    let t1 = wait_cursor(&h, 2, Duration::from_secs(150));
-    eprintln!("[e2e] 自定义提示符的嵌套 shell：nx_exec 用了 {:?}；反馈：\n{}", t1 - t0, h.llm.feedback()[1]);
+    let t1 = wait_cursor(&h, 2, Duration::from_secs(40));
     assert!(t1 - t0 < Duration::from_secs(30), "嵌套 shell 的 nx_exec 过了 {:?} 才返回", t1 - t0);
+    let p = h.wait_terminal(Duration::from_secs(30));
+    assert_completed(&h, &p);
 }

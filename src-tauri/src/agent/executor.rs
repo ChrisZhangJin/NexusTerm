@@ -146,6 +146,41 @@ pub fn same_prompt(base: &str, line: &str) -> bool {
         || common_affix(base.bytes().rev(), line.bytes().rev()) >= PROMPT_AFFIX_MATCH
 }
 
+/// 自定义提示符交接时给模型的分类：形状像、但没有分类器背书，置信度压在「大概率」一档。
+const CUSTOM_PROMPT_CONFIDENCE: f32 = 0.6;
+const HINT_CUSTOM_PROMPT: &str =
+    "末行像一个新 shell 的自定义提示符（形状判断，不太确定）：先 nx_screen 读屏确认现场再继续。";
+/// 自定义提示符最多多长（字符）；长行更可能是程序输出
+const CUSTOM_PROMPT_MAX_CHARS: usize = 40;
+
+/// 光标所在的末行像不像一个**分类器认不出的**新 shell 提示符（`inner$ ` `app> ` `dev% ` `box ❯ `）。
+///
+/// 只在「安静了足够久、原提示符没回来」之后才问（见 `wait_for_end` 的交接分支），所以要求的是形状：
+/// 和基线提示符不是同一个、短、以提示符号收尾、符号前有字母数字主体、不超过三个词。
+/// 刻意排除：数字收尾（`50%` `5 $`）、分隔线与箭头（`##` `=>` `->`）、HTML / 标签（含 `<`）、URL、
+/// PS2 续行等裸符号（`> ` 是 heredoc / 引号没闭合，不是新 shell）。
+pub fn looks_like_custom_prompt(base: &str, cursor_line: &str) -> bool {
+    let t = cursor_line.trim();
+    let n = t.chars().count();
+    if n < 2 || n > CUSTOM_PROMPT_MAX_CHARS || same_prompt(base, cursor_line) || t.contains('<') || t.contains("://") {
+        return false;
+    }
+    let Some(last) = t.chars().next_back() else { return false };
+    if !matches!(last, '$' | '#' | '%' | '>' | '❯') {
+        return false;
+    }
+    let body = t[..t.len() - last.len_utf8()].trim_end();
+    let Some(prev) = body.chars().next_back() else { return false };
+    // 数字收尾的多半是计数 / 百分比 / 金额（`50%` `5 $`）；`bash-5.1$` 这类分类器自己认得
+    if prev.is_ascii_digit() {
+        return false;
+    }
+    if matches!(prev, '$' | '#' | '%' | '>' | '=' | '-' | '.' | ',' | ':' | ';') {
+        return false;
+    }
+    body.chars().any(|c| c.is_alphanumeric()) && body.split_whitespace().count() <= 3
+}
+
 /// 这个分类结果算不算「终端正停在一个交互提示上等人应答」。
 ///
 /// 只认需要应答的几类（密码 / 是否确认 / 分页器 / 菜单 / REPL）；
@@ -272,9 +307,16 @@ where
                         handover_at = Some(last);
                         let t: Tail = tail().into();
                         let alt = t.alt;
+                        let cursor_line = t.text.rsplit('\n').next().unwrap_or_default().to_string();
                         let g = classify_tail(t);
                         let new_shell = g.kind == PromptKind::ShellPrompt && g.confidence >= AWAIT_INPUT_MIN_CONFIDENCE;
                         if alt || new_shell {
+                            return finish(&mut output, &mut tail, ExecEnd::Handover, Some(g));
+                        }
+                        // 分类器认不出的自定义短提示符（`inner$ ` `app> `）：形状对就也算交接，免得等满总超时
+                        if let Some(base) = prompt.filter(|b| looks_like_custom_prompt(b, &cursor_line)) {
+                            tracing::debug!(base, line = cursor_line.as_str(), "exec: 自定义提示符，按交接收尾");
+                            let g = PromptGuess { kind: PromptKind::ShellPrompt, confidence: CUSTOM_PROMPT_CONFIDENCE, hint: HINT_CUSTOM_PROMPT };
                             return finish(&mut output, &mut tail, ExecEnd::Handover, Some(g));
                         }
                     }
@@ -323,6 +365,54 @@ mod tests {
         .await;
         assert_eq!(out.reason, ExecEnd::Handover);
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    /// 回归（e2e `nested_shell_with_custom_prompt_hands_over`）：`PS1='inner$ ' bash` —— 分类器认不出这么短的
+    /// 自定义提示符，原提示符又不会回来，曾经等满 120s 才 Timeout。
+    #[tokio::test(start_paused = true)]
+    async fn custom_short_prompt_hands_over_instead_of_timing_out() {
+        let started = Instant::now();
+        let out = wait_for_end(
+            cfg(300, 120_000, 50),
+            Some("root@e2e:/tmp/work# "),
+            || 0,
+            || "inner$".to_string(),
+            || "root@e2e:/tmp/work# PS1='inner$ ' bash --norc\ninner$".to_string(),
+            || String::new(),
+            || false,
+        )
+        .await;
+        assert_eq!(out.reason, ExecEnd::Handover);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        let g = out.prompt.unwrap();
+        assert_eq!(g.kind, PromptKind::ShellPrompt);
+        assert!(g.confidence < AWAIT_INPUT_MIN_CONFIDENCE, "形状判断，不冒充分类器的把握");
+    }
+
+    #[test]
+    fn custom_prompt_shape() {
+        let base = "chris@host:~$ ";
+        for l in ["inner$ ", "app> ", "dev% ", "box ❯ ", "my shell #", "mysh$"] {
+            assert!(looks_like_custom_prompt(base, l), "{l}");
+        }
+        for l in [
+            "   Compiling serde v1.0.200",
+            "Downloading 50%",
+            "> ",
+            ">",
+            "$",
+            "==>",
+            "build ->",
+            "<div>",
+            "####",
+            "see http://x.y/a#",
+            "a very long line of program output that happens to end with $",
+            "chris@host:~$ ",
+            "Total cost: 5 $",
+            "...>",
+        ] {
+            assert!(!looks_like_custom_prompt(base, l), "{l}");
+        }
     }
 
     /// 回归（截图：`tmux attach -t cnn` 等了 50 秒还在等）：全屏程序接管了终端，同样提前收尾。
