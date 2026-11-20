@@ -4301,21 +4301,29 @@ pub async fn run(
             drive_gate!(&session);
             // heredoc 改道（对话 / 托管都管）：在可见终端里敲 `cat > f <<EOF` 这类多行输入极易被读屏误判、卡住后续，
             // 不执行，请模型改用 nx_write（写文件）/ nx_run（其他 heredoc）
-            if let Some(why) = heredoc_refusal(app, state, &action, &targets, &session) {
-                let shown = match &action {
-                    AgentAction::Keys { keys, .. } => keys.clone(),
-                    AgentAction::Exec { command, .. } => command.trim().to_string(),
-                    _ => String::new(),
+            if let Some(hd) = heredoc_refusal(app, state, &action, &targets, &session) {
+                let (target, shown) = match &action {
+                    AgentAction::Keys { target, keys } => (target, keys.clone()),
+                    AgentAction::Exec { target, command } => (target, command.trim().to_string()),
+                    _ => (&None, String::new()),
                 };
                 if trace_on {
                     trace::record(&session, step, "heredoc", &format!("`{shown}` → 改道"));
                 }
+                // 与托管门禁卡同形（`kind:"gate"`、refused）：没有命中契约禁止项，也不涉及读屏误判，卡上不给按钮
+                let console = locate(target.as_deref(), &targets, &session).map(|(i, _)| i).unwrap_or_else(|i| i);
                 emit_step(
                     app,
                     &session,
-                    StepPayload { command: Some(shown.clone()), reasons: Some(vec![why.clone()]), ..StepPayload::new("skip", step) },
+                    StepPayload {
+                        target: Some(console),
+                        command: Some(super::redact::redact(&shown)),
+                        reasons: Some(vec![super::host::heredoc::card_reason(&hd)]),
+                        gate_verdict: Some("refused"),
+                        ..StepPayload::new("gate", step)
+                    },
                 );
-                feedback.push_str(&format!("「{shown}」{why}\n"));
+                feedback.push_str(&format!("「{shown}」{}\n", super::host::heredoc::feedback(&hd)));
                 continue;
             }
             // 托管：契约的唯一强制点。每个写入动作（Exec / Keys / Secret / Skill-run / Open / Tab-close）
@@ -7076,7 +7084,7 @@ fn run_failure_feedback(command: &str, label: &str, e: &RunErr, secs: u64) -> St
     }
 }
 
-/// heredoc 改道：动作要在可见终端里敲 heredoc 时返回拒绝原因（话术见 `host::heredoc`）。
+/// heredoc 改道：动作要在可见终端里敲 heredoc 时返回识别结果（卡片 / 话术见 `host::heredoc`）。
 /// 只有按键要看局面（前台不是 shell 时不管），先用纯文本判一遍，命中了才读屏。
 fn heredoc_refusal(
     app: &AppHandle,
@@ -7084,8 +7092,8 @@ fn heredoc_refusal(
     action: &AgentAction,
     targets: &[AgentTarget],
     session: &str,
-) -> Option<String> {
-    super::host::heredoc::redirect(action, None)?;
+) -> Option<super::host::heredoc::Heredoc> {
+    super::host::heredoc::find(action, None)?;
     let sit = match action {
         AgentAction::Keys { target, .. } => {
             let tid = locate(target.as_deref(), targets, session).map(|(i, _)| i).unwrap_or_else(|i| i);
@@ -7093,7 +7101,7 @@ fn heredoc_refusal(
         }
         _ => None,
     };
-    super::host::heredoc::redirect(action, sit.as_ref())
+    super::host::heredoc::find(action, sit.as_ref())
 }
 
 /// 反射代答：剧本 + 策略 + 托管闸门都放行时，在同一租约下写入（写前过控制权闸与 keys_recheck），
@@ -7894,6 +7902,10 @@ mod tests {
         assert!(matches!(auth(&run("cd /srv\nrm -rf build")), Gate::Deny(t) if t.contains("delete")));
         // 不可逆：同样停下来问人
         assert!(matches!(auth(&run("sudo reboot")), Gate::Approve(_)));
+        // 门禁卡（与 nx_exec 同一个 hosted_authorize → gate::explain）：拒绝卡带命中的禁止项
+        let a = run("psql -h prod-db -c 'select 1'");
+        let ex = super::super::host::gate::explain(&p, &a, None, &auth(&a)).unwrap();
+        assert_eq!((ex.verdict, ex.deny_item.as_deref()), ("refused", Some("prod-db")));
         assert_eq!(auth(&run("uptime")), auth(&exec("uptime")));
         // 档位 / allow 同口径
         let ctx = ctx_with("notify");

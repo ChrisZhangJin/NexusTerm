@@ -327,11 +327,28 @@ pub fn feedback(h: &Heredoc) -> String {
     }
 }
 
+/// 门禁卡上给人看的一句话（给模型的完整话术见 [`feedback`]）。
+pub fn card_reason(h: &Heredoc) -> String {
+    match h {
+        Heredoc::File { path, .. } => format!(
+            "在终端里逐行敲 heredoc 写文件容易被读屏误判、卡住后面的步骤，没有执行；已请 AI 改用 nx_write 直接写「{path}」"
+        ),
+        Heredoc::Other { head } => format!(
+            "在终端里逐行敲带 heredoc 的命令（{head} <<…）容易被读屏误判，没有执行；已请 AI 改用 nx_run 旁路执行"
+        ),
+    }
+}
+
 /// 动作级判断：`nx_exec` 的命令、`nx_send_keys` 真正提交（带回车）的那几行里，有没有 heredoc。
 /// 有就返回改道话术（调用方不执行，作为拒绝原因反馈给模型）。
 ///
 /// 按键只在终端前台是 shell（或认不出）时才管：往 vim / Claude Code 输入框里打一段含 `<<` 的文字不是在敲 heredoc。
 pub fn redirect(a: &AgentAction, sit: Option<&Situation>) -> Option<String> {
+    find(a, sit).map(|h| feedback(&h))
+}
+
+/// 同 [`redirect`]，返回识别结果本身（拼卡片 / 话术由调用方决定）。
+pub fn find(a: &AgentAction, sit: Option<&Situation>) -> Option<Heredoc> {
     let lines: Vec<String> = match a {
         AgentAction::Exec { command, .. } => command.lines().map(str::to_string).collect(),
         AgentAction::Keys { keys, .. } => {
@@ -345,7 +362,7 @@ pub fn redirect(a: &AgentAction, sit: Option<&Situation>) -> Option<String> {
         }
         _ => return None,
     };
-    lines.iter().find_map(|l| detect(l)).map(|h| feedback(&h))
+    lines.iter().find_map(|l| detect(l))
 }
 
 #[cfg(test)]
@@ -425,5 +442,9 @@ mod tests {
         assert!(redirect(&keys("cat > f <<EOF<Enter>"), Some(&s)).is_some());
         // 其他动作不管
         assert!(redirect(&AgentAction::Screen { target: None }, None).is_none());
+        // 门禁卡上的一句话：说清没执行、改用哪个工具
+        let h = find(&exec("cat > /etc/x.json <<'EOF'"), None).unwrap();
+        assert!(card_reason(&h).contains("nx_write") && card_reason(&h).contains("/etc/x.json"));
+        assert!(card_reason(&find(&exec("psql <<SQL"), None).unwrap()).contains("nx_run"));
     }
 }
