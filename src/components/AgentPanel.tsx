@@ -12,7 +12,9 @@ import { isAgentReady, useAgentConfig } from "../lib/agent";
 import { pauseBannerText, type StewardBudgetPref } from "../lib/agentBudget";
 import { convKeyOf } from "../lib/agentHistory";
 import {
+  expirePendingSecrets,
   finishWithoutAnswer,
+  pendingPrompts,
   uid,
   withError,
 } from "../lib/agentRun";
@@ -174,6 +176,22 @@ export function AgentPanel({
       .filter((h) => !isTerminal(h.phase))
       .map((h) => h.consoleId),
   ]);
+  // 托管的密码请求在别处了结了（你直接在终端里输了 / 接管 / 停止 / 运行结束）：实况里那张密码卡收不到事件，
+  // 在这里看托管状态的迁移把它收掉。只认「从等密码变成别的」和「进入终态」，不在密码卡刚到、状态还没推来时误收
+  const wasWaitingSecret = useRef(new Map<string, boolean>());
+  useEffect(() => {
+    for (const h of Object.values(hostRuns.hosts)) {
+      const b = basePhase(h.phase);
+      const waitingSecret = b.kind === "waitingHuman" && b.card.kind.kind === "secret";
+      const was = wasWaitingSecret.current.get(h.contractId) ?? false;
+      wasWaitingSecret.current.set(h.contractId, waitingSecret);
+      if ((was && !waitingSecret) || isTerminal(h.phase)) {
+        if (pendingPrompts(hostFeeds.feed(h.consoleId).messages) > 0) hostFeeds.patch(h.consoleId, expirePendingSecrets);
+      }
+    }
+    // hostFeeds 每次渲染都是新对象；只跟着托管状态走
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostRuns.hosts]);
   const [pending, setPending] = useState<
     { kind: "clear" } | { kind: "clearConv" } | { kind: "cmd"; cmd: string } | null
   >(null);
@@ -622,6 +640,7 @@ export function AgentPanel({
 
       {view === "chat" && hostedHere && !isTerminal(hostedHere.phase) && !needsReattach(hostedHere.phase) && (
         <HostCard
+          key={hostedHere.contractId}
           status={hostedHere}
           label={sessions.find((s) => s.id === hostedHere.consoleId)?.label}
           stopCtrlC={run.stopCtrlC}

@@ -137,5 +137,3 @@ export function parseStewardBudgetPref(raw: string | null | undefined): StewardB
 export const isBudgetPause = (k: PauseKind | undefined): boolean =>
   k === "steps" || k === "time" || k === "output" || k === "cost";
 
-/** 托管页预算用尽横幅。后端暂停后 1 小时没人点「继续」会自动结束这一轮。 */
-export const BUDGET_EXHAUSTED_BANNER = "已达到预算上限，点「继续」接着跑（1 小时内不点会自动结束）";

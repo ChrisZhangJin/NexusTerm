@@ -293,6 +293,18 @@ export function withSecretResult(
   };
 }
 
+/**
+ * 把还没答的密码卡都置成「已失效」。托管里密码请求被别处了结（用户直接在终端里输了 / 接管 / 停止 / 运行结束）时，
+ * 实况里那张卡不会收到任何事件，不收掉它会一直挂着「有 1 项等你处理」、把实况强行展开。没有待答的就原样返回。
+ */
+export function expirePendingSecrets(c: Conversation): Conversation {
+  if (!c.messages.some((m) => m.secret && m.secretResult === undefined)) return c;
+  return {
+    ...c,
+    messages: c.messages.map((m) => (m.secret && m.secretResult === undefined ? { ...m, secretResult: "expired" } : m)),
+  };
+}
+
 /** 暂停 / 继续步骤改变对话的暂停标记（其余步骤原样，不产生新对象）。 */
 export function withPauseState(c: Conversation, step: AgentStep): Conversation {
   const next = nextPause(c.paused, step);

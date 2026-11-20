@@ -329,6 +329,8 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
   const extraOptions = (sessions ?? []).filter((s) => {
     if (s.id === selected) return false;
     const h = run.hostFor(s.id);
+    // 那个终端上正跑着一轮对话 / 技能：后端会拒，干脆不列
+    if (runFor(s.id).otherBusy) return false;
     return !h || isTerminal(h.phase);
   });
   /** 勾选里仍然可选的那些（标签关了 / 被别的托管占了 / 换成了主终端的自动剔掉） */
@@ -550,6 +552,8 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
       {/* 选中终端上的托管：一句话状态 + 控制 + 等你回答 / 批准的卡片（永远等下去，没有倒计时） */}
       {selectedHost && !needsReattach(selectedHost.phase) && (
         <HostCard
+          // 按托管换实例：卡里的草稿 / 通知卡 / 「改目标」等局部状态不能跟着面板串到另一份托管上
+          key={selectedHost.contractId}
           status={selectedHost}
           label={label(selectedHost.consoleId)}
           grant={{
@@ -564,7 +568,14 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
             run.otherBusy || !run.ready
               ? undefined
               : (nextGoal: string, prev: HostStartOpts["followUp"]) =>
-                  run.start(selectedHost.consoleId, nextGoal, budgetPref, tier, yolo, { deny, followUp: prev })
+                  run.start(selectedHost.consoleId, nextGoal, budgetPref, tier, yolo, {
+                    deny,
+                    followUp: prev,
+                    // 多终端托管的后续任务沿用同一组终端（只留还开着的）
+                    extra: (selectedHost.consoles ?? [])
+                      .filter((c) => !c.primary && (sessions ?? []).some((s) => s.id === c.consoleId))
+                      .map((c) => c.consoleId),
+                  })
           }
         />
       )}
@@ -594,7 +605,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
             rows={3}
           />
           {extraOptions.length > 0 && (
-            <details className="hc-more hc-extra" open={extraChosen.length > 0}>
+            <details className="hc-more hc-extra">
               <summary
                 title="目标要跨几台机器时（例如在 A 上搭代理、再从 B 上测试），把其余终端也勾上：它们一起交给 AI、一起只读锁定，你在其中任何一个上动手，整个托管都会让路"
               >
@@ -767,7 +778,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
           有密码 / 批准卡等你时换个 key 重新挂载：用户先前手动收起过的话，`open` 表达式没变（运行中恒为 true），
           React 不会重新应用，密码输入框就藏在收起的实况里了 */}
       {runHere && (run.active || run.messages.length > 0) && (
-        <details key={`${selected}${promptsPending > 0 ? ":pending" : ""}`} className="hc-feed" open={run.active || promptsPending > 0}>
+        <details key={`${selected}:${promptsPending}`} className="hc-feed" open={run.active || promptsPending > 0}>
           <summary>
             托管实况 · {label(selected)}
             <span className={promptsPending > 0 ? "hc-warn" : "st-meta"}>

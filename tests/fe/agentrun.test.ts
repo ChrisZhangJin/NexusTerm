@@ -152,3 +152,17 @@ test("maskReveal：按非空行打码，不泄露原文与长度", () => {
   assert.ok(!m.includes("hunter2"));
   assert.equal(maskReveal(""), "••••••••");
 });
+
+import { expirePendingSecrets as _expire } from "../../src/lib/agentRun";
+
+test("expirePendingSecrets：只收没答的密码卡，没有就原样返回", () => {
+  const sec = (id: string, result?: "submitted") => ({
+    id, role: "assistant" as const, text: "", ts: 0,
+    secret: { requestId: id } as never, ...(result ? { secretResult: result } : {}),
+  });
+  const c = { busy: false, interrupted: false, messages: [sec("a"), sec("b", "submitted")] };
+  const out = _expire(c);
+  assert.equal(out.messages[0].secretResult, "expired");
+  assert.equal(out.messages[1].secretResult, "submitted");
+  assert.equal(_expire(out), out, "没有待答的：同一个对象");
+});
