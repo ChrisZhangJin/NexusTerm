@@ -55,6 +55,7 @@ import {
   type MacroRecorder,
 } from "./lib/macro";
 import ConfirmDialog, { type ConfirmOptions } from "./components/ConfirmDialog";
+import { describeSftpActivity, sftpActivity } from "./lib/sftpActivity";
 import { resolveAuth } from "./lib/auth";
 import {
   getExtras,
@@ -112,6 +113,8 @@ export default function App() {
   // 按 tabId 索引（而不是单个全局值）：面板必须「只在自己所属的标签前台时展示」，
   // 单槽做不到 —— 切标签时它既不隐藏也不跟着换。
   const [sftpTabs, setSftpTabs] = useState<Record<string, SessionRecord>>({});
+  /** 每次从终端点「SFTP 文件管理」递增，让已开着的面板重新同步到终端当前目录 */
+  const [sftpNav, setSftpNav] = useState<Record<string, number>>({});
   /**
    * AI 助手侧栏是否展开。
    * 与「面板是否挂载」是两件事：面板始终挂载、只切 visible，
@@ -988,16 +991,20 @@ export default function App() {
       if (!t) return;
       const live =
         t.status === "connected" || t.status === "connecting" || t.status === "reconnecting";
-      if (live && getPrefs().confirmCloseTab) {
+      // 有传输在跑时关标签会连带断开 SFTP：不受「不再询问」约束，一定要确认
+      const busy = describeSftpActivity(sftpActivity(tabId));
+      if (busy || (live && getPrefs().confirmCloseTab)) {
         const name = t.customTitle || t.title;
+        const base = t.local
+          ? `关闭「${name}」？本地 shell 及其中运行的程序会被结束。`
+          : `关闭「${name}」？SSH 连接会断开，未在 tmux 中运行的前台程序会被终止。`;
         const { ok, dontAsk } = await askConfirm({
           title: "关闭标签页",
-          message: t.local
-            ? `关闭「${name}」？本地 shell 及其中运行的程序会被结束。`
-            : `关闭「${name}」？SSH 连接会断开，未在 tmux 中运行的前台程序会被终止。`,
+          message: busy ? `关闭「${name}」？${busy}` : base,
+          detail: busy && live ? base.replace(/^关闭「.*?」？/, "") : undefined,
           okText: "关闭",
           danger: true,
-          dontAskLabel: "不再询问（可在 设置 → 外观 中恢复）",
+          dontAskLabel: busy ? undefined : "不再询问（可在 设置 → 外观 中恢复）",
         });
         if (!ok) return;
         // 可在「⚙ 设置 → 外观 → 终端行为」重新勾选恢复
@@ -1538,19 +1545,31 @@ export default function App() {
       if (!s) return;
       setActiveTab(tabId);
       setSftpTabs((prev) => ({ ...prev, [tabId]: s }));
+      setSftpNav((prev) => ({ ...prev, [tabId]: (prev[tabId] ?? 0) + 1 }));
     },
     [sessions, tabs]
   );
 
   /** 关掉某个标签的 SFTP 面板（面板自己的卸载 effect 会去断开连接） */
-  const closeSftpTab = useCallback((tabId: string) => {
+  const closeSftpTab = useCallback(async (tabId: string) => {
+    // 还有传输在跑 / 排队：关面板会断开 SFTP 连接，先让用户确认
+    const busy = describeSftpActivity(sftpActivity(tabId));
+    if (busy) {
+      const { ok } = await askConfirm({
+        title: "关闭 SFTP",
+        message: busy,
+        okText: "关闭并中断",
+        danger: true,
+      });
+      if (!ok) return;
+    }
     setSftpTabs((prev) => {
       if (!(tabId in prev)) return prev;
       const next = { ...prev };
       delete next[tabId];
       return next;
     });
-  }, []);
+  }, [askConfirm]);
 
   const activeTabState = tabs.find((t) => t.id === activeTab) ?? null;
   const activeSession = activeTabState?.sessionId
@@ -1692,6 +1711,8 @@ export default function App() {
                 active={tabId === activeTab}
                 session={s}
                 passphrase={passphraseRef.current.get(s.id)}
+                navToken={sftpNav[tabId] ?? 0}
+                getCwd={() => probeTab(tabId).then((c) => c?.cwd)}
                 onClose={() => closeSftpTab(tabId)}
               />
             ))}

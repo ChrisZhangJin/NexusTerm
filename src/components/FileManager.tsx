@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as RMouseEvent, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as RMouseEvent, type MutableRefObject, type ReactNode } from "react";
 import { homeDir } from "@tauri-apps/api/path";
 import { api, onSftpProgress } from "../api";
 import { resolveAuth } from "../lib/auth";
@@ -7,6 +7,8 @@ import { isWindows } from "../lib/platform";
 import { getPrefs } from "../lib/prefs";
 import type { AuthMethod, RemoteEntry, SessionRecord } from "../types";
 import { kindIcon, viewableKind } from "../lib/viewable";
+import { nameMatcher } from "../lib/nameFilter";
+import { registerSftpActivity } from "../lib/sftpActivity";
 
 export function formatSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -39,7 +41,9 @@ interface Transfer {
   transferred: number;
   localPath: string;
   remotePath: string;
-  status: "running" | "done" | "error" | "canceled";
+  status: "queued" | "running" | "done" | "error" | "canceled";
+  /** 经「队列」加入：排队中的项一次只放行一个，前一个结束才轮到下一个 */
+  viaQueue?: boolean;
   error?: string;
   startedAt: number;
   /** 上一次采样的时间戳/字节数，用来算瞬时速度（两次 progress 事件之间的差分） */
@@ -142,7 +146,10 @@ interface PaneProps {
   onUp: () => void;
   /** 路径栏回车跳转；返回 false 表示路径无效（输入框抖动并保留输入） */
   onNavigate: (p: string) => Promise<boolean>;
-  onEntryContext?: (e: RMouseEvent, entry: RemoteEntry) => void;
+  /** 右键：`entry` 为 null 表示点在列表空白处 */
+  onContext?: (e: RMouseEvent, entry: RemoteEntry | null) => void;
+  /** 每递增一次就打开一次搜索框（右键菜单「搜索」用） */
+  findToken: number;
   children?: ReactNode;
 }
 
@@ -197,6 +204,92 @@ function PathInput({
   );
 }
 
+interface RowCbs {
+  onSelect: (e: RemoteEntry) => void;
+  onActivate: (e: RemoteEntry) => void;
+  onContext?: (ev: RMouseEvent, e: RemoteEntry | null) => void;
+}
+
+/**
+ * 单行。回调走 ref、`selected` 传布尔，这样 props 在重渲染之间保持稳定，
+ * 进度事件 / 点选 / 拖动传输栏时 memo 能整行跳过——否则万级目录每次都要重建所有行。
+ */
+const Row = memo(function Row({
+  e,
+  selected,
+  cbs,
+}: {
+  e: RemoteEntry;
+  selected: boolean;
+  cbs: MutableRefObject<RowCbs>;
+}) {
+  return (
+    <div
+      className={`fm-row ${selected ? "selected" : ""}`}
+      onClick={() => cbs.current.onSelect(e)}
+      onDoubleClick={() => cbs.current.onActivate(e)}
+      onContextMenu={(ev) => {
+        const { onSelect, onContext } = cbs.current;
+        if (!onContext) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        onSelect(e);
+        onContext(ev, e);
+      }}
+    >
+      <span className="fm-icon">{e.isDir ? "📁" : kindIcon(viewableKind(e.name))}</span>
+      <span className="fm-name">{e.name}</span>
+      <span className="fm-size">{e.isDir ? "" : formatSize(e.size)}</span>
+      <span className="fm-type">{typeLabel(e)}</span>
+      <span className="fm-mtime">{formatTime(e.mtime)}</span>
+    </div>
+  );
+});
+
+/** 搜索框。草稿放在这里而不是 Pane：敲字不该牵动整张文件列表重渲染。 */
+function FindBar({
+  focusToken,
+  onApply,
+  onClose,
+}: {
+  focusToken: number;
+  onApply: (q: string) => void;
+  onClose: () => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    ref.current?.focus();
+    ref.current?.select();
+  }, [focusToken]);
+  return (
+    <div className="fm-find" onMouseDown={(e) => e.stopPropagation()}>
+      <input
+        ref={ref}
+        className="fm-find-input"
+        value={draft}
+        spellCheck={false}
+        placeholder="精确匹配；* 通配，如 *.txt"
+        title="不带 * 是整名精确匹配（07.txt）；带 * 为通配（*07.txt = 以 07.txt 结尾）"
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") onApply(draft);
+          else if (e.key === "Escape") {
+            e.stopPropagation();
+            onClose();
+          }
+        }}
+      />
+      <button className="btn" onClick={() => onApply(draft)}>
+        过滤
+      </button>
+      <button className="btn fm-find-x" onClick={onClose} title="关闭 (Esc)">
+        ✕
+      </button>
+    </div>
+  );
+}
+
 function Pane({
   title,
   path,
@@ -208,7 +301,8 @@ function Pane({
   onActivate,
   onUp,
   onNavigate,
-  onEntryContext,
+  onContext,
+  findToken,
   children,
 }: PaneProps) {
   const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: "name", dir: 1 });
@@ -220,8 +314,48 @@ function Pane({
     setSort((s) => (s.key === key ? { key, dir: s.dir === 1 ? -1 : 1 } : { key, dir: 1 }));
   const arrow = (key: SortKey) => (sort.key === key ? (sort.dir === 1 ? " ▲" : " ▼") : "");
 
+  // 搜索 = 按文件名过滤当前目录。点「过滤」或回车才生效（同 Xftp），Esc / × 关闭并还原
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [findOpen, setFindOpen] = useState(false);
+  const [findFocus, setFindFocus] = useState(0);
+  const [filter, setFilter] = useState("");
+  const openFind = useCallback(() => {
+    setFindOpen(true);
+    setFindFocus((n) => n + 1);
+  }, []);
+  const closeFind = () => {
+    setFindOpen(false);
+    setFilter("");
+    rootRef.current?.focus();
+  };
+  useEffect(() => {
+    if (findToken > 0) openFind();
+  }, [findToken, openFind]);
+  // 换了目录，旧的过滤词就没意义了
+  useEffect(() => {
+    setFindOpen(false);
+    setFilter("");
+  }, [path]);
+  const visible = useMemo(() => {
+    const match = nameMatcher(filter);
+    return filter.trim() ? sorted.filter((e) => match(e.name)) : sorted;
+  }, [sorted, filter]);
+  const cbs = useRef<RowCbs>({ onSelect, onActivate, onContext });
+  cbs.current = { onSelect, onActivate, onContext };
+
   return (
-    <div className="fm-pane">
+    <div
+      ref={rootRef}
+      className="fm-pane"
+      // 要先点一下这一栏拿到焦点，Ctrl/Cmd+F 才落在这一栏
+      tabIndex={-1}
+      onKeyDown={(e) => {
+        if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") {
+          e.preventDefault();
+          openFind();
+        }
+      }}
+    >
       <div className="fm-pane-head">
         <strong>{title}</strong>
         <PathInput path={path} onNavigate={onNavigate} />
@@ -246,34 +380,28 @@ function Pane({
         </button>
       </div>
 
-      <div className="fm-list">
-        {loading && <div className="empty">加载中…</div>}
-        {error && <div className="error">{error}</div>}
-        {!loading && !error && entries.length === 0 && (
-          <div className="empty">空目录</div>
-        )}
-        {sorted.map((e) => (
-          <div
-            key={e.path}
-            className={`fm-row ${selected === e.path ? "selected" : ""}`}
-            onClick={() => onSelect(e)}
-            onDoubleClick={() => onActivate(e)}
-            onContextMenu={(ev) => {
-              if (!onEntryContext) return;
-              ev.preventDefault();
-              onSelect(e);
-              onEntryContext(ev, e);
-            }}
-          >
-            <span className="fm-icon">{e.isDir ? "📁" : kindIcon(viewableKind(e.name))}</span>
-            <span className="fm-name">{e.name}</span>
-            <span className="fm-size">
-              {e.isDir ? "" : formatSize(e.size)}
-            </span>
-            <span className="fm-type">{typeLabel(e)}</span>
-            <span className="fm-mtime">{formatTime(e.mtime)}</span>
-          </div>
-        ))}
+      <div className="fm-list-wrap">
+        <div
+          className="fm-list"
+          onContextMenu={(ev) => {
+            if (!onContext) return;
+            ev.preventDefault();
+            onContext(ev, null);
+          }}
+        >
+          {loading && <div className="empty">加载中…</div>}
+          {error && <div className="error">{error}</div>}
+          {!loading && !error && entries.length === 0 && (
+            <div className="empty">空目录</div>
+          )}
+          {!loading && !error && entries.length > 0 && visible.length === 0 && (
+            <div className="empty">无匹配项</div>
+          )}
+          {visible.map((e) => (
+            <Row key={e.path} e={e} selected={selected === e.path} cbs={cbs} />
+          ))}
+        </div>
+        {findOpen && <FindBar focusToken={findFocus} onApply={setFilter} onClose={closeFind} />}
       </div>
 
       {children && <div className="fm-actions">{children}</div>}
@@ -289,9 +417,15 @@ interface Props {
   onClose: () => void;
   /** 不活跃时只用 CSS 隐藏、保持挂载（连接、路径、传输列表都留着），这样切标签页不会反复重连 SFTP。 */
   active: boolean;
+  /** 取终端当前所在的远端目录。打开面板时远端栏据此直接落到那个目录，而不是家目录。 */
+  getCwd?: () => Promise<string | undefined>;
+  /** 每次从终端「SFTP 文件管理」进来递增；面板已开着时再点一次，远端栏重新同步到终端目录 */
+  navToken?: number;
 }
 
-export default function FileManager({ session, tabId, passphrase, onClose, active }: Props) {
+type PaneCtx = { x: number; y: number; side: "local" | "remote"; entry: RemoteEntry | null };
+
+export default function FileManager({ session, tabId, passphrase, onClose, active, getCwd, navToken = 0 }: Props) {
   // 连接 id 按「拥有这个面板的标签」来起，不能按 session.id——两个标签完全可能
   // 连的是同一个已保存 session（同一台机器开两个标签），按 session.id 起的话
   // 第二个面板的 sftp_connect 会直接覆盖第一个在后端 map 里的同名条目，
@@ -299,6 +433,8 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
   const sftpId = `sftp-${tabId}`;
   const readyRef = useRef(false);
   const homeRef = useRef("/");
+  const getCwdRef = useRef(getCwd);
+  getCwdRef.current = getCwd;
 
   const [status, setStatus] = useState<"connecting" | "ready" | "error">(
     "connecting"
@@ -316,6 +452,43 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
   const [remoteBusy, setRemoteBusy] = useState(false);
   const [remoteError, setRemoteError] = useState<string | null>(null);
   const [remoteSel, setRemoteSel] = useState<string | null>(null);
+  // 传输完成后的刷新要刷「当时」所在的目录，不是发起传输那一刻闭包里的
+  const localPathRef = useRef(localPath);
+  localPathRef.current = localPath;
+  const remotePathRef = useRef(remotePath);
+  remotePathRef.current = remotePath;
+  /** 传输栏高度：null = 随内容增长（上限见 CSS），拖过分隔条后固定为用户定的值 */
+  const [xferH, setXferH] = useState<number | null>(null);
+  const xferRef = useRef<HTMLDivElement>(null);
+  const startXferResize = (ev: React.PointerEvent<HTMLDivElement>) => {
+    ev.preventDefault();
+    const startY = ev.clientY;
+    const startH = xferRef.current?.getBoundingClientRect().height ?? 0;
+    const el = ev.currentTarget;
+    el.setPointerCapture(ev.pointerId);
+    let last = startH;
+    const move = (e: PointerEvent) => {
+      // 往上拖 = 变高。拖动过程直接写 DOM，不走 state：否则每个 pointermove
+      // 都让整个面板（含两张文件列表）重渲染；松手时再把最终值落进 state。
+      last = Math.max(70, Math.min(startH + (startY - e.clientY), window.innerHeight * 0.75));
+      const box = xferRef.current;
+      if (box) {
+        box.style.height = `${last}px`;
+        box.style.maxHeight = "none";
+      }
+    };
+    const up = () => {
+      setXferH(last);
+      el.removeEventListener("pointermove", move);
+      el.removeEventListener("pointerup", up);
+      el.removeEventListener("pointercancel", up);
+    };
+    el.addEventListener("pointermove", move);
+    el.addEventListener("pointerup", up);
+    el.addEventListener("pointercancel", up);
+  };
+  const [localFind, setLocalFind] = useState(0);
+  const [remoteFind, setRemoteFind] = useState(0);
 
   /** 不属于「传输」的一次性提示（新建目录失败、路径跳转失败……） */
   const [transferMsg, setTransferMsg] = useState<string | null>(null);
@@ -323,31 +496,42 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
   /** 正在等取消生效的 id：取消是异步的（要等拷贝循环下一轮才检查标志），
    *  这段等待期里后端返回的还是「失败」，不是「已取消」——靠这个集合纠正状态。 */
   const cancelingRef = useRef<Set<string>>(new Set());
+  // 登记传输活动，App 关标签前据此确认
+  const activityRef = useRef({ running: 0, queued: 0 });
+  activityRef.current = {
+    running: transfers.filter((t) => t.status === "running").length,
+    queued: transfers.filter((t) => t.status === "queued").length,
+  };
+  useEffect(() => registerSftpActivity(tabId, () => activityRef.current), [tabId]);
 
   useEffect(() => {
     const sub = onSftpProgress(({ transferId, transferred, total }) => {
+      // 事件是全局广播：别的标签（display:none 但仍挂载）的传输不是我的，
+      // 原样返回旧数组，避免白白重渲染
       setTransfers((prev) =>
-        prev.map((t) => {
-          if (t.id !== transferId) return t;
-          const now = Date.now();
-          const dt = (now - t.lastSampleAt) / 1000;
-          const speed = dt > 0.2 ? (transferred - t.lastSampleBytes) / dt : t.speed;
-          return {
-            ...t,
-            transferred,
-            size: total || t.size,
-            speed: dt > 0.2 ? speed : t.speed,
-            lastSampleAt: dt > 0.2 ? now : t.lastSampleAt,
-            lastSampleBytes: dt > 0.2 ? transferred : t.lastSampleBytes,
-          };
-        })
+        !prev.some((t) => t.id === transferId)
+          ? prev
+          : prev.map((t) => {
+              if (t.id !== transferId) return t;
+              const now = Date.now();
+              const dt = (now - t.lastSampleAt) / 1000;
+              const speed = dt > 0.2 ? (transferred - t.lastSampleBytes) / dt : t.speed;
+              return {
+                ...t,
+                transferred,
+                size: total || t.size,
+                speed: dt > 0.2 ? speed : t.speed,
+                lastSampleAt: dt > 0.2 ? now : t.lastSampleAt,
+                lastSampleBytes: dt > 0.2 ? transferred : t.lastSampleBytes,
+              };
+            })
       );
     });
     return () => void sub.then((u) => u());
   }, []);
 
-  /** 远端条目右键菜单 */
-  const [ctx, setCtx] = useState<{ x: number; y: number; entry: RemoteEntry } | null>(null);
+  /** 本地 / 远端文件列表右键菜单（entry 为 null = 点在空白处） */
+  const [ctx, setCtx] = useState<PaneCtx | null>(null);
   /** 传输行右键菜单 */
   const [transferCtx, setTransferCtx] = useState<{ x: number; y: number; transfer: Transfer } | null>(null);
   const transferCtxRef = useRef<HTMLDivElement>(null);
@@ -416,6 +600,8 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      // 与建连并行去问终端在哪个目录，不拖慢连接
+      const cwdAsk = (getCwdRef.current?.() ?? Promise.resolve(undefined)).catch(() => undefined);
       try {
         // 凭据只是「独立连一条」时才需要。拿不到也先往下走：
         // 只要这台机器的终端标签还连着的，后端会复用它，不必再认证。
@@ -441,11 +627,30 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
         if (cancelled) return;
         const home = await api.sftpHome(sftpId);
         if (cancelled) return;
+        // 终端当前目录列得出来就直接落在那里；列不出（已删 / 无权限）退回家目录
+        const cwd = await cwdAsk;
+        if (cancelled) return;
+        let start = home;
+        let first: RemoteEntry[] | undefined;
+        if (cwd && cwd.startsWith("/") && cwd !== home) {
+          try {
+            first = await api.sftpList(sftpId, cwd);
+            start = cwd;
+          } catch {
+            first = undefined;
+          }
+          if (cancelled) return;
+        }
         readyRef.current = true;
         homeRef.current = home;
-        setRemotePath(home);
+        setRemotePath(start);
         setStatus("ready");
-        await loadRemote(home);
+        if (first) {
+          setRemoteEntries(first);
+          setRemoteError(null);
+        } else {
+          await loadRemote(home);
+        }
       } catch (e) {
         if (cancelled) return;
         setStatus("error");
@@ -456,6 +661,19 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
       cancelled = true;
     };
   }, [sftpId, session, loadRemote]);
+
+  // 面板已开着时再从终端点一次「SFTP 文件管理」：远端栏跟到终端当前目录
+  const lastNavRef = useRef(navToken);
+  useEffect(() => {
+    if (navToken === lastNavRef.current) return;
+    lastNavRef.current = navToken;
+    if (status !== "ready") return; // 还在连：建连流程自己会去取
+    void (async () => {
+      const cwd = await (getCwdRef.current?.() ?? Promise.resolve(undefined)).catch(() => undefined);
+      if (cwd && cwd.startsWith("/") && cwd !== remotePathRef.current) await gotoRemote(cwd);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [navToken, status]);
 
   // 本地面板从家目录起步。取不到时 Windows 退回盘符根，而不是 POSIX 的 `/`
   useEffect(() => {
@@ -515,6 +733,8 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
     if (e.isDir) {
       setLocalSel(null);
       setLocalPath(e.path);
+    } else {
+      transferEntry("local", e, false);
     }
   };
 
@@ -523,13 +743,22 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
       setRemoteSel(null);
       setRemotePath(e.path);
       loadRemote(e.path);
-    } else if (viewableKind(e.name)) {
-      void doView(e);
+    } else {
+      // 双击文件 = 传输（原先是浏览可预览的类型；浏览仍在右键菜单里）
+      transferEntry("remote", e, false);
     }
   };
 
   /** 上传/下载共用。传入的 `id` 会按 id 去重替换已有行，使「重试」在原行上重开而不是另起一条。 */
-  const runTransfer = (kind: "upload" | "download", name: string, local: string, remote: string, size: number, id: string) => {
+  const runTransfer = (
+    kind: "upload" | "download",
+    name: string,
+    local: string,
+    remote: string,
+    size: number,
+    id: string,
+    viaQueue = false
+  ) => {
     setTransfers((prev) => [
       {
         id,
@@ -540,6 +769,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
         localPath: local,
         remotePath: remote,
         status: "running",
+        viaQueue,
         startedAt: Date.now(),
         lastSampleAt: Date.now(),
         lastSampleBytes: 0,
@@ -551,8 +781,8 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
     run
       .then((n) => {
         setTransfers((prev) => prev.map((t) => (t.id === id ? { ...t, status: "done", transferred: n, size: n } : t)));
-        if (kind === "upload") void loadRemote(remotePath);
-        else void loadLocal(localPath);
+        if (kind === "upload") void loadRemote(remotePathRef.current);
+        else void loadLocal(localPathRef.current);
       })
       .catch((e) => {
         const wasCanceling = cancelingRef.current.delete(id);
@@ -582,6 +812,52 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
     runTransfer("download", src.name, joinLocal(localPath, src.name), src.path, src.size, crypto.randomUUID());
   };
 
+  /** 右键「传输」/「队列」：`side` 是被点的那一栏，本地 → 上传，远端 → 下载 */
+  const transferEntry = (side: "local" | "remote", e: RemoteEntry, queued: boolean) => {
+    if (status !== "ready") return;
+    if (e.isDir) {
+      setTransferMsg("暂不支持传输目录，请选择文件");
+      return;
+    }
+    const kind = side === "local" ? "upload" : "download";
+    const local = side === "local" ? e.path : joinLocal(localPath, e.name);
+    const remote = side === "local" ? joinPath(remotePath, e.name) : e.path;
+    const id = crypto.randomUUID();
+    if (!queued) {
+      runTransfer(kind, e.name, local, remote, e.size, id);
+      return;
+    }
+    const now = Date.now();
+    setTransfers((prev) => [
+      {
+        id,
+        kind,
+        name: e.name,
+        size: e.size,
+        transferred: 0,
+        localPath: local,
+        remotePath: remote,
+        status: "queued",
+        viaQueue: true,
+        startedAt: now,
+        lastSampleAt: now,
+        lastSampleBytes: 0,
+        speed: 0,
+      },
+      ...prev,
+    ]);
+  };
+
+  // 队列按加入顺序（列表是新的在前，所以从尾部找）一次放行一个，
+  // 而且要等手动「传输」的那些也结束——排队就是排在所有正在传的后面
+  useEffect(() => {
+    if (status !== "ready") return;
+    if (transfers.some((t) => t.status === "running")) return;
+    const next = [...transfers].reverse().find((t) => t.status === "queued");
+    if (next) runTransfer(next.kind, next.name, next.localPath, next.remotePath, next.size, next.id, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transfers, status]);
+
   const retryTransfer = (t: Transfer) => {
     setTransferCtx(null);
     // 复用同一个 id：重试是在这一行上重新开始，不是另起一条新记录
@@ -589,6 +865,10 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
   };
 
   const cancelTransfer = (t: Transfer) => {
+    if (t.status === "queued") {
+      setTransfers((prev) => prev.map((x) => (x.id === t.id ? { ...x, status: "canceled" } : x)));
+      return;
+    }
     if (t.status !== "running") return;
     cancelingRef.current.add(t.id);
     void api.sftpCancelTransfer(t.id).catch(() => {});
@@ -596,8 +876,9 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
 
   const removeTransfer = (id: string) => setTransfers((prev) => prev.filter((t) => t.id !== id));
   const clearFinishedTransfers = () =>
-    setTransfers((prev) => prev.filter((t) => t.status === "running"));
-  const cancelAllTransfers = () => transfers.filter((t) => t.status === "running").forEach(cancelTransfer);
+    setTransfers((prev) => prev.filter((t) => t.status === "running" || t.status === "queued"));
+  const cancelAllTransfers = () =>
+    transfers.filter((t) => t.status === "running" || t.status === "queued").forEach(cancelTransfer);
 
   const revealLocal = async (path: string) => {
     try {
@@ -635,8 +916,8 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
     }
   };
 
-  const doDelete = async () => {
-    const src = remoteEntries.find((e) => e.path === remoteSel);
+  const doDelete = async (entry?: RemoteEntry) => {
+    const src = entry ?? remoteEntries.find((e) => e.path === remoteSel);
     if (!src) {
       setTransferMsg("请先在右侧选择要删除的条目");
       return;
@@ -651,8 +932,8 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
     }
   };
 
-  const doRename = async () => {
-    const src = remoteEntries.find((e) => e.path === remoteSel);
+  const doRename = async (entry?: RemoteEntry) => {
+    const src = entry ?? remoteEntries.find((e) => e.path === remoteSel);
     if (!src) {
       setTransferMsg("请先在右侧选择要重命名的条目");
       return;
@@ -666,6 +947,35 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
       setTransferMsg(`重命名失败: ${e}`);
     }
   };
+
+  const doRenameLocal = async (src: RemoteEntry) => {
+    const name = prompt("新名称", src.name);
+    if (!name || name === src.name) return;
+    try {
+      await api.renameLocal(src.path, joinLocal(localPath, name));
+      setLocalSel(null);
+      await loadLocal(localPath);
+    } catch (e) {
+      setTransferMsg(`重命名失败: ${e}`);
+    }
+  };
+
+  const copyRemotePath = async (p: string) => {
+    try {
+      await api.clipboardWrite(p);
+      setTransferMsg(`已复制路径：${p}`);
+    } catch (e) {
+      setTransferMsg(`复制失败: ${e}`);
+    }
+  };
+
+  const openPaneCtx = (side: "local" | "remote", ev: RMouseEvent, entry: RemoteEntry | null) =>
+    setCtx({
+      side,
+      entry,
+      x: Math.min(ev.clientX, window.innerWidth - 200),
+      y: Math.min(ev.clientY, window.innerHeight - (side === "remote" ? 320 : 220)),
+    });
 
   return (
     <div className="fm" style={{ display: active ? "flex" : "none" }}>
@@ -691,9 +1001,14 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
           onActivate={enterLocal}
           onUp={() => setLocalPath(parentLocal(localPath))}
           onNavigate={gotoLocal}
+          onContext={(ev, entry) => openPaneCtx("local", ev, entry)}
+          findToken={localFind}
         >
           <button className="btn" onClick={doUpload} disabled={status !== "ready"}>
             上传 →
+          </button>
+          <button className="btn" onClick={() => void loadLocal(localPath)}>
+            刷新
           </button>
         </Pane>
 
@@ -712,26 +1027,24 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
             loadRemote(p);
           }}
           onNavigate={gotoRemote}
-          onEntryContext={(ev, entry) =>
-            setCtx({
-              x: Math.min(ev.clientX, window.innerWidth - 200),
-              y: Math.min(ev.clientY, window.innerHeight - 190),
-              entry,
-            })
-          }
+          onContext={(ev, entry) => openPaneCtx("remote", ev, entry)}
+          findToken={remoteFind}
         >
           <button className="btn" onClick={doDownload} disabled={status !== "ready"}>
             ← 下载
           </button>
+          <button className="btn" onClick={() => void loadRemote(remotePath)} disabled={status !== "ready"}>
+            刷新
+          </button>
           <button className="btn" onClick={doMkdir} disabled={status !== "ready"}>
             新建目录
           </button>
-          <button className="btn" onClick={doRename} disabled={status !== "ready"}>
+          <button className="btn" onClick={() => void doRename()} disabled={status !== "ready"}>
             重命名
           </button>
           <button
             className="btn danger"
-            onClick={doDelete}
+            onClick={() => void doDelete()}
             disabled={status !== "ready"}
           >
             删除
@@ -742,7 +1055,17 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
       {transferMsg && <div className="fm-transfer">{transferMsg}</div>}
 
       {transfers.length > 0 && (
-        <div className="fm-xfer">
+        <div
+          ref={xferRef}
+          className="fm-xfer"
+          style={xferH != null ? { height: xferH, maxHeight: "none" } : undefined}
+        >
+          <div
+            className="fm-xfer-resize"
+            title="上下拖动调整高度，双击还原"
+            onPointerDown={startXferResize}
+            onDoubleClick={() => setXferH(null)}
+          />
           <div className="fm-xfer-head">
             <span>名称</span>
             <span>状态</span>
@@ -777,7 +1100,9 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
                     {t.name}
                   </span>
                   <span className={`fm-xfer-status fm-xfer-status-${t.status}`}>
-                    {t.status === "running"
+                    {t.status === "queued"
+                      ? "排队中"
+                      : t.status === "running"
                       ? "进行中"
                       : t.status === "done"
                         ? "已完成"
@@ -815,7 +1140,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
         <div ref={transferCtxRef} className="ctx-menu" style={{ left: transferCtx.x, top: transferCtx.y }}>
           <button
             className="ctx-item"
-            disabled={transferCtx.transfer.status !== "running"}
+            disabled={transferCtx.transfer.status !== "running" && transferCtx.transfer.status !== "queued"}
             onClick={() => {
               cancelTransfer(transferCtx.transfer);
               setTransferCtx(null);
@@ -825,7 +1150,11 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
           </button>
           <button
             className="ctx-item"
-            disabled={transferCtx.transfer.status === "running" || transferCtx.transfer.status === "done"}
+            disabled={
+              transferCtx.transfer.status === "running" ||
+              transferCtx.transfer.status === "queued" ||
+              transferCtx.transfer.status === "done"
+            }
             onClick={() => retryTransfer(transferCtx.transfer)}
           >
             重试
@@ -868,65 +1197,122 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
         </div>
       )}
 
-      {ctx && (
-        <div ref={ctxRef} className="ctx-menu" style={{ left: ctx.x, top: ctx.y }}>
-          {ctx.entry.isDir ? (
-            <button
-              className="ctx-item"
-              onClick={() => {
-                const e = ctx.entry;
-                setCtx(null);
-                enterRemote(e);
-              }}
-            >
-              打开
-            </button>
-          ) : (
-            <>
-              <button
-                className="ctx-item"
-                disabled={!viewableKind(ctx.entry.name)}
-                title={
-                  viewableKind(ctx.entry.name)
-                    ? "在新窗口中查看"
-                    : "支持 Markdown、HTML、图片、音频、视频、文本与配置文件（json/yaml/toml/ini/conf/xml/sql…）"
-                }
-                onClick={() => doView(ctx.entry)}
-              >
-                浏览
-              </button>
+      {ctx && (() => {
+        const { side, entry } = ctx;
+        const remote = side === "remote";
+        const xferOk = status === "ready" && !!entry && !entry.isDir;
+        const xferTip = entry?.isDir ? "暂不支持传输目录" : undefined;
+        const done = () => setCtx(null);
+        return (
+          <div ref={ctxRef} className="ctx-menu" style={{ left: ctx.x, top: ctx.y }}>
+            {remote && entry?.isDir && (
               <button
                 className="ctx-item"
                 onClick={() => {
-                  setCtx(null);
-                  void doDownload();
+                  done();
+                  enterRemote(entry);
                 }}
               >
-                下载到本地
+                打开
               </button>
-            </>
-          )}
-          <div className="ctx-sep" />
-          <button
-            className="ctx-item"
-            onClick={() => {
-              setCtx(null);
-              void doRename();
-            }}
-          >
-            重命名
-          </button>
-          <button
-            className="ctx-item danger"
-            onClick={() => {
-              setCtx(null);
-              void doDelete();
-            }}
-          >
-            删除
-          </button>
-        </div>
-      )}
+            )}
+            {remote && entry && !entry.isDir && (
+              <button
+                className="ctx-item"
+                disabled={!viewableKind(entry.name)}
+                title={
+                  viewableKind(entry.name)
+                    ? "在新窗口中查看"
+                    : "支持 Markdown、HTML、图片、音频、视频、文本与配置文件（json/yaml/toml/ini/conf/xml/sql…）"
+                }
+                onClick={() => void doView(entry)}
+              >
+                浏览
+              </button>
+            )}
+            <button
+              className="ctx-item"
+              disabled={!xferOk}
+              title={xferTip}
+              onClick={() => {
+                done();
+                if (entry) transferEntry(side, entry, false);
+              }}
+            >
+              传输
+            </button>
+            <button
+              className="ctx-item"
+              disabled={!xferOk}
+              title={xferTip ?? "加入传输队列，按顺序逐个传输"}
+              onClick={() => {
+                done();
+                if (entry) transferEntry(side, entry, true);
+              }}
+            >
+              队列
+            </button>
+            <div className="ctx-sep" />
+            <button
+              className="ctx-item"
+              onClick={() => {
+                done();
+                if (remote) setRemoteFind((n) => n + 1);
+                else setLocalFind((n) => n + 1);
+              }}
+            >
+              搜索
+            </button>
+            {remote && (
+              <button
+                className="ctx-item"
+                onClick={() => {
+                  done();
+                  void copyRemotePath(entry ? entry.path : remotePath);
+                }}
+              >
+                复制路径
+              </button>
+            )}
+            <button
+              className="ctx-item"
+              disabled={!entry || (remote && status !== "ready")}
+              onClick={() => {
+                done();
+                if (!entry) return;
+                if (remote) void doRename(entry);
+                else void doRenameLocal(entry);
+              }}
+            >
+              重命名
+            </button>
+            {remote && (
+              <button
+                className="ctx-item danger"
+                disabled={!entry || status !== "ready"}
+                onClick={() => {
+                  done();
+                  if (entry) void doDelete(entry);
+                }}
+              >
+                删除
+              </button>
+            )}
+            <div className="ctx-sep" />
+            <button
+              className="ctx-item"
+              disabled={remote && status !== "ready"}
+              onClick={() => {
+                done();
+                if (remote) void loadRemote(remotePath);
+                else void loadLocal(localPath);
+              }}
+            >
+              刷新
+            </button>
+          </div>
+        );
+      })()}
     </div>
   );
 }

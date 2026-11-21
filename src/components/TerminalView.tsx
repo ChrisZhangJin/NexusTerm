@@ -48,6 +48,7 @@ import { themeToXterm } from "../lib/theme";
 import { isMacOS } from "../lib/platform";
 import { installMacKeyboard, setInputTrace, traceSend } from "../lib/macInput";
 import { SHIFT_ENTER_SEQ, shouldSendMetaEnter, textBeforeCursor, wantsMetaEnter } from "../lib/shiftEnter";
+import { isSftpCommand } from "../lib/sftpCmd";
 import { attachZmodem, type ZmodemGate } from "../lib/zmodem";
 import type { ClosedInfo, TerminalTab, Theme } from "../types";
 
@@ -373,6 +374,24 @@ export default function TerminalView({
   const lineStartRef = useRef<LineStart | null>(null);
   // 录制状态由后端事件驱动（面板可能浮出在另一个窗口里按的「开始录制」），终端只需同步问 `isRecording`
   useEffect(() => watchRecording(tabId), [tabId]);
+  const onOpenSftpRef = useRef(onOpenSftp);
+  onOpenSftpRef.current = onOpenSftp;
+  const sftpTimerRef = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(sftpTimerRef.current), []);
+  /**
+   * 一行命令被当成「真的 shell 命令」提交之后的统一出口（与进历史同一个判定：
+   * 行有回显、不在全屏程序里）。目前只做一件事：SSH 标签里敲了 `sftp ...` 就
+   * 稍后打开 / 同步 SFTP 面板。命令本身照常发给远端，这里不拦。
+   */
+  const onCommandCommitted = useCallback((line: string) => {
+    if (kind !== "ssh" || statusRef.current !== "connected") return;
+    if (!isSftpCommand(line)) return;
+    // 延后一点：别和回车的回显抢；面板内部会再探测 cwd
+    window.clearTimeout(sftpTimerRef.current);
+    sftpTimerRef.current = window.setTimeout(() => {
+      if (statusRef.current === "connected") onOpenSftpRef.current?.();
+    }, 300);
+  }, [kind]);
   const ghostRef = useRef(new GhostText());
   const hintsRef = useRef<CompletionItem[]>([]);
   /**
@@ -510,6 +529,8 @@ export default function TerminalView({
     refreshHints(lineRef.current.text);
   }, [dismissHints, isLocal, refreshHints]);
 
+  const onCommandCommittedRef = useRef(onCommandCommitted);
+  onCommandCommittedRef.current = onCommandCommitted;
   /** 写 pty 的那条路定义在 mount 的 effect 里，用 ref 桥给下面的回调 */
   const sendRef = useRef<(d: string) => void>(() => {});
   /**
@@ -533,6 +554,7 @@ export default function TerminalView({
     if (committed) {
       if (lineEchoedRef.current && termRef.current?.buffer.active.type === "normal") {
         recordCommand(historyKeyRef.current, committed);
+        onCommandCommitted(committed);
       }
       pushUserCommand(tabId, committed, lineEchoedRef.current, termRef.current?.buffer.active.type !== "normal");
       lineEchoedRef.current = false;
@@ -541,7 +563,7 @@ export default function TerminalView({
       tapRecorder(tabId, termRef.current, "\r", committed, wasKnown, lineStartRef.current);
     }
     sendRef.current("\r");
-  }, [dismissHints]);
+  }, [dismissHints, onCommandCommitted]);
 
   /** 把当前行列数同步给后端（SSH 是 window_change，本地是 PTY resize） */
   const syncSize = useCallback(() => {
@@ -854,6 +876,7 @@ export default function TerminalView({
         // 全屏程序（vim / less）里敲的不是 shell 命令，不进历史
         if (lineEchoedRef.current && term.buffer.active.type === "normal") {
           recordCommand(historyKeyRef.current, committed);
+          onCommandCommittedRef.current(committed);
         }
         pushUserCommand(tabId, committed, lineEchoedRef.current, term.buffer.active.type !== "normal");
         lineEchoedRef.current = false;
