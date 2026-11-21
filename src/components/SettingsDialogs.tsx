@@ -13,10 +13,16 @@ import type {
   AgentConfig,
   AgentExecMode,
   AgentProvider,
+  HostNotifyConfig,
   SweepReport,
   VaultStatus,
 } from "../types";
+import { normalizeBudget, parseBudgetInput, type RunBudget } from "../lib/agentBudget";
+import { normalizePrice, priceFor } from "../lib/usage";
+import type { ModelPrice } from "../types";
 import MasterPasswordDialog, { type MasterPasswordMode } from "./MasterPasswordDialog";
+import ConnMigrateDialog, { type ConnMigrateMode } from "./ConnMigrateDialog";
+import { CONN_FILE_EXT, type MigrateReport } from "../lib/connMigrate";
 import {
   DEFAULT_SHORTCUTS,
   SHORTCUT_LABELS,
@@ -431,6 +437,69 @@ const CONTEXT_CHOICES: readonly { bytes: number; label: string }[] = [
   { bytes: 128 * 1024, label: "128 KB · 约 4.4 万汉字 · 最完整" },
 ];
 
+const DEFAULT_HOST_NOTIFY: HostNotifyConfig = { system: true, taskbar: true, webhook: "" };
+
+/** 单价表的一行：数字先按文本编辑（输入「0.」时不被吞掉），失焦再规整 */
+function PriceRow({
+  price,
+  disabled,
+  onChange,
+  onRemove,
+}: {
+  price: ModelPrice;
+  disabled: boolean;
+  onChange: (p: ModelPrice) => void;
+  onRemove: () => void;
+}) {
+  const [inDraft, setInDraft] = useState<string | null>(null);
+  const [outDraft, setOutDraft] = useState<string | null>(null);
+  const num = (n: number) => (n > 0 ? String(n) : "");
+  return (
+    <div className="row ag-price-row">
+      <input
+        className="ag-price-pattern"
+        placeholder="模型名包含…（如 deepseek-chat）"
+        value={price.pattern}
+        disabled={disabled}
+        onChange={(e) => onChange({ ...price, pattern: e.target.value })}
+      />
+      <input
+        className="ag-price-num"
+        type="number"
+        min={0}
+        step={0.01}
+        placeholder="输入"
+        title="美元 / 百万输入 token"
+        value={inDraft ?? num(price.inputPerM)}
+        disabled={disabled}
+        onChange={(e) => setInDraft(e.target.value)}
+        onBlur={() => {
+          if (inDraft !== null) onChange(normalizePrice({ ...price, inputPerM: Number(inDraft) }));
+          setInDraft(null);
+        }}
+      />
+      <input
+        className="ag-price-num"
+        type="number"
+        min={0}
+        step={0.01}
+        placeholder="输出"
+        title="美元 / 百万输出 token"
+        value={outDraft ?? num(price.outputPerM)}
+        disabled={disabled}
+        onChange={(e) => setOutDraft(e.target.value)}
+        onBlur={() => {
+          if (outDraft !== null) onChange(normalizePrice({ ...price, outputPerM: Number(outDraft) }));
+          setOutDraft(null);
+        }}
+      />
+      <button className="ap-mini" disabled={disabled} onClick={onRemove} title="删除这一行">
+        删除
+      </button>
+    </div>
+  );
+}
+
 export function AgentDialog({ onClose }: { onClose: () => void }) {
   const saved = useAgentConfig();
   const [draft, setDraft] = useState<AgentConfig>(saved);
@@ -440,8 +509,21 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
   const [saveErr, setSaveErr] = useState<string | null>(null);
   /** 用户动过表单之后，后端的异步回包就不再覆盖本地草稿 */
   const editedRef = useRef(false);
+  /** 托管提醒：单独存（不进 AgentConfig，改它不需要保险库解锁）。null = 还没读到 */
+  const [notifySaved, setNotifySaved] = useState<HostNotifyConfig | null>(null);
+  const [notify, setNotify] = useState<HostNotifyConfig>(DEFAULT_HOST_NOTIFY);
 
   useEsc(onClose);
+
+  useEffect(() => {
+    api
+      .hostNotifyGet()
+      .then((c) => {
+        setNotifySaved(c);
+        setNotify(c);
+      })
+      .catch(() => {});
+  }, []);
 
   // 配置是异步从后端读的，首帧是默认值：用户没编辑过就跟随真值，否则界面会停在「假」配置上，一保存就把真值冲掉。
   useEffect(() => {
@@ -482,7 +564,8 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
     patch({ accounts: rest, activeId: rest[0].id });
   };
 
-  const dirty = JSON.stringify(draft) !== JSON.stringify(saved);
+  const notifyDirty = notifySaved !== null && JSON.stringify(notify) !== JSON.stringify(notifySaved);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(saved) || notifyDirty;
 
   // 与后端 validate 的后三项一致：地址 / 模型 / Key
   const missing = [
@@ -517,9 +600,14 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
   const save = async () => {
     setSaveErr(null);
     try {
+      // 托管提醒先存：它不依赖保险库，Agent 配置因锁定存不进去时它也不该跟着丢
+      if (notifyDirty) {
+        await api.hostNotifySet(notify);
+        setNotifySaved(notify);
+      }
       // 先写盘、后关窗：saveAgentConfig 写成功才更新内存缓存，不会出现「界面显示已保存、库里其实没变」。
       // autoAttach 恒为 true：界面已没有置 false 的入口，这里兜住旧配置里残留的 false。
-      await saveAgentConfig({ ...draft, autoAttach: true });
+      await saveAgentConfig({ ...draft, autoAttach: true, budget: normalizeBudget(draft.budget) });
       onClose();
     } catch (e) {
       setSaveErr(String(e ?? "保存失败"));
@@ -761,6 +849,103 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
           )}
         </p>
 
+        <div className="settings-section">运行预算</div>
+        {(
+          [
+            ["maxSteps", "最多步数", "步", 1],
+            ["maxMinutes", "最长时间（分钟，0 = 不限）", "分钟", 0],
+            ["maxOutputChars", "输出字符上限（0 = 不限）", "字符", 0],
+          ] as [keyof RunBudget, string, string, number][]
+        ).map(([key, label, unit, min]) => (
+          <div className="row" key={key}>
+            <label>{label}</label>
+            <input
+              type="number"
+              min={min}
+              step={1}
+              disabled={!draft.enabled}
+              value={Number.isFinite(draft.budget[key]) ? draft.budget[key] : ""}
+              title={unit}
+              onChange={(e) =>
+                patch({ budget: { ...draft.budget, [key]: parseBudgetInput(e.target.value) } })
+              }
+              onBlur={() => patch({ budget: normalizeBudget(draft.budget) })}
+            />
+          </div>
+        ))}
+        <p className="ag-hint">
+          一轮 Agent 运行最多做这么多步（一次 <code>nx_skill</code> 运行算 1 步）、最多跑这么久、最多读写这么多字符；
+          任何一项用完都不会直接失败，而是<strong>暂停</strong>并说明已做了什么，由你点「继续」（换一份新预算接着做）或「停止」。
+          运行中也可以随时手动「暂停」。
+        </p>
+
+        <div className="settings-section">模型单价</div>
+        {draft.prices.map((p, i) => (
+          <PriceRow
+            key={i}
+            price={p}
+            disabled={!draft.enabled}
+            onChange={(next) => patch({ prices: draft.prices.map((x, j) => (j === i ? next : x)) })}
+            onRemove={() => patch({ prices: draft.prices.filter((_, j) => j !== i) })}
+          />
+        ))}
+        <div className="row">
+          <button
+            className="ap-mini"
+            disabled={!draft.enabled}
+            onClick={() => patch({ prices: [...draft.prices, { pattern: current.model.trim(), inputPerM: 0, outputPerM: 0 }] })}
+          >
+            + 添加一行
+          </button>
+          <span className="ag-hint">
+            {priceFor(draft.prices, current.model)
+              ? `当前模型「${current.model}」按「${priceFor(draft.prices, current.model)?.pattern}」计价`
+              : `当前模型「${current.model || "未填"}」没有单价：只显示 token，不显示花费`}
+          </span>
+        </div>
+        <p className="ag-hint">
+          美元 / 百万 token（输入、输出）。模型名包含左栏的文字（不分大小写）就用这一行，多行命中取最长的那行。
+          用来在托管卡和对话框底部显示「≈$」、以及托管的「最多花费」。只预置了几款价格确定的模型，别的请按服务商的价目自己填；
+          不含缓存折扣，结果只是估算。
+        </p>
+
+        <div className="settings-section">托管需要我时</div>
+        <label className="settings-check">
+          <input
+            type="checkbox"
+            checked={notify.system}
+            onChange={(e) => setNotify((n) => ({ ...n, system: e.target.checked }))}
+          />
+          <span>
+            系统通知
+            <em>托管在等你回答 / 批准、暂停、挂起或结束时弹一条通知；窗口在前台时不弹（标签上的琥珀色圆点照常亮）</em>
+          </span>
+        </label>
+        <label className="settings-check">
+          <input
+            type="checkbox"
+            checked={notify.taskbar}
+            onChange={(e) => setNotify((n) => ({ ...n, taskbar: e.target.checked }))}
+          />
+          <span>
+            任务栏闪烁
+            <em>窗口不在前台时让任务栏 / Dock 图标闪一下</em>
+          </span>
+        </label>
+        <div className="row">
+          <label>Webhook（可选）</label>
+          <input
+            type="url"
+            placeholder="https://… 留空不推送"
+            value={notify.webhook}
+            onChange={(e) => setNotify((n) => ({ ...n, webhook: e.target.value }))}
+          />
+        </div>
+        <p className="ag-hint">
+          填了就在同样的时机 POST 一段 JSON <code>{"{title, body, host, state, ts}"}</code>
+          ，可接企业微信 / 飞书 / Telegram 的转发桥推到手机。只带一行原因（已脱敏），不含终端内容。
+        </p>
+
         <div className="settings-section">排查</div>
         <label className="settings-check">
           <input
@@ -835,7 +1020,14 @@ function describeDone(mode: MasterPasswordMode, r: SweepReport | null): VaultRep
     : { text: "已解锁，本次运行期间凭据可正常读写。", warn: false };
 }
 
-export function SecurityDialog({ onClose }: { onClose: () => void }) {
+export function SecurityDialog({
+  onClose,
+  onImported,
+}: {
+  onClose: () => void;
+  /** 连接迁移导入成功后调用：调用方要重新拉连接列表与会话附加设置 */
+  onImported?: () => void;
+}) {
   const [status, setStatus] = useState<VaultStatus | null>(null);
   /** null = 还在问系统凭据服务。不是 false —— 「没记住」和「还不知道」要分开显示 */
   const [remembered, setRemembered] = useState<boolean | null>(null);
@@ -843,11 +1035,14 @@ export function SecurityDialog({ onClose }: { onClose: () => void }) {
   /** 开出去的那个弹窗里「在本机记住」要不要预先勾上 */
   const [rememberDefault, setRememberDefault] = useState(false);
   const [report, setReport] = useState<VaultReport | null>(null);
+  /** 连接迁移：开着的密码弹窗（导出 / 导入）与上一次的结果 */
+  const [mig, setMig] = useState<ConnMigrateMode | null>(null);
+  const [migReport, setMigReport] = useState<MigrateReport | null>(null);
   /** 每次操作完 +1，驱动下面两条 effect 重新拉状态 */
   const [tick, setTick] = useState(0);
 
   // 弹窗开着的时候 Escape 归它管，否则一下 Esc 会把两层一起关掉
-  useEsc(onClose, prompt === null);
+  useEsc(onClose, prompt === null && mig === null);
 
   // 状态是廉价的内存读，挂载即拉
   useEffect(() => {
@@ -913,11 +1108,37 @@ export function SecurityDialog({ onClose }: { onClose: () => void }) {
     void api.vaultForget();
   };
 
+  /** 先选文件、再问密码：选文件的系统对话框关掉后才弹自己的弹窗，两层不叠在一起 */
+  const pickImport = async () => {
+    setMigReport(null);
+    try {
+      const { open: openDialog } = await import("@tauri-apps/plugin-dialog");
+      const picked = await openDialog({
+        multiple: false,
+        directory: false,
+        title: "导入连接",
+        filters: [{ name: "NexusTerm 连接迁移文件", extensions: [CONN_FILE_EXT] }],
+      });
+      if (typeof picked === "string") setMig({ kind: "import", path: picked });
+    } catch (e) {
+      setMigReport({ text: `无法打开文件选择框：${String(e)}`, warn: true, details: [] });
+    }
+  };
+
+  const migDone = (kind: ConnMigrateMode["kind"]) => (r: MigrateReport) => {
+    setMig(null);
+    setMigReport(r);
+    if (kind === "import") onImported?.();
+  };
+
   const enabled = status?.enabled === true;
   const unlocked = status?.unlocked === true;
 
   return (
-    <div className="modal-backdrop" onMouseDown={() => prompt === null && onClose()}>
+    <div
+      className="modal-backdrop"
+      onMouseDown={() => prompt === null && mig === null && onClose()}
+    >
       <div className="modal settings-modal" onMouseDown={(e) => e.stopPropagation()}>
         <div className="settings-head">
           <h2>安全</h2>
@@ -1054,12 +1275,52 @@ export function SecurityDialog({ onClose }: { onClose: () => void }) {
           </div>
         </div>
 
+        <div className="settings-section">连接迁移</div>
+        <p className="ag-hint">
+          把全部已保存的连接（含密码、私钥口令、TOTP 种子，可选私钥文件）打成一个文件，
+          换电脑时导入。文件用你设的导出密码加密，和主密码无关。
+          <strong>拿到文件并且知道导出密码的人就能读到这些凭据</strong>
+          —— 导出密码请和文件分开保管，迁移完成后记得删除文件。
+          导入时与已有连接（主机、端口、用户名、名称都相同）重复的会跳过，不会覆盖。
+        </p>
+        <div className="row">
+          <label>连接</label>
+          <button
+            className="btn"
+            onClick={() => {
+              setMigReport(null);
+              setMig({ kind: "export" });
+            }}
+          >
+            导出全部连接…
+          </button>
+          <button className="btn" onClick={() => void pickImport()}>
+            导入连接…
+          </button>
+        </div>
+        {migReport && (
+          <div className={`vault-report${migReport.warn ? " warn" : ""}`}>
+            <strong>{migReport.text}</strong>
+            {migReport.details.length > 0 && (
+              <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+                {migReport.details.map((w, i) => (
+                  <li key={i}>{w}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
         <div className="modal-actions">
           <button className="btn primary" onClick={onClose}>
             完成
           </button>
         </div>
       </div>
+
+      {mig && (
+        <ConnMigrateDialog mode={mig} onClose={() => setMig(null)} onDone={migDone(mig.kind)} />
+      )}
 
       {prompt && (
         <MasterPasswordDialog

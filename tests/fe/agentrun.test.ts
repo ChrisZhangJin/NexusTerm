@@ -1,0 +1,168 @@
+/**
+ * `lib/agentRun` 的回归测试：从 AgentPanel 抽出的运行状态 reducer，以及托管视图用的切片 / 待处理计数。
+ */
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  EMPTY_CONV,
+  isHandEyeKind,
+  maskReveal,
+  pendingPrompts,
+  sliceFromMessage,
+  withApprove,
+  withConclusion,
+  withDecision,
+  withStep,
+  type Conversation,
+} from "../../src/lib/agentRun";
+import type { AgentMessage, AgentStep } from "../../src/types";
+
+const step = (o: Partial<AgentStep>): AgentStep => ({ kind: "note", step: 1, ...o });
+const busy: Conversation = { ...EMPTY_CONV, busy: true };
+
+test("watch 属于「手和眼」：收尾步骤并回同目标同内容的进行中卡片", () => {
+  assert.equal(isHandEyeKind("watch"), true);
+  assert.equal(isHandEyeKind("exec"), false);
+  let c = withStep(busy, step({ kind: "watch", target: "t1", command: "盯屏" }));
+  assert.equal(c.messages.length, 1);
+  c = withStep(c, step({ kind: "watch", target: "t1", command: "盯屏", output: "done" }));
+  assert.equal(c.messages.length, 1);
+  assert.equal(c.messages[0].step?.output, "done");
+});
+
+test("未知步骤种类原样追加成一张卡，不丢", () => {
+  const c = withStep(busy, step({ kind: "something-new", text: "x" }));
+  assert.equal(c.messages.length, 1);
+  assert.equal(c.messages[0].step?.kind, "something-new");
+});
+
+test("exec → result 合成一张卡片", () => {
+  let c = withStep(busy, step({ kind: "exec", target: "t", command: "ls" }));
+  c = withStep(c, step({ kind: "result", target: "t", command: "ls", output: "a" }));
+  assert.equal(c.messages.length, 1);
+  assert.equal(c.messages[0].step?.kind, "result");
+});
+
+test("结论落地即收掉 busy", () => {
+  const c = withConclusion(busy, "完成");
+  assert.equal(c.busy, false);
+  assert.equal(c.messages[c.messages.length - 1].text, "完成");
+});
+
+test("sliceFromMessage：只取起手消息之后；找不到 / 没有起点就是空", () => {
+  const msgs: AgentMessage[] = [
+    { id: "a", role: "user", text: "聊天", ts: 1 },
+    { id: "g", role: "user", text: "托管目标：x", ts: 2 },
+    { id: "s", role: "assistant", text: "", ts: 3, step: step({ kind: "exec" }) },
+  ];
+  assert.deepEqual(sliceFromMessage(msgs, "g").map((m) => m.id), ["s"]);
+  assert.deepEqual(sliceFromMessage(msgs, "zzz"), []);
+  assert.deepEqual(sliceFromMessage(msgs, null), []);
+});
+
+test("pendingPrompts：审批 / 密码卡片答复后不再计数", () => {
+  let c = withApprove(busy, { requestId: "r1", target: "t", targetLabel: "T", command: "rm -rf x", reasons: [] } as never);
+  assert.equal(pendingPrompts(c.messages), 1);
+  c = withDecision(c, "r1", true);
+  assert.equal(pendingPrompts(c.messages), 0);
+});
+
+test("watch 心跳（output 为空、同 target+command）原地更新，不另起卡", () => {
+  let c = withStep(busy, step({ kind: "watch", target: "t1", command: "盯屏", text: "已盯 60s" }));
+  for (let i = 0; i < 5; i++) {
+    c = withStep(c, step({ kind: "watch", target: "t1", command: "盯屏", text: `已盯 ${(i + 2) * 60}s` }));
+  }
+  assert.equal(c.messages.length, 1);
+  assert.equal(c.messages[0].step?.text, "已盯 360s");
+  assert.equal(c.messages[0].step?.output, undefined);
+  // 收尾（output 为空串也算）合并进同一张卡
+  c = withStep(c, step({ kind: "watch", target: "t1", command: "盯屏", output: "" }));
+  assert.equal(c.messages.length, 1);
+  assert.equal(c.messages[0].step?.output, "");
+});
+
+test("watch 心跳：不同 target / command 是另一次盯屏，已收尾的不再被心跳复活", () => {
+  let c = withStep(busy, step({ kind: "watch", target: "t1", command: "A" }));
+  c = withStep(c, step({ kind: "watch", target: "t2", command: "A" }));
+  c = withStep(c, step({ kind: "watch", target: "t1", command: "B" }));
+  assert.equal(c.messages.length, 3);
+  // t1/A 收尾后，再来的同款心跳是新一次盯屏 → 新卡，且不改已收尾那张
+  c = withStep(c, step({ kind: "watch", target: "t1", command: "A", output: "ok" }));
+  c = withStep(c, step({ kind: "watch", target: "t1", command: "A" }));
+  assert.equal(c.messages.length, 4);
+  assert.equal(c.messages[0].step?.output, "ok");
+  assert.equal(c.messages[3].step?.output, undefined);
+});
+
+import {
+  DEFAULT_STEWARD_BUDGET_PREF,
+  isBudgetPause,
+  parseStewardBudgetPref,
+} from "../../src/lib/agentBudget";
+
+test("托管长度偏好：缺失 / 损坏回落默认，时长只认选项，步数夹到 [1,500]", () => {
+  assert.deepEqual(parseStewardBudgetPref(null), DEFAULT_STEWARD_BUDGET_PREF);
+  assert.deepEqual(parseStewardBudgetPref("not json"), DEFAULT_STEWARD_BUDGET_PREF);
+  assert.deepEqual(DEFAULT_STEWARD_BUDGET_PREF, { maxMinutes: 360, maxSteps: 400, maxCostUsd: 0 });
+  assert.deepEqual(parseStewardBudgetPref('{"maxMinutes":720,"maxSteps":50}'), { maxMinutes: 720, maxSteps: 50, maxCostUsd: 0 });
+  assert.deepEqual(parseStewardBudgetPref('{"maxMinutes":999,"maxSteps":9999}'), { maxMinutes: 360, maxSteps: 500, maxCostUsd: 0 });
+  assert.deepEqual(parseStewardBudgetPref('{"maxMinutes":120,"maxSteps":0}'), { maxMinutes: 120, maxSteps: 400, maxCostUsd: 0 });
+});
+
+test("托管花费上限：默认不限，非法 / 负数回落 0，保留两位小数并封顶", () => {
+  assert.equal(parseStewardBudgetPref('{"maxMinutes":120,"maxSteps":5,"maxCostUsd":1.234}').maxCostUsd, 1.23);
+  assert.equal(parseStewardBudgetPref('{"maxCostUsd":-3}').maxCostUsd, 0);
+  assert.equal(parseStewardBudgetPref('{"maxCostUsd":"abc"}').maxCostUsd, 0);
+  assert.equal(parseStewardBudgetPref('{"maxCostUsd":1e9}').maxCostUsd, 10_000);
+  assert.equal(isBudgetPause("cost"), true);
+});
+
+test("isBudgetPause：预算三项是，手动暂停 / 未暂停不是", () => {
+  assert.equal(isBudgetPause("steps"), true);
+  assert.equal(isBudgetPause("time"), true);
+  assert.equal(isBudgetPause("output"), true);
+  assert.equal(isBudgetPause("user"), false);
+  assert.equal(isBudgetPause(undefined), false);
+});
+
+// ——————————————— 交付给你（nx_reveal） ———————————————
+
+test("交付卡：每次交付各占一张卡，内容原样留在内存里的步骤上", () => {
+  const reveal = (title: string, content: string): AgentStep => ({
+    kind: "reveal",
+    step: 3,
+    target: "t1",
+    command: "文件 /etc/sing-box/links.txt",
+    text: title,
+    output: "1 行，20 字节",
+    revealContent: content,
+  });
+  let c = withStep(EMPTY_CONV, reveal("节点链接", "vless://secret-a\n"));
+  c = withStep(c, reveal("节点链接", "vless://secret-b\n"));
+  assert.equal(c.messages.length, 2, "同标题同来源也不合并：两次交付是两份内容");
+  assert.equal(c.messages[0].step?.revealContent, "vless://secret-a\n");
+  assert.equal(c.messages[1].step?.revealContent, "vless://secret-b\n");
+});
+
+test("maskReveal：按非空行打码，不泄露原文与长度", () => {
+  const m = maskReveal("password=hunter2\n\nuuid=1b6f3c2e-9d1a-4c8e-b0f2-7a3d5e9c1f42\n");
+  assert.equal(m, "••••••••\n••••••••");
+  assert.ok(!m.includes("hunter2"));
+  assert.equal(maskReveal(""), "••••••••");
+});
+
+import { expirePendingSecrets as _expire } from "../../src/lib/agentRun";
+
+test("expirePendingSecrets：只收没答的密码卡，没有就原样返回", () => {
+  const sec = (id: string, result?: "submitted") => ({
+    id, role: "assistant" as const, text: "", ts: 0,
+    secret: { requestId: id } as never, ...(result ? { secretResult: result } : {}),
+  });
+  const c = { busy: false, interrupted: false, messages: [sec("a"), sec("b", "submitted")] };
+  const out = _expire(c);
+  assert.equal(out.messages[0].secretResult, "expired");
+  assert.equal(out.messages[1].secretResult, "submitted");
+  assert.equal(_expire(out), out, "没有待答的：同一个对象");
+});

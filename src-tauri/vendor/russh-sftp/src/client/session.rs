@@ -16,6 +16,8 @@ use crate::{
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Features {
     pub hardlink: bool,
+    /// NexusTerm 补丁 2
+    pub posix_rename: bool,
     pub fsync: bool,
     pub statvfs: bool,
     pub expand_path: bool,
@@ -54,6 +56,7 @@ impl SftpSession {
 
         let mut features = Features {
             hardlink: has_extension(extensions::HARDLINK, "1"),
+            posix_rename: has_extension(extensions::POSIX_RENAME, "1"),
             fsync: has_extension(extensions::FSYNC, "1"),
             statvfs: has_extension(extensions::STATVFS, "2"),
             expand_path: has_extension(extensions::EXPAND_PATH, "1"),
@@ -264,6 +267,21 @@ impl SftpSession {
         }
 
         self.session.hardlink(oldpath, newpath).await.map(|_| true)
+    }
+
+    /// NexusTerm 补丁 2：用 `posix-rename@openssh.com` 改名，目标已存在时原子覆盖
+    /// （标准 SSH_FXP_RENAME 在 OpenSSH 上遇到已存在的目标会失败）。
+    /// 服务器没声明该扩展时返回 `Ok(false)`，什么也不做，由调用方自行退路。
+    pub async fn posix_rename<O, N>(&self, oldpath: O, newpath: N) -> SftpResult<bool>
+    where
+        O: Into<String>,
+        N: Into<String>,
+    {
+        if !self.features.posix_rename {
+            return Ok(false);
+        }
+
+        self.session.posix_rename(oldpath, newpath).await.map(|_| true)
     }
 
     /// Performs a statvfs on the remote file system path.

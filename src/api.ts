@@ -5,8 +5,22 @@ import type {
   AgentBufferStats,
   AgentConfig,
   AgentDonePayload,
+  RunUsage,
   AgentExecResult,
   AgentRunRequest,
+  HostBudgetGrant,
+  HostCardReply,
+  HostCheck,
+  HostConsoleHint,
+  HostReattachCandidate,
+  HostNotice,
+  HostStartRequest,
+  HostStatus,
+  HostChanges,
+  HostHistoryItem,
+  HostNotifyConfig,
+  AgentScreenRequest,
+  AgentSecretRequest,
   AgentStep,
   AgentTabInfo,
   AgentTabRequest,
@@ -17,15 +31,29 @@ import type {
   DiscoveredKey,
   GenerateKeyOptions,
   KeyInfo,
+  MacroMigrationPreview,
+  MacroMigrationResult,
   MacroRecord,
   MacroStep,
   NewSession,
   RemoteEntry,
   SessionRecord,
+  Skill,
+  HostMemoryView,
+  HostNote,
+  HostNoteKind,
+  SkillRunReport,
+  SkillTrustView,
+  SkillInput,
   SweepReport,
+  ConnExportSummary,
+  ConnImportSummary,
   TotpPreview,
   VaultStatus,
 } from "./types";
+import type { ControlPayload, ControlState } from "./lib/control";
+import type { RecorderStatus, RecordingDraft } from "./lib/recorder";
+import type { RefinedSkillDraft } from "./lib/skillRefine";
 
 export const api = {
   health: () => invoke<string>("health"),
@@ -193,9 +221,91 @@ export const api = {
     invoke<string>("agent_context", { sessionId, maxBytes: maxBytes ?? null }),
   /** 清空缓冲（让 agent 忘掉刚才的事） */
   agentClear: (sessionId: string) => invoke<void>("agent_clear", { sessionId }),
+  /** 读回某个连接（`convKeyOf`）已保存的面板对话。结构见 `lib/agentHistory`。 */
+  agentHistoryLoad: (key: string) => invoke<unknown[]>("agent_history_load", { key }),
+  /** 覆盖保存面板对话。后端落盘前会再脱敏、截断、限量。 */
+  agentHistorySave: (messages: unknown[], key: string) => invoke<void>("agent_history_save", { messages, key }),
+  /** 「清空对话」：真删已保存的对话与运行摘要。 */
+  agentHistoryClear: (key: string) => invoke<void>("agent_history_clear", { key }),
+  /** 「新对话」：下一次提问不再接着之前的模型消息历史（面板记录不动） */
+  agentConversationReset: (key: string) => invoke<void>("agent_conversation_reset", { key }),
+  // ——— Skill（Phase 3.1）。校验失败的 reject 文案是换行分隔的全部问题。———
+  /** 最近更新在前；`query` 非空时按名称 / 描述子串搜索 */
+  skillList: (query?: string) => invoke<Skill[]>("skill_list", { query: query ?? null }),
+  skillGet: (id: string) => invoke<Skill | null>("skill_get", { id }),
+  skillCreate: (input: SkillInput) => invoke<Skill>("skill_create", { input }),
+  skillUpdate: (id: string, input: SkillInput) => invoke<Skill>("skill_update", { id, input }),
+  /** 返回是否真删了 */
+  skillDelete: (id: string) => invoke<boolean>("skill_delete", { id }),
+  /** 只校验不保存（编辑器实时提示）；空数组 = 通过 */
+  skillValidate: (input: SkillInput) => invoke<string[]>("skill_validate", { input }),
+  /** 导出为带版本头的美化 JSON 文本；写文件由前端负责 */
+  skillExport: (id: string) => invoke<string>("skill_export", { id }),
+  /** 解析并校验导入文本，不保存（预览 / 改名用） */
+  skillImportPreview: (text: string) => invoke<Skill>("skill_import_preview", { text }),
+  /** 导入并保存：新 id、来源 imported、计数为 0 */
+  skillImport: (text: string) => invoke<Skill>("skill_import", { text }),
+  /**
+   * 4.2/4.3：在会话上回放技能。走与 Agent 同一套闸门（范围 / 危险 / 审批 / 控制权 / 取消）；
+   * 进度与审批 / 密码卡片经该会话的 agent 事件频道推送，`await` 到的是整次运行结束。
+   * `params` 只放非 secret 参数；secret 参数运行时走密码卡片，传了也不会被代入。
+   */
+  skillRun: (skillId: string, params: Record<string, string>, sessionId: string, targetLabel?: string) =>
+    invoke<SkillRunReport>("skill_run", { skillId, params, sessionId, targetLabel: targetLabel ?? null }),
+  /**
+   * 4.4：所有技能的信任档位（只读，后端按成功次数 / 风险 / 内容指纹算出，前端无法改写）。
+   * 传 `sessionId` 时同时给出该会话是否在各技能的适用主机范围内（超出则运行会被拒绝）。
+   */
+  skillTrust: (sessionId?: string, targetLabel?: string) =>
+    invoke<SkillTrustView[]>("skill_trust", { sessionId: sessionId ?? null, targetLabel: targetLabel ?? null }),
+  /**
+   * 3.3：让 Agent 把录制草稿整理成 skill 草稿（不保存）。草稿按账号 redact 标志脱敏后出网；
+   * 模型输出在后端被夹紧并校验，失败重试一次、再失败退回机械草稿（`fallback`）。
+   * 总开关未启用 / 没配 Key / 模型调用失败会 reject（中文句子）。
+   */
+  skillRefineDraft: (draft: RecordingDraft, hint?: string) =>
+    invoke<RefinedSkillDraft>("skill_refine_draft", { draft, hint: hint?.trim() || null }),
+  // ——— 旧宏迁移（Phase 3.5）。`ids` 省略 = 全部宏；原宏永远不会被改动或删除。———
+  /** 预览转换结果（草稿 + 警告），不写入任何东西 */
+  macrosMigratePreview: (ids?: string[]) =>
+    invoke<MacroMigrationPreview[]>("macros_migrate_preview", { ids: ids ?? null }),
+  /** 转成技能并保存；已迁移过的宏会跳过（幂等） */
+  macrosMigrate: (ids?: string[]) =>
+    invoke<MacroMigrationResult[]>("macros_migrate", { ids: ids ?? null }),
+  // ——— 主机记忆（Phase 4.5）。主机键由后端按会话推导，前端只传会话 id + 标签名。———
+  hostMemoryList: (sessionId: string, label: string) =>
+    invoke<HostMemoryView>("host_memory_list", { sessionId, label }),
+  hostMemoryAdd: (sessionId: string, label: string, text: string, kind: HostNoteKind) =>
+    invoke<HostNote>("host_memory_add", { sessionId, label, text, kind }),
+  /** 编辑后作者变为用户（Agent 此后不能再删它） */
+  hostMemoryUpdate: (id: string, text: string, kind: HostNoteKind) =>
+    invoke<HostNote>("host_memory_update", { id, text, kind }),
+  hostMemoryDelete: (id: string) => invoke<void>("host_memory_delete", { id }),
+  hostMemoryClear: (sessionId: string, label: string) =>
+    invoke<number>("host_memory_clear", { sessionId, label }),
   /** 会话没登记过旁路时返回 null，而不是抛错 */
   agentStats: (sessionId: string) =>
     invoke<AgentBufferStats | null>("agent_stats", { sessionId }),
+  /**
+   * 用户在终端提交了一行命令（只在回车时调，fire-and-forget）。
+   * `noEcho` = 这行没被回显过（密码提示）：后端只存占位，行内容不会被记录。
+   */
+  agentUserCommand: (sessionId: string, line: string, noEcho: boolean) =>
+    invoke<void>("agent_user_command", { sessionId, line, noEcho }),
+  // ——— 录制器（Phase 3.2）。草稿只经 `agentRecordStop` 的返回值交给前端，后端不留存。———
+  /** 开始录制这个终端。总开关未启用 / 已在录制中会 reject */
+  agentRecordStart: (sessionId: string, hostLabel?: string) =>
+    invoke<RecorderStatus>("agent_record_start", { sessionId, hostLabel: hostLabel ?? null }),
+  /** 结束录制，返回草稿（见 `lib/recorder.RecordingDraft`）。没在录制会 reject */
+  agentRecordStop: (sessionId: string) =>
+    invoke<RecordingDraft>("agent_record_stop", { sessionId }),
+  agentRecordStatus: (sessionId: string) =>
+    invoke<RecorderStatus>("agent_record_status", { sessionId }),
+  /** 放弃录制、不产出草稿；返回之前是否在录制 */
+  agentRecordCancel: (sessionId: string) => invoke<boolean>("agent_record_cancel", { sessionId }),
+  /** 录制中上报一次无文字的用户操作（Ctrl-C / Ctrl-D / Ctrl-Z / 空回车），fire-and-forget */
+  agentUserKeys: (sessionId: string, keys: string) =>
+    invoke<void>("agent_user_keys", { sessionId, keys }),
   /**
    * 提问。**resolve 只代表流已启动，不代表回答完成** ——
    * 答案要走 `onAgentToken` / `onAgentDone` / `onAgentError` 事件收。
@@ -214,9 +324,82 @@ export const api = {
    * 与 `agentAsk` 的分工：这条会真在终端里跑命令。
    */
   agentRun: (request: AgentRunRequest) => invoke<void>("agent_run", { request }),
-  /** 中止该会话正在进行的一轮。幂等。 */
-  agentRunCancel: (sessionId: string) =>
-    invoke<void>("agent_run_cancel", { sessionId }),
+
+  // ——— 统一托管：任务在后端常驻，命令立即返回，相位走 `onHost` / `onHostAll` ———
+
+  /** 开始托管：先拿终端租约再签契约，起任务后立即返回 contractId */
+  hostStart: (req: HostStartRequest) => invoke<string>("host_start", { ...req }),
+  /** 停止托管（进入「已停止」并释放终端）；返回是否确实停了一个在跑的 */
+  hostStop: (contractId: string, sendCtrlC?: boolean) =>
+    invoke<boolean>("host_stop", { contractId, sendCtrlC: sendCtrlC ?? false }),
+  /** 答复卡片（问题 / 审批）。卡片已处理过会 reject */
+  hostAnswer: (contractId: string, reply: HostCardReply) =>
+    invoke<void>("host_answer", { contractId, reply }),
+  hostTakeover: (contractId: string) => invoke<void>("host_takeover", { contractId }),
+  hostHandback: (contractId: string) => invoke<void>("host_handback", { contractId }),
+  hostPause: (contractId: string) => invoke<void>("host_pause", { contractId }),
+  /** 加预算继续：只有暂停时有效 */
+  hostResume: (contractId: string, budget?: HostBudgetGrant) =>
+    invoke<void>("host_resume", { contractId, budget: budget ?? null }),
+  hostStatus: (contractId: string) => invoke<HostStatus | null>("host_status", { contractId }),
+  hostList: () => invoke<HostStatus[]>("host_list"),
+  /** 历史托管：最近结束的（完成 / 失败 / 已停止），新的在前 */
+  hostHistory: (limit?: number) => invoke<HostHistoryItem[]>("host_history", { limit: limit ?? null }),
+  /** 一次托管的「实际改动」+ 可还原的原文备份 */
+  hostChanges: (contractId: string) => invoke<HostChanges>("host_changes", { contractId }),
+  /** 把托管改动前的原文写回去（经原来那个终端的文件通道） */
+  hostRestoreBackup: (contractId: string, backupId: string) =>
+    invoke<string>("host_restore_backup", { contractId, backupId }),
+  /** 托管提醒设置（系统通知 / 任务栏闪烁 / webhook） */
+  hostNotifyGet: () => invoke<HostNotifyConfig>("host_notify_get"),
+  hostNotifySet: (config: HostNotifyConfig) => invoke<void>("host_notify_set", { config }),
+  /** 接受（编辑后的）完成判据草稿，托管随即开跑 */
+  hostConfirmCriteria: (contractId: string, cardId: string, checks: HostCheck[]) =>
+    invoke<void>("host_confirm_criteria", { contractId, cardId, checks }),
+  /** 「待重新接驳」卡的候选 tab（按相似度排好） */
+  hostReattachCandidates: (contractId: string, candidates: HostConsoleHint[], slot?: string | null) =>
+    invoke<HostReattachCandidate[]>("host_reattach_candidates", { contractId, candidates, slot: slot ?? null }),
+  /** 确认接驳：接到某个 tab，或按保存的记录新开连接。多终端托管用 `slot`（原来的 console id）指明接的是哪一个 */
+  hostReattach: (contractId: string, consoleId: string | null, openNew = false, slot?: string | null) =>
+    invoke<void>("host_reattach", { contractId, consoleId, openNew, slot: slot ?? null }),
+  /** 改契约（目标 / 档位），不重启运行 */
+  hostAmend: (contractId: string, goal?: string, authorityTier?: string, deny?: string[]) =>
+    invoke<void>("host_amend", { contractId, goal: goal ?? null, authorityTier: authorityTier ?? null, deny: deny ?? null }),
+  /** 门禁卡「这是误判」：把当时的屏幕存成回归样本（返回文件路径），并告诉模型屏幕被认错了 */
+  hostReportMisread: (contractId: string, gateId?: string, note?: string) =>
+    invoke<string>("host_report_misread", { contractId, gateId: gateId ?? null, note: note ?? null }),
+  /** 通知档的纠正：记成 Learned 偏好，并把那条决策标为 rejected */
+  hostCorrect: (contractId: string, seq: number, topic: string, correction: string) =>
+    invoke<void>("host_correct", { contractId, seq, topic, correction }),
+
+  /**
+   * 中止该会话正在进行的一轮。幂等。
+   * `sendCtrlC` 为真时同时给被驾驶的会话发 Ctrl-C（打断前台进程）；停止后控制权回到用户。
+   */
+  agentRunCancel: (sessionId: string, sendCtrlC?: boolean) =>
+    invoke<void>("agent_run_cancel", { sessionId, sendCtrlC: sendCtrlC ?? false }),
+  /**
+   * 手动暂停该会话正在进行的一轮：在下一个步骤边界停下并把终端还给用户（4.6）。
+   * 返回是否确有一轮在跑；幂等。
+   */
+  agentRunPause: (sessionId: string) => invoke<boolean>("agent_run_pause", { sessionId }),
+  /**
+   * 继续一轮已暂停（预算用尽 / 手动暂停）的运行：同一段对话上下文，换一份新预算接着跑。
+   * 只有确实处于暂停时才返回 true。
+   */
+  agentRunResume: (sessionId: string) => invoke<boolean>("agent_run_resume", { sessionId }),
+  /** 查询会话的控制权状态（事件只在变化时推，挂载时用它对账）。 */
+  agentControlGet: (sessionId: string) =>
+    invoke<ControlState>("agent_control_get", { sessionId }),
+  /** 用户在 Agent 驾驶的终端里敲了键（前端只在状态切换时调一次）。 */
+  agentControlUserInput: (sessionId: string) =>
+    invoke<void>("agent_control_user_input", { sessionId }),
+  /** 「接管」：Agent 让路直到交还。 */
+  agentControlTakeover: (sessionId: string) =>
+    invoke<void>("agent_control_takeover", { sessionId }),
+  /** 「交还」：Paused → AgentDriving，Agent 继续。 */
+  agentControlHandback: (sessionId: string) =>
+    invoke<void>("agent_control_handback", { sessionId }),
   /**
    * 答复一条审批请求。
    * 返回 false 表示这条请求已经没人接了（超时 / 答复晚到）—— 不是错误。
@@ -235,6 +418,27 @@ export const api = {
     detail?: string,
     tabs?: AgentTabInfo[]
   ) => invoke<boolean>("agent_tab_ack", { requestId, ok, detail, tabs }),
+  /**
+   * 回执一次读屏请求（`nx_screen`）。后端 3 秒等不到就退回旁路缓冲，所以**每条分支都要回**。
+   * `ok=false` 时 `detail` 写原因。返回 false 表示请求已超时被丢弃，不是错误。
+   */
+  agentScreenAck: (
+    requestId: string,
+    ok: boolean,
+    text?: string,
+    alt?: boolean,
+    detail?: string
+  ) => invoke<boolean>("agent_screen_ack", { requestId, ok, text, alt, detail }),
+  /**
+   * 答复一次密码请求（`nx_secret`）。`value` 省略 = 跳过。
+   *
+   * **这是密码唯一的出口**：值直接进后端、写进目标终端，不经过模型、不回显、不进任何记录。
+   * resolve(true) = 已交给后端；resolve(false) = 请求已经没人接了（超时 / 本轮被停止）；
+   * reject(原因) = 输入没通过校验（含换行 / 控制字符 / 过长），请求仍有效，可以改了再交。
+   * 调用方拿到结果后应立刻丢掉自己手里的值。
+   */
+  agentSecretAck: (requestId: string, value?: string) =>
+    invoke<boolean>("agent_secret_ack", { requestId, value }),
   /**
    * 不经模型、直接在会话里跑一条命令并拿回结果。
    *
@@ -298,6 +502,17 @@ export const api = {
       kind: "markdown" | "html" | "image" | "audio" | "video" | "code";
       data: string;
     }>("viewer_doc", { id }),
+
+  // ——— 连接迁移 ———
+  //
+  // 读 → 加密 → 写文件全在 Rust 侧完成：凭据明文不过 IPC，前端只给导出密码与路径。
+
+  /** 导出全部连接到 dest（`.nexusconn`）。保险库锁着时后端会拒绝 */
+  connectionsExport: (dest: string, password: string, includeKeys: boolean) =>
+    invoke<ConnExportSummary>("connections_export", { dest, password, includeKeys }),
+  /** 导入 `.nexusconn`：重复连接跳过、不覆盖；密码错 / 文件被改则什么都不导入 */
+  connectionsImport: (path: string, password: string) =>
+    invoke<ConnImportSummary>("connections_import", { path, password }),
 
   // ——— 主密码保险库 ———
   //
@@ -443,6 +658,14 @@ export async function onAgentDone(
   return listen<AgentDonePayload>(`nx://agent/done/${id}`, (ev) => handler(ev.payload));
 }
 
+/** 一轮对话结束时的用量（token / 花费 / 用时），在 `answer` 之后、本轮登记摘掉之前推 */
+export async function onAgentUsage(
+  id: string,
+  handler: (u: RunUsage) => void
+): Promise<UnlistenFn> {
+  return listen<RunUsage>(`nx://agent/usage/${id}`, (ev) => handler(ev.payload));
+}
+
 /** 终态错误，payload 是后端翻译好的中文文案 */
 export async function onAgentError(
   id: string,
@@ -455,6 +678,27 @@ export async function onAgentError(
  * Agentic 一轮里发生的每一步：下令 / 执行结果 / 被跳过 / 提示 / 最终结论。
  * 与 token/done 是两条并行的线：这里送过程，那边送说了什么话。
  */
+/** 某个托管任务的相位变化（含卡片） */
+export async function onHost(
+  contractId: string,
+  handler: (st: HostStatus) => void
+): Promise<UnlistenFn> {
+  return listen<HostStatus>(`nx://host/${contractId}`, (ev) => handler(ev.payload));
+}
+
+/** 通知档写入后的通知卡 */
+export async function onHostNotify(
+  contractId: string,
+  handler: (n: HostNotice) => void
+): Promise<UnlistenFn> {
+  return listen<HostNotice>(`nx://host/${contractId}/notify`, (ev) => handler(ev.payload));
+}
+
+/** 所有托管任务的相位变化（面板的总表） */
+export async function onHostAll(handler: (st: HostStatus) => void): Promise<UnlistenFn> {
+  return listen<HostStatus>("nx://host/all", (ev) => handler(ev.payload));
+}
+
 export async function onAgentStep(
   id: string,
   handler: (step: AgentStep) => void
@@ -473,6 +717,34 @@ export async function onAgentApprove(
 }
 
 /**
+ * 终端控制权变化（人 / Agent / 暂停）。同一个事件既发给被驾驶的会话自己（终端据此开关键盘闸），
+ * 也发给驾驶它的那一轮运行的发起会话（面板据此出「接管 / 交还」）。载荷带 `session` 区分是谁的状态。
+ */
+export async function onAgentControl(
+  id: string,
+  handler: (p: ControlPayload) => void
+): Promise<UnlistenFn> {
+  return listen<ControlPayload>(`nx://agent/control/${id}`, (ev) => handler(ev.payload));
+}
+
+
+/** 录制状态变化（开始 / 结束 / 取消）。载荷是完整的 `RecorderStatus`。 */
+export async function onAgentRecorder(
+  id: string,
+  handler: (st: RecorderStatus) => void
+): Promise<UnlistenFn> {
+  return listen<RecorderStatus>(`nx://agent/recorder/${id}`, (ev) => handler(ev.payload));
+}
+
+/** Agent 请用户输入一个密码（`nx_secret`）。处理完用 `api.agentSecretAck(...)` 答复。 */
+export async function onAgentSecret(
+  id: string,
+  handler: (req: AgentSecretRequest) => void
+): Promise<UnlistenFn> {
+  return listen<AgentSecretRequest>(`nx://agent/secret/${id}`, (ev) => handler(ev.payload));
+}
+
+/**
  * Agent 要对标签页动手（列出 / 切换 / 关闭 / 改名 / 重连）。
  *
  * 这是唯一一类**必须由前端执行**的动作：tab 是 React state，后端不知道它存在。
@@ -484,6 +756,16 @@ export async function onAgentTab(
   handler: (req: AgentTabRequest) => void
 ): Promise<UnlistenFn> {
   return listen<AgentTabRequest>("nx://agent/tab", (ev) => handler(ev.payload));
+}
+
+/**
+ * Agent 要读某个会话此刻的 xterm 屏幕（`nx_screen`）。xterm 只在前端，后端读不到渲染后的画面。
+ * 处理完务必 `api.agentScreenAck(...)`，后端在等回执（全局事件，同 `onAgentTab`）。
+ */
+export async function onAgentScreen(
+  handler: (req: AgentScreenRequest) => void
+): Promise<UnlistenFn> {
+  return listen<AgentScreenRequest>("nx://agent/screen", (ev) => handler(ev.payload));
 }
 
 /**

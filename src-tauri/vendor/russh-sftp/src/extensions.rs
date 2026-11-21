@@ -5,6 +5,8 @@ pub const HARDLINK: &str = "hardlink@openssh.com";
 pub const FSYNC: &str = "fsync@openssh.com";
 pub const STATVFS: &str = "statvfs@openssh.com";
 pub const EXPAND_PATH: &str = "expand-path@openssh.com";
+// NexusTerm 补丁 2：见 PATCHES.md
+pub const POSIX_RENAME: &str = "posix-rename@openssh.com";
 
 macro_rules! impl_try_into_bytes {
     ($struct:ty) => {
@@ -33,6 +35,15 @@ pub struct HardlinkExtension {
 }
 
 impl_try_into_bytes!(HardlinkExtension);
+
+/// NexusTerm 补丁 2：`posix-rename@openssh.com`，载荷与 hardlink 相同（两个字符串）
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PosixRenameExtension {
+    pub oldpath: String,
+    pub newpath: String,
+}
+
+impl_try_into_bytes!(PosixRenameExtension);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FsyncExtension {

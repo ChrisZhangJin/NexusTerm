@@ -58,6 +58,23 @@ jobs:
         # 用 npm ci 保证与 package-lock.json 完全一致
         run: npm ci
 
+      - name: 取这一版的更新说明
+        # 从 CHANGELOG.md 里截出「## [x.y.z]」那一节放进 Release 正文；找不到就留空，不影响构建
+        id: notes
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          notes=$(awk -v v="$ver" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md 2>/dev/null || true)
+          {
+            echo "body<<NX_NOTES_EOF"
+            printf '%s\n' "$notes"
+            echo "NX_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: 构建并上传到 Release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -71,6 +88,8 @@ jobs:
           prerelease: false
           releaseBody: |
             NexusTerm __VERSION__
+
+            ${{ steps.notes.outputs.body }}
 
             ### 安装
 

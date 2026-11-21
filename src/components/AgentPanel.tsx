@@ -1,25 +1,35 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { UnlistenFn } from "@tauri-apps/api/event";
+import { useEffect, useRef, useState } from "react";
 import ConfirmDialog, { type ConfirmOptions } from "./ConfirmDialog";
-import {
-  api,
-  onAgentApprove,
-  onAgentDone,
-  onAgentError,
-  onAgentStep,
-  onAgentToken,
-} from "../api";
+import SkillManager from "./SkillManager";
+import { HostMemoryDialog } from "./HostMemory";
+import { RecorderControls, RecorderDraftCard } from "./RecorderBar";
+import StewardPanel, { type StewardRunBridge } from "./StewardPanel";
+import HostCard from "./HostCard";
+import { RecordingBadge } from "./RecorderBar";
+import { RunCard, isRunCard } from "./RunFeed";
+import { api } from "../api";
 import { isAgentReady, useAgentConfig } from "../lib/agent";
+import { pauseBannerText, type StewardBudgetPref } from "../lib/agentBudget";
+import { convKeyOf } from "../lib/agentHistory";
+import {
+  expirePendingSecrets,
+  finishWithoutAnswer,
+  pendingPrompts,
+  uid,
+  withError,
+} from "../lib/agentRun";
 import { toFriendlyError } from "../lib/errors";
 import { enterVerdict, ImeGuard, isImeKey, keyInfoFrom } from "../lib/ime";
 import { matchSessions, scanMention } from "../lib/mention";
-import type {
-  AgentApproveRequest,
-  AgentDoneReason,
-  AgentMessage,
-  AgentStep,
-  AgentTarget,
-} from "../types";
+import { useAgentHistory } from "../lib/useAgentHistory";
+import { useAgentRun } from "../lib/useAgentRun";
+import { fromRunUsage, usageTooltip, usageWithTime, usdToMicros } from "../lib/usage";
+import { useHostRuns } from "../lib/useHostRuns";
+import { useHostFeeds } from "../lib/useHostFeeds";
+import { basePhase, hostDetail, isTerminal, needsReattach } from "../lib/host";
+import { stewardApi, stewardConsoleIds } from "../lib/steward";
+import { setStewardConsoles } from "../lib/termRegistry";
+import type { AgentTarget, HostStartOpts, Skill, SkillInput } from "../types";
 
 export interface AgentPanelProps {
   /** 当前会话 id（绑定哪个终端） */
@@ -47,29 +57,6 @@ export interface AgentPanelProps {
   onGetConsole?: (sessionId: string) => { text: string; alt: boolean } | null;
 }
 
-/** 单个会话的对话状态。按 sessionId 分桶，切会话时彼此完全隔离。 */
-interface Conversation {
-  messages: AgentMessage[];
-  /** 这个会话正在等一次回答的流结束 */
-  busy: boolean;
-  /** 上一次是被「切走会话 / 收起面板」打断的 —— 半截答案不可信，要提示 */
-  interrupted: boolean;
-}
-
-const EMPTY_CONV: Conversation = { messages: [], busy: false, interrupted: false };
-
-/** 撞到 max_tokens 时追加在答案末尾的说明 */
-const TRUNCATED_HINT = "\n\n— 回答被长度限制截断，可以让它继续，或缩小问题范围再问一次。";
-/** 一个字都没收到就 done 了（被过滤 / 空回复）：不能给用户留一个空气泡 */
-const EMPTY_ANSWER = "（本次没有返回内容）";
-const CANCELLED_ANSWER = "（已取消）";
-/** 一轮跑完却没等到结论（多半是撞到步数上限）时补的那句话 */
-const NO_CONCLUSION = "（这一轮没有给出结论：上面的步骤就是它做过的全部事情。）";
-
-let seq = 0;
-/** 纯前端的消息 id。不用 crypto.randomUUID：Tauri 的 WebView 不保证是安全上下文。 */
-const uid = () => `m${Date.now().toString(36)}-${(seq++).toString(36)}`;
-
 type Segment =
   | { kind: "text"; text: string }
   | { kind: "code"; lang: string; text: string };
@@ -94,144 +81,13 @@ function splitSegments(text: string): Segment[] {
   return out;
 }
 
-/** 收到一个增量文本块：追加到当前正在流的那条助手消息上 */
-function withToken(c: Conversation, chunk: string): Conversation {
-  const msgs = c.messages.slice();
-  const last = msgs[msgs.length - 1];
-  if (last && last.role === "assistant" && last.streaming) {
-    msgs[msgs.length - 1] = { ...last, text: last.text + chunk };
-    return { ...c, messages: msgs };
-  }
-  // 正常路径下提问时已经先建好占位消息；真走到这儿说明后端漏了顺序，补一条别丢字
-  msgs.push({ id: uid(), role: "assistant", text: chunk, ts: Date.now(), streaming: true });
-  return { ...c, messages: msgs };
-}
-
-/**
- * 收到 done：这是唯一的正常收尾信号（后端保证一定发，取消时 reason=cancelled）。
- * 前端不做任何超时兜底 —— 猜出来的结束会和后端状态打架。
- */
-function withDone(c: Conversation, reason: AgentDoneReason): Conversation {
-  return {
-    messages: c.messages.map((m) => {
-      if (!m.streaming) return m;
-      const text = reason === "length" ? m.text + TRUNCATED_HINT : m.text;
-      return {
-        ...m,
-        streaming: false,
-        text: text.trim()
-          ? text
-          : reason === "cancelled"
-            ? CANCELLED_ANSWER
-            : EMPTY_ANSWER,
-      };
-    }),
-    busy: false,
-    interrupted: false,
-  };
-}
-
-/** 收到 error：终态，其后不会再有 done。把当前助手消息整条换成错误文案。 */
-function withError(c: Conversation, msg: string): Conversation {
-  const msgs = c.messages.slice();
-  const idx = msgs.findIndex((m) => m.role === "assistant" && m.streaming);
-  if (idx >= 0) {
-    msgs[idx] = { ...msgs[idx], streaming: false, error: true, text: msg };
-  } else {
-    msgs.push({ id: uid(), role: "assistant", text: msg, ts: Date.now(), error: true });
-  }
-  return { messages: msgs, busy: false, interrupted: false };
-}
-
-/**
- * 追加一个过程步骤。`result` 会回填到它对应的那条 `exec` 上合成**一张**卡片：
- * 拆成两张会把对话拉长一倍，也看不出哪个结果属于哪条命令。
- */
-function withStep(c: Conversation, step: AgentStep): Conversation {
-  const msgs = c.messages.slice();
-  if (step.kind === "result") {
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i];
-      const s = m.step;
-      if (
-        s &&
-        s.kind === "exec" &&
-        s.output === undefined &&
-        s.target === step.target &&
-        s.command === step.command
-      ) {
-        msgs[i] = { ...m, step: { ...s, kind: "result", output: step.output } };
-        return { ...c, messages: msgs };
-      }
-    }
-  }
-  // 纯展示用的「还在等」心跳：合并进对应的 exec 卡片，不单独起一张卡；
-  // 对应的卡片已经收尾（或从没出现过，比如面板是后打开的）就直接丢弃，
-  // 不能退化成下面的"推一条新消息"，那样会在对话里冒出一张没头没尾的孤卡。
-  if (step.kind === "waiting") {
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i];
-      const s = m.step;
-      if (
-        s &&
-        s.kind === "exec" &&
-        s.output === undefined &&
-        s.target === step.target &&
-        s.command === step.command
-      ) {
-        msgs[i] = { ...m, step: { ...s, elapsedSecs: step.elapsedSecs } };
-        return { ...c, messages: msgs };
-      }
-    }
-    return c;
-  }
-  msgs.push({ id: uid(), role: "assistant", text: "", ts: Date.now(), step });
-  return { ...c, messages: msgs };
-}
-
-/** 追加一张待批卡片。真正的执行由用户在卡片上点头后才继续。 */
-function withApprove(c: Conversation, req: AgentApproveRequest): Conversation {
-  return {
-    ...c,
-    messages: [...c.messages, { id: uid(), role: "assistant", text: "", ts: Date.now(), approve: req }],
-  };
-}
-
-/** 记录用户对某张待批卡片的答复（卡片自己据此变成「已允许 / 已拒绝」的终态）。 */
-function withDecision(
-  c: Conversation,
-  requestId: string,
-  approved: boolean
-): Conversation {
-  return {
-    ...c,
-    messages: c.messages.map((m) =>
-      m.approve?.requestId === requestId ? { ...m, approveResult: approved } : m
-    ),
-  };
-}
-
-/** Agentic 一轮的结束语落地：既不置也不用补 markup，直接作为一条完整助手消息。 */
-function withConclusion(c: Conversation, text: string): Conversation {
-  const trimmed = text.trim();
-  return {
-    busy: false,
-    interrupted: false,
-    messages: [
-      ...c.messages,
-      { id: uid(), role: "assistant", text: trimmed || EMPTY_ANSWER, ts: Date.now() },
-    ],
-  };
-}
-
-/**
- * 一轮结束却**没等到**结论时兜的那一步（多半撞到步数上限）。判据是「busy 仍为
- * true」：有结论的话 kind=answer 走 `withConclusion` 早把它置回 false 了。
- * 不补这一步界面会永远转圈。
- */
-function finishWithoutAnswer(c: Conversation): Conversation {
-  return withConclusion(c, NO_CONCLUSION);
-}
+/** 清空对话的确认框文案（真删已保存的对话与运行摘要） */
+const CLEAR_CONV_OPTS: ConfirmOptions = {
+  title: "清空对话",
+  message: "将删除本面板的全部对话记录与已保存的运行摘要（含重启后恢复用的那份），助手不再记得之前做过什么。此操作不可恢复。",
+  okText: "清空",
+  danger: true,
+};
 
 /** 清空记忆的确认框文案是固定的，提到组件外避免每次渲染新建对象 */
 const CLEAR_OPTS: ConfirmOptions = {
@@ -253,12 +109,41 @@ export function AgentPanel({
 }: AgentPanelProps) {
   const cfg = useAgentConfig();
   const ready = isAgentReady(cfg);
+  // 对话 / 托管 视图切换（「时间线」页已删，录制按钮挪到了面板头部）
+  const [view, setView] = useState<"chat" | "steward">("chat");
+  // 技能管理器（3.4）。`draft` 给了就直接弹出预填的「新建技能」编辑器（录制器 / LLM 草稿 / 宏迁移用）
+  const [skillUi, setSkillUi] = useState<{ draft?: SkillInput } | null>(null);
+  const [memOpen, setMemOpen] = useState(false);
 
   /**
-   * Agent 面向全局：整个应用只有**一份**对话。
+   * Agent 面向全局：整个应用只有**一份**对话（`useAgentRun`，对话与托管两个视图共用，
+   * 事件只订阅这一份 —— 审批 / 密码卡片不会被两处各答一次）。
    * 切标签只换「当前会话」这个上下文，不换聊天记录 —— 助手是同一个助手。
    */
-  const [conv, setConv] = useState<Conversation>(EMPTY_CONV);
+  const [err, setErr] = useState<string | null>(null);
+  /** 面板此刻看的是哪段对话：按连接分（同一台主机的标签共用一段），切标签就切过去 */
+  const convKey = convKeyOf(sessions.find((x) => x.id === sessionId));
+  const run = useAgentRun({ sessionId, convKey, onError: setErr });
+  // 托管任务总表（每个 console 的胶囊 / 卡片）。任务结束时后端已停契约，这里顺手撤掉屏幕帧采集
+  const hostRuns = useHostRuns(() => {
+    void stewardApi
+      .status()
+      .then((l) => setStewardConsoles(stewardConsoleIds(l)))
+      .catch(() => {});
+  });
+  /** 托管动作（停止 / 继续 / 接管 / 交还）：失败落一行错误 */
+  const hostAct = async (f: () => Promise<unknown>) => {
+    try {
+      await f();
+    } catch (e) {
+      setErr(toFriendlyError(e).message);
+    }
+  };
+  /** 当前终端上的托管（对话页也显示它的胶囊与卡片） */
+  const hostedHere = hostRuns.forConsole(sessionId);
+  // 托管不占对话的 busy；但它的密码卡 / 审批卡在跑着的托管里要能答
+  const hostedHereLive = !!hostedHere && !isTerminal(hostedHere.phase);
+  const { conv, setConv, patch, runSession, setRunSession, pausedIds, drivingIds } = run;
   const [input, setInput] = useState("");
   /** 输入框。`@` 联想要在选中一项之后把光标放回原处，所以得拿得到它 */
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -282,14 +167,33 @@ export function AgentPanel({
     const ta = taRef.current;
     if (ta) ta.selectionStart = ta.selectionEnd = input.length;
   }, [input]);
-  const [err, setErr] = useState<string | null>(null);
-  /**
-   * 这一轮实际发起的会话。事件订阅挂在它上面，而**不跟随 sessionId** ——
-   * 用户切到别的标签时，正在跑的那条流仍要收得到，否则答案会断在半截。
-   */
-  const [runSession, setRunSession] = useState<string | null>(null);
+  /** 本次会话里从托管页开过托管的终端（结束后实况仍留着看） */
+  const [hostStarted, setHostStarted] = useState<string[]>([]);
+  /** 每个托管终端一份实况：活着的托管 + 本次开过的 */
+  const hostFeeds = useHostFeeds([
+    ...hostStarted,
+    ...Object.values(hostRuns.hosts)
+      .filter((h) => !isTerminal(h.phase))
+      .map((h) => h.consoleId),
+  ]);
+  // 托管的密码请求在别处了结了（你直接在终端里输了 / 接管 / 停止 / 运行结束）：实况里那张密码卡收不到事件，
+  // 在这里看托管状态的迁移把它收掉。只认「从等密码变成别的」和「进入终态」，不在密码卡刚到、状态还没推来时误收
+  const wasWaitingSecret = useRef(new Map<string, boolean>());
+  useEffect(() => {
+    for (const h of Object.values(hostRuns.hosts)) {
+      const b = basePhase(h.phase);
+      const waitingSecret = b.kind === "waitingHuman" && b.card.kind.kind === "secret";
+      const was = wasWaitingSecret.current.get(h.contractId) ?? false;
+      wasWaitingSecret.current.set(h.contractId, waitingSecret);
+      if ((was && !waitingSecret) || isTerminal(h.phase)) {
+        if (pendingPrompts(hostFeeds.feed(h.consoleId).messages) > 0) hostFeeds.patch(h.consoleId, expirePendingSecrets);
+      }
+    }
+    // hostFeeds 每次渲染都是新对象；只跟着托管状态走
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostRuns.hosts]);
   const [pending, setPending] = useState<
-    { kind: "clear" } | { kind: "cmd"; cmd: string } | null
+    { kind: "clear" } | { kind: "clearConv" } | { kind: "cmd"; cmd: string } | null
   >(null);
 
   /**
@@ -317,89 +221,8 @@ export function AgentPanel({
   /** 本轮的作用范围：scoped 为空时就是「仅当前会话」 */
   const activeScope = scoped && scoped.length > 0 ? scoped : [sessionId];
 
-  const patch = useCallback((fn: (c: Conversation) => Conversation) => {
-    setConv((prev) => fn(prev));
-  }, []);
-
-  // ——— 会话切换 / 收起时的收尾 ———
-
-  /**
-   * 切走会话或收起面板都会 unlisten，之后流跑完我们也收不到。把消息从 streaming
-   * 摘下并标记 interrupted，否则切回来是一个永远转圈的「正在回答」。
-   */
-  const markInterrupted = useCallback(() => {
-    setConv((c) => {
-      const streaming = c.messages.some((m) => m.streaming);
-      if (!c.busy && !streaming) return c;
-      return {
-        busy: false,
-        interrupted: streaming,
-        messages: streaming
-          ? c.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m))
-          : c.messages,
-      };
-    });
-  }, []);
-
-  // 面板收起时事件订阅会断掉，把还在转圈的那条消息摘下来。
-  // **切换会话不触发** —— 对话是全局的，流不该因为切标签而中断。
-  useEffect(() => {
-    if (!visible) markInterrupted();
-  }, [visible, markInterrupted]);
-
-  // ——— 事件订阅：按 sessionId 订阅，切会话即整体换掉 ———
-
-  useEffect(() => {
-    if (!visible || !runSession) return;
-    let disposed = false;
-    const unlisteners: UnlistenFn[] = [];
-
-    void (async () => {
-      try {
-        const [offToken, offDone, offError, offStep, offApprove] = await Promise.all([
-          onAgentToken(runSession, (chunk) => {
-            if (!disposed) patch((c) => withToken(c, chunk));
-          }),
-          onAgentDone(runSession, (p) => {
-            if (!disposed) patch((c) => withDone(c, p.reason));
-          }),
-          onAgentError(runSession, (msg) => {
-            if (!disposed) patch((c) => withError(c, msg));
-          }),
-          onAgentStep(runSession, (step) => {
-            if (disposed) return;
-            // kind=answer 是这一轮的总结，作为一条完整的助手消息落地并收掉 busy；
-            // 其余都当作过程卡片逐条追加。
-            patch((c) =>
-              step.kind === "answer"
-                ? withConclusion(c, step.text ?? "")
-                : withStep(c, step)
-            );
-          }),
-          onAgentApprove(runSession, (req) => {
-            if (!disposed) patch((c) => withApprove(c, req));
-          }),
-        ]);
-        // 竞态：listen 是异步的，等它 resolve 时这一轮可能已经结束了 —— 这时要立刻退订
-        if (disposed) {
-          offToken();
-          offDone();
-          offError();
-          offStep();
-          offApprove();
-          return;
-        }
-        unlisteners.push(offToken, offDone, offError, offStep, offApprove);
-      } catch {
-        // 订阅失败：提问时会在 agentRun 上抛出真错误，这里不必再弹一次
-      }
-    })();
-
-    return () => {
-      disposed = true;
-      unlisteners.forEach((f) => f());
-    };
-  }, [runSession, visible, patch]);
+  // ——— 对话持久化：重载 / 重启后恢复，变化时防抖写盘 ———
+  const history = useAgentHistory(run.convs, convKey, run.patchIn);
 
   // ——— 清空记忆 ———
 
@@ -410,6 +233,34 @@ export function AgentPanel({
       setErr(null);
     } catch (e) {
       setErr(`清空失败：${toFriendlyError(e).message}`);
+    }
+  };
+
+  /**
+   * 「新对话」：之后的提问不再接着之前的模型消息历史（对话模式默认会接着上一轮的上下文追问）。
+   * 面板上的记录不删，只插一条分隔，免得人以为 AI 还记得上面的内容。
+   */
+  const newConversation = async () => {
+    try {
+      await api.agentConversationReset(convKey);
+      setConv((c) => ({
+        ...c,
+        messages: [...c.messages, { id: uid(), role: "assistant" as const, text: "——— 新对话：之后的提问不再接着上面的上下文 ———", ts: Date.now() }],
+      }));
+      setErr(null);
+    } catch (e) {
+      setErr(`开始新对话失败：${toFriendlyError(e).message}`);
+    }
+  };
+
+  /** 「清空对话」：先真删盘上的数据，成功后再清界面（失败就保持原样并报错）。 */
+  const clearConversation = async () => {
+    try {
+      await history.clear();
+      setConv((c) => ({ ...c, messages: [], interrupted: false }));
+      setErr(null);
+    } catch (e) {
+      setErr(`清空对话失败：${toFriendlyError(e).message}`);
     }
   };
 
@@ -447,6 +298,10 @@ export function AgentPanel({
     const q = input.trim();
     setMention(null);
     if (!q || busy || !sessionId) return;
+    if (run.anyBusy) {
+      setErr("另一个连接上的对话还在跑：等它结束（或在那个标签里停止）再问");
+      return;
+    }
     if (!ready.ok) {
       // 引导态会盖住输入框，正常到不了这里；真到了就把原因说清楚而不是发一个注定失败的请求
       patch((c) => withError(c, ready.reason ?? "Nexus AI Agent 尚未配置完成"));
@@ -462,17 +317,21 @@ export function AgentPanel({
    * 不再提前立一个空的助手泡：这一轮的过程是一张张 step 卡片，
    * 结论等它自己给出时才落地 —— 先立一个空泡只会让对话里多一条空气泡。
    */
-  const startRun = (q: string) => {
+  const startRun = (q: string): string => {
     setInput("");
     historyIndexRef.current = -1;
     draftRef.current = "";
     setErr(null);
     stickRef.current = true;
+    const id = uid();
+    // 这一轮属于面板此刻看的那段对话：之后的事件都进它，哪怕中途切到别的标签
+    run.setRunKey(convKey);
     patch((c) => ({
       busy: true,
       interrupted: false,
-      messages: [...c.messages, { id: uid(), role: "user" as const, text: q, ts: Date.now() }],
+      messages: [...c.messages, { id, role: "user" as const, text: q, ts: Date.now() }],
     }));
+    return id;
   };
 
   // ——— `@会话名` 联想 ———
@@ -518,7 +377,8 @@ export function AgentPanel({
     const alive = new Map(sessions.map((s) => [s.id, s.label]));
     return activeScope
       .filter((id) => id === sessionId || alive.has(id))
-      .map((id) => ({ id, label: alive.get(id) ?? "当前会话" }));
+      // cwd：文件工具的相对路径按它补全（前端探测到的终端当前目录）
+      .map((id) => ({ id, label: alive.get(id) ?? "当前会话", cwd: sessions.find((s) => s.id === id)?.hint?.cwd ?? null }));
   };
 
   /** Agentic：这一条会真的在终端里跑命令。
@@ -537,6 +397,7 @@ export function AgentPanel({
     try {
       await api.agentRun({
         sessionId: sid,
+        conversation: convKey,
         question: q,
         targets: targetsForRun(),
         consoleText: snap?.text,
@@ -549,26 +410,87 @@ export function AgentPanel({
     }
   };
 
-  const cancel = async () => {
-    const sid = runSession ?? sessionId;
-    if (!sid) return;
+  /**
+   * 托管页点「开始托管」：后端 `host_start` 先拿终端租约、再签契约，起一个常驻的托管任务后**立即返回**。
+   * 之后的步骤仍走这个终端的 `nx://agent/step` 频道（同一份订阅、同一份对话状态），
+   * 相位与卡片走 `nx://host/{id}`（`useHostRuns`）。任务只有完成 / 失败 / 停止才结束：
+   * 模型问人、你接管、预算用尽都只是挂起，所以这里不再在 `finally` 里停契约。
+   */
+  const runSteward = async (
+    sid: string,
+    goal: string,
+    budget?: StewardBudgetPref,
+    tier?: string,
+    yolo?: boolean,
+    opts?: HostStartOpts
+  ): Promise<void> => {
+    // 托管不占对话：实况进这个终端自己的那一份（别的终端上的托管照常跑、照常看）
+    setErr(null);
+    hostFeeds.begin(sid, `托管目标：${goal}`);
+    setHostStarted((l) => (l.includes(sid) ? l : [...l, sid]));
+    // 对话页上一轮恰好订阅着这个终端：让出来，免得同一张密码卡在两处出现
+    if (runSession === sid && !busy) setRunSession(null);
+    const snap = onGetConsole?.(sid) ?? null;
+    const label = sessions.find((x) => x.id === sid)?.label ?? "当前会话";
     try {
-      // 幂等：没有在跑时后端什么都不做
-      await api.agentRunCancel(sid);
+      await api.hostStart({
+        consoleId: sid,
+        goal,
+        authorityTier: tier,
+        yolo,
+        label,
+        consoleText: snap?.text,
+        consoleAlt: snap?.alt,
+        budget: budget
+          ? { maxSteps: budget.maxSteps, maxMinutes: budget.maxMinutes, maxCostMicros: usdToMicros(budget.maxCostUsd) }
+          : undefined,
+        // 重启后找回这个终端用（SSH 记录 / 标签 / cwd / tmux）
+        consoleRef: sessions.find((x) => x.id === sid)?.hint,
+        deny: opts?.deny,
+        followUp: opts?.followUp,
+        // 多终端托管：其余终端（同样带重启后找回用的线索）
+        extraConsoles: opts?.extra?.length
+          ? opts.extra.map((id) => {
+              const t = sessions.find((x) => x.id === id);
+              return t?.hint ?? { consoleId: id, label: t?.label ?? id };
+            })
+          : undefined,
+      });
+      // 契约已签：马上让前端开始为这个终端上报屏幕帧（不等托管页的轮询）
+      void reconcileStewardConsoles();
     } catch (e) {
-      setErr(`取消失败：${toFriendlyError(e).message}`);
+      hostFeeds.patch(sid, (c) => withError(c, toFriendlyError(e).message));
     }
   };
 
-  /** 用户在审批卡片上的选择。后端收不到（超时）也照样把卡片置成终态。 */
-  const decide = async (req: AgentApproveRequest, approved: boolean) => {
+  /** 按后端契约表对一次屏幕帧采集门控（托管结束后后端已停契约，这里撤掉采集） */
+  const reconcileStewardConsoles = async () => {
     try {
-      await api.agentApprove(req.requestId, approved);
-    } catch (e) {
-      setErr(`提交审批结果失败：${toFriendlyError(e).message}`);
-      return;
+      setStewardConsoles(stewardConsoleIds(await stewardApi.status()));
+    } catch {
+      /* 对账由 StewardPanel 的轮询负责 */
     }
-    patch((c) => withDecision(c, req.requestId, approved));
+  };
+
+  /**
+   * 技能管理器里点「运行」：关掉管理器，在当前会话上回放。
+   * 与 runAgentic 同构（订阅挂到本次会话、busy 转圈、停止按钮同一条取消路径）；
+   * 进度 / 审批 / 密码卡片都走这条会话的事件频道，所以必须由面板而不是管理器自己发起。
+   */
+  const runSkill = async (skill: Skill, params: Record<string, string>) => {
+    const sid = sessionId;
+    if (!sid || busy || run.anyBusy) return;
+    setSkillUi(null);
+    setRunSession(sid);
+    startRun(`运行技能「${skill.name}」`);
+    const label = sessions.find((x) => x.id === sid)?.label ?? "当前会话";
+    try {
+      await api.skillRun(skill.id, params, sid, label);
+    } catch (e) {
+      patch((c) => withError(c, toFriendlyError(e).message));
+    } finally {
+      patch((c) => (c.busy ? finishWithoutAnswer(c) : c));
+    }
   };
 
   /**
@@ -591,15 +513,73 @@ export function AgentPanel({
     setPending(null);
     if (!ok || !p) return;
     if (p.kind === "clear") void clearMemory();
+    else if (p.kind === "clearConv") void clearConversation();
     else void insertCommand(p.cmd);
+  };
+
+  /** 托管页上某个终端的运行桥：每个终端各看各的托管（同一时刻可以托管好几个终端） */
+  const stewardBridgeFor = (cid: string): StewardRunBridge => {
+    const hosted = hostRuns.forConsole(cid);
+    const hostedLive = !!hosted && !isTerminal(hosted.phase);
+    const hostedBase = hosted ? basePhase(hosted.phase) : null;
+    // 实况按托管走（发在主终端的频道上）：多终端托管在它的任何一个终端上看到的都是同一份
+    const feedId = hosted?.consoleId ?? cid;
+    const feed = hostFeeds.feed(feedId);
+    return {
+      session: hosted || feed.messages.length > 0 ? feedId : null,
+      active: hostedLive,
+      // 只有同一个终端上正跑着一轮对话 / 技能才挡（别的终端上的不相干）
+      otherBusy: run.anyBusy && runSession === cid,
+      messages: feed.messages,
+      paused: hostedLive && hostedBase?.kind === "paused",
+      pauseText: hosted ? (hostDetail(hosted.phase) ?? undefined) : undefined,
+      hostFor: hostRuns.forConsole,
+      awaitingReattach: hostRuns.awaitingReattach,
+      stopCtrlC: run.stopCtrlC,
+      toggleStopCtrlC: run.toggleStopCtrlC,
+      start: runSteward,
+      cancel: async () => {
+        if (hosted) await hostAct(() => api.hostStop(hosted.contractId, run.stopCtrlC));
+      },
+      decide: run.decide,
+      answerSecret: (req, value) => hostFeeds.answerSecret(feedId, req, value),
+      ready: ready.ok,
+      notReadyReason: ready.reason,
+      error: err,
+    };
   };
 
   if (!visible || !sessionId) return null;
 
   return (
-    <div className="ap-root">
+    <div className={`ap-root${view === "steward" ? " show-steward" : ""}`}>
       <div className="ap-head">
         <span className="ap-title">Nexus AI Agent</span>
+        <RecordingBadge sessionId={sessionId} />
+        <div className="ap-tabs" role="tablist">
+          <button
+            role="tab"
+            aria-selected={view === "chat"}
+            className={`ap-tab${view === "chat" ? " on" : ""}`}
+            onClick={() => setView("chat")}
+          >
+            对话
+          </button>
+          <button
+            role="tab"
+            aria-selected={view === "steward"}
+            className={`ap-tab${view === "steward" ? " on" : ""}`}
+            onClick={() => setView("steward")}
+            title="会话织物：终端屏幕状态与托管契约（P0 只观察）"
+          >
+            托管
+          </button>
+        </div>
+        {/* 录制技能：原来放在「时间线」页头部，时间线页删掉后挪到这里（录制按终端记，切标签各录各的） */}
+        {sessionId && <RecorderControls sessionId={sessionId} hostLabel={sessions.find((s) => s.id === sessionId)?.label} />}
+        <button className="ap-skill-btn" onClick={() => setSkillUi({})} title="管理技能（可回放的操作流程）">
+          技能
+        </button>
         {onFloatOut && (
           <button className="ap-x ap-float" onClick={onFloatOut} title="浮出为独立窗口">
             ⧉
@@ -609,6 +589,11 @@ export function AgentPanel({
           ✕
         </button>
       </div>
+
+
+      {view === "steward" && (
+        <StewardPanel sessionId={sessionId} sessions={sessions} runFor={stewardBridgeFor} />
+      )}
 
       <div className="ap-status">
         <span className="ap-stat">
@@ -621,9 +606,52 @@ export function AgentPanel({
         >
           清空记忆
         </button>
+        <button
+          className="ap-mini"
+          onClick={() => setMemOpen(true)}
+          title="查看 / 编辑助手对这台主机记下的备忘（提示符、sudo 习惯、常用路径……）"
+        >
+          主机备忘
+        </button>
+        <button
+          className="ap-mini"
+          disabled={busy}
+          onClick={() => void newConversation()}
+          title="之后的提问从头开始（默认会接着之前的上下文追问）；面板上的记录保留"
+        >
+          新对话
+        </button>
+        <button
+          className="ap-mini"
+          disabled={busy}
+          onClick={() => setPending({ kind: "clearConv" })}
+          title="删除本面板的对话记录与已保存的运行摘要（重启后也不会再恢复）"
+        >
+          清空对话
+        </button>
       </div>
 
       {err && <div className="ap-err">{err}</div>}
+
+      {/* 录制结束后的草稿卡：「整理为技能 / 直接编辑」打开技能管理器预填 */}
+      {view === "chat" && sessionId && (
+        <RecorderDraftCard sessionId={sessionId} onOpenSkillDraft={(draft) => setSkillUi({ draft })} />
+      )}
+
+      {view === "chat" && hostedHere && !isTerminal(hostedHere.phase) && !needsReattach(hostedHere.phase) && (
+        <HostCard
+          key={hostedHere.contractId}
+          status={hostedHere}
+          label={sessions.find((s) => s.id === hostedHere.consoleId)?.label}
+          stopCtrlC={run.stopCtrlC}
+          onStopCtrlC={run.toggleStopCtrlC}
+        />
+      )}
+      {/* 等重新接驳的托管（重启后 / 终端关了）：不管在哪个 tab 都摆出来，接驳要你确认 */}
+      {view === "chat" &&
+        hostRuns.awaitingReattach.map((h) => (
+          <HostCard key={h.contractId} status={h} label={h.label} tabs={sessions} stopCtrlC={run.stopCtrlC} />
+        ))}
 
       {ready.ok ? (
         <>
@@ -638,15 +666,14 @@ export function AgentPanel({
             )}
             {messages.map((m) => {
               // 过程卡片不是对话泡：整幅宽度更能排得下命令与输出
-              if (m.step) return <StepCard key={m.id} step={m.step} />;
-              if (m.approve) {
+              if (isRunCard(m)) {
                 return (
-                  <ApproveCard
+                  <RunCard
                     key={m.id}
-                    req={m.approve}
-                    result={m.approveResult}
-                    busy={busy}
-                    onDecide={(ok) => void decide(m.approve!, ok)}
+                    message={m}
+                    busy={busy || hostedHereLive}
+                    onDecide={(req, ok) => void run.decide(req, ok)}
+                    onAnswerSecret={run.answerSecret}
                   />
                 );
               }
@@ -683,7 +710,7 @@ export function AgentPanel({
               );
             })}
             {/* Agentic 没有占位泡，过程中的「还在跑」要靠这一行说出来 */}
-            {busy && (
+            {busy && !conv.paused && (
               <div className="ap-running">
                 <span className="ap-typing">
                   <i />
@@ -699,6 +726,35 @@ export function AgentPanel({
               </div>
             )}
           </div>
+
+          {/* 控制权横幅：谁在操作终端要一眼看得出。用户一敲键盘 Agent 就自动暂停，
+              只有点「交还」它才会继续；「接管」则是不用敲键盘也能让它让路。 */}
+          {busy && conv.paused ? (
+            <div className="ap-control paused" role="status">
+              <span className="ap-control-text">{pauseBannerText(conv.paused)}</span>
+              <button className="btn primary" onClick={() => void run.resumeRun()}>
+                继续
+              </button>
+            </div>
+          ) : pausedIds.length > 0 ? (
+            <div className="ap-control paused" role="status">
+              <span className="ap-control-text">
+                你正在操作终端，Agent 已暂停（不会往终端里写入）。
+              </span>
+              <button className="btn primary" onClick={run.handback}>
+                交还
+              </button>
+            </div>
+          ) : busy && drivingIds.length > 0 ? (
+            <div className="ap-control driving" role="status">
+              <span className="ap-control-text">
+                Agent 正在操作终端。你在终端里一敲键盘它就会自动暂停。
+              </span>
+              <button className="btn" onClick={run.takeover}>
+                接管
+              </button>
+            </div>
+          ) : null}
 
           {/* 作用范围。放在输入框上方而不是藏在卡片里：
               勾选了哪些机器，是下一次发送前**必须**看得见的东西。 */}
@@ -861,10 +917,37 @@ export function AgentPanel({
             )}
             <div className="ap-input-row">
               <span className="ap-input-hint">Enter 发送 · Shift+Enter 换行</span>
+              {!busy && conv.lastUsage && (
+                <span className="ap-input-hint ap-usage" title={usageTooltip(fromRunUsage(conv.lastUsage))}>
+                  上一轮 {usageWithTime(fromRunUsage(conv.lastUsage))}
+                </span>
+              )}
               {busy ? (
-                <button className="btn danger" onClick={() => void cancel()}>
-                  停止
-                </button>
+                <>
+                  <label
+                    className="ap-stop-ctrlc"
+                    title="停止时同时往正在被驾驶的终端发送 Ctrl-C，打断它正在跑的命令"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={run.stopCtrlC}
+                      onChange={(e) => run.toggleStopCtrlC(e.target.checked)}
+                    />
+                    同时发 Ctrl-C
+                  </label>
+                  {!conv.paused && (
+                    <button
+                      className="btn"
+                      title="当前这一步做完后暂停，终端还给你；之后可以「继续」"
+                      onClick={() => void run.pauseRun()}
+                    >
+                      暂停
+                    </button>
+                  )}
+                  <button className="btn danger" onClick={() => void run.cancel()}>
+                    停止
+                  </button>
+                </>
               ) : (
                 <button
                   className="btn primary"
@@ -896,6 +979,8 @@ export function AgentPanel({
           opts={
             pending.kind === "clear"
               ? CLEAR_OPTS
+              : pending.kind === "clearConv"
+              ? CLEAR_CONV_OPTS
               : {
                   title: "确认插入到终端",
                   message: "以下内容将写入当前会话的终端（只插入，不会自动回车执行）：",
@@ -905,6 +990,20 @@ export function AgentPanel({
                 }
           }
           onResult={onConfirm}
+        />
+      )}
+
+      {skillUi && <SkillManager
+          initialDraft={skillUi.draft}
+          onClose={() => setSkillUi(null)}
+          onRunSkill={sessionId && !busy ? (sk, p) => void runSkill(sk, p) : undefined}
+          scopeTarget={sessionId ? { sessionId, label: sessions.find((s) => s.id === sessionId)?.label ?? "当前会话" } : undefined}
+        />}
+      {memOpen && (
+        <HostMemoryDialog
+          sessionId={sessionId}
+          label={sessions.find((s) => s.id === sessionId)?.label ?? ""}
+          onClose={() => setMemOpen(false)}
         />
       )}
     </div>
@@ -930,192 +1029,6 @@ function SuggestionCard({
         </button>
       </div>
       <pre className="ap-code">{cmd}</pre>
-    </div>
-  );
-}
-
-/**
- * 把工具的原始参数 JSON 排成一行人话：`{"op":"list"}` → `op=list`。
- * 刻意单行而非缩进块：参数通常只有两三个字段，缩进白白占掉对话区高度。
- */
-function prettyToolArgs(raw: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed === "{}") return "";
-  try {
-    const obj = JSON.parse(trimmed) as Record<string, unknown>;
-    if (typeof obj !== "object" || obj === null) return trimmed;
-    const parts = Object.entries(obj).map(([k, v]) => {
-      if (typeof v === "string") return `${k}=${v}`;
-      return `${k}=${JSON.stringify(v)}`;
-    });
-    return parts.length ? parts.join("  ") : trimmed;
-  } catch {
-    // 模型偶尔吐出不是 JSON 的参数串。原样展示比丢掉强：
-    // 用户至少能看到它到底想传什么。
-    return trimmed;
-  }
-}
-
-/**
- * 一次执行的卡片：命令 + 结果。「在哪台机器上跑的」必须写清楚 —— Agent 是全局的，
- * 可以同时在好几个会话上下令，只显示命令的话分不清输出来自哪台机器。
- */
-function StepCard({ step }: { step: AgentStep }) {
-  if (step.kind === "note") {
-    return <div className="ap-note">{step.text ?? ""}</div>;
-  }
-  // 工具调用卡片：把「调了哪个工具、传了什么参数」原样摆出来，让调用过程看得见。
-  // 没有它时，模型想开新标签页会写出 `new-tab` 这种不存在的命令，敲进去只换来
-  // command not found —— 看起来就像它答应了却没动手。
-  if (step.kind === "tool") {
-    return (
-      <div className="ap-step tool">
-        <div className="ap-step-head">
-          <span className="ap-step-tag">工具调用</span>
-          <span className="ap-step-tool">{step.toolLabel ?? "工具"}</span>
-        </div>
-        <div className="ap-step-why">
-          <code>{step.tool ?? ""}</code>
-          {step.toolArgs && step.toolArgs.trim() !== "{}" ? (
-            <span className="ap-tool-args">{prettyToolArgs(step.toolArgs)}</span>
-          ) : (
-            <span className="ap-tool-args dim">（无参数）</span>
-          )}
-        </div>
-      </div>
-    );
-  }
-  // `open` / `export` 没有 command / output：掉进下面那张执行卡会变成一个永远
-  // 「执行中」的空框，看着像卡住了，其实标签页早就开出来了。
-  if (step.kind === "open" || step.kind === "export" || step.kind === "tab") {
-    const isOpen = step.kind === "open";
-    const isTab = step.kind === "tab";
-    return (
-      <div className="ap-step">
-        <div className="ap-step-head">
-          <span className="ap-step-tag">
-            {isTab ? "标签页" : isOpen ? "新会话" : "导记录"}
-          </span>
-          {step.targetLabel ? (
-            <span className="ap-step-where" title={step.target}>
-              {step.targetLabel}
-            </span>
-          ) : null}
-        </div>
-        <div className="ap-step-why">{step.text ?? ""}</div>
-      </div>
-    );
-  }
-  if (step.kind === "skip") {
-    return (
-      <div className="ap-step danger">
-        <div className="ap-step-head">
-          <span className="ap-step-tag">未执行</span>
-          {/* 被拦下的伪命令（new-tab 之类）没有目标会话：写"未知会话"会让人以
-              为它跑去了某台机器上，而实情是它一步都没出去。没有目标就别编一个。 */}
-          {step.targetLabel ? (
-            <span className="ap-step-where" title={step.target}>
-              {step.targetLabel}
-            </span>
-          ) : null}
-        </div>
-        <pre className="ap-code">{step.command ?? ""}</pre>
-        {step.reasons?.length ? (
-          <div className="ap-step-why">原因：{step.reasons.join("；")}</div>
-        ) : null}
-      </div>
-    );
-  }
-
-  // 没有退出码这回事了：命令是否成功，由模型读下面这段真实输出自己判断，
-  // 跟真人盯着终端看一样。这里只中性地标「执行中 / 已完成」，不再染色判对错。
-  const done = step.kind === "result";
-  const tag = done ? "已完成" : "执行中";
-  const lines = (step.output ?? "").split("\n").length;
-  return (
-    <div className={`ap-step${done ? "" : " pending"}`}>
-      <div className="ap-step-head">
-        <span className="ap-step-tag">{tag}</span>
-        <span className="ap-step-where" title={step.target}>
-          {step.targetLabel ?? "未知会话"}
-        </span>
-      </div>
-      <pre className="ap-code">{step.command ?? ""}</pre>
-      {done ? (
-        (step.output ?? "").trim() ? (
-          // 长输出折叠：一屏七八行的核对性输出最常见，全展开会把对话挤没
-          lines > 10 ? (
-            <details className="ap-out">
-              <summary>输出 {lines} 行</summary>
-              <pre className="ap-code">{step.output}</pre>
-            </details>
-          ) : (
-            <pre className="ap-code ap-out-plain">{step.output}</pre>
-          )
-        ) : (
-          <div className="ap-step-why">（该命令没有输出）</div>
-        )
-      ) : (
-        <div className="ap-running">
-          <span className="ap-typing">
-            <i />
-            <i />
-            <i />
-          </span>
-          等待输出…{step.elapsedSecs ? `（已等待 ${step.elapsedSecs} 秒）` : ""}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/**
- * 待批卡片。危险命令在这里停一下等人点头 ——
- * 这是「人在回路」唯一发生的地方，所以命令原文必须完整可见，不许折叠。
- */
-function ApproveCard({
-  req,
-  result,
-  busy,
-  onDecide,
-}: {
-  req: AgentApproveRequest;
-  result?: boolean;
-  busy: boolean;
-  onDecide: (approved: boolean) => void;
-}) {
-  const settled = result !== undefined;
-  // 越界批准与危险命令批准含义不同：前者批的是「动这台不在范围里的会话」，
-  // 标题与文案必须直说，别让人以为只是又一次命令风险提示。
-  const scope = req.kind === "scope";
-  return (
-    <div className={`ap-approve${settled ? (result ? " ok" : " no") : ""}`}>
-      <div className="ap-step-head">
-        <span className="ap-step-tag">{scope ? "超出作用范围 · 需要批准" : "需要批准"}</span>
-        <span className="ap-step-where" title={req.target}>
-          {req.targetLabel || "未知会话"}
-        </span>
-      </div>
-      <pre className="ap-code">{req.command}</pre>
-      {req.reasons.length > 0 && (
-        <div className="ap-step-why">
-          {scope ? "越界原因" : "风险提示"}：{req.reasons.join("；")}
-        </div>
-      )}
-      {settled ? (
-        <div className="ap-approve-done">
-          {result ? (scope ? "已允许，该会话已并入本轮作用范围" : "已允许执行") : "已拒绝 / 已超时"}
-        </div>
-      ) : (
-        <div className="ap-approve-row">
-          <button className="btn primary" disabled={!busy} onClick={() => onDecide(true)}>
-            {scope ? "允许越界操作" : "允许执行"}
-          </button>
-          <button className="btn" disabled={!busy} onClick={() => onDecide(false)}>
-            拒绝
-          </button>
-        </div>
-      )}
     </div>
   );
 }

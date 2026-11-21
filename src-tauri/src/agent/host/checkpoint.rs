@@ -1,0 +1,522 @@
+//! 托管任务的可落盘现场（设计 §4）：整条 JSON 存 `host_sessions.json`。
+//!
+//! - 带版本号 `v`。读到比本程序新的版本**不猜**：返回 `FutureVersion`，调用方保留原行、不覆盖；
+//! - `messages` 落盘前先 `compact::compact`（≤60k 字符）再 `history::sanitize_messages`（脱敏 + 截断），
+//!   密文永远不进 `messages`；
+//! - 恢复判定复用 `checkpoint::resume_verdict`：屏幕漂移就把档位降到 approve。
+
+use std::collections::HashMap;
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::super::checkpoint::{resume_verdict, ResumeVerdict, Spent, StewardCheckpoint, CHECKPOINT_TTL_MS};
+use super::super::compact::compact;
+use super::super::history::sanitize_messages;
+use super::super::llm::ChatMessage;
+use super::super::policy::Authority;
+use super::super::steward::StewardContract;
+use super::phase::{step, Effect, HostEvent, HostPhase};
+use super::watchdog::WatchdogState;
+use super::ConsoleRef;
+
+/// 当前写出的版本。
+pub const HOST_CHECKPOINT_V: u32 = 1;
+/// 落盘前对话历史的字符上限
+pub const MESSAGES_BUDGET_CHARS: usize = 60_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostCheckpoint {
+    pub v: u32,
+    pub contract: StewardContract,
+    pub authority: Authority,
+    pub phase: HostPhase,
+    /// 主终端（不写 target 的动作落在它上面；判据核验也在它上面跑）
+    pub console: ConsoleRef,
+    /// 多终端托管里一并操作的其余终端；旧现场没有该字段 → 空（单终端）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra: Vec<ConsoleRef>,
+    pub messages: Vec<ChatMessage>,
+    pub spent: Spent,
+    pub step: usize,
+    #[serde(default)]
+    pub woke_hash: HashMap<String, String>,
+    #[serde(default)]
+    pub last_screen_hash: String,
+    #[serde(default)]
+    pub watchdog: WatchdogState,
+    /// 计划清单（nx_todo）；旧现场没有该字段 → 空
+    #[serde(default)]
+    pub todo: Vec<super::super::todo::TodoItem>,
+    /// 意向期限到了、用户已经「继续」过（接驳后不再因同一期限暂停）
+    #[serde(default)]
+    pub deadline_acked: bool,
+    /// 本次托管生效的运行预算（含开始时的覆盖与「加预算继续」放宽过的）；接驳 / 重启后按它接着跑。
+    /// 旧现场没有该字段 → None（按配置 / 托管默认）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<super::super::budget::RunBudget>,
+    pub created_wall_ms: i64,
+    pub saved_wall_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadError {
+    /// 比本程序新的版本写的：不解析、不覆盖
+    FutureVersion(u32),
+    /// 不是 JSON / 缺字段 / 没有版本号
+    Corrupt(String),
+}
+
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FutureVersion(v) => write!(f, "托管现场由更新版本（v{v}）写入，当前版本只认到 v{HOST_CHECKPOINT_V}"),
+            Self::Corrupt(e) => write!(f, "托管现场损坏：{e}"),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+impl HostCheckpoint {
+    pub fn new(
+        contract: StewardContract,
+        authority: Authority,
+        console: ConsoleRef,
+        now_wall_ms: i64,
+    ) -> Self {
+        Self {
+            v: HOST_CHECKPOINT_V,
+            contract,
+            authority,
+            phase: HostPhase::Running,
+            console,
+            extra: Vec::new(),
+            messages: Vec::new(),
+            spent: Spent::default(),
+            step: 0,
+            woke_hash: HashMap::new(),
+            last_screen_hash: String::new(),
+            watchdog: WatchdogState::default(),
+            todo: Vec::new(),
+            deadline_acked: false,
+            limits: None,
+            created_wall_ms: now_wall_ms,
+            saved_wall_ms: now_wall_ms,
+        }
+    }
+
+    /// 主终端在前、其余按开始时的顺序。
+    pub fn consoles(&self) -> impl Iterator<Item = &ConsoleRef> {
+        std::iter::once(&self.console).chain(self.extra.iter())
+    }
+
+    /// 按（保存时的）console id 找到那一格。
+    pub fn slot(&self, console_id: &str) -> Option<&ConsoleRef> {
+        self.consoles().find(|c| c.console_id == console_id)
+    }
+
+    /// 把 `slot`（保存的 console id）那一格换成 `console`（接驳到的新 tab）。换的是主终端就同步契约。
+    /// 返回是否找到了那一格。
+    pub fn replace_slot(&mut self, slot: &str, console: ConsoleRef) -> bool {
+        if self.console.console_id == slot {
+            self.contract.console_id = console.console_id.clone();
+            self.console = console;
+        } else if let Some(i) = self.extra.iter().position(|c| c.console_id == slot) {
+            self.extra[i] = console;
+        } else {
+            return false;
+        }
+        self.contract.extra_consoles = self.extra.iter().map(|c| c.console_id.clone()).collect();
+        true
+    }
+
+    /// `host_sessions.state` 列。
+    pub fn state(&self) -> &'static str {
+        self.phase.label()
+    }
+
+    /// 落盘前清洗对话历史：先压缩，再脱敏 / 截断。
+    pub fn prepare_messages(mut msgs: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        compact(&mut msgs, MESSAGES_BUDGET_CHARS);
+        let vals: Vec<Value> = msgs.iter().filter_map(|m| serde_json::to_value(m).ok()).collect();
+        sanitize_messages(vals).into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect()
+    }
+
+    /// 序列化。`messages` 一律先过 `prepare_messages`，调用方不必记得。
+    pub fn to_json(&self, now_wall_ms: i64) -> Result<String, String> {
+        let mut c = self.clone();
+        c.v = HOST_CHECKPOINT_V;
+        c.saved_wall_ms = now_wall_ms;
+        c.messages = Self::prepare_messages(c.messages);
+        // 写文件审批卡上的 diff 给人看的是原文；落盘前脱敏（库里不躺凭据）
+        c.phase = scrub_phase(c.phase);
+        serde_json::to_string(&c).map_err(|e| e.to_string())
+    }
+
+    pub fn from_json(s: &str) -> Result<Self, LoadError> {
+        let raw: Value = serde_json::from_str(s).map_err(|e| LoadError::Corrupt(e.to_string()))?;
+        let v = raw
+            .get("v")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| LoadError::Corrupt("缺少版本号 v".into()))?;
+        let v = u32::try_from(v).map_err(|_| LoadError::FutureVersion(u32::MAX))?;
+        if v > HOST_CHECKPOINT_V {
+            return Err(LoadError::FutureVersion(v));
+        }
+        if v == 0 {
+            return Err(LoadError::Corrupt("版本号 v=0".into()));
+        }
+        // v1 是第一版，没有更旧的需要迁移
+        serde_json::from_value(raw).map_err(|e| LoadError::Corrupt(e.to_string()))
+    }
+
+    /// 超过 TTL（从创建算，周期快照不续命）。
+    pub fn expired(&self, now_wall_ms: i64) -> bool {
+        now_wall_ms - self.created_wall_ms > CHECKPOINT_TTL_MS
+    }
+
+    /// 启动扫描：非终态一律挂起（AppRestart），此时不写终端。返回是否改动。
+    pub fn suspend_for_restart(&mut self) -> bool {
+        match step(&self.phase, HostEvent::Restart) {
+            Ok((p, _)) if p != self.phase => {
+                self.phase = p;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 接驳前核对现场。复用 `checkpoint::resume_verdict` 的口径（TTL / 没帧 / hash 漂移）。
+    pub fn reattach_verdict(&self, current_hash: Option<&str>, now_wall_ms: i64) -> ResumeVerdict {
+        let mut cp = StewardCheckpoint::new(&self.contract.id, &self.console.console_id, &self.contract.goal, &self.authority);
+        cp.screen_hash = self.last_screen_hash.clone();
+        cp.created_wall_ms = self.created_wall_ms;
+        cp.saved_wall_ms = self.saved_wall_ms;
+        cp.host_key = self.console.host_key.clone();
+        cp.state = if self.phase.is_terminal() { "completed" } else { "observing" }.to_string();
+        resume_verdict(&cp, current_hash, now_wall_ms)
+    }
+
+    /// 用户确认接驳：按判定降档，再把相位迁回挂起前的状态。返回迁移副作用。
+    /// Expired / Suspended（没帧）不接驳，返回 Err 说明。
+    pub fn reattach(
+        &mut self,
+        console: ConsoleRef,
+        verdict: &ResumeVerdict,
+    ) -> Result<Vec<Effect>, String> {
+        let slot = self.console.console_id.clone();
+        self.reattach_slot(&slot, console, verdict)
+    }
+
+    /// 同 [`reattach`]，接驳的是 `slot`（保存的 console id，可以是主终端也可以是其余终端之一）。
+    pub fn reattach_slot(
+        &mut self,
+        slot: &str,
+        console: ConsoleRef,
+        verdict: &ResumeVerdict,
+    ) -> Result<Vec<Effect>, String> {
+        if self.slot(slot).is_none() {
+            return Err(format!("这份托管里没有终端「{slot}」"));
+        }
+        match verdict {
+            ResumeVerdict::Expired { reason } | ResumeVerdict::Suspended { reason } => return Err(reason.clone()),
+            ResumeVerdict::Drift { downgrade_to } => self.authority.tier = downgrade_to.clone(),
+            ResumeVerdict::Clean => {}
+        }
+        let (p, fx) = step(&self.phase, HostEvent::Reattach(console.clone())).map_err(|e| e.to_string())?;
+        self.phase = p;
+        self.replace_slot(slot, console);
+        Ok(fx)
+    }
+}
+
+/// 相位里（含 UserDriving / Suspended 嵌套的）等人卡片的 diff 脱敏。
+fn scrub_phase(p: HostPhase) -> HostPhase {
+    match p {
+        HostPhase::WaitingHuman { mut card } => {
+            card.diff = card.diff.map(|d| super::super::redact::redact(&d));
+            HostPhase::WaitingHuman { card }
+        }
+        HostPhase::UserDriving { resume_to } => HostPhase::UserDriving { resume_to: Box::new(scrub_phase(*resume_to)) },
+        HostPhase::Suspended { reason, resume_to } => {
+            HostPhase::Suspended { reason, resume_to: Box::new(scrub_phase(*resume_to)) }
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::checkpoint::CHECKPOINT_TTL_MS;
+    use super::super::super::policy::TIER_APPROVE;
+    use super::super::{Check, PauseCause, SuspendReason};
+    use super::*;
+
+    fn contract() -> StewardContract {
+        StewardContract {
+            id: "c1".into(),
+            console_id: "t1".into(),
+            host_key: "ssh:root@a:22".into(),
+            goal: "升级 nginx".into(),
+            authority_tier: "auto".into(),
+            status: "observing".into(),
+            intent_ids: vec!["i1".into()],
+            timebox_ms: 0,
+            created_at: 1,
+            success_criteria: vec![Check::ScreenMatches { re: "nginx/1\\.2".into() }],
+            yolo: true,
+            criteria_confirmed: false,
+            extra_consoles: Vec::new(),
+        }
+    }
+    fn console(id: &str) -> ConsoleRef {
+        ConsoleRef {
+            host_key: "ssh:root@a:22".into(),
+            session_record_id: Some("rec".into()),
+            label: "a".into(),
+            cwd: Some("/etc/nginx".into()),
+            tmux: Some("main".into()),
+            console_id: id.into(),
+        }
+    }
+    fn cp() -> HostCheckpoint {
+        let mut c = HostCheckpoint::new(contract(), Authority::default().with_tier("auto"), console("t1"), 1_000);
+        c.phase = HostPhase::Paused { cause: PauseCause::Budget { reason: "步数".into() } };
+        c.messages = vec![ChatMessage::user("开始"), ChatMessage::assistant("好的")];
+        c.spent.steps = 12;
+        c.step = 12;
+        c.woke_hash.insert("t1".into(), "abc".into());
+        c.last_screen_hash = "h1".into();
+        c
+    }
+
+    #[test]
+    fn card_diff_is_redacted_on_save_but_kept_in_memory() {
+        let mut card = super::super::HumanCard::ask("a1", "批准写入", 1);
+        card.diff = Some("-key=sk-proj-abcdefghijklmnopqrstuvwxyz1234\n+key=x".into());
+        let mut c = cp();
+        c.phase = HostPhase::UserDriving { resume_to: Box::new(HostPhase::WaitingHuman { card: card.clone() }) };
+        let j = c.to_json(5).unwrap();
+        assert!(!j.contains("abcdefghijklmnopqrstuvwxyz1234"), "落盘的 checkpoint 里不能有原文");
+        assert_eq!(c.phase, HostPhase::UserDriving { resume_to: Box::new(HostPhase::WaitingHuman { card }) }, "内存里不动");
+    }
+
+    #[test]
+    fn round_trip() {
+        let c = cp();
+        let j = c.to_json(2_000).unwrap();
+        let back = HostCheckpoint::from_json(&j).unwrap();
+        let mut want = c.clone();
+        want.saved_wall_ms = 2_000;
+        assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&want).unwrap());
+        assert_eq!(back.contract.success_criteria, contract().success_criteria);
+        assert!(back.contract.yolo);
+        assert_eq!(back.state(), "paused");
+    }
+
+    #[test]
+    fn run_limits_round_trip_and_old_checkpoints_load_without_them() {
+        use super::super::super::budget::RunBudget;
+        let mut c = cp();
+        assert!(!c.to_json(0).unwrap().contains("\"limits\""), "没设就不写");
+        let l = RunBudget { max_steps: 300, max_minutes: 90, max_output_chars: 0, max_cost_micros: 2_000_000 };
+        c.limits = Some(l);
+        let back = HostCheckpoint::from_json(&c.to_json(0).unwrap()).unwrap();
+        assert_eq!(back.limits, Some(l));
+        // 旧现场没有 limits 字段
+        let mut v: Value = serde_json::from_str(&c.to_json(0).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("limits");
+        assert_eq!(HostCheckpoint::from_json(&v.to_string()).unwrap().limits, None);
+    }
+
+    #[test]
+    fn future_version_is_refused_not_guessed() {
+        let mut v: Value = serde_json::from_str(&cp().to_json(0).unwrap()).unwrap();
+        v["v"] = Value::from(HOST_CHECKPOINT_V + 1);
+        v["somethingNew"] = Value::from(true);
+        assert_eq!(HostCheckpoint::from_json(&v.to_string()).unwrap_err(), LoadError::FutureVersion(HOST_CHECKPOINT_V + 1));
+        v["v"] = Value::from(u64::MAX);
+        assert!(matches!(HostCheckpoint::from_json(&v.to_string()), Err(LoadError::FutureVersion(_))));
+    }
+
+    #[test]
+    fn missing_or_bad_version_and_garbage_are_corrupt() {
+        let mut v: Value = serde_json::from_str(&cp().to_json(0).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("v");
+        assert!(matches!(HostCheckpoint::from_json(&v.to_string()), Err(LoadError::Corrupt(_))));
+        v["v"] = Value::from(0);
+        assert!(matches!(HostCheckpoint::from_json(&v.to_string()), Err(LoadError::Corrupt(_))));
+        assert!(matches!(HostCheckpoint::from_json("not json"), Err(LoadError::Corrupt(_))));
+        assert!(matches!(HostCheckpoint::from_json(r#"{"v":1}"#), Err(LoadError::Corrupt(_))));
+    }
+
+    #[test]
+    fn old_contract_json_without_new_fields_still_loads() {
+        let mut v: Value = serde_json::from_str(&cp().to_json(0).unwrap()).unwrap();
+        let c = v["contract"].as_object_mut().unwrap();
+        c.remove("successCriteria");
+        c.remove("yolo");
+        v.as_object_mut().unwrap().remove("watchdog");
+        v.as_object_mut().unwrap().remove("wokeHash");
+        let back = HostCheckpoint::from_json(&v.to_string()).unwrap();
+        assert!(back.contract.success_criteria.is_empty());
+        assert!(!back.contract.yolo);
+        assert_eq!(back.watchdog, WatchdogState::default());
+    }
+
+    #[test]
+    fn messages_are_sanitized_and_compacted_on_save() {
+        let mut c = cp();
+        c.messages = vec![ChatMessage::user("目标")];
+        for n in 0..200 {
+            c.messages.push(ChatMessage::assistant(format!("第 {n} 步 {}", "x".repeat(800))));
+            c.messages.push(ChatMessage::user(format!("反馈 {n} {}", "y".repeat(800))));
+        }
+        c.messages.push(ChatMessage::user("password=hunter2secret"));
+        let back = HostCheckpoint::from_json(&c.to_json(0).unwrap()).unwrap();
+        let total: usize = back.messages.iter().map(|m| m.content.chars().count()).sum();
+        assert!(total <= MESSAGES_BUDGET_CHARS + 2_000, "{total}");
+        assert!(back.messages.len() < c.messages.len());
+        assert!(!back.messages.iter().any(|m| m.content.contains("hunter2secret")));
+    }
+
+    /// 整个 checkpoint 落盘串里不能有任何凭据：正文、工具参数、工具回执（含整段私钥）都要过加强后的脱敏
+    #[test]
+    fn checkpoint_round_trip_holds_no_secret() {
+        use super::super::super::llm::{ToolResult, ToolUse};
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun\nVTLw7onLRnrq0/IzW7yWR7QkrmBL7jTKEn5u+qKhbwKfBstIs+bMY2Zkp18gnTxK\n-----END RSA PRIVATE KEY-----\n";
+        let numbered: String = pem.lines().enumerate().map(|(i, l)| format!("{:>6}\t{l}\n", i + 1)).collect();
+        let mut c = cp();
+        c.messages = vec![
+            ChatMessage::user("部署：DB_PASSWORD=Hunter2Hunter2 GITHUB_TOKEN=ghp_0123456789abcdefghijABCDEFGHIJ012345"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: "读一下配置".into(),
+                tool_calls: vec![ToolUse {
+                    id: "call_1".into(),
+                    name: "nx_write".into(),
+                    arguments: r#"{"path":"/srv/app.yml","content":"db:\n  password: S3cretYamlPw\n"}"#.into(),
+                }],
+                tool_results: vec![],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: String::new(),
+                tool_results: vec![ToolResult {
+                    id: "call_1".into(),
+                    content: format!("文件 /root/key：\n{numbered}root:$6$Zr8qBx1L$Qk4pU2c9dYJ0oF1vXxjv5w8m3eTq7Lr2sN6aH4bG9yK:19700:0:99999:7:::\n"),
+                    is_error: false,
+                }],
+                tool_calls: vec![],
+            },
+        ];
+        let json = c.to_json(0).unwrap();
+        for secret in [
+            "Hunter2Hunter2",
+            "0123456789abcdefghij",
+            "S3cretYamlPw",
+            "MIIEowIBAAKCAQEAu1SU1Lf",
+            "VTLw7onLRnrq0",
+            "Qk4pU2c9dYJ0",
+        ] {
+            assert!(!json.contains(secret), "落盘串里有 {secret}：{json}");
+        }
+        let back = HostCheckpoint::from_json(&json).unwrap();
+        assert_eq!(back.messages.len(), 3);
+        assert_eq!(back.messages[1].tool_calls[0].id, "call_1", "id 不脱敏，配对不断");
+        assert_eq!(back.messages[2].tool_results[0].id, "call_1");
+        assert!(back.messages[0].content.contains("DB_PASSWORD=[REDACTED]"));
+    }
+
+    #[test]
+    fn restart_suspends_non_terminal_only() {
+        let mut c = cp();
+        assert!(c.suspend_for_restart());
+        assert_eq!(c.phase, HostPhase::Suspended {
+            reason: SuspendReason::AppRestart,
+            resume_to: Box::new(HostPhase::Paused { cause: PauseCause::Budget { reason: "步数".into() } }),
+        });
+        assert!(!c.suspend_for_restart(), "已挂起再扫一次不变");
+        c.phase = HostPhase::Stopped;
+        assert!(!c.suspend_for_restart());
+    }
+
+    #[test]
+    fn reattach_clean_restores_saved_phase_and_tier() {
+        let mut c = cp();
+        c.suspend_for_restart();
+        let v = c.reattach_verdict(Some("h1"), 5_000);
+        assert_eq!(v, ResumeVerdict::Clean);
+        let fx = c.reattach(console("t9"), &v).unwrap();
+        assert!(matches!(c.phase, HostPhase::Paused { .. }), "预算暂停经重启仍是暂停");
+        assert_eq!(c.authority.tier, "auto");
+        assert_eq!(c.console.console_id, "t9");
+        assert!(fx.contains(&Effect::ForceScreen));
+    }
+
+    #[test]
+    fn reattach_drift_downgrades_to_approve() {
+        let mut c = cp();
+        c.phase = HostPhase::Running;
+        c.suspend_for_restart();
+        let v = c.reattach_verdict(Some("other"), 5_000);
+        assert!(matches!(v, ResumeVerdict::Drift { .. }));
+        c.reattach(console("t9"), &v).unwrap();
+        assert_eq!(c.phase, HostPhase::Running);
+        assert_eq!(c.authority.tier, TIER_APPROVE);
+    }
+
+    #[test]
+    fn reattach_refused_when_expired_or_no_frame() {
+        let mut c = cp();
+        c.suspend_for_restart();
+        let late = c.created_wall_ms + CHECKPOINT_TTL_MS + 1;
+        assert!(c.expired(late));
+        assert!(!c.expired(c.created_wall_ms + 10));
+        let v = c.reattach_verdict(Some("h1"), late);
+        assert!(matches!(v, ResumeVerdict::Expired { .. }));
+        assert!(c.reattach(console("t9"), &v).is_err());
+        let v = c.reattach_verdict(None, 5_000);
+        assert!(matches!(v, ResumeVerdict::Suspended { .. }));
+        assert!(c.reattach(console("t9"), &v).is_err());
+        assert!(matches!(c.phase, HostPhase::Suspended { .. }), "拒绝接驳时状态不变");
+    }
+
+    // ——— 多终端 ———
+
+    /// 旧现场（没有 extra / extraConsoles 字段）照样读得回来，是单终端；单终端写出去也不带这两个字段
+    #[test]
+    fn old_single_console_json_still_loads() {
+        let mut v = serde_json::to_value(cp()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("extra");
+        o["contract"].as_object_mut().unwrap().remove("extraConsoles");
+        let back = HostCheckpoint::from_json(&v.to_string()).unwrap();
+        assert!(back.extra.is_empty() && back.contract.extra_consoles.is_empty());
+        assert_eq!(back.consoles().count(), 1);
+        let j = cp().to_json(5).unwrap();
+        assert!(!j.contains("\"extra\"") && !j.contains("extraConsoles"), "单终端的落盘格式不变");
+    }
+
+    #[test]
+    fn multi_console_round_trip_and_slot_replace() {
+        let mut c = cp();
+        c.extra = vec![console("t2")];
+        c.contract.extra_consoles = vec!["t2".into()];
+        let back = HostCheckpoint::from_json(&c.to_json(9).unwrap()).unwrap();
+        assert_eq!(back.consoles().map(|x| x.console_id.as_str()).collect::<Vec<_>>(), vec!["t1", "t2"]);
+        assert_eq!(back.contract.extra_consoles, vec!["t2".to_string()]);
+        // 换其余终端那一格：主终端不动，契约里的其余终端跟着换
+        let mut m = back.clone();
+        assert!(m.replace_slot("t2", console("t9")));
+        assert_eq!(m.console.console_id, "t1");
+        assert_eq!(m.contract.extra_consoles, vec!["t9".to_string()]);
+        // 换主终端那一格：契约的 console_id 跟着换
+        assert!(m.replace_slot("t1", console("t8")));
+        assert_eq!((m.console.console_id.as_str(), m.contract.console_id.as_str()), ("t8", "t8"));
+        assert!(!m.replace_slot("nope", console("x")));
+    }
+}

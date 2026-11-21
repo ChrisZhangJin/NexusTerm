@@ -81,9 +81,84 @@ fn collect_blocking() -> Result<Stats, String> {
     Ok(out)
 }
 
+// ── macOS 采集 ──────────────────────────────────────────────────────────
+// macOS 没有 /proc，只能借系统自带命令。用 `top -l 2` 取第二次采样的 CPU 占用
+// （第一次是从开机到现在的累计值，不具代表性），`vm_stat` + `sysctl` 取内存。
+// 这些命令都是只读、无需特权，失败时优雅缺项而不是让状态栏报错。
+
+#[cfg(target_os = "macos")]
+fn sysctl_value(key: &str) -> Option<String> {
+    let o = std::process::Command::new("sysctl")
+        .args(["-n", key])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_cpu_pct() -> Option<f64> {
+    // `top` 在受限环境（沙箱 / 无 TTY）里可能被系统拒绝，改用 iostat：
+    // `iostat -c 2 -w 1` 的表头含 `us sy id`，取最后一次采样的 idle 反推占用。
+    // 磁盘数量决定列数，所以按表头里 "id" 的 token 位置取列，不写死下标。
+    let o = std::process::Command::new("iostat")
+        .args(["-c", "2", "-w", "1"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&o.stdout);
+    let id_idx = s
+        .lines()
+        .find_map(|l| l.split_whitespace().position(|t| t == "id"))?;
+    let last = s.lines().rev().find(|l| {
+        l.split_whitespace()
+            .next()
+            .and_then(|x| x.parse::<f64>().ok())
+            .is_some()
+    })?;
+    let idle: f64 = last.split_whitespace().nth(id_idx)?.parse().ok()?;
+    Some((100.0 - idle).clamp(0.0, 100.0))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mem() -> Option<(u64, u64)> {
+    let total = sysctl_value("hw.memsize")?.parse::<u64>().ok()?;
+    let page_size = sysctl_value("hw.pagesize")?.parse::<u64>().ok()?;
+    let o = std::process::Command::new("vm_stat").output().ok()?;
+    let s = String::from_utf8_lossy(&o.stdout);
+    let mut avail_pages: u64 = 0;
+    for line in s.lines() {
+        let wanted = ["Pages free:", "Pages inactive:", "Pages speculative:"]
+            .iter()
+            .any(|k| line.starts_with(k));
+        if !wanted {
+            continue;
+        }
+        if let Some(v) = line
+            .split(':')
+            .nth(1)
+            .and_then(|x| x.trim().trim_end_matches('.').parse::<u64>().ok())
+        {
+            avail_pages = avail_pages.saturating_add(v);
+        }
+    }
+    let avail = avail_pages.saturating_mul(page_size).min(total);
+    Some((total, avail))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_load() -> Option<String> {
+    let s = sysctl_value("vm.loadavg")?;
+    let nums: Vec<&str> = s
+        .trim_matches(|c: char| !c.is_ascii_digit() && c != '.' && c != ' ')
+        .split_whitespace()
+        .take(3)
+        .collect();
+    (nums.len() == 3).then(|| nums.join(" "))
+}
+
 #[cfg(not(target_os = "windows"))]
 fn collect_blocking() -> Result<Stats, String> {
-    // Linux 读 /proc；macOS 没有 /proc，CPU/内存会缺项，磁盘仍可用 df 取到
+    // Linux 读 /proc；macOS 没有 /proc，走下面 cfg(macos) 的系统命令分支
     fn cpu() -> Option<(u64, u64)> {
         let s = std::fs::read_to_string("/proc/stat").ok()?;
         let line = s.lines().find(|l| l.starts_with("cpu "))?;
@@ -145,6 +220,21 @@ fn collect_blocking() -> Result<Stats, String> {
                     out.insert("DISK_MOUNT".into(), f[5].to_string());
                 }
             }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if !out.contains_key("CPU_PCT") {
+            if let Some(pct) = macos_cpu_pct() {
+                out.insert("CPU_PCT".into(), format!("{pct:.1}"));
+            }
+        }
+        if let Some((total, avail)) = macos_mem() {
+            out.insert("MEM_TOTAL".into(), total.to_string());
+            out.insert("MEM_AVAIL".into(), avail.to_string());
+        }
+        if let Some(load) = macos_load() {
+            out.insert("LOAD".into(), load);
         }
     }
     Ok(out)

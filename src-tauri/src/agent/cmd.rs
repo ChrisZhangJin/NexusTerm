@@ -8,7 +8,10 @@ use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use super::act::{self, AgentRunRequest, ExecResult, OpenKind, OpenSpec};
 use super::{capture, load_config, save_config, AgentConfig, AgentError};
 use crate::agent::buffer::BufferStats;
+use crate::agent::control::{ControlEvent, ControlState};
 use crate::agent::llm;
+use crate::agent::timeline;
+use crate::agent::usercmd::UserEntryKind;
 use crate::cmd::AppState;
 
 /// 浮动 Agent 窗口的固定 label。只开一个：再次调用就聚焦并切会话，不叠窗。
@@ -91,10 +94,73 @@ pub fn agent_clear(session_id: String, state: State<'_, AppState>) -> Result<(),
     Ok(())
 }
 
+// ——— 对话持久化（2.6）：面板的全局对话跨重载 / 重启保留 ———
+
+/// 读回已保存的面板对话（消息对象数组，结构由前端定义，后端只透传）。
+#[tauri::command]
+pub fn agent_history_load(key: Option<String>, state: State<'_, AppState>) -> Vec<serde_json::Value> {
+    state.store.agent_conv_load_in(key.as_deref().unwrap_or(""))
+}
+
+/// 覆盖保存面板对话。落盘前由后端统一清洗：只留最近若干条、文本脱敏并截断、
+/// 丢掉任何 value / password 形态的键（见 `agent::history::sanitize_messages`）。
+///
+/// 做成 async：脱敏是 CPU 活，别占主线程。
+#[tauri::command]
+pub async fn agent_history_save(
+    messages: Vec<serde_json::Value>,
+    key: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let cleaned = super::history::sanitize_messages(messages);
+    state.store.agent_conv_save_in(key.as_deref().unwrap_or(""), &cleaned)
+}
+
+/// 「新对话」：下一次提问不再接着之前的模型消息历史（面板上的记录不动）。
+#[tauri::command]
+pub fn agent_conversation_reset(key: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+    state.store.agent_llm_clear_in(key.as_deref().unwrap_or(""))
+}
+
+/// 「清空对话」：真删已保存的对话与运行摘要。
+#[tauri::command]
+pub fn agent_history_clear(key: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+    state.store.agent_history_clear_in(key.as_deref().unwrap_or(""))
+}
+
 /// 缓冲统计（字节数 / 累计丢弃量 / 是否已被截断）。
 #[tauri::command]
 pub fn agent_stats(session_id: String, state: State<'_, AppState>) -> Option<BufferStats> {
     state.agent.stats(&session_id)
+}
+
+/// 用户在终端里提交（回车）了一行命令。前端 `onCommandCommitted` 路径推来，
+/// 只在回车时调一次，fire-and-forget。
+///
+/// `no_echo` 为真 = 前端判定这行没被终端回显过（密码提示）：此时 `line` 会被
+/// 直接丢弃，只存 `secret_input` 占位。后端还会按屏幕尾部再兜一道底。
+/// 同步命令、不返回条目：这条路径必须尽可能便宜，调用方也不关心结果。
+#[tauri::command]
+pub fn agent_user_command(
+    session_id: String,
+    line: String,
+    no_echo: Option<bool>,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) {
+    let no_echo = no_echo.unwrap_or(false);
+    // 无回显时内容不该走到任何存储，这里先清掉，后面谁改了实现也碰不到
+    let line = if no_echo { String::new() } else { line };
+    let Some(entry) = state.agent.record_user_command(&session_id, &line, no_echo) else {
+        return;
+    };
+    // 录制中（3.2）：先记下这一行是在回答什么提示，再并入命令本身
+    super::recorder_cmd::capture_context(&state, &session_id);
+    // 并入统一时间线（2.5，给模型的摘要与录制用）；命令的输出摘要等输出安静下来再补一条
+    let evs = state.agent.timeline_user(&session_id, &entry);
+    if entry.kind == UserEntryKind::Command {
+        timeline::schedule_user_flush(app, session_id, evs.last().map(|e| e.seq).unwrap_or(0));
+    }
 }
 
 // ——— 提问 / 取消 / 测试连接 ———
@@ -170,25 +236,97 @@ pub async fn agent_run(
     app: AppHandle,
 ) -> Result<(), String> {
     let config = load_config(&state.store);
-    act::run(&app, &state, &state.act, &config, &request)
+    act::run(&app, &state, &state.act, &config, &request, act::RunMode::Chat)
         .await
         .map_err(err)
 }
 
 /// 取消该会话正在进行的这一轮 Agentic 运行（中止整条连锁操作）。
 ///
+/// `send_ctrl_c = true` 时还会给它驾驶的会话发一个 Ctrl-C（`\x03`），打断正在跑的前台进程；
+/// 省略 / false 只停 Agent、不碰终端。无论哪种，停止后控制权都回到用户
+/// （`nx://agent/control` 推 `userDriving`）。
+///
 /// 幂等：没有在跑时什么都不做 —— 用户连点两次不该弹错误。
 #[tauri::command]
-pub fn agent_run_cancel(session_id: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn agent_run_cancel(
+    session_id: String,
+    send_ctrl_c: Option<bool>,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
     if session_id.trim().is_empty() {
         return Err(AgentError::NoSession(session_id).to_string());
     }
-    if state.act.cancel(&session_id) {
-        tracing::info!("Agentic 运行已请求取消：{}", session_id);
+    let ctrl_c = send_ctrl_c.unwrap_or(false);
+    if act::stop_run(&app, &state, &session_id, ctrl_c).await {
+        tracing::info!("Agentic 运行已请求取消：{}（Ctrl-C：{}）", session_id, ctrl_c);
     } else {
         tracing::debug!("取消请求被忽略，该会话没有进行中的 Agentic 运行：{}", session_id);
     }
     Ok(())
+}
+
+/// 手动「暂停」这一轮：在下一个步骤边界（下一次模型调用前 / 下一个动作前）停下，
+/// 把控制权还给用户，等「继续」或「停止」。正在执行的那一步不会被打断。
+/// 返回是否确有一轮在跑；幂等（已暂停 / 已请求时再点无害）。
+#[tauri::command]
+pub fn agent_run_pause(session_id: String, state: State<'_, AppState>, app: AppHandle) -> Result<bool, String> {
+    if session_id.trim().is_empty() {
+        return Err(AgentError::NoSession(session_id).to_string());
+    }
+    let fresh = state.act.phases.phase(&session_id) == Some(super::budget::RunPhase::RUNNING);
+    let ok = state.act.phases.request_pause(&session_id);
+    if ok && fresh {
+        act::emit_step(
+            &app,
+            &session_id,
+            act::StepPayload {
+                text: Some("已请求暂停：当前这一步做完后会停下。".into()),
+                ..act::StepPayload::new("note", 0)
+            },
+        );
+    }
+    Ok(ok)
+}
+
+/// 「继续」一轮已暂停（预算用尽 / 手动暂停）的运行：同一轮、同一段对话上下文，换一份新预算接着跑。
+/// 只有确实处于暂停时才返回 true（陈旧点击 / 重复点击无害）。
+/// 控制权由运行循环自己经正常的重新获取路径拿回，审批 / 作用范围 / 危险判断一律照旧。
+#[tauri::command]
+pub fn agent_run_resume(session_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    if session_id.trim().is_empty() {
+        return Err(AgentError::NoSession(session_id).to_string());
+    }
+    Ok(state.act.phases.resume(&session_id))
+}
+
+// ——— 终端控制权（人 / Agent / 暂停） ———
+
+/// 查询某会话此刻的控制权状态。终端挂载 / 面板打开时对一次账（事件只在变化时推）。
+#[tauri::command]
+pub fn agent_control_get(session_id: String, state: State<'_, AppState>) -> ControlState {
+    state.act.control.state(&session_id)
+}
+
+/// 用户在一个 Agent 正在驾驶的终端里敲了键。**前端只在状态切换时调一次**
+/// （键盘热路径上没有 Agent 驾驶时一个 IPC 都不发）。后端：AgentDriving → Paused 并推事件；
+/// 其余状态空操作。
+#[tauri::command]
+pub fn agent_control_user_input(session_id: String, state: State<'_, AppState>, app: AppHandle) {
+    state.act.user_control(&app, &session_id, ControlEvent::UserInput);
+}
+
+/// 用户点「接管」：Agent 立刻让路（等同于自己敲了键），直到「交还」。
+#[tauri::command]
+pub fn agent_control_takeover(session_id: String, state: State<'_, AppState>, app: AppHandle) {
+    state.act.user_control(&app, &session_id, ControlEvent::Takeover);
+}
+
+/// 用户点「交还」：Paused → AgentDriving，等着的 Agent 继续。
+#[tauri::command]
+pub fn agent_control_handback(session_id: String, state: State<'_, AppState>, app: AppHandle) {
+    state.act.user_control(&app, &session_id, ControlEvent::Handback);
 }
 
 /// 答复一次审批请求。`approved = false` 或请求已超时，都按「不执行」处理。
@@ -226,6 +364,51 @@ pub fn agent_tab_ack(
     ))
 }
 
+/// 前端对一次读屏请求（`nx_screen`）的回执。
+///
+/// 必须回：后端在等它，3 秒没等到就退回旁路缓冲。`ok=false` 时 `detail` 写原因（如终端不存在）。
+/// 返回 false 表示这个请求已经超时被丢掉了 —— 前端忽略即可，不是错误。
+#[tauri::command]
+pub fn agent_screen_ack(
+    request_id: String,
+    ok: bool,
+    text: Option<String>,
+    alt: Option<bool>,
+    detail: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    Ok(state.act.answer_screen(
+        &request_id,
+        crate::agent::act::ScreenReply {
+            ok,
+            text: text.unwrap_or_default(),
+            alt: alt.unwrap_or(false),
+            detail: detail.unwrap_or_default(),
+        },
+    ))
+}
+
+/// 用户对一次密码请求（`nx_secret`）的答复。`value = None` 表示「跳过」。
+///
+/// **这是密码唯一的入口，也是唯一的去向**：值在这里被装进 `Zeroizing`，经 oneshot 交给
+/// 等着的 `act::run`，由它直接写进目标 pty。不返回给前端、不进日志（本函数与下游都不打印参数）、
+/// 不进模型上下文 / trace / 旁路缓冲。
+///
+/// - `Ok(true)`：已交给后端；`Ok(false)`：请求已经没人接了（超时 / 本轮被停止），前端把卡片置灰；
+/// - `Err(原因)`：输入没通过校验（含换行 / 控制字符 / 过长），请求仍然有效，用户可以改了再交。
+///   原因文案不含输入内容。
+#[tauri::command]
+pub fn agent_secret_ack(
+    request_id: String,
+    value: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    state
+        .act
+        .answer_secret(&request_id, value)
+        .map_err(|e| e.to_string())
+}
+
 /// 在指定会话里手动跑一条命令（UI 上的「帮我执行」按钮、结果卡重试）。
 ///
 /// 与 `agent_run` 共用同一条执行链路，但不调用模型：用户点哪条就跑哪条。
@@ -257,6 +440,7 @@ pub async fn agent_exec(
         e
     })?;
     Ok(ExecResult {
+        prompt_kind: outcome.prompt.as_ref().map(|g| g.kind.as_str().to_string()),
         output: outcome.output,
         reason: outcome.reason,
     })

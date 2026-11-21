@@ -14,14 +14,62 @@
 //!    HTTP 请求、磁盘 IO 一律拿到释放之后再发生。
 
 pub mod act;
+pub mod budget;
 pub mod buffer;
 pub mod capture;
 pub mod cmd;
+pub mod control;
 pub mod danger;
 pub mod executor;
+pub mod files;
+pub mod files_tool;
+pub mod history;
+pub mod hostmem;
+pub mod hostmem_cmd;
+pub mod interact;
 pub mod llm;
+pub mod macro_migrate;
+pub mod prompt;
+pub mod recorder;
+pub mod recorder_cmd;
 pub mod redact;
+pub mod reveal;
+pub mod secret;
+pub mod skill;
+pub mod skill_cmd;
+pub mod skill_refine;
+pub mod skill_run;
+pub mod situation;
+pub mod skilltool;
+pub mod steward;
+pub mod steward_loop;
+pub mod steward_mode;
+pub mod decision;
+pub mod profile;
+pub mod steward_cmd;
+// P3 授权与协作
+pub mod policy;
+// P4 长运行与恢复
+pub mod checkpoint;
+pub mod host;
+pub mod host_cmd;
+pub mod host_history_cmd;
+pub mod host_notify;
+// P5 学习闭环 / LLM 兜底
+pub mod learning;
+// P3–P5 共享运行时状态
+pub mod steward_core;
+#[cfg(test)]
+mod steward_e2e;
+#[cfg(test)]
+mod e2e;
+pub mod timeline;
+pub mod todo;
 pub mod trace;
+pub mod usercmd;
+pub mod usage;
+pub mod watch;
+pub mod compact;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +80,7 @@ use serde::{Deserialize, Serialize};
 // 接线点（ssh/session.rs、local/mod.rs、cmd.rs）只需要这个来源标记
 pub use self::buffer::StreamKind;
 use self::buffer::{BufferStats, SessionBuffer, DEFAULT_CAPACITY};
+use self::usercmd::UserCommandEntry;
 use crate::store::Store;
 
 /// 单次喂给模型的默认上下文字节数（远小于缓冲容量 `buffer::DEFAULT_CAPACITY`）。
@@ -188,6 +237,14 @@ pub struct AgentConfig {
     /// 旧配置没有这个字段，靠 `serde(default)` 落到 false，不会让整份配置反序列化失败。
     #[serde(default)]
     pub trace: bool,
+    /// 一轮 Agentic 运行的预算（步数 / 时间 / 输出字符），见 `budget`。
+    /// 旧配置没有这个字段，靠 `serde(default)` 落到默认值（25 步 / 10 分钟 / 输出不限）。
+    #[serde(default)]
+    pub budget: budget::RunBudget,
+    /// 模型单价表（美元 / 百万 token，按模型名匹配），用来把 token 折成钱，见 `usage`。
+    /// 旧配置没有这个字段时落到内置默认（几款价格确定的模型）；用户清空就是空表（只显示 token）。
+    #[serde(default = "usage::default_prices")]
+    pub prices: Vec<usage::ModelPrice>,
 }
 
 impl Default for AgentConfig {
@@ -204,6 +261,8 @@ impl Default for AgentConfig {
             accounts: vec![acct],
             exec_mode: ExecMode::Approval,
             trace: false,
+            budget: budget::RunBudget::default(),
+            prices: usage::default_prices(),
         }
     }
 }
@@ -238,6 +297,7 @@ impl AgentConfig {
         if !self.accounts.iter().any(|a| a.id == self.active_id) {
             self.active_id = self.accounts[0].id.clone();
         }
+        self.budget = self.budget.clamped();
     }
 }
 
@@ -347,6 +407,8 @@ fn migrate_legacy_config(raw: &str) -> AgentConfig {
         // 旧配置没有这一项，按最保守的「人在回路」给
         exec_mode: ExecMode::Approval,
         trace: false,
+        budget: budget::RunBudget::default(),
+        prices: usage::default_prices(),
     }
 }
 
@@ -390,6 +452,10 @@ pub struct AgentManager {
     /// 未显式登记过的会话，默认是否旁路。
     auto_attach: AtomicBool,
     sessions: Mutex<HashMap<String, SessionBuffer>>,
+    /// 每会话的统一时间线（2.5，见 `timeline.rs`）。与 `sessions` **不嵌套持锁**。
+    timelines: Mutex<timeline::Timelines>,
+    /// 每会话的录制状态（3.2，见 `recorder.rs`）。与 `sessions` / `timelines` **不嵌套持锁**。
+    recordings: Mutex<recorder::Recordings>,
 }
 
 impl AgentManager {
@@ -398,6 +464,8 @@ impl AgentManager {
             enabled: AtomicBool::new(false),
             auto_attach: AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
+            timelines: Mutex::new(HashMap::new()),
+            recordings: Mutex::new(HashMap::new()),
         }
     }
 
@@ -499,11 +567,66 @@ impl AgentManager {
         self.sessions.lock().get(session_id).map(|b| b.last_line())
     }
 
+    /// 记一条用户提交的命令（回车时前端推来）。与 `feed` 同样的开关语义：
+    /// 总开关关着 / 该会话旁路关闭则忽略；未登记的会话按 autoAttach 建缓冲。
+    /// `no_echo` 为真或屏幕在等密码时只存占位，见 `SessionBuffer::record_user_command`。
+    pub fn record_user_command(
+        &self,
+        session_id: &str,
+        line: &str,
+        no_echo: bool,
+    ) -> Option<UserCommandEntry> {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let ts = usercmd::now_ms();
+        let mut guard = self.sessions.lock();
+        if !guard.contains_key(session_id) {
+            if !self.auto_attach.load(Ordering::Relaxed) {
+                return None;
+            }
+            guard.insert(session_id.to_string(), SessionBuffer::with_attach(true));
+        }
+        let buf = guard.get_mut(session_id)?;
+        if !buf.is_enabled() {
+            return None;
+        }
+        buf.record_user_command(line, no_echo, ts)
+    }
+
+    /// 最近 `limit` 条用户命令（时间正序）。**原文**；喂模型前必须过
+    /// [`Self::user_commands_redacted`] 或 `UserCommandEntry::redacted`。
+    pub fn user_commands(&self, session_id: &str, limit: usize) -> Vec<UserCommandEntry> {
+        self.sessions
+            .lock()
+            .get(session_id)
+            .map(|b| b.user_commands(limit))
+            .unwrap_or_default()
+    }
+
+    /// 同 [`Self::user_commands`]，但 `line` 已脱敏。给模型 / trace 用这个。
+    pub fn user_commands_redacted(&self, session_id: &str, limit: usize) -> Vec<UserCommandEntry> {
+        self.user_commands(session_id, limit)
+            .iter()
+            .map(UserCommandEntry::redacted)
+            .collect()
+    }
+
+    /// `seq` 大于 `after` 的用户命令（增量读取，给时间线 / 录制器）。
+    pub fn user_commands_since(&self, session_id: &str, after: u64) -> Vec<UserCommandEntry> {
+        self.sessions
+            .lock()
+            .get(session_id)
+            .map(|b| b.user_commands_since(after))
+            .unwrap_or_default()
+    }
+
     /// 丢弃已缓冲的内容，但保留开关状态（用户「让 agent 忘掉刚才的事」）。
     pub fn clear(&self, session_id: &str) {
         if let Some(buf) = self.sessions.lock().get_mut(session_id) {
             buf.clear();
         }
+        self.timeline_clear(session_id);
     }
 
     /// 会话关闭时调用。**必须调用**，否则长生命周期的 AppState 会
@@ -511,6 +634,8 @@ impl AgentManager {
     /// 调用点：`cmd::ssh_close` 与 `cmd::local_close`。
     pub fn remove(&self, session_id: &str) {
         self.sessions.lock().remove(session_id);
+        self.timelines.lock().remove(session_id);
+        self.recordings.lock().remove(session_id);
     }
 
     pub fn stats(&self, session_id: &str) -> Option<BufferStats> {
@@ -542,6 +667,53 @@ mod tests {
             ..Default::default()
         });
         m
+    }
+
+    #[test]
+    fn user_command_respects_global_switch_and_is_readable() {
+        let off = mgr(false, true);
+        assert!(off.record_user_command("s1", "ls", false).is_none());
+        assert!(off.user_commands("s1", 10).is_empty());
+
+        let m = mgr(true, true);
+        m.feed("s1", b"$ ", StreamKind::Out);
+        m.record_user_command("s1", "echo hi", false).unwrap();
+        m.record_user_command("s1", "TOKEN=abcdef0123456789abcdef0123456789 run", false);
+        m.record_user_command("s1", "pw", true).unwrap();
+        let all = m.user_commands("s1", 10);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].line, "echo hi");
+        assert_eq!(m.user_commands_since("s1", all[0].seq).len(), 2);
+        // 给模型的副本脱敏，原文仍在
+        let red = m.user_commands_redacted("s1", 10);
+        assert!(!red[1].line.contains("abcdef0123456789abcdef0123456789"), "{}", red[1].line);
+        assert!(all[1].line.contains("abcdef0123456789abcdef0123456789"));
+        m.remove("s1");
+        assert!(m.user_commands("s1", 10).is_empty());
+    }
+
+    /// 4.6：旧配置（没有 budget 字段）仍能反序列化，落到默认预算；越界值被夹紧。
+    #[test]
+    fn old_config_without_budget_gets_defaults() {
+        let raw = r#"{"enabled":true,"autoAttach":false,"accounts":[{"id":"a","name":"x"}],"activeId":"a","execMode":"approval","trace":false}"#;
+        let mut cfg: AgentConfig = serde_json::from_str(raw).expect("旧配置必须能解析");
+        cfg.normalize();
+        assert_eq!(cfg.budget, budget::RunBudget::default());
+        assert!(cfg.budget.max_steps > 8);
+    }
+
+    #[test]
+    fn budget_in_config_round_trips_and_is_clamped_on_normalize() {
+        let raw = r#"{"accounts":[{"id":"a"}],"activeId":"a","budget":{"maxSteps":0,"maxMinutes":999999,"maxOutputChars":5000}}"#;
+        let mut cfg: AgentConfig = serde_json::from_str(raw).unwrap();
+        cfg.normalize();
+        assert_eq!(cfg.budget.max_steps, budget::DEFAULT_MAX_STEPS);
+        assert_eq!(cfg.budget.max_minutes, budget::MAX_MINUTES_CEIL);
+        assert_eq!(cfg.budget.max_output_chars, 5000);
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(v["budget"]["maxOutputChars"], 5000);
+        let back: AgentConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(back.budget, cfg.budget);
     }
 
     #[test]

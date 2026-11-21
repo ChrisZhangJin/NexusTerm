@@ -147,7 +147,12 @@ struct SessionRuntime {
     /// 而卡在这里的话，任何等着往它的 `data_tx` 发数据的调用都会跟着无限期挂起
     /// （见 Agent 执行命令「写完立刻执行、面板却要等几分钟」那个 bug）。
     task: tokio::task::AbortHandle,
+    /// 这条连接的代号：同一个会话 id 每次（重）连上都换一个新的。托管据此认出「同一个 tab、但已经是断线重连后的新 shell」
+    generation: u64,
 }
+
+/// 连接代号的发号器（进程内单调递增，见 [`SessionRuntime::generation`]）
+static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// 探测脚本：在同一 SSH 连接上开 exec 通道执行（stdin 喂给 `sh -s`，不依赖用户登录 shell 类型）。
 ///
@@ -298,6 +303,17 @@ impl SessionManager {
     /// 供需要「先判断是 SSH 还是本地，再决定往哪写」的调用方使用。
     pub fn contains(&self, id: &str) -> bool {
         self.inner.lock().contains_key(id)
+    }
+
+    /// 会话当前这条连接的代号；不在（断了 / 关了）为 `None`。断线重连后同一个 id 会换一个新代号。
+    pub fn generation(&self, id: &str) -> Option<u64> {
+        self.inner.lock().get(id).map(|rt| rt.generation)
+    }
+
+    /// 当前活着的 SSH 会话 id 列表。P0 会话枚举用（`agent::steward::steward_list_consoles`）。
+    /// 与 `contains` 一样轻量：不握手、不开通道，只在锁内拷一份键。
+    pub fn ids(&self) -> Vec<String> {
+        self.inner.lock().keys().cloned().collect()
     }
 
     pub fn close(&self, id: &str) {
@@ -466,6 +482,7 @@ impl SessionManager {
                     sidecar,
                     last_sidecar,
                     task,
+                    generation: NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 },
             );
         }

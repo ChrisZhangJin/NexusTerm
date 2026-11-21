@@ -12,6 +12,25 @@ use crate::vault::{Field, Vault};
 mod vault_ops;
 pub use vault_ops::SweepReport;
 
+/// Agent 对话与运行摘要的持久化（Phase 2.6）。
+mod agent_history;
+
+/// Skill（可回放的操作流程）的持久化（Phase 3.1）。
+mod skills;
+
+/// 旧宏 → skill 迁移的幂等记录（Phase 3.5）。
+mod macro_migration;
+
+/// 主机记忆（Phase 4.5）：每台主机的备忘。
+mod host_memory;
+
+/// NexusAgent v2 / P2：决策依据（偏好 / 意向 / 知识 / 剧本）与决策记录。
+mod steward;
+pub use steward::CtxRow;
+
+/// 统一托管引擎：每份契约一行可接驳的现场。
+pub(crate) mod host;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
@@ -237,6 +256,12 @@ impl Store {
         .map_err(|e| e.to_string())?;
 
         migrate(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
+        agent_history::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
+        skills::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
+        macro_migration::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
+        host_memory::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
+        steward::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
+        host::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
 
         // 一次主键查找就能判定要不要弹解锁框。刻意不做 KDF、不碰系统凭据服务 ——
         // 这条路径在 `lib.rs` 的 setup 里是 `expect`，不能慢也不能阻塞。
@@ -842,7 +867,7 @@ mod legacy_keyring {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(super) fn temp_store(tag: &str) -> Store {
@@ -850,7 +875,7 @@ mod tests {
     }
 
     /// 连 db 文件路径一起返回，给需要直接翻字节的用例。
-    pub(super) fn temp_store_at(tag: &str) -> (Store, PathBuf) {
+    pub(crate) fn temp_store_at(tag: &str) -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "nexus-store-{tag}-{}",
             uuid::Uuid::new_v4()

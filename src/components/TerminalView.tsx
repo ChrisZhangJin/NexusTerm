@@ -29,9 +29,14 @@ import {
 } from "../lib/complete";
 import { GhostText, cursorAtLineEnd, cursorFollowsTyped } from "../lib/ghost";
 import { ImeGuard, type KeyLike } from "../lib/ime";
+import { buildUserCommandReport } from "../lib/userCommand";
+import { captureLineStart, readLogicalLine, recorderTapAction, type LineStart } from "../lib/termLine";
+import { isRecording, watchRecording } from "../lib/useRecorder";
+import { createControlGate, lockedInput } from "../lib/control";
 
 import {
   api,
+  onAgentControl,
   onLocalClosed,
   onLocalData,
   onTermClosed,
@@ -42,6 +47,7 @@ import {
 import { themeToXterm } from "../lib/theme";
 import { isMacOS } from "../lib/platform";
 import { installMacKeyboard, setInputTrace, traceSend } from "../lib/macInput";
+import { SHIFT_ENTER_SEQ, shouldSendMetaEnter, textBeforeCursor, wantsMetaEnter } from "../lib/shiftEnter";
 import { attachZmodem, type ZmodemGate } from "../lib/zmodem";
 import type { ClosedInfo, TerminalTab, Theme } from "../types";
 
@@ -77,6 +83,19 @@ const macLayerOn = (): boolean => localStorage.getItem(LS_MAC_INPUT) !== "0";
  * （`@tauri-apps/api/path` 依赖没装的 path 插件），这里只是给人看的说明。
  */
 const INPUT_LOG_HINT = "~/Library/Application Support/com.nexus-term.app/logs/input.log";
+
+/**
+ * 光标是否被程序关掉了（DECTCEM `CSI ?25l`）。公开 API 没有这个状态，只能读内部；
+ * 结构变了就当「没关」—— 对 Shift+Enter 判定来说那是退回只看提示符。
+ */
+function isCursorHidden(term: Terminal): boolean {
+  try {
+    const core = (term as unknown as { _core?: { coreService?: { isCursorHidden?: boolean } } })._core;
+    return core?.coreService?.isCursorHidden === true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * 让 macOS 也支持按住 Shift 拖选文本（绕过 tmux 等程序的鼠标捕获）。
@@ -200,6 +219,41 @@ function debounce<A extends unknown[]>(fn: (...a: A) => void, ms: number) {
   };
 }
 
+/**
+ * 回车提交的整行推给后端 side buffer（agent 时间线 / 录制器的数据源）。
+ * 只在回车时调一次，fire-and-forget；无回显的行只发「无回显」标记，不发内容。
+ */
+function pushUserCommand(sessionId: string, committed: string, echoed: boolean, altScreen: boolean): void {
+  const r = buildUserCommandReport(committed, echoed, altScreen);
+  if (!r) return;
+  void api.agentUserCommand(sessionId, r.line, r.noEcho).catch(() => {});
+}
+
+/**
+ * 录制中（3.2）补报行状态机没能交出的操作：Ctrl-C 等按键、空回车、↑ 历史 / Tab 补全出来的整行。
+ * 调用方先问 `isRecording`，没在录制时这里一次都不会走到。
+ */
+function tapRecorder(
+  sessionId: string,
+  term: Terminal,
+  data: string,
+  committed: string | null,
+  wasKnown: boolean,
+  start: LineStart | null,
+): void {
+  const buf = term.buffer.active;
+  const act = recorderTapAction({
+    data,
+    committed,
+    wasKnown,
+    altScreen: buf.type !== "normal",
+    recover: () => readLogicalLine(buf, start),
+  });
+  if (!act) return;
+  if (act.kind === "keys") void api.agentUserKeys(sessionId, act.keys).catch(() => {});
+  else pushUserCommand(sessionId, act.line, true, false);
+}
+
 export default function TerminalView({
   tabId,
   active,
@@ -241,6 +295,10 @@ export default function TerminalView({
   const searchRef = useRef<SearchAddon | null>(null);
   const hlRef = useRef<Highlighter | null>(null);
   const [findOpen, setFindOpen] = useState(false);
+  /** AI 正在驾驶这个会话：只读（见 `lib/control` 的 `lockedInput`） */
+  const [aiLocked, setAiLocked] = useState(false);
+  /** 锁住时被丢掉的按键计数：变化时横幅闪一下，告诉用户「按键没进去」 */
+  const [lockNudge, setLockNudge] = useState(0);
   const [markOpen, setMarkOpen] = useState(false);
   /** 当前生效的标记规则数（右上角徽标用） */
   const [markCount, setMarkCount] = useState(0);
@@ -311,6 +369,10 @@ export default function TerminalView({
    * `cursorFollowsTyped` 永远匹配不上；回了车却从没见过回显就不记进历史。
    */
   const lineEchoedRef = useRef(false);
+  /** 录制用：当前这行输入的起点（提示符之后）。↑ 历史 / Tab 补全后靠它把整行从屏幕读回来 */
+  const lineStartRef = useRef<LineStart | null>(null);
+  // 录制状态由后端事件驱动（面板可能浮出在另一个窗口里按的「开始录制」），终端只需同步问 `isRecording`
+  useEffect(() => watchRecording(tabId), [tabId]);
   const ghostRef = useRef(new GhostText());
   const hintsRef = useRef<CompletionItem[]>([]);
   /**
@@ -466,12 +528,17 @@ export default function TerminalView({
   const runTypedLine = useCallback(() => {
     dismissHints();
     // 走的是与「自己敲回车」同一条记账路径：行状态提交 + 进历史，再发 \r。
+    const wasKnown = lineRef.current.known;
     const committed = feedKeys(lineRef.current, "\r");
     if (committed) {
       if (lineEchoedRef.current && termRef.current?.buffer.active.type === "normal") {
         recordCommand(historyKeyRef.current, committed);
       }
+      pushUserCommand(tabId, committed, lineEchoedRef.current, termRef.current?.buffer.active.type !== "normal");
       lineEchoedRef.current = false;
+    }
+    if (termRef.current && isRecording(tabId)) {
+      tapRecorder(tabId, termRef.current, "\r", committed, wasKnown, lineStartRef.current);
     }
     sendRef.current("\r");
   }, [dismissHints]);
@@ -722,6 +789,32 @@ export default function TerminalView({
         : api.sshWrite(tabId, stringToBytes(d));
     sendRef.current = send;
 
+    // ——— Agent 控制权闸 ———
+    // 平时（没有 Agent 在驾驶这个终端）闸是关的：每个键只多一次布尔判断，不发 IPC。
+    // Agent 驾驶时闸开着，用户第一次真的打字就通知后端一次（→ Paused），随即闸关。
+    // 字节本身永远先发给 pty，闸只旁观，不拦、不延迟。
+    const controlGate = createControlGate(() => {
+      api.agentControlUserInput(tabId).catch(() => {});
+    });
+    let sawControlEvent = false;
+    onAgentControl(tabId, (p) => {
+      // 同一频道也会收到「以本会话为发起方的运行」驾驶别的会话的状态，只认自己的
+      if (disposed || p.session !== tabId) return;
+      sawControlEvent = true;
+      controlGate.set(p.state);
+      setAiLocked(p.state === "agentDriving");
+    }).then((u) => cleanups.push(u));
+    // 挂载时对一次账（比如终端是在 Agent 已经在跑时才重建的）；期间若已有事件到达，以事件为准
+    api
+      .agentControlGet(tabId)
+      .then((st) => {
+        if (!disposed && !sawControlEvent) {
+          controlGate.set(st);
+          setAiLocked(st === "agentDriving");
+        }
+      })
+      .catch(() => {});
+
     /**
      * 所有「用户敲进来的字节」的唯一出口。
      *
@@ -731,12 +824,30 @@ export default function TerminalView({
      */
     const handleInput = (d: string) => {
       if (zmodem.isActive()) return;
+      // AI 在驾驶这个会话：只读。打字 / 粘贴一律丢掉（误触会把 AI 挤成「你在驾驶」）；
+      // Ctrl+C 是唯一的键盘出口：立即接管，再把 ^C 发出去中断正在跑的命令
+      const verdict = lockedInput(controlGate.armed, d);
+      if (verdict === "drop") {
+        setLockNudge((n) => n + 1);
+        return;
+      }
+      if (verdict === "interrupt") {
+        controlGate.set("paused");
+        setAiLocked(false);
+        api.agentControlTakeover(tabId).catch(() => {});
+      }
       // 旁路监听（宏录制、宏回放时「用户插了一脚就中止」）。发不发送由这里决定，监听方只读
       emitInput(tabId, d);
       send(d).catch(() => {});
+      // 用户键入 → 若 Agent 正在驾驶则让它暂停（字节已发出，这里只通知，不拦）
+      controlGate.onInput(d);
       // 新行开始要清掉上一行的回显标记，否则密码行的「已回显过」旧状态会把
       // 紧接着敲的命令蹭进历史
       if (!lineRef.current.text) lineEchoedRef.current = false;
+      // 录制中：新一行的第一个键到来时屏幕光标还停在提示符末尾，记下它作为「这行输入的起点」
+      const recording = isRecording(tabId);
+      const wasKnown = lineRef.current.known;
+      if (recording && wasKnown && !lineRef.current.text) lineStartRef.current = captureLineStart(term.buffer.active);
       // 喂键攒行（同步、纯字符串运算），候选留到下一帧再算
       const committed = feedKeys(lineRef.current, d);
       if (committed) {
@@ -744,8 +855,10 @@ export default function TerminalView({
         if (lineEchoedRef.current && term.buffer.active.type === "normal") {
           recordCommand(historyKeyRef.current, committed);
         }
+        pushUserCommand(tabId, committed, lineEchoedRef.current, term.buffer.active.type !== "normal");
         lineEchoedRef.current = false;
       }
+      if (recording) tapRecorder(tabId, term, d, committed, wasKnown, lineStartRef.current);
       refreshHintsSoon();
     };
 
@@ -793,11 +906,40 @@ export default function TerminalView({
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
 
+      // Shift+Enter → `ESC \r`（Meta+Enter），让 Claude Code / nanopi 这类 TUI 换行而不是提交；
+      // shell 提示符、vim / less 等备用屏程序里保持原样（当回车，含下面的灰字路径）。判定见 `lib/shiftEnter`。
+      // 必须排在灰字块之前：那里对 Shift+Enter 直接 `return true` 交还 xterm。
+      if (e.key === "Enter" && e.shiftKey) {
+        const imeBusy = imeRef.current.captures({
+          key: e.key,
+          shiftKey: e.shiftKey,
+          isComposing: e.isComposing,
+          keyCode: e.keyCode ?? 0,
+          timeStamp: e.timeStamp,
+        });
+        const metaEnter = shouldSendMetaEnter(
+          { key: e.key, shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, altKey: e.altKey, metaKey: e.metaKey, imeBusy },
+          () =>
+            wantsMetaEnter({
+              before: textBeforeCursor(term.buffer.active),
+              cursorHidden: isCursorHidden(term),
+              altScreen: term.buffer.active.type !== "normal",
+            })
+        );
+        if (metaEnter) {
+          e.preventDefault();
+          dismissHints();
+          handleInput(SHIFT_ENTER_SEQ);
+          return false;
+        }
+      }
+
       // 只在灰字**真的画着**时才接管 Tab / Enter / Esc：ghost 没显示（放不下、
       // 已收起、或在全屏程序里）就放行 —— 这几个键本来属于 shell 自己的补全与
       // 历史，不能被提示层挤掉。按 `hintsRef` 判的话候选非空但灰字没画出来的
       // 场景会误吞 Tab，表现为「Tab 突然没反应」。
-      if (ghostRef.current.active) {
+      // AI 驾驶中不走灰字快捷路径（它直接写 pty、绕过只读闸）；按键交给 xterm → handleInput 丢掉
+      if (ghostRef.current.active && !controlGate.armed) {
         // 输入法组合中一律不接管：那时回车是「选词上屏」、Esc 是「取消候选」，
         // 吞了就打不出中文。判定走 `lib/ime.ts`。
         const info: KeyLike = {
@@ -1376,9 +1518,26 @@ export default function TerminalView({
           </div>
         </>
       )}
+      {active && aiLocked && (
+        <div key={lockNudge} className={`ai-lock-banner${lockNudge > 0 ? " nudge" : ""}`} onMouseDown={(e) => e.stopPropagation()}>
+          <span className="ai-lock-dot" />
+          <span>AI 托管中 · 只读</span>
+          <span className="ai-lock-hint">要动手请点「接管」· Ctrl+C 立即接管并中断</span>
+          <button
+            className="st-btn primary"
+            onClick={() => {
+              setAiLocked(false);
+              api.agentControlTakeover(tabId).catch(() => {});
+            }}
+          >
+            接管
+          </button>
+        </div>
+      )}
       {active && findOpen && searchRef.current && (
         <FindBar
           search={searchRef.current}
+          term={termRef.current}
           initial={termRef.current?.getSelection() ?? ""}
           onClose={() => {
             searchRef.current?.clearDecorations();
@@ -1423,10 +1582,12 @@ const FIND_DECO = {
 
 function FindBar({
   search,
+  term,
   initial,
   onClose,
 }: {
   search: SearchAddon;
+  term: Terminal | null;
   initial: string;
   onClose: () => void;
 }) {
@@ -1437,11 +1598,20 @@ function FindBar({
   const [result, setResult] = useState<{ index: number; count: number } | null>(null);
   const [bad, setBad] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  // tmux / screen / less / vim 等全屏程序跑在备用屏：xterm 没有它的滚动历史，只能搜到当前这一屏
+  const [altScreen, setAltScreen] = useState(term?.buffer.active.type === "alternate");
 
   useEffect(() => {
     inputRef.current?.focus();
     inputRef.current?.select();
   }, []);
+
+  useEffect(() => {
+    if (!term) return;
+    setAltScreen(term.buffer.active.type === "alternate");
+    const sub = term.buffer.onBufferChange((b) => setAltScreen(b.type === "alternate"));
+    return () => sub.dispose();
+  }, [term]);
 
   useEffect(() => {
     const sub = search.onDidChangeResults((r) =>
@@ -1520,6 +1690,11 @@ function FindBar({
         <button className="find-btn" onClick={next} title="下一个 (Enter)">↓</button>
         <button className="find-btn" onClick={onClose} title="关闭 (Esc)">×</button>
       </div>
+      {altScreen && (
+        <div className="find-hint">
+          当前在全屏程序（tmux / screen / less 等）里，只能搜索当前这一屏；它自己的滚动历史请用它自带的搜索（tmux：Ctrl+B 后按 [，再按 Ctrl+S）。
+        </div>
+      )}
       <div className="find-opts">
         <label>
           <input

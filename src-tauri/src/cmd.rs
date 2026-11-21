@@ -1,5 +1,9 @@
 use tauri::{AppHandle, State};
 
+use crate::agent::profile::StewardBrain;
+use crate::agent::steward::{ScreenStore, StewardRegistry};
+use crate::agent::steward_core::StewardCore;
+use crate::agent::steward_loop::StewardBus;
 use crate::agent::StreamKind;
 use crate::keys;
 use crate::sftp::{RemoteEntry, SftpError, SftpManager};
@@ -137,11 +141,45 @@ pub fn local_resize(
 }
 
 #[tauri::command]
-pub fn local_close(id: String, state: State<'_, AppState>) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+pub fn local_close(
+    id: String,
+    state: State<'_, AppState>,
+    screen: State<'_, ScreenStore>,
+    registry: State<'_, StewardRegistry>,
+    brain: State<'_, StewardBrain>,
+    core: State<'_, StewardCore>,
+    bus: State<'_, StewardBus>,
+) -> Result<(), String> {
     let res = state.local.close(&id);
     // 无论关闭是否报错（会话可能根本不存在），agent 侧都要清干净
     state.agent.remove(&id);
+    // 屏幕帧同理：不清理的话每个关掉的标签都留 200 行常驻内存。
+    screen.drop(&id);
+    // 标签关了，托管契约随之结束并把 Checkpoint 标记完成；否则下次启动会把它
+    // 当成未完成任务恢复到一个已经不存在的终端上
+    release_steward(&id, &state, &registry, &brain, &core, &bus);
     res
+}
+
+fn release_steward(
+    id: &str,
+    state: &AppState,
+    registry: &StewardRegistry,
+    brain: &StewardBrain,
+    core: &StewardCore,
+    bus: &StewardBus,
+) {
+    // 统一托管的终端：tab 关了只告诉托管任务（→ 挂起 ConsoleGone，等用户接到别的 tab），
+    // 契约与意向都留着 —— 停掉契约等于把一个还能接驳的托管直接作废
+    if let Some(h) = state.act.host.live_on_console(id) {
+        h.console_gone();
+        bus.wake();
+        return;
+    }
+    if crate::agent::steward::release_console(registry, brain, &state.store, core, id) {
+        bus.wake();
+    }
 }
 
 #[tauri::command]
@@ -211,11 +249,30 @@ pub fn ssh_resize(
 }
 
 #[tauri::command]
-pub fn ssh_close(id: String, state: State<'_, AppState>) {
+pub fn ssh_close(
+    id: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    screen: State<'_, ScreenStore>,
+    registry: State<'_, StewardRegistry>,
+    brain: State<'_, StewardBrain>,
+    core: State<'_, StewardCore>,
+    bus: State<'_, StewardBus>,
+) {
     state.sessions.close(&id);
+    // Agent 文件工具在这个标签的连接上开过 SFTP：一并关掉，否则它会替已关的连接续命
+    let sftp_id = crate::sftp::SftpManager::agent_sftp_id(&id);
+    tauri::async_runtime::spawn(async move {
+        use tauri::Manager;
+        if let Some(st) = app.try_state::<AppState>() {
+            st.sftp.close(&sftp_id).await;
+        }
+    });
     // 会话没了，旁路缓冲也要跟着放掉：AppState 活到应用退出，
     // 不清理的话每个关掉的标签都会留下最多 256KB 常驻内存
     state.agent.remove(&id);
+    screen.drop(&id);
+    release_steward(&id, &state, &registry, &brain, &core, &bus);
 }
 
 /// 回填二次验证（keyboard-interactive）的答案。
@@ -1081,5 +1138,44 @@ pub fn vault_change_password(
 pub fn vault_disable(password: String, state: State<'_, AppState>) -> Result<SweepReport, String> {
     let password = Zeroizing::new(password);
     state.store.vault_disable(&password)
+}
+
+// ——— 连接迁移 ———
+
+/// 导出全部连接（含凭据与私钥文件）到 `dest`，用 `password` 加密。
+///
+/// 读 → 加密 → 写文件全在后端完成：明文凭据不过 IPC，前端只给导出密码和目标路径。
+/// 同步命令（Tauri 放线程池跑），里面有一次 Argon2。
+#[tauri::command]
+pub fn connections_export(
+    dest: String,
+    password: String,
+    include_keys: bool,
+    state: State<'_, AppState>,
+) -> Result<crate::migrate::ExportSummary, String> {
+    let password = Zeroizing::new(password);
+    crate::migrate::export_to_file(
+        &state.store,
+        std::path::Path::new(&dest),
+        &password,
+        include_keys,
+    )
+}
+
+/// 导入 `.nexusconn`。解密 + 校验全部通过后才开始写库；重复连接跳过，不覆盖。
+#[tauri::command]
+pub async fn connections_import(
+    path: String,
+    password: String,
+    state: State<'_, AppState>,
+) -> Result<crate::migrate::ImportSummary, String> {
+    let password = Zeroizing::new(password);
+    // Argon2 要几百毫秒，放到阻塞线程，别占着异步运行时
+    let payload = tauri::async_runtime::spawn_blocking(move || {
+        crate::migrate::read_and_open(std::path::Path::new(&path), &password)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    crate::migrate::apply_import(&state.store, &state.keys_dir, payload).await
 }
 

@@ -195,27 +195,229 @@ pub fn build_user_message(context: Option<&str>, question: &str) -> String {
     format!("{body}\n我的问题：{question}")
 }
 
-/// 一条聊天消息。两种方言的形状一致（`role` + `content`），故共用。
+/// 一条聊天消息（内部形状，落盘 / checkpoint 用的也是它）。
+///
+/// - 文本在 `content`；
+/// - assistant 发起的原生工具调用在 `tool_calls`（带 id）；
+/// - 紧随其后的 user 消息在 `tool_results` 里逐个回执（id 一一对应，被拒 / 失败的 `is_error`）。
+///
+/// 发请求时由 [`wire_messages`] 翻译成各家形状（Anthropic `tool_use` / `tool_result` 块；
+/// OpenAI `tool_calls` + `role:"tool"`）。旧数据只有 `role` + `content`，两个新字段缺省为空，照常读回。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolUse>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_results: Vec<ToolResult>,
 }
+
+/// assistant 消息里的一次原生工具调用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolUse {
+    pub id: String,
+    pub name: String,
+    /// 原始参数 JSON 文本
+    #[serde(default)]
+    pub arguments: String,
+}
+
+/// user 消息里对某次工具调用的回执。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub id: String,
+    #[serde(default)]
+    pub content: String,
+    /// 被拒 / 失败 / 没执行
+    #[serde(default)]
+    pub is_error: bool,
+}
+
+/// 补出来的回执：调用没有得到执行（取消 / 被拒 / 中途收场）。
+pub const UNRUN_RESULT: &str = "（这次调用没有执行：本轮在它之前被中断、拒绝或改道。）";
 
 impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into() }
+        Self { role: "user".into(), content: content.into(), tool_calls: Vec::new(), tool_results: Vec::new() }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into() }
+        Self { role: "assistant".into(), content: content.into(), tool_calls: Vec::new(), tool_results: Vec::new() }
     }
+    /// 带原生工具调用的 assistant 消息。
+    pub fn assistant_calls(content: impl Into<String>, calls: Vec<ToolUse>) -> Self {
+        Self { role: "assistant".into(), content: content.into(), tool_calls: calls, tool_results: Vec::new() }
+    }
+    /// 带工具回执的 user 消息。
+    pub fn results(content: impl Into<String>, results: Vec<ToolResult>) -> Self {
+        Self { role: "user".into(), content: content.into(), tool_calls: Vec::new(), tool_results: results }
+    }
+
+    /// 压平成纯文本（压缩笔记 / token 估算 / 不带 tools 的请求用）。
+    pub fn flat_text(&self) -> String {
+        let mut s = String::new();
+        for r in &self.tool_results {
+            s.push_str(&format!("（工具结果{}）{}\n", if r.is_error { "·未成功" } else { "" }, r.content));
+        }
+        s.push_str(&self.content);
+        for c in &self.tool_calls {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&format!("（调用工具 {}：{}）", c.name, c.arguments));
+        }
+        s
+    }
+
+    /// 压掉结构，只留文本。
+    pub fn flattened(&self) -> Self {
+        Self { role: self.role.clone(), content: self.flat_text(), tool_calls: Vec::new(), tool_results: Vec::new() }
+    }
+}
+
+/// 修复工具调用配对（每次请求前调用；压缩 / 截断 / 取消之后都可能出现孤儿）：
+/// - assistant 的每个 tool_use 在紧随其后的 user 消息里**恰好**有一个 tool_result；缺的补上
+///   [`UNRUN_RESULT`]（is_error），没有 user 消息就插一条；多余 / 重复的回执丢弃；
+/// - 前面没有对应 tool_use 的回执（比如它的调用被压缩折掉了）压成那条 user 消息里的文本；
+/// - 没有 id 的调用补一个稳定的 id。
+/// 返回是否改动。
+pub fn repair_tool_pairing(messages: &mut Vec<ChatMessage>) -> bool {
+    let mut changed = false;
+    let mut seq = 0usize;
+    let mut i = 0usize;
+    while i < messages.len() {
+        if messages[i].role == "assistant" && !messages[i].tool_calls.is_empty() {
+            for c in messages[i].tool_calls.iter_mut() {
+                if c.id.trim().is_empty() {
+                    seq += 1;
+                    c.id = format!("call_fix_{i}_{seq}");
+                    changed = true;
+                }
+            }
+            let ids: Vec<String> = messages[i].tool_calls.iter().map(|c| c.id.clone()).collect();
+            let next_is_user = messages.get(i + 1).is_some_and(|m| m.role == "user");
+            if !next_is_user {
+                messages.insert(i + 1, ChatMessage::results("", Vec::new()));
+                changed = true;
+            }
+            let next = &mut messages[i + 1];
+            let mut fixed: Vec<ToolResult> = Vec::with_capacity(ids.len());
+            for id in &ids {
+                match next.tool_results.iter().find(|r| &r.id == id) {
+                    Some(r) => fixed.push(r.clone()),
+                    None => {
+                        fixed.push(ToolResult { id: id.clone(), content: UNRUN_RESULT.to_string(), is_error: true });
+                        changed = true;
+                    }
+                }
+            }
+            // 不属于这一轮的回执：压成文本，不丢信息
+            let strays: Vec<ToolResult> = next.tool_results.iter().filter(|r| !ids.contains(&r.id)).cloned().collect();
+            if !strays.is_empty() {
+                changed = true;
+                let mut text: String = strays.iter().map(|r| format!("（工具结果）{}\n", r.content)).collect();
+                text.push_str(&next.content);
+                next.content = text;
+            }
+            if next.tool_results != fixed {
+                changed = true;
+            }
+            next.tool_results = fixed;
+            i += 2;
+            continue;
+        }
+        if !messages[i].tool_results.is_empty() {
+            // 前面没有对应的 tool_use：孤儿回执压成文本
+            let m = &mut messages[i];
+            m.content = m.flat_text();
+            m.tool_results.clear();
+            changed = true;
+        }
+        if messages[i].role != "assistant" && !messages[i].tool_calls.is_empty() {
+            messages[i].tool_calls.clear();
+            changed = true;
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// 内部消息 → 某家的 wire 形状。`native = false`（服务方不认 tools）时把结构压成文本。
+pub fn wire_messages(provider: Provider, system: &str, messages: &[ChatMessage], native: bool) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    let mut msgs = messages.to_vec();
+    if native {
+        repair_tool_pairing(&mut msgs);
+    } else {
+        msgs = msgs.iter().map(ChatMessage::flattened).collect();
+    }
+    let mut out = Vec::with_capacity(msgs.len() + 1);
+    match provider {
+        Provider::OpenAI => {
+            // OpenAI 方言的 system 是 messages 里的第一条 system 消息（Anthropic 才是顶层字段）
+            if !system.trim().is_empty() {
+                out.push(json!({ "role": "system", "content": system }));
+            }
+            for m in &msgs {
+                if !m.tool_calls.is_empty() {
+                    let calls: Vec<_> = m
+                        .tool_calls
+                        .iter()
+                        .map(|c| json!({ "id": c.id, "type": "function", "function": { "name": c.name, "arguments": if c.arguments.trim().is_empty() { "{}" } else { &c.arguments } } }))
+                        .collect();
+                    let content = if m.content.is_empty() { serde_json::Value::Null } else { json!(m.content) };
+                    out.push(json!({ "role": "assistant", "content": content, "tool_calls": calls }));
+                    continue;
+                }
+                for r in &m.tool_results {
+                    let content = if r.is_error { format!("[未成功] {}", r.content) } else { r.content.clone() };
+                    out.push(json!({ "role": "tool", "tool_call_id": r.id, "content": content }));
+                }
+                if !m.content.is_empty() || m.tool_results.is_empty() {
+                    out.push(json!({ "role": m.role, "content": m.content }));
+                }
+            }
+        }
+        Provider::Anthropic => {
+            for m in &msgs {
+                if !m.tool_calls.is_empty() {
+                    let mut blocks = Vec::new();
+                    if !m.content.trim().is_empty() {
+                        blocks.push(json!({ "type": "text", "text": m.content }));
+                    }
+                    for c in &m.tool_calls {
+                        let input = serde_json::from_str::<serde_json::Value>(&c.arguments)
+                            .ok()
+                            .filter(|v| v.is_object())
+                            .unwrap_or_else(|| json!({}));
+                        blocks.push(json!({ "type": "tool_use", "id": c.id, "name": c.name, "input": input }));
+                    }
+                    out.push(json!({ "role": "assistant", "content": blocks }));
+                } else if !m.tool_results.is_empty() {
+                    // tool_result 块必须排在这条 user 消息的最前面
+                    let mut blocks: Vec<_> = m
+                        .tool_results
+                        .iter()
+                        .map(|r| json!({ "type": "tool_result", "tool_use_id": r.id, "content": r.content, "is_error": r.is_error }))
+                        .collect();
+                    if !m.content.trim().is_empty() {
+                        blocks.push(json!({ "type": "text", "text": m.content }));
+                    }
+                    out.push(json!({ "role": "user", "content": blocks }));
+                } else {
+                    out.push(json!({ "role": m.role, "content": m.content }));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// OpenAI 兼容：`POST {base}/chat/completions`
 #[derive(Debug, Serialize)]
 struct OpenAiRequest {
     model: String,
-    messages: Vec<ChatMessage>,
+    messages: Vec<serde_json::Value>,
     stream: bool,
     /// 空则不出现：不支持 tools 的兼容层收到空数组也可能报错，干脆不声明。
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -232,7 +434,7 @@ struct AnthropicRequest {
     /// 空则整个字段不出现（部分兼容层不接受空字符串）。
     #[serde(skip_serializing_if = "is_blank")]
     system: String,
-    messages: Vec<ChatMessage>,
+    messages: Vec<serde_json::Value>,
     /// Anthropic 没有默认值，必须显式给
     max_tokens: u32,
     stream: bool,
@@ -295,6 +497,8 @@ struct AnthropicToolChoice {
 /// 模型要求调用的一个工具。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
+    /// 服务方给的调用 id（回执要按它配对）；兼容层没给时为空，入历史前补一个
+    pub id: String,
     pub name: String,
     /// 原始参数 JSON 文本。
     ///
@@ -319,6 +523,12 @@ pub struct LlmReply {
     ///
     /// 降级重试（服务方不认 tools）后置 false，调用方据此改回围栏协议。
     pub tools_supported: bool,
+    /// 回复是否因输出长度上限被截断（OpenAI `finish_reason=length` / Anthropic `stop_reason=max_tokens`）。
+    ///
+    /// 截断的回复不能当成最终结论：调用方应请模型接着写（见 `act::run`）。
+    pub truncated: bool,
+    /// 这次调用的 token 用量。服务方没报时由 [`complete_reply_once`] 按字数估（`estimated = true`）。
+    pub usage: super::usage::Usage,
 }
 
 fn openai_tools(specs: &[ToolSpec]) -> Vec<OpenAiTool> {
@@ -429,7 +639,7 @@ pub fn build_messages_with_tools(
             push_accept_sse(&mut headers, stream);
             let req = OpenAiRequest {
                 model: model.to_string(),
-                messages: messages.to_vec(),
+                messages: wire_messages(provider, system, messages, !tools.is_empty()),
                 stream,
                 tools: openai_tools(tools),
                 tool_choice: if tools.is_empty() {
@@ -451,7 +661,7 @@ pub fn build_messages_with_tools(
             let req = AnthropicRequest {
                 model: model.to_string(),
                 system: system.to_string(),
-                messages: messages.to_vec(),
+                messages: wire_messages(provider, system, messages, !tools.is_empty()),
                 max_tokens: ANTHROPIC_MAX_TOKENS,
                 stream,
                 tools: anthropic_tools(tools),
@@ -645,6 +855,15 @@ pub enum SseAction {
 #[derive(Debug, Default)]
 pub struct SseState {
     event: Option<String>,
+    /// 流里报过的用量（OpenAI 的 include_usage 末 chunk / Anthropic 的 message_start + message_delta），合并后的值
+    usage: super::usage::Usage,
+}
+
+impl SseState {
+    /// 到目前为止流里报过的用量；一个都没报是空的（`is_empty`）。
+    pub fn usage(&self) -> super::usage::Usage {
+        self.usage
+    }
 }
 
 /// 把一行喂进状态机，返回这一行要产生的动作。
@@ -661,6 +880,10 @@ pub fn dispatch_line(provider: Provider, state: &mut SseState, line: &str) -> Ss
     let Some(data) = parse_data_line(line) else {
         return SseAction::Nothing;
     };
+    // 用量与正文 / 结束可能在同一个 chunk 里，单独顺手收一份，不影响下面的动作
+    if let Some(u) = super::usage::usage_in_sse_data(data) {
+        state.usage.merge_max(&u);
+    }
     match provider {
         Provider::OpenAI => parse_openai_event(data),
         Provider::Anthropic => parse_anthropic_event(state.event.as_deref(), data),
@@ -1161,6 +1384,9 @@ impl Drop for InflightGuard {
 #[derive(Clone, Serialize)]
 struct DonePayload {
     reason: FinishReason,
+    /// 这次问答的用量（取消时也给已花掉的估算）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<super::usage::RunUsage>,
 }
 
 /// `nx://agent/token/{session}` → 增量文本块。
@@ -1173,9 +1399,13 @@ fn emit_token(app: &AppHandle, session: &str, text: &str) {
 
 /// `nx://agent/done/{session}` → `{ reason }`。
 fn emit_done(app: &AppHandle, session: &str, reason: FinishReason) {
+    emit_done_with(app, session, reason, None);
+}
+
+fn emit_done_with(app: &AppHandle, session: &str, reason: FinishReason, usage: Option<super::usage::RunUsage>) {
     let _ = app.emit(
         &format!("nx://agent/done/{session}"),
-        DonePayload { reason },
+        DonePayload { reason, usage },
     );
 }
 
@@ -1212,11 +1442,13 @@ fn step(
     app: &AppHandle,
     session: &str,
     reasoning: Option<&mut String>,
+    answer: &mut String,
 ) -> Step {
     match dispatch_line(provider, state, line) {
         SseAction::Nothing => Step::Continue,
         SseAction::Text(text) => {
             emit_token(app, session, &text);
+            answer.push_str(&text);
             Step::Continue
         }
         SseAction::Reasoning(text) => {
@@ -1315,6 +1547,9 @@ async fn stream_answer(
     let mut finished: Option<FinishReason> = None;
     // 过程日志开着才攒推理文本；关着就是 None，step 里连 push 都不会发生
     let mut reasoning = cfg.trace.then(String::new);
+    // 收到的正文：服务方没报用量时按它估输出
+    let mut answer = String::new();
+    let started = std::time::Instant::now();
 
     while let Some(item) = stream.next().await {
         // 取消检查放在每段的开头：置位后最多再多处理一个网络包就停。
@@ -1332,11 +1567,15 @@ async fn stream_answer(
         };
         decoder.push(&chunk, &mut lines);
         for line in lines.drain(..) {
-            match step(provider, &mut state, &line, &app, &session, reasoning.as_mut()) {
+            if finished.is_some() {
+                // 已经结束：同一包里剩下的行只收用量（OpenAI include_usage 的末 chunk 排在 finish_reason 之后）
+                let _ = dispatch_line(provider, &mut state, &line);
+                continue;
+            }
+            match step(provider, &mut state, &line, &app, &session, reasoning.as_mut(), &mut answer) {
                 Step::Continue => {}
                 Step::Finished(reason) => {
                     finished = Some(reason);
-                    break;
                 }
                 Step::Aborted(message) => {
                     emit_error(&app, &session, &message);
@@ -1353,7 +1592,7 @@ async fn stream_answer(
     // 冲刷残行再判一次，否则最后一段答案会丢。
     if finished.is_none() {
         if let Some(line) = decoder.finish() {
-            match step(provider, &mut state, &line, &app, &session, reasoning.as_mut()) {
+            match step(provider, &mut state, &line, &app, &session, reasoning.as_mut(), &mut answer) {
                 Step::Continue => {}
                 Step::Finished(reason) => finished = Some(reason),
                 Step::Aborted(message) => {
@@ -1368,12 +1607,15 @@ async fn stream_answer(
         super::trace::record(&session, 0, "reasoning（流式问答）", &r);
     }
 
-    match finished {
-        Some(reason) => emit_done(&app, &session, reason),
-        // 既没有 [DONE] 也没有 message_stop 就断了：按正常结束处理。
-        // 少发一个 done，前端就会永远停在「生成中」。
-        None => emit_done(&app, &session, FinishReason::Stop),
+    let mut used = state.usage();
+    if used.is_empty() {
+        let input = super::compact::estimate_tokens(system_prompt(acct)) + super::compact::estimate_tokens(&user);
+        used = super::usage::estimate(input, &answer);
     }
+    let run_usage = super::usage::RunUsage::priced(used, &cfg.prices, &acct.model, started.elapsed().as_secs());
+    // 既没有 [DONE] 也没有 message_stop 就断了：按正常结束处理。
+    // 少发一个 done，前端就会永远停在「生成中」。
+    emit_done_with(&app, &session, finished.unwrap_or(FinishReason::Stop), Some(run_usage));
 }
 
 // ——————————————————————————————— 测试连接 ———————————————————————————————
@@ -1395,6 +1637,16 @@ pub fn extract_answer_text(provider: Provider, body: &str) -> Option<String> {
 pub fn extract_reply(provider: Provider, body: &str) -> Option<LlmReply> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let mut reply = LlmReply::default();
+    if let Some(u) = super::usage::usage_in(&value) {
+        reply.usage = u;
+    }
+    let stop = match provider {
+        Provider::OpenAI => value.pointer("/choices/0/finish_reason"),
+        Provider::Anthropic => value.pointer("/stop_reason"),
+    };
+    reply.truncated = stop
+        .and_then(|v| v.as_str())
+        .is_some_and(|r| finish_reason_from(r) == FinishReason::Length);
 
     match provider {
         Provider::OpenAI => {
@@ -1427,7 +1679,8 @@ pub fn extract_reply(provider: Provider, body: &str) -> Option<LlmReply> {
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "{}".to_string()),
                     };
-                    reply.tool_calls.push(ToolCall { name: name.to_string(), arguments });
+                    let id = c.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    reply.tool_calls.push(ToolCall { id, name: name.to_string(), arguments });
                 }
             }
         }
@@ -1458,7 +1711,8 @@ pub fn extract_reply(provider: Provider, body: &str) -> Option<LlmReply> {
                                 .filter(|v| !v.is_null())
                                 .map(|v| v.to_string())
                                 .unwrap_or_else(|| "{}".to_string());
-                            reply.tool_calls.push(ToolCall { name: name.to_string(), arguments });
+                            let id = b.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                            reply.tool_calls.push(ToolCall { id, name: name.to_string(), arguments });
                         }
                         _ => {}
                     }
@@ -1501,13 +1755,165 @@ async fn until_cancelled(cancel: &AtomicBool) {
     }
 }
 
-/// 带工具调用的 [`complete`]（**Agentic 循环专用**）。
+// ——————————————————————————————— 失败分类与重试 ———————————————————————————————
+
+/// 一次模型请求失败属于哪一类：决定 Agentic 循环是退避重试、暂停等人，还是直接报错收场。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// 等一会儿大概率会好：限流（429）、服务端 5xx、超时、连接失败、空回复。
+    Transient,
+    /// 重试也没用：Key 错（401/403）、请求不合法（400）、模型不存在（404）、欠费（402）……
+    Fatal,
+    /// 用户点了取消。
+    Cancelled,
+}
+
+/// [`complete_reply_once`] 的失败：带分类和服务方给的 `Retry-After`。
+#[derive(Debug)]
+pub struct LlmFailure {
+    pub error: AgentError,
+    pub kind: FailureKind,
+    pub retry_after: Option<Duration>,
+}
+
+impl LlmFailure {
+    fn new(kind: FailureKind, msg: String) -> Self {
+        Self { error: AgentError::Transport(msg), kind, retry_after: None }
+    }
+    fn cancelled() -> Self {
+        Self::new(FailureKind::Cancelled, "已取消".into())
+    }
+}
+
+impl From<LlmFailure> for AgentError {
+    fn from(f: LlmFailure) -> Self {
+        f.error
+    }
+}
+
+/// 按 HTTP 状态码 + 错误体给失败分类。
 ///
-/// 返回正文 + 模型要求调用的工具。`tools` 为空时等价 [`complete`]。
+/// 429 里有一种不是「太快了」而是「额度用完了」（OpenAI 的 `insufficient_quota`），
+/// 等多久都不会好，按 Fatal 处理，免得白等一分多钟才报错。
+pub fn classify_status(status: StatusCode, body: &str) -> FailureKind {
+    match status.as_u16() {
+        429 => {
+            let lower = body.to_ascii_lowercase();
+            if lower.contains("insufficient_quota") || lower.contains("billing") {
+                FailureKind::Fatal
+            } else {
+                FailureKind::Transient
+            }
+        }
+        408 | 409 | 425 => FailureKind::Transient,
+        // 501 Not Implemented / 505 版本不支持：重试不会改变结果
+        501 | 505 => FailureKind::Fatal,
+        500..=599 => FailureKind::Transient,
+        _ => FailureKind::Fatal,
+    }
+}
+
+/// `Retry-After` 的上限：服务方让等十分钟的话，宁可直接进入暂停让人决定。
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// 解析服务方给的重试等待：`retry-after-ms`（OpenAI 兼容层常见）优先，其次 `retry-after` 秒数。
+/// HTTP-date 形式不解析（少见，按退避算）。
+pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let get = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(str::trim);
+    if let Some(ms) = get("retry-after-ms").and_then(|v| v.parse::<f64>().ok()) {
+        if ms.is_finite() && ms >= 0.0 {
+            return Some(Duration::from_millis(ms as u64).min(MAX_RETRY_AFTER));
+        }
+    }
+    let secs = get("retry-after")?.parse::<f64>().ok()?;
+    // 先封顶再转换：`from_secs_f64` 遇到天文数字会 panic
+    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs.min(MAX_RETRY_AFTER.as_secs_f64())))
+}
+
+/// 重试策略。
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// 总共最多请求几次（含第一次）。
+    pub max_attempts: u32,
+    /// 第一次退避的基准时长；之后每次翻倍。
+    pub base: Duration,
+    /// 单次退避的上限。
+    pub cap: Duration,
+}
+
+/// Agentic 循环用的默认策略：最多 4 次，约 2s → 4s → 8s（各带抖动），总等待一般不到半分钟。
+pub const AGENT_RETRY: RetryPolicy =
+    RetryPolicy { max_attempts: 4, base: Duration::from_secs(2), cap: Duration::from_secs(30) };
+
+/// 第 `failures` 次失败后该等多久。`jitter ∈ [0,1)`。
 ///
-/// **服务方不认 tools 时自动降级**：拿掉 tools 重发一次并把 `tools_supported` 置回 false。
-/// 不少自建网关只转发 messages，没有这一步整个 Agentic 循环会被它们直接打死；
-/// 调用方据此改回围栏协议。
+/// 服务方给了 `Retry-After` 就照它来（已在解析时封顶）；否则指数退避 + 「一半固定一半随机」的抖动，
+/// 免得多个标签页的运行在同一时刻一起撞回去。
+pub fn backoff_delay(policy: &RetryPolicy, failures: u32, retry_after: Option<Duration>, jitter: f64) -> Duration {
+    if let Some(ra) = retry_after {
+        return ra.min(MAX_RETRY_AFTER);
+    }
+    let exp = policy.base.saturating_mul(1u32 << failures.saturating_sub(1).min(16)).min(policy.cap);
+    exp.mul_f64(0.5 + 0.5 * jitter.clamp(0.0, 1.0))
+}
+
+fn jitter() -> f64 {
+    use rand_core::RngCore;
+    f64::from(rand_core::OsRng.next_u32()) / (f64::from(u32::MAX) + 1.0)
+}
+
+/// 一次重试即将发生时交给调用方的信息（用来在面板上落一张提示卡）。
+#[derive(Debug, Clone)]
+pub struct RetryNotice {
+    /// 接下来是第几次请求（从 2 起）。
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub delay: Duration,
+    /// 刚才那次失败的中文说明。
+    pub error: String,
+}
+
+/// 带退避重试的 [`complete_reply_once`]（**Agentic 循环专用**）。
+///
+/// 只重试 [`FailureKind::Transient`]；Fatal / Cancelled 立即返回。退避期间可被 `cancel` 打断。
+/// 每次重试前回调 `on_retry`，调用方据此告诉用户「正在重试」。重试用尽返回最后一次的失败。
+pub async fn complete_reply_retrying(
+    acct: &AgentAccount,
+    system: &str,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+    cancel: &AtomicBool,
+    policy: &RetryPolicy,
+    mut on_retry: impl FnMut(&RetryNotice),
+) -> Result<LlmReply, LlmFailure> {
+    let mut attempt = 1u32;
+    loop {
+        let failure = match complete_reply_once(acct, system, messages, tools, Some(cancel)).await {
+            Ok(r) => return Ok(r),
+            Err(f) => f,
+        };
+        if failure.kind != FailureKind::Transient || attempt >= policy.max_attempts {
+            return Err(failure);
+        }
+        let delay = backoff_delay(policy, attempt, failure.retry_after, jitter());
+        tracing::warn!("模型请求失败（第 {attempt} 次），{:.1}s 后重试：{}", delay.as_secs_f64(), failure.error);
+        attempt += 1;
+        on_retry(&RetryNotice {
+            attempt,
+            max_attempts: policy.max_attempts,
+            delay,
+            error: failure.error.to_string(),
+        });
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = until_cancelled(cancel) => return Err(LlmFailure::cancelled()),
+        }
+    }
+}
+
+/// 带工具调用的 [`complete`]（不重试，失败只给中文错误）。
+///
+/// 技能精炼、托管摘要等一次性调用用它；Agentic 循环用 [`complete_reply_retrying`]。
 pub async fn complete_reply(
     acct: &AgentAccount,
     system: &str,
@@ -1515,56 +1921,98 @@ pub async fn complete_reply(
     tools: &[ToolSpec],
     cancel: Option<&AtomicBool>,
 ) -> Result<LlmReply, AgentError> {
+    complete_reply_once(acct, system, messages, tools, cancel).await.map_err(AgentError::from)
+}
+
+/// 单次带工具调用的请求，失败时带分类（见 [`FailureKind`]）。
+///
+/// 返回正文 + 模型要求调用的工具。`tools` 为空时等价 [`complete`]。
+///
+/// **服务方不认 tools 时自动降级**：拿掉 tools 重发一次并把 `tools_supported` 置回 false。
+/// 不少自建网关只转发 messages，没有这一步整个 Agentic 循环会被它们直接打死；
+/// 调用方据此改回围栏协议。
+pub async fn complete_reply_once(
+    acct: &AgentAccount,
+    system: &str,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+    cancel: Option<&AtomicBool>,
+) -> Result<LlmReply, LlmFailure> {
     // 首轮先按「支持 tools」发
     let first = post_chat(acct, system, messages, tools, cancel).await?;
     let provider = first.provider;
 
     let mut degraded = false;
-    let (status, body) = if !first.status.is_success()
-        && !tools.is_empty()
-        && is_tool_unsupported(&first.body)
-    {
+    let res = if !first.status.is_success() && !tools.is_empty() && is_tool_unsupported(&first.body) {
         tracing::warn!("服务方不接受 tools 声明（HTTP {}），本轮起改为纯文本协议", first.status.as_u16());
         degraded = true;
-        post_chat(acct, system, messages, &[], cancel).await?.into_parts()
+        post_chat(acct, system, messages, &[], cancel).await?
     } else {
-        first.into_parts()
+        first
     };
 
-    if !status.is_success() {
-        return Err(AgentError::Transport(http_status_message(status, &body)));
+    if !res.status.is_success() {
+        return Err(LlmFailure {
+            error: AgentError::Transport(http_status_message(res.status, &res.body)),
+            kind: classify_status(res.status, &res.body),
+            retry_after: res.retry_after,
+        });
     }
 
-    let mut reply = extract_reply(provider, &body).unwrap_or_default();
+    let mut reply = extract_reply(provider, &res.body).unwrap_or_default();
     reply.tools_supported = !tools.is_empty() && !degraded;
+    if reply.usage.is_empty() {
+        reply.usage = estimate_reply_usage(system, messages, &reply);
+    }
     if reply.text.trim().is_empty() && reply.tool_calls.is_empty() {
-        return Err(AgentError::Transport(
+        // 偶发的空回复（网关抖动、模型把 token 全花在推理上）重试往往就好
+        return Err(LlmFailure::new(
+            FailureKind::Transient,
             "模型返回了空回复：请确认该模型可用于对话接口".into(),
         ));
     }
     Ok(reply)
 }
 
+/// 服务方没报用量：按发出去的提示词与收到的回复粗估（标 `estimated`）。
+fn estimate_reply_usage(system: &str, messages: &[ChatMessage], reply: &LlmReply) -> super::usage::Usage {
+    let input = super::compact::estimate_tokens(system) + super::compact::total_tokens(messages);
+    let mut out = String::with_capacity(reply.text.len() + reply.reasoning.len());
+    out.push_str(&reply.text);
+    out.push_str(&reply.reasoning);
+    for c in &reply.tool_calls {
+        out.push_str(&c.name);
+        out.push_str(&c.arguments);
+    }
+    super::usage::estimate(input, &out)
+}
+
 /// 发一次非流式请求。返回「状态码 + 响应体 + 解析出的 provider」。
 ///
-/// 三条出网路径（complete / complete_reply / 降级重试）共用，
-/// 免得取消判定与限长读取被复制三份。
+/// complete_reply 与它的降级重试共用，免得取消判定与限长读取被复制多份。
+/// 传输层错误（超时 / 连不上 / 读响应中断）一律算 Transient；构造请求失败算 Fatal。
 async fn post_chat(
     acct: &AgentAccount,
     system: &str,
     messages: &[ChatMessage],
     tools: &[ToolSpec],
     cancel: Option<&AtomicBool>,
-) -> Result<PostResult, AgentError> {
+) -> Result<PostResult, LlmFailure> {
     if let Some(flag) = cancel {
         if flag.load(Ordering::Relaxed) {
-            return Err(AgentError::Transport("已取消".into()));
+            return Err(LlmFailure::cancelled());
         }
     }
+    let fatal = |e: AgentError| LlmFailure { error: e, kind: FailureKind::Fatal, retry_after: None };
+    let net = |e: reqwest::Error| {
+        let kind = if e.is_builder() { FailureKind::Fatal } else { FailureKind::Transient };
+        LlmFailure::new(kind, transport_error(&e))
+    };
     let provider = resolve_provider(acct);
-    let prepared = build_messages_with_tools(acct, provider, system, messages, false, tools)?;
-    let client = http_client()?;
-    let headers = header_map(&prepared.headers)?;
+    let prepared =
+        build_messages_with_tools(acct, provider, system, messages, false, tools).map_err(fatal)?;
+    let client = http_client().map_err(fatal)?;
+    let headers = header_map(&prepared.headers).map_err(fatal)?;
 
     let request = client
         .post(&prepared.url)
@@ -1573,39 +2021,30 @@ async fn post_chat(
         .send();
 
     let resp = match cancel {
-        Some(flag) => match tokio::select! {
-            r = request => r,
-            _ = until_cancelled(flag) => return Err(AgentError::Transport("已取消".into())),
-        } {
-            Ok(r) => r,
-            Err(e) => return Err(AgentError::Transport(transport_error(&e))),
+        Some(flag) => tokio::select! {
+            r = request => r.map_err(net)?,
+            _ = until_cancelled(flag) => return Err(LlmFailure::cancelled()),
         },
-        None => request
-            .await
-            .map_err(|e| AgentError::Transport(transport_error(&e)))?,
+        None => request.await.map_err(net)?,
     };
 
     let status = resp.status();
+    let retry_after = parse_retry_after(resp.headers());
     // 成功响应也可以很大（模型可能一口气吐出几十 KB），统一限长
     let body = if status.is_success() {
         read_body_limited(resp, MAX_COMPLETE_BODY).await
     } else {
         read_error_body(resp).await
     };
-    Ok(PostResult { status, body, provider })
+    Ok(PostResult { status, body, provider, retry_after })
 }
 
-/// [`post_chat`] 的结果。小结构是为了让重试那行能直接 `.into_parts()`。
+/// [`post_chat`] 的结果。
 struct PostResult {
     status: StatusCode,
     body: String,
     provider: Provider,
-}
-
-impl PostResult {
-    fn into_parts(self) -> (reqwest::StatusCode, String) {
-        (self.status, self.body)
-    }
+    retry_after: Option<Duration>,
 }
 
 /// 用一条极短消息验证 Key / 地址 / 模型是否可用，供设置界面「测试连接」用。
@@ -2005,6 +2444,154 @@ mod tests {
     }
 
     #[test]
+    fn extract_reply_reads_usage_for_both_providers() {
+        let oa = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":7}}"#;
+        let u = extract_reply(Provider::OpenAI, oa).unwrap().usage;
+        assert_eq!((u.input_tokens, u.output_tokens, u.estimated), (100, 7, false));
+        let an = r#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":50,"output_tokens":3,"cache_read_input_tokens":10}}"#;
+        let u = extract_reply(Provider::Anthropic, an).unwrap().usage;
+        assert_eq!((u.input_tokens, u.output_tokens, u.cache_read_tokens), (60, 3, 10));
+        // 没报用量：空的，由 complete_reply_once 估
+        let bare = r#"{"choices":[{"message":{"content":"hi"}}]}"#;
+        assert!(extract_reply(Provider::OpenAI, bare).unwrap().usage.is_empty());
+    }
+
+    #[test]
+    fn estimate_reply_usage_counts_prompt_and_reply() {
+        let reply = LlmReply {
+            text: "好的".into(),
+            tool_calls: vec![ToolCall { id: String::new(), name: "nx_exec".into(), arguments: r#"{"command":"ls"}"#.into() }],
+            ..Default::default()
+        };
+        let u = estimate_reply_usage("系统提示", &[ChatMessage::user("帮我看看磁盘")], &reply);
+        assert!(u.estimated);
+        assert!(u.input_tokens >= 4 + 6, "{u:?}");
+        assert!(u.output_tokens > 2, "{u:?}");
+    }
+
+    #[test]
+    fn sse_state_collects_usage_openai_and_anthropic() {
+        let mut st = SseState::default();
+        assert_eq!(
+            dispatch_line(Provider::OpenAI, &mut st, r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#),
+            SseAction::Text("hi".into())
+        );
+        assert!(st.usage().is_empty());
+        // 有的网关把 usage 和 finish_reason 放在同一个 chunk
+        assert_eq!(
+            dispatch_line(
+                Provider::OpenAI,
+                &mut st,
+                r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2}}"#
+            ),
+            SseAction::Done(FinishReason::Stop)
+        );
+        assert_eq!((st.usage().input_tokens, st.usage().output_tokens), (11, 2));
+        // include_usage 的末 chunk：choices 为空
+        let mut st = SseState::default();
+        dispatch_line(Provider::OpenAI, &mut st, r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":9}}"#);
+        assert_eq!(st.usage().output_tokens, 9);
+
+        let mut st = SseState::default();
+        dispatch_line(Provider::Anthropic, &mut st, "event: message_start");
+        dispatch_line(
+            Provider::Anthropic,
+            &mut st,
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":25,"output_tokens":1}}}"#,
+        );
+        dispatch_line(Provider::Anthropic, &mut st, "");
+        dispatch_line(Provider::Anthropic, &mut st, "event: message_delta");
+        assert_eq!(
+            dispatch_line(
+                Provider::Anthropic,
+                &mut st,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15}}"#
+            ),
+            SseAction::Done(FinishReason::Stop)
+        );
+        assert_eq!((st.usage().input_tokens, st.usage().output_tokens), (25, 15));
+    }
+
+    #[test]
+    fn extract_reply_detects_truncation() {
+        let oa = r#"{"choices":[{"message":{"content":"写到一半"},"finish_reason":"length"}]}"#;
+        assert!(extract_reply(Provider::OpenAI, oa).unwrap().truncated);
+        let oa_ok = r#"{"choices":[{"message":{"content":"完"},"finish_reason":"stop"}]}"#;
+        assert!(!extract_reply(Provider::OpenAI, oa_ok).unwrap().truncated);
+        let an = r#"{"content":[{"type":"text","text":"写到一半"}],"stop_reason":"max_tokens"}"#;
+        assert!(extract_reply(Provider::Anthropic, an).unwrap().truncated);
+        let an_ok = r#"{"content":[{"type":"text","text":"完"}],"stop_reason":"end_turn"}"#;
+        assert!(!extract_reply(Provider::Anthropic, an_ok).unwrap().truncated);
+        // 没有 finish_reason 的兼容层：不当成截断
+        let bare = r#"{"choices":[{"message":{"content":"完"}}]}"#;
+        assert!(!extract_reply(Provider::OpenAI, bare).unwrap().truncated);
+    }
+
+    #[test]
+    fn status_classification_retries_only_transient() {
+        let c = |code: u16, body: &str| classify_status(StatusCode::from_u16(code).unwrap(), body);
+        for code in [408, 409, 425, 429, 500, 502, 503, 504, 529] {
+            assert_eq!(c(code, ""), FailureKind::Transient, "{code}");
+        }
+        for code in [400, 401, 402, 403, 404, 422, 501] {
+            assert_eq!(c(code, ""), FailureKind::Fatal, "{code}");
+        }
+        // 额度耗尽的 429 等多久都不会好
+        assert_eq!(
+            c(429, r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#),
+            FailureKind::Fatal
+        );
+    }
+
+    #[test]
+    fn retry_after_header_is_honored_and_capped() {
+        let mut h = HeaderMap::new();
+        assert_eq!(parse_retry_after(&h), None);
+        h.insert("retry-after", HeaderValue::from_static("7"));
+        assert_eq!(parse_retry_after(&h), Some(Duration::from_secs(7)));
+        h.insert("retry-after", HeaderValue::from_static("3600"));
+        assert_eq!(parse_retry_after(&h), Some(MAX_RETRY_AFTER));
+        h.insert("retry-after", HeaderValue::from_static("1e300"));
+        assert_eq!(parse_retry_after(&h), Some(MAX_RETRY_AFTER), "天文数字不能 panic");
+        h.insert("retry-after", HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        assert_eq!(parse_retry_after(&h), None);
+        h.insert("retry-after-ms", HeaderValue::from_static("1500"));
+        assert_eq!(parse_retry_after(&h), Some(Duration::from_millis(1500)));
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_with_bounded_jitter() {
+        let p = RetryPolicy { max_attempts: 5, base: Duration::from_secs(2), cap: Duration::from_secs(30) };
+        // jitter=1 → 满额；jitter=0 → 一半
+        assert_eq!(backoff_delay(&p, 1, None, 1.0), Duration::from_secs(2));
+        assert_eq!(backoff_delay(&p, 2, None, 1.0), Duration::from_secs(4));
+        assert_eq!(backoff_delay(&p, 3, None, 1.0), Duration::from_secs(8));
+        assert_eq!(backoff_delay(&p, 3, None, 0.0), Duration::from_secs(4));
+        assert_eq!(backoff_delay(&p, 10, None, 1.0), Duration::from_secs(30), "封顶");
+        assert_eq!(backoff_delay(&p, 40, None, 1.0), Duration::from_secs(30), "移位不溢出");
+        // 服务方给了 Retry-After 就照它来
+        assert_eq!(backoff_delay(&p, 1, Some(Duration::from_secs(9)), 0.3), Duration::from_secs(9));
+        for _ in 0..100 {
+            let j = jitter();
+            assert!((0.0..1.0).contains(&j));
+        }
+    }
+
+    /// 取消标记已置位时一次请求都不发，直接按 Cancelled 返回（不会被当成可重试的错误）。
+    #[tokio::test]
+    async fn retrying_returns_cancelled_without_sending() {
+        let acct = AgentAccount { api_key: "k".into(), ..AgentAccount::default() };
+        let cancel = AtomicBool::new(true);
+        let mut retries = 0;
+        let r = complete_reply_retrying(&acct, "", &[ChatMessage::user("hi")], &[], &cancel, &AGENT_RETRY, |_| {
+            retries += 1
+        })
+        .await;
+        assert_eq!(r.unwrap_err().kind, FailureKind::Cancelled);
+        assert_eq!(retries, 0);
+    }
+
+    #[test]
     fn extract_reply_collects_reasoning_for_both_providers() {
         let openai = r#"{"choices":[{"message":{"content":"好","reasoning_content":"先想"}}]}"#;
         let r = extract_reply(Provider::OpenAI, openai).unwrap();
@@ -2110,9 +2697,11 @@ mod tests {
         let body = body_of(&req);
         assert_eq!(body["model"], "gpt-4o-mini");
         assert_eq!(body["stream"], true);
-        assert_eq!(body["messages"][0]["role"], "user");
-        assert_eq!(body["messages"][0]["content"], "USER");
-        // OpenAI 方言的 system 走 messages，body 里不该有顶层 system
+        // OpenAI 方言的 system 走 messages 的第一条（以前这里被整个丢掉了），body 里不该有顶层 system
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "SYS");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "USER");
         assert!(body.get("system").is_none());
     }
 
@@ -2215,6 +2804,116 @@ mod tests {
         for key in ["终端会话", "不要臆测", "不确定", "风险"] {
             assert!(s.contains(key), "兜底提示词缺少要点：{key}");
         }
+    }
+
+    // ——— 原生工具回执配对 ———
+
+    fn tu(id: &str, name: &str) -> ToolUse {
+        ToolUse { id: id.into(), name: name.into(), arguments: "{\"command\":\"ls\"}".into() }
+    }
+    fn tr(id: &str, content: &str, is_error: bool) -> ToolResult {
+        ToolResult { id: id.into(), content: content.into(), is_error }
+    }
+    fn exec_spec() -> ToolSpec {
+        ToolSpec { name: "nx_exec", description: "exec".into(), schema: serde_json::json!({"type":"object"}) }
+    }
+
+    /// 一轮三个调用：第一个执行了，第二个被拒，第三个因取消没轮到（回执里没有它）
+    fn multi_call_history() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::user("清理一下 /tmp"),
+            ChatMessage::assistant_calls("我分三步做", vec![tu("a1", "nx_exec"), tu("a2", "nx_exec"), tu("a3", "nx_exec")]),
+            ChatMessage::results("用户点了停止", vec![tr("a1", "ok", false), tr("a2", "「rm -rf /tmp/x」没有执行：契约禁止", true)]),
+        ]
+    }
+
+    #[test]
+    fn anthropic_body_pairs_tool_use_with_tool_result() {
+        let req = build_messages_with_tools(&acct(), Provider::Anthropic, "SYS", &multi_call_history(), false, &[exec_spec()]).unwrap();
+        let body = body_of(&req);
+        let m = body["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 3);
+        let uses: Vec<&str> = m[1]["content"].as_array().unwrap().iter().filter(|b| b["type"] == "tool_use").map(|b| b["id"].as_str().unwrap()).collect();
+        assert_eq!(uses, vec!["a1", "a2", "a3"]);
+        assert_eq!(m[1]["content"][1]["input"]["command"], "ls", "input 是对象不是字符串");
+        let results = m[2]["content"].as_array().unwrap();
+        let ids: Vec<&str> = results.iter().filter(|b| b["type"] == "tool_result").map(|b| b["tool_use_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["a1", "a2", "a3"], "每个 tool_use 恰好一个 tool_result，且排在最前");
+        assert_eq!(results[0]["is_error"], false);
+        assert_eq!(results[1]["is_error"], true, "被拒");
+        assert_eq!(results[2]["is_error"], true, "取消没执行，补回执");
+        assert_eq!(results[2]["content"], UNRUN_RESULT);
+        assert_eq!(results.last().unwrap()["type"], "text");
+    }
+
+    #[test]
+    fn openai_body_pairs_tool_calls_with_tool_messages() {
+        let req = build_messages_with_tools(&acct(), Provider::OpenAI, "SYS", &multi_call_history(), false, &[exec_spec()]).unwrap();
+        let body = body_of(&req);
+        let m = body["messages"].as_array().unwrap();
+        assert_eq!(m[0]["role"], "system");
+        assert_eq!(m[2]["role"], "assistant");
+        let ids: Vec<&str> = m[2]["tool_calls"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["a1", "a2", "a3"]);
+        assert_eq!(m[2]["tool_calls"][0]["function"]["arguments"], "{\"command\":\"ls\"}");
+        let tools: Vec<&str> = m.iter().filter(|x| x["role"] == "tool").map(|x| x["tool_call_id"].as_str().unwrap()).collect();
+        assert_eq!(tools, vec!["a1", "a2", "a3"]);
+        assert!(m[4]["content"].as_str().unwrap().starts_with("[未成功]"));
+        assert_eq!(m.last().unwrap()["role"], "user");
+        assert_eq!(m.last().unwrap()["content"], "用户点了停止");
+    }
+
+    #[test]
+    fn without_tools_history_is_flattened() {
+        let req = build_messages_with_tools(&acct(), Provider::Anthropic, "SYS", &multi_call_history(), false, &[]).unwrap();
+        let body = body_of(&req);
+        for m in body["messages"].as_array().unwrap() {
+            assert!(m["content"].is_string(), "不带 tools 时不能出现 tool_use / tool_result 块：{m}");
+        }
+        assert!(body["messages"][1]["content"].as_str().unwrap().contains("调用工具 nx_exec"));
+    }
+
+    #[test]
+    fn sanitizer_repairs_orphans() {
+        // assistant 的调用后面直接又是 assistant（中途出错）：补一条带回执的 user
+        let mut v = vec![
+            ChatMessage::user("u"),
+            ChatMessage::assistant_calls("", vec![tu("x1", "nx_exec"), tu("", "nx_screen")]),
+            ChatMessage::assistant("后来又说了一句"),
+        ];
+        assert!(repair_tool_pairing(&mut v));
+        assert_eq!(v[2].role, "user");
+        assert_eq!(v[2].tool_results.len(), 2);
+        assert!(v[2].tool_results.iter().all(|r| r.is_error));
+        assert!(!v[1].tool_calls[1].id.is_empty(), "缺 id 的调用补上 id");
+        assert_eq!(v[2].tool_results[1].id, v[1].tool_calls[1].id);
+        // 前面没有调用的回执：压成文本；重复的回执去掉
+        let mut w = vec![
+            ChatMessage::user("u"),
+            ChatMessage::results("尾巴", vec![tr("gone", "旧结果", false)]),
+        ];
+        assert!(repair_tool_pairing(&mut w));
+        assert!(w[1].tool_results.is_empty() && w[1].content.contains("旧结果"));
+        let mut d = vec![
+            ChatMessage::user("u"),
+            ChatMessage::assistant_calls("", vec![tu("k", "nx_exec")]),
+            ChatMessage::results("", vec![tr("k", "1", false), tr("k", "2", false), tr("zz", "?", false)]),
+        ];
+        repair_tool_pairing(&mut d);
+        assert_eq!(d[2].tool_results, vec![tr("k", "1", false)]);
+        assert!(d[2].content.contains("?"));
+        // 已经正确的不动
+        let mut ok = multi_call_history();
+        repair_tool_pairing(&mut ok);
+        assert!(!repair_tool_pairing(&mut ok));
+    }
+
+    #[test]
+    fn old_flat_messages_still_deserialize() {
+        let v: Vec<ChatMessage> = serde_json::from_str(r#"[{"role":"user","content":"hi"},{"role":"assistant","content":"（调用工具 nx_exec：{}）"}]"#).unwrap();
+        assert_eq!(v[1], ChatMessage::assistant("（调用工具 nx_exec：{}）"));
+        // 新字段为空时不出现在 JSON 里（旧版本读得回来）
+        assert_eq!(serde_json::to_string(&ChatMessage::user("x")).unwrap(), r#"{"role":"user","content":"x"}"#);
     }
 
     #[test]
@@ -2374,14 +3073,24 @@ mod tests {
     fn done_payload_serializes_as_expected() {
         let json = serde_json::to_value(DonePayload {
             reason: FinishReason::Cancelled,
+            usage: None,
         })
         .expect("应能序列化");
         assert_eq!(json, serde_json::json!({"reason": "cancelled"}));
         let json = serde_json::to_value(DonePayload {
             reason: FinishReason::Length,
+            usage: None,
         })
         .expect("应能序列化");
         assert_eq!(json, serde_json::json!({"reason": "length"}));
+        let u = super::super::usage::Usage { input_tokens: 3, output_tokens: 4, estimated: true, ..Default::default() };
+        let json = serde_json::to_value(DonePayload {
+            reason: FinishReason::Stop,
+            usage: Some(super::super::usage::RunUsage { usage: u, cost_usd: None, elapsed_secs: 2 }),
+        })
+        .expect("应能序列化");
+        assert_eq!(json["usage"]["outputTokens"], 4);
+        assert_eq!(json["usage"]["estimated"], true);
     }
 
     #[test]

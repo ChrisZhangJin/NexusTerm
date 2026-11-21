@@ -28,6 +28,8 @@ interface Props {
   /** 右侧 AI 助手面板开关 */
   agentOpen: boolean;
   onToggleAgent: () => void;
+  /** 托管在等人的终端：console id（= tab.sessionId）→ 一行说明（见 lib/host 的 hostTabBadges） */
+  hostBadges?: Record<string, string>;
 }
 
 const appWindow = getCurrentWindow();
@@ -56,6 +58,7 @@ export default function TabBar({
   onToggleSessionPopup,
   agentOpen,
   onToggleAgent,
+  hostBadges,
 }: Props) {
   const mac = isMacOS();
   const [ctx, setCtx] = useState<{ x: number; y: number; id: string } | null>(null);
@@ -207,6 +210,7 @@ export default function TabBar({
           const isDragging = drag?.id === t.id; // drag 只在越过阈值后才被设置
           const dropBefore = drag?.overId === t.id && drag.id !== t.id && !drag.after;
           const dropAfter = drag?.overId === t.id && drag.id !== t.id && drag.after;
+          const hostBadge = t.sessionId ? hostBadges?.[t.sessionId] : undefined;
           return (
             <div
               key={t.id}
@@ -221,6 +225,7 @@ export default function TabBar({
                 t.status === "error" ? "tab-error" : "",
                 // 不在前台时收到过新输出：点亮提醒动效。已经是当前标签就不用再提醒自己。
                 t.hasActivity && t.id !== activeTab ? "tab-activity" : "",
+                hostBadge ? "tab-host-wait" : "",
                 isDragging ? "tab-dragging" : "",
                 dropBefore ? "drop-before" : "",
                 dropAfter ? "drop-after" : "",
@@ -247,9 +252,10 @@ export default function TabBar({
                   id: t.id,
                 });
               }}
-              title={tabLabel(t)}
+              title={hostBadge ? `${tabLabel(t)}\n${hostBadge}` : tabLabel(t)}
             >
               {t.status === "reconnecting" && <span className="spinner sm" title="正在重连" />}
+              {hostBadge && <span className="tab-host-dot" aria-label={hostBadge} />}
               {renaming === t.id ? (
                 <input
                   className="tab-rename"

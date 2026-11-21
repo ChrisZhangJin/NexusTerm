@@ -10,6 +10,9 @@
 
 use std::collections::VecDeque;
 
+use super::prompt::{classify, PromptKind};
+use super::usercmd::{UserCommandEntry, UserCommandLog};
+
 /// 单会话默认的缓冲上限（字节）。
 ///
 /// 256KB 是「能装下几分钟真实操作」与「不会因为一个失控的 `yes | dd` 把内存吃光」之间的折中。
@@ -32,6 +35,14 @@ const MAX_PENDING_ECHO: usize = 4096;
 /// [`SessionBuffer::last_line`] 往回扫多少字节。提示符再长也不会有这么长，
 /// 而全量扫一遍长会话（256KB）要在持锁状态下做，会拖慢 pty 读线程。
 const LAST_LINE_SCAN_BYTES: usize = 2048;
+
+/// 判定「是不是在等密码」时往回看多少字节的**程序输出**。
+const SECRET_PROBE_BYTES: usize = 512;
+/// 后端按屏幕尾部判为密码提示所需的最低置信度。
+const SECRET_CONFIDENCE: f32 = 0.8;
+
+/// [`SessionBuffer::out_since`] 最多回看多少原始字节。
+const OUTPUT_SLICE_MAX_BYTES: u64 = 64 * 1024;
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -103,6 +114,8 @@ pub struct SessionBuffer {
     /// 本会话的旁路开关。放在这里而不是 manager 里再开一张表，
     /// 是为了让「缓冲存在」和「是否启用」永远同步，不会出现半初始化状态。
     enabled: bool,
+    /// 用户提交过的命令（结构化、带时间戳），见 `usercmd.rs`。
+    user_cmds: UserCommandLog,
 }
 
 impl SessionBuffer {
@@ -119,6 +132,7 @@ impl SessionBuffer {
             pushed: 0,
             pending_echo: VecDeque::new(),
             enabled: true,
+            user_cmds: UserCommandLog::default(),
         }
     }
 
@@ -303,6 +317,30 @@ impl SessionBuffer {
         out
     }
 
+    /// 从位置 `mark` 往后**只含程序输出（Out）**的文本，不含人敲的输入（`$ ` 行）。
+    ///
+    /// 给时间线（2.5）切「某条命令对应的输出段」用：命令之后用户可能已经在敲下一条，
+    /// 那些输入不该算进上一条命令的输出里。最多回看 [`OUTPUT_SLICE_MAX_BYTES`] 原始字节，
+    /// 持锁时间有上界。
+    pub fn out_since(&self, mark: u64) -> String {
+        let start = self.pushed - self.bytes as u64;
+        let floor = self.pushed.saturating_sub(OUTPUT_SLICE_MAX_BYTES);
+        let mut skip = mark.max(floor).saturating_sub(start).min(self.bytes as u64) as usize;
+        let mut out = String::new();
+        for chunk in &self.chunks {
+            let len = chunk.data.len();
+            if skip >= len {
+                skip -= len;
+                continue;
+            }
+            if chunk.kind == StreamKind::Out {
+                out.push_str(&chunk.text_from(skip));
+            }
+            skip = 0;
+        }
+        out
+    }
+
     /// 只取最近 `max_bytes`（按清洗后的字节计）的内容 —— **这是实际发给模型的东西**。
     ///
     /// 为什么不清全量再截：长会话的缓冲清一遍要扫满 256KB，
@@ -354,6 +392,103 @@ impl SessionBuffer {
         // 一并作废：清空的语义是「忘掉刚才的一切」，留着回显队列会让
         // 清空之后的第一段输出被无端削掉一截
         self.pending_echo.clear();
+        self.user_cmds.clear();
+    }
+
+    /// 记一条用户提交的命令（回车时由前端推来，见 `cmd::agent_user_command`）。
+    ///
+    /// `no_echo`：前端判定这行没被终端回显过（密码提示）。
+    /// 除此之外后端再看一眼屏幕尾部——最近的程序输出若是置信度 >= 0.8 的密码提示，
+    /// 同样丢弃内容。两条里任一成立都只存 `SecretInput` 占位。
+    ///
+    /// 返回入账的条目；整行清洗后为空（且不是密码）时返回 `None`。
+    pub fn record_user_command(
+        &mut self,
+        line: &str,
+        no_echo: bool,
+        ts_ms: u64,
+    ) -> Option<UserCommandEntry> {
+        let at = self.pushed;
+        if no_echo || self.awaiting_password() {
+            return Some(self.user_cmds.push_secret(ts_ms, at));
+        }
+        self.user_cmds.push_command(line, ts_ms, at)
+    }
+
+    /// 最近 `limit` 条用户命令，时间正序。**原文**；给模型前用 `UserCommandEntry::redacted`。
+    pub fn user_commands(&self, limit: usize) -> Vec<UserCommandEntry> {
+        self.user_cmds.recent(limit)
+    }
+
+    /// `seq` 大于 `after` 的用户命令（增量读取）。
+    pub fn user_commands_since(&self, after: u64) -> Vec<UserCommandEntry> {
+        self.user_cmds.since_seq(after)
+    }
+
+    /// 最近至少 `max_bytes` 字节的**程序输出（Out 段）**，剥 ANSI、时间正序。
+    ///
+    /// 只看 Out：人敲进去的字符在 In 段里，混进来会把 `Password:` 之后的内容
+    /// 当成提示符的一部分。给「判密码提示」与录制器（3.2）判「用户是在回答什么提示」共用。
+    pub fn out_tail(&self, max_bytes: usize) -> String {
+        let mut picked: Vec<String> = Vec::new();
+        let mut total = 0usize;
+        for chunk in self.chunks.iter().rev() {
+            if chunk.kind != StreamKind::Out {
+                continue;
+            }
+            let text = chunk.text();
+            total += text.len();
+            picked.push(text);
+            if total >= max_bytes {
+                break;
+            }
+        }
+        picked.reverse();
+        picked.concat()
+    }
+
+    /// 从位置 `mark` 往后，**输入段（In）**里提交了多少次回车（`\r`，或不跟在 `\r` 后的 `\n`；
+    /// `\r\n` 算一次）。录制器（3.2）据此对账「终端实际收到的提交」与「前端推来的命令」：
+    /// 前者多出来的就是没被捕获的操作（历史回溯 / 片段 / 快速发送 / 宏回放 / 全屏程序里的回车）。
+    /// 与 [`Self::out_since`] 同坐标；`mark` 之前已被环形缓冲丢掉的部分只会少算、不会多算。
+    pub fn in_enters_since(&self, mark: u64) -> u32 {
+        let start = self.pushed - self.bytes as u64;
+        let mut skip = mark.saturating_sub(start).min(self.bytes as u64) as usize;
+        let mut n = 0u32;
+        let mut prev_cr = false;
+        for chunk in &self.chunks {
+            let len = chunk.data.len();
+            if skip >= len {
+                skip -= len;
+                continue;
+            }
+            if chunk.kind == StreamKind::In {
+                for &b in chunk.data.iter().skip(skip) {
+                    match b {
+                        b'\r' => {
+                            n = n.saturating_add(1);
+                            prev_cr = true;
+                            continue;
+                        }
+                        b'\n' if !prev_cr => n = n.saturating_add(1),
+                        _ => {}
+                    }
+                    prev_cr = false;
+                }
+            }
+            skip = 0;
+        }
+        n
+    }
+
+    /// 终端此刻是否停在密码提示上。
+    ///
+    /// **只看程序输出（Out 段）**：人敲进去的字符在 In 段里，混进来会把
+    /// `Password:` 之后的内容当成提示符的一部分。
+    fn awaiting_password(&self) -> bool {
+        let tail = self.out_tail(SECRET_PROBE_BYTES);
+        let g = classify(&tail, false);
+        g.kind == PromptKind::Password && g.confidence >= SECRET_CONFIDENCE
     }
 
     pub fn stats(&self) -> BufferStats {
@@ -553,6 +688,7 @@ fn skip_string(bytes: &[u8], mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::usercmd::UserEntryKind;
 
     const CSI: &str = "\u{1b}[";
 
@@ -960,5 +1096,65 @@ mod tests {
         assert!(b.is_enabled());
         b.set_enabled(false);
         assert!(!b.is_enabled());
+    }
+    // ——— 用户命令事件（2.4）———
+
+    #[test]
+    fn user_command_recorded_with_actor_ts_and_position() {
+        let mut b = buf(1024);
+        b.feed(b"me@host:~$ ", StreamKind::Out);
+        let before = b.pushed();
+        let e = b.record_user_command("  ls -la ", false, 1234).unwrap();
+        assert_eq!(e.kind, UserEntryKind::Command);
+        assert_eq!(e.line, "ls -la");
+        assert_eq!(e.ts_ms, 1234);
+        assert_eq!(e.actor, crate::agent::usercmd::Actor::User);
+        assert_eq!(e.at, before);
+        assert_eq!(b.user_commands(10), vec![e]);
+    }
+
+    #[test]
+    fn user_command_no_echo_stores_marker_without_content() {
+        let mut b = buf(1024);
+        b.feed(b"me@host:~$ ", StreamKind::Out);
+        let e = b.record_user_command("hunter2", true, 1).unwrap();
+        assert_eq!(e.kind, UserEntryKind::SecretInput);
+        assert_eq!(e.line, "");
+        assert!(!format!("{:?}", b.user_commands(10)).contains("hunter2"));
+    }
+
+    #[test]
+    fn user_command_dropped_when_screen_is_password_prompt() {
+        let mut b = buf(4096);
+        b.feed(b"ssh root@10.0.0.1\r\nroot@10.0.0.1's password: ", StreamKind::Out);
+        // 前端以为回显了（比如判据没触发），后端仍要兜住
+        let e = b.record_user_command("s3cretpw", false, 2).unwrap();
+        assert_eq!(e.kind, UserEntryKind::SecretInput);
+        assert_eq!(e.line, "");
+        // 密码输入落在 In 段、不影响判定；回到 shell 提示符后恢复正常记录
+        b.feed(b"s3cretpw\r", StreamKind::In);
+        b.feed(b"\r\nLast login: x\r\nroot@10.0.0.1:~# ", StreamKind::Out);
+        let e = b.record_user_command("whoami", false, 3).unwrap();
+        assert_eq!(e.kind, UserEntryKind::Command);
+        assert_eq!(e.line, "whoami");
+    }
+
+    #[test]
+    fn user_command_empty_line_not_recorded() {
+        let mut b = buf(1024);
+        b.feed(b"$ ", StreamKind::Out);
+        assert!(b.record_user_command("   ", false, 1).is_none());
+        assert!(b.user_commands(10).is_empty());
+    }
+
+    #[test]
+    fn user_commands_cleared_with_buffer_and_since_is_incremental() {
+        let mut b = buf(1024);
+        b.feed(b"$ ", StreamKind::Out);
+        let a = b.record_user_command("a", false, 1).unwrap();
+        b.record_user_command("b", false, 2).unwrap();
+        assert_eq!(b.user_commands_since(a.seq).len(), 1);
+        b.clear();
+        assert!(b.user_commands(10).is_empty());
     }
 }

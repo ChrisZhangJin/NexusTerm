@@ -1,7 +1,7 @@
 {
   "name": "nexus-term",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "description": "原生 macOS SSH / SFTP 终端 — Rust 后端 + TypeScript 前端",
   "scripts": {
@@ -36,6 +36,7 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.0.0",
+    "@xterm/headless": "^5.5.0",
     "esbuild": "^0.28.2",
     "typescript": "^5.9.0",
     "vite": "^7.1.0"

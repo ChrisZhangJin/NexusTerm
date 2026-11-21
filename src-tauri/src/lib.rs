@@ -14,6 +14,7 @@ mod cmd;
 mod histfile;
 mod keys;
 mod local;
+mod migrate;
 mod viewer;
 mod secret;
 mod sftp;
@@ -134,6 +135,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         // 浏览窗口里 HTML iframe 的页面来源（带独立 CSP，默认禁脚本）
         .register_uri_scheme_protocol("nxdoc", viewer::protocol)
         .setup(|app| {
@@ -168,6 +170,27 @@ pub fn run() {
             let agent = agent::AgentManager::new();
             agent.apply_config(&agent::load_config(&store));
             app.manage(viewer::DocStore::default());
+            // P0 会话织物 + P1 常驻循环：屏幕帧状态、契约表、事件流、时钟统计、配置
+            // 都独立于 AppState，避免给热路径上的 AppState 再添锁；命令层通过 State<T> 直接取。
+            // 每份状态 clone 一份给常驻循环（都是 Arc），循环本身只读屏幕、不写终端。
+            let steward_screen = agent::steward::ScreenStore::new();
+            let steward_registry = agent::steward::StewardRegistry::new();
+            let steward_events = agent::steward_loop::EventLog::new();
+            let steward_bus = agent::steward_loop::StewardBus::default();
+            let steward_runtime = agent::steward_loop::StewardRuntime::new();
+            let steward_config = agent::steward_loop::StewardConfigStore::new();
+            // 决策依据是 db 的内存镜像，启动时载入并写默认种子
+            let steward_brain = agent::profile::StewardBrain::load(&store);
+            // 契约 id → 授权；托管任务起步 / 接驳时读取
+            let steward_core = agent::steward_core::StewardCore::new();
+            app.manage(steward_screen.clone());
+            app.manage(steward_registry.clone());
+            app.manage(steward_events.clone());
+            app.manage(steward_bus.clone());
+            app.manage(steward_runtime.clone());
+            app.manage(steward_config.clone());
+            app.manage(steward_brain.clone());
+            app.manage(steward_core.clone());
             app.manage(AppState {
                 sessions,
                 sftp,
@@ -179,6 +202,19 @@ pub fn run() {
                 auth_prompts,
                 keys_dir,
             });
+            // 统一托管的启动扫描：未结束的托管一律挂起（AppRestart）待用户确认接驳，不写任何终端
+            agent::host_cmd::boot_scan(app.handle());
+            // P1：一个常驻 Supervisor 管所有被托管 console 的状态槽，
+            // 面板关闭 / 窗口最小化都不影响它按心跳观察。全程只读、零 LLM。
+            agent::steward_loop::spawn_daemon(
+                app.handle().clone(),
+                steward_screen,
+                steward_registry,
+                steward_events,
+                steward_bus,
+                steward_runtime,
+                steward_config,
+            );
             tracing::info!("nexus-term 后端就绪");
             Ok(())
         })
@@ -260,6 +296,8 @@ pub fn run() {
             cmd::vault_forget,
             cmd::vault_change_password,
             cmd::vault_disable,
+            cmd::connections_export,
+            cmd::connections_import,
             viewer::viewer_open_sftp,
             viewer::viewer_open_ssh,
             viewer::viewer_open_local,
@@ -270,20 +308,99 @@ pub fn run() {
             agent::cmd::agent_get_session,
             agent::cmd::agent_context,
             agent::cmd::agent_clear,
+            agent::cmd::agent_history_load,
+            agent::cmd::agent_history_save,
+            agent::cmd::agent_history_clear,
+            agent::cmd::agent_conversation_reset,
             agent::cmd::agent_stats,
+            agent::cmd::agent_user_command,
+            agent::recorder_cmd::agent_record_start,
+            agent::recorder_cmd::agent_record_stop,
+            agent::recorder_cmd::agent_record_status,
+            agent::recorder_cmd::agent_record_cancel,
+            agent::recorder_cmd::agent_user_keys,
             agent::cmd::agent_ask,
             agent::cmd::agent_cancel,
             agent::cmd::agent_test,
             agent::cmd::agent_run,
             agent::cmd::agent_run_cancel,
+            agent::cmd::agent_run_pause,
+            agent::cmd::agent_run_resume,
+            agent::cmd::agent_control_get,
+            agent::cmd::agent_control_user_input,
+            agent::cmd::agent_control_takeover,
+            agent::cmd::agent_control_handback,
             agent::cmd::agent_approve,
             agent::cmd::agent_tab_ack,
+            agent::cmd::agent_screen_ack,
+            agent::cmd::agent_secret_ack,
             agent::cmd::agent_exec,
             agent::cmd::agent_export_session,
             agent::cmd::agent_open_session,
             agent::cmd::agent_open_window,
             agent::cmd::agent_close_window,
             agent::cmd::agent_window_open,
+            agent::skill_cmd::skill_list,
+            agent::skill_cmd::skill_get,
+            agent::skill_cmd::skill_create,
+            agent::skill_cmd::skill_update,
+            agent::skill_cmd::skill_delete,
+            agent::skill_cmd::skill_validate,
+            agent::skill_cmd::skill_export,
+            agent::skill_cmd::skill_import_preview,
+            agent::skill_cmd::skill_import,
+            agent::skill_cmd::skill_refine_draft,
+            agent::skill_cmd::skill_run,
+            agent::skill_cmd::skill_trust,
+            agent::macro_migrate::macros_migrate_preview,
+            agent::macro_migrate::macros_migrate,
+            agent::hostmem_cmd::host_memory_list,
+            agent::hostmem_cmd::host_memory_add,
+            agent::hostmem_cmd::host_memory_update,
+            agent::hostmem_cmd::host_memory_delete,
+            agent::hostmem_cmd::host_memory_clear,
+            agent::steward::steward_list_consoles,
+            agent::steward::steward_screen_delta,
+            agent::steward::steward_screen_get,
+            agent::host_cmd::host_start,
+            agent::host_cmd::host_stop,
+            agent::host_cmd::host_answer,
+            agent::host_cmd::host_takeover,
+            agent::host_cmd::host_handback,
+            agent::host_cmd::host_pause,
+            agent::host_cmd::host_resume,
+            agent::host_cmd::host_status,
+            agent::host_cmd::host_list,
+            agent::host_history_cmd::host_history,
+            agent::host_history_cmd::host_changes,
+            agent::host_history_cmd::host_restore_backup,
+            agent::host_notify::host_notify_get,
+            agent::host_notify::host_notify_set,
+            agent::host_cmd::host_confirm_criteria,
+            agent::host_cmd::host_amend,
+            agent::host_cmd::host_correct,
+            agent::host_cmd::host_report_misread,
+            agent::host_cmd::host_reattach,
+            agent::host_cmd::host_reattach_candidates,
+            agent::steward::steward_stop,
+            agent::steward::steward_status,
+            agent::steward_loop::steward_events,
+            agent::steward_loop::steward_runtime_info,
+            agent::steward_loop::steward_classify_now,
+            agent::steward_loop::steward_clear_events,
+            agent::steward_loop::steward_config,
+            agent::steward_loop::steward_set_config,
+            agent::steward_loop::steward_wake,
+            agent::steward_cmd::steward_brain,
+            agent::steward_cmd::steward_ctx_upsert,
+            agent::steward_cmd::steward_ctx_delete,
+            agent::steward_cmd::steward_intent_push,
+            agent::steward_cmd::steward_decisions,
+            agent::steward_cmd::steward_clear_decisions,
+            // 复盘 / 统一审计 / 解释链（只读决策记录）
+            agent::steward_cmd::steward_explain,
+            agent::steward_cmd::steward_review,
+            agent::steward_cmd::steward_audit,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

@@ -334,8 +334,11 @@ function fakeTerm(opts?: { cursorX?: number; lineText?: string }) {
     cols: 80,
     cursorX,
     text: () => written.join(""),
-    write(s: string) {
-      written.push(s);
+    // 假终端的写入是同步的：回调（xterm 在之前的数据解析完后才调）就该当场触发；
+    // 空写入只用来排队取回调，不算字节
+    write(s: string, cb?: () => void) {
+      if (s) written.push(s);
+      cb?.();
     },
     buffer: {
       active: {
@@ -1560,7 +1563,8 @@ test("接管：中文上屏时的回车属于输入法，不能往 pty 里塞一
  */
 function asyncTerm(opts?: { cursorX?: number; lineText?: string }) {
   const written: string[] = [];
-  const queue: string[] = [];
+  // 与 xterm 一样：写入先排队，flush 时按顺序解析；回调在它之前的数据解析完后触发
+  const queue: { s: string; cb?: () => void }[] = [];
   const cells = [...(opts?.lineText ?? "")];
   let cursorX = opts?.cursorX ?? (opts?.lineText?.length ?? 0);
   const CSI_RE = new RegExp(`${ESC}\\[(\\d*)(?:;(\\d*))?([DXmH])`, "g");
@@ -1595,11 +1599,15 @@ function asyncTerm(opts?: { cursorX?: number; lineText?: string }) {
       cursorX = x;
     },
     flush() {
-      while (queue.length) apply(queue.shift()!);
+      while (queue.length) {
+        const { s, cb } = queue.shift()!;
+        apply(s);
+        cb?.();
+      }
     },
-    write(s: string) {
-      written.push(s);
-      queue.push(s);
+    write(s: string, cb?: () => void) {
+      if (s) written.push(s);
+      queue.push({ s, cb });
     },
     buffer: {
       active: {
@@ -1634,13 +1642,15 @@ test("灰字：clear 返回 idle/erased/moved，让调用方免读异步缓冲",
   t.flush();
   assert.equal(t.line(), "st", "flush 后灰字真的没了");
 
-  // 光标被 shell 挪走后再 clear：不能写任何东西
+  // 灰字还在写队列里（位置未定）就 clear：擦除排在灰字之后，处理到它时光标正停在灰字前，
+  // 照样擦干净（修复前判 moved、一个字节不写 → 灰字留在已执行的命令行上）。
+  // 「灰字画好之后光标被挪走」见下面 cleaned / moved 两条用例。
   const t2 = asyncTerm({ lineText: "st" });
   const g2 = new GhostText();
   g2.show(t2 as never, "atus", 40);
-  t2.move(0); // shell 把光标挪走了
-  assert.equal(g2.clear(t2 as never), "moved");
-  assert.equal(t2.written.length, 1, "只有 show 那一次写");
+  assert.equal(g2.clear(t2 as never), "erased");
+  t2.flush();
+  assert.equal(t2.line(), "st", "灰字没有残留");
 });
 
 test("灰字：ECH 还没 flush 时换建议也能重画（修复前会误判行中间而罢画）", () => {

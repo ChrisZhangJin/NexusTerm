@@ -10,12 +10,28 @@ const lastOutput = new Map<string, number>();
 
 export function registerTerm(id: string, term: Terminal): () => void {
   registry.set(id, term);
+  // P0 会话织物：屏幕帧采集挂在这里（TerminalView 之下、App 之上），
+  // 与 AgentPanel 是否打开完全无关 —— 面板关掉、窗口最小化都照常上报。
+  // 用 typeof 守卫：测试里塞进来的假 Terminal 没有这些事件。
+  const disposables: Array<{ dispose(): void }> = [];
+  const withCursor = term as Terminal & {
+    onCursorMove?: (fn: () => void) => { dispose(): void };
+    onWriteParsed?: (fn: () => void) => { dispose(): void };
+  };
+  if (typeof withCursor.onWriteParsed === "function") {
+    disposables.push(withCursor.onWriteParsed(() => scheduleCapture(id)));
+  }
+  if (typeof withCursor.onCursorMove === "function") {
+    disposables.push(withCursor.onCursorMove(() => scheduleCapture(id)));
+  }
   return () => {
+    for (const d of disposables) d.dispose();
     if (registry.get(id) === term) {
       registry.delete(id);
       lastOutput.delete(id);
       outputCount.delete(id);
       inputTaps.delete(id);
+      dropCaptureState(id);
     }
   };
 }
@@ -72,6 +88,108 @@ export function lastOutputAt(id: string): number {
  */
 type InputTap = (data: string) => void;
 const inputTaps = new Map<string, Set<InputTap>>();
+
+/**
+ * xterm **自己**生成、却同样经 `onData` 冒出来的字节：焦点进出、鼠标上报、
+ * 对远端查询的自动应答（光标位置 / 设备属性 / 状态 / 模式 / 窗口尺寸 / OSC / DCS）。
+ * 这些不是用户动手，当成敲键会让托管任务无缘无故让路（开了鼠标追踪的 TUI 里
+ * 鼠标一晃就是一串）。一次 onData 可能连着好几段，整串都由这些组成才算。
+ *
+ * 与 `macro.isTerminalReply` 同一思路、覆盖面更大；放这里是因为 macro 依赖本模块，
+ * 反过来引用会成环。只排除结构明确的形状，方向键 `ESC[A`、`ESC O P` 等仍算用户。
+ */
+const XTERM_GENERATED = new RegExp(
+  "^(?:" +
+    [
+      "\\x1b\\[[IO]", // 焦点进出（DECSET 1004）
+      "\\x1b\\[M[\\s\\S]{3}", // X10 / normal 鼠标：ESC [ M Cb Cx Cy
+      "\\x1b\\[<[0-9]+;[0-9]+;[0-9]+[Mm]", // SGR 鼠标（1006）
+      "\\x1b\\[[0-9]+;[0-9]+;[0-9]+M", // urxvt 鼠标（1015）
+      "\\x1b\\[\\??[0-9]+;[0-9]+R", // CPR：光标位置报告
+      "\\x1b\\[[?>][0-9;]*c", // DA1 / DA2：设备属性
+      "\\x1b\\[\\??[0-9;]*n", // DSR：状态报告
+      "\\x1b\\[\\??[0-9;]*\\$y", // DECRPM：模式应答
+      "\\x1b\\[[0-9;]*t", // 窗口尺寸报告
+      "\\x1b\\][\\s\\S]*?(?:\\x07|\\x1b\\\\)", // OSC 应答（标题 / 颜色查询）
+      "\\x1bP[\\s\\S]*?\\x1b\\\\", // DCS 应答
+    ].join("|") +
+    ")+$"
+);
+
+export function isXtermGenerated(data: string): boolean {
+  return data.length > 0 && XTERM_GENERATED.test(data);
+}
+
+/**
+ * 当前有托管契约的 console。只有它们才采屏幕帧、发心跳 ——
+ * 没签契约的终端没人读这些帧，每 2s 一次的全屏重建 + 哈希 + IPC 纯属浪费。
+ * App / 托管面板轮询契约列表后调 `setStewardConsoles` 喂进来。
+ */
+const stewardConsoles = new Set<string>();
+
+export function setStewardConsoles(ids: Iterable<string>): void {
+  const next = new Set(ids);
+  const added = [...next].filter((id) => !stewardConsoles.has(id));
+  const removed = [...stewardConsoles].filter((id) => !next.has(id));
+  if (added.length === 0 && removed.length === 0) return;
+  for (const id of removed) {
+    stewardConsoles.delete(id);
+    if (!agentConsoles.has(id)) dropCaptureState(id);
+  }
+  for (const id of added) stewardConsoles.add(id);
+  // 新签的契约立刻补一帧全量：后端马上就有屏幕可读，不必等下一次输出或心跳
+  for (const id of added) {
+    if (!registry.has(id)) continue;
+    pendingFull.add(id);
+    scheduleCapture(id, 0);
+  }
+  syncCaptureHeartbeat();
+}
+
+export function isStewardConsole(id: string): boolean {
+  return stewardConsoles.has(id);
+}
+
+/**
+ * 有 Agent 运行（对话模式也算）正在驾驶的 console：运行期间也采屏幕帧，结束就停。
+ * 后端在控制权变化时发 `nx://agent/capture {session, on}`（on = 不再是用户在驾驶），App 喂进来。
+ * 平时（没有契约、没有运行）零采集。
+ */
+const agentConsoles = new Set<string>();
+
+/** 纯函数：一次 capture 事件之后的「Agent 驾驶中」集合 */
+export function applyCapture(prev: ReadonlySet<string>, ev: { session: string; on: boolean }): Set<string> {
+  const next = new Set(prev);
+  if (ev.on) next.add(ev.session);
+  else next.delete(ev.session);
+  return next;
+}
+
+/** 纯函数：此刻该采集的 console = 托管契约 ∪ Agent 驾驶中 */
+export function captureTargets(steward: ReadonlySet<string>, agent: ReadonlySet<string>): Set<string> {
+  return new Set([...steward, ...agent]);
+}
+
+function isCaptured(id: string): boolean {
+  return stewardConsoles.has(id) || agentConsoles.has(id);
+}
+
+export function setAgentCapture(session: string, on: boolean): void {
+  const had = agentConsoles.has(session);
+  if (had === on) return;
+  const next = applyCapture(agentConsoles, { session, on });
+  agentConsoles.clear();
+  for (const id of next) agentConsoles.add(id);
+  if (on) {
+    if (registry.has(session)) {
+      pendingFull.add(session);
+      scheduleCapture(session, 0);
+    }
+  } else if (!stewardConsoles.has(session)) {
+    dropCaptureState(session);
+  }
+  syncCaptureHeartbeat();
+}
 
 export function onInput(id: string, fn: InputTap): () => void {
   let set = inputTaps.get(id);
@@ -174,4 +292,259 @@ export function snapshotConsole(
   let text = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
   if (text.length > maxChars) text = text.slice(text.length - maxChars);
   return { text, alt };
+}
+
+// ————————————————————————————————————————————————————————————————————————
+// P0 会话织物：结构化屏幕帧采集
+//
+// 现状的 `snapshotConsole` 是「一轮工具调用里抓一次」的请求-回执模型；
+// 主动托管需要的是后端常驻的屏幕状态。这里把 xterm 的活动缓冲摊成
+// 「尾部 200 行 + 帧指纹」，只推变化行；后端 `ScreenStore` 合并并校验。
+//
+// 三条约束：
+// 1. 采集失败绝不能影响终端（sink 抛错、buffer 读失败都吞掉）；
+// 2. 不去重掉光标帧 —— 后端要靠它数 idle_frames 做空转判定；
+// 3. 纯模块：不 import Tauri，IPC 由 App 注入 sink。
+// ————————————————————————————————————————————————————————————————————————
+
+/** 抓屏窗口内的行下标（0 = 窗口最旧一行），不是终端绝对行号 */
+export interface ScreenLine {
+  y: number;
+  text: string;
+}
+
+export interface ScreenDelta {
+  consoleId: string;
+  frameId: number;
+  /** 抓屏窗口首行的绝对行号；窗口滑动后必须发全量帧 */
+  windowStart: number;
+  total: number;
+  cols: number;
+  rows: number;
+  alt: boolean;
+  cursorX: number;
+  cursorY: number;
+  /** 应用光标键模式（DECCKM） */
+  appCursor?: boolean;
+  hash: string;
+  full: boolean;
+  lines: ScreenLine[];
+  tsMs: number;
+}
+
+export interface ScreenDeltaAck {
+  applied: boolean;
+  /** 后端与前端不同步，下一帧必须发全量 */
+  needFull: boolean;
+  changed: boolean;
+  frameId: number;
+}
+
+interface CaptureFrame {
+  windowStart: number;
+  lines: string[];
+  hash: string;
+  alt: boolean;
+  cols: number;
+  rows: number;
+  cursorX: number;
+  cursorY: number;
+  frameId: number;
+}
+
+/** 与后端 `agent::steward::frame_hash` 完全一致（校验向量见 steward.test.ts） */
+export function frameHash(
+  lines: string[],
+  alt: boolean,
+  cols: number,
+  rows: number,
+  cursorX: number,
+  cursorY: number
+): string {
+  const payload =
+    lines.join("\n") +
+    `\n#${alt ? 1 : 0}:${cols}:${rows}:${cursorX}:${cursorY}`;
+  const bytes = new TextEncoder().encode(payload);
+  let h = 0x811c9dc5 >>> 0;
+  for (let i = 0; i < bytes.length; i++) {
+    h ^= bytes[i];
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+const CAPTURE_LINES = 200;
+const CAPTURE_DEBOUNCE_MS = 180;
+/**
+ * P1：静默期也要发心跳帧。P0 只在 onWriteParsed / onCursorMove 时上报，
+ * 后端分不清「屏幕没动」和「前端不在（浮窗 / 最小化 / 锁屏）」，
+ * 空转计数也只会在有输出时增长。这里每 2s 补一帧同哈希帧（只带 frameId，
+ * 不带行内容），后端 ScreenStore 据此累 idleFrames、Steward 据此判断流。
+ * 与后端 stale_ms 默认 6s 配套：连续 3 次心跳没到才算断流。
+ */
+const CAPTURE_HEARTBEAT_MS = 2000;
+type DeltaSink = (d: ScreenDelta) => void;
+
+let captureEnabled = false;
+let deltaSink: DeltaSink | null = null;
+const captureFrames = new Map<string, CaptureFrame>();
+const captureTimers = new Map<string, number>();
+const pendingFull = new Set<string>();
+let captureHeartbeat: number | null = null;
+
+/** 注入 IPC 出口。App 启动时调一次；不注入时采集为空操作（前端单测不受影响）。 */
+export function setScreenDeltaSink(fn: DeltaSink | null): void {
+  deltaSink = fn;
+}
+
+/**
+ * 本地总开关。采集是纯本地行为，不出网、不调模型；实际只对有托管契约的 console
+ * 生效（见 `setStewardConsoles`），没有契约时连心跳定时器都不起。
+ */
+export function setScreenCaptureEnabled(on: boolean): void {
+  captureEnabled = on;
+  if (on) {
+    for (const id of registry.keys()) {
+      if (!isCaptured(id)) continue;
+      pendingFull.add(id);
+      scheduleCapture(id);
+    }
+  }
+  syncCaptureHeartbeat();
+}
+
+/** 有开关、且至少一个托管中的 console 时才跑心跳 */
+function syncCaptureHeartbeat(): void {
+  if (captureEnabled && (stewardConsoles.size > 0 || agentConsoles.size > 0)) startCaptureHeartbeat();
+  else stopCaptureHeartbeat();
+}
+
+function startCaptureHeartbeat(): void {
+  if (captureHeartbeat !== null) return;
+  captureHeartbeat = window.setInterval(() => {
+    if (!captureEnabled || !deltaSink) return;
+    // hash 不变的帧只带 frameId + 空 lines，后端仍会累 idleFrames 并刷新 updatedAt
+    for (const id of captureTargets(stewardConsoles, agentConsoles)) {
+      if (registry.has(id)) scheduleCapture(id, 0);
+    }
+  }, CAPTURE_HEARTBEAT_MS);
+}
+
+function stopCaptureHeartbeat(): void {
+  if (captureHeartbeat !== null) {
+    window.clearInterval(captureHeartbeat);
+    captureHeartbeat = null;
+  }
+}
+
+/** 后端回报 needFull 时调用：下一帧改发全量，立刻重采一次。 */
+export function requestFullFrame(id: string): void {
+  pendingFull.add(id);
+  scheduleCapture(id, 0);
+}
+
+/** 供面板手动刷新 / 验证用：显式操作，不受托管门控限制 */
+export function captureNow(id: string): void {
+  pendingFull.add(id);
+  captureFrame(id, true);
+}
+
+function dropCaptureState(id: string): void {
+  captureFrames.delete(id);
+  pendingFull.delete(id);
+  const timer = captureTimers.get(id);
+  if (timer !== undefined) {
+    window.clearTimeout(timer);
+    captureTimers.delete(id);
+  }
+}
+
+function scheduleCapture(id: string, delay = CAPTURE_DEBOUNCE_MS): void {
+  // 没签契约的终端连定时器都不排：onWriteParsed 是热路径，这里只读两个布尔 + 一次 Set 查找
+  if (!captureEnabled || !deltaSink || !isCaptured(id)) return;
+  const existing = captureTimers.get(id);
+  if (existing !== undefined) window.clearTimeout(existing);
+  const timer = window.setTimeout(() => {
+    captureTimers.delete(id);
+    captureFrame(id);
+  }, delay);
+  captureTimers.set(id, timer);
+}
+
+function captureFrame(id: string, force = false): void {
+  const term = registry.get(id);
+  if (!term || !captureEnabled || !deltaSink) return;
+  if (!force && !isCaptured(id)) return;
+  try {
+    const buf = term.buffer.active;
+    const alt = buf.type !== "normal";
+    const start = Math.max(0, buf.length - CAPTURE_LINES);
+    const total = buf.length - start;
+    const lines: string[] = [];
+    for (let y = start; y < buf.length; y++) {
+      const line = buf.getLine(y);
+      lines.push(line ? line.translateToString(true) : "");
+    }
+    const cols = term.cols;
+    const rows = term.rows;
+    const cursorX = buf.cursorX;
+    const cursorY = buf.cursorY;
+    // 应用光标键模式（DECCKM）：后端据此把方向键发成 SS3
+    const appCursor = !!term.modes?.applicationCursorKeysMode;
+    const hash = frameHash(lines, alt, cols, rows, cursorX, cursorY);
+    const prev = captureFrames.get(id);
+    const structural =
+      !prev ||
+      prev.windowStart !== start ||
+      prev.lines.length !== total ||
+      prev.alt !== alt ||
+      prev.cols !== cols ||
+      prev.rows !== rows;
+    const full = structural || pendingFull.has(id);
+    const changes: ScreenLine[] = [];
+    if (full) {
+      for (let i = 0; i < total; i++) changes.push({ y: i, text: lines[i] });
+    } else if (prev) {
+      for (let i = 0; i < total; i++) {
+        if (lines[i] !== prev.lines[i]) changes.push({ y: i, text: lines[i] });
+      }
+    }
+    const frameId = (prev?.frameId ?? 0) + 1;
+    const delta: ScreenDelta = {
+      consoleId: id,
+      frameId,
+      windowStart: start,
+      total,
+      cols,
+      rows,
+      alt,
+      cursorX,
+      cursorY,
+      appCursor,
+      hash,
+      full,
+      lines: changes,
+      tsMs: Date.now(),
+    };
+    captureFrames.set(id, {
+      windowStart: start,
+      lines,
+      hash,
+      alt,
+      cols,
+      rows,
+      cursorX,
+      cursorY,
+      frameId,
+    });
+    pendingFull.delete(id);
+    // sink 是 IPC 边界，抛错只记、绝不让终端渲染链路受影响
+    try {
+      deltaSink(delta);
+    } catch {
+      /* 旁路失败不影响主链路 */
+    }
+  } catch {
+    /* buffer 正在被重建等瞬时状态，等下一次 tick */
+  }
 }

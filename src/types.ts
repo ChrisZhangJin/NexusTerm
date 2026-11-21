@@ -1,3 +1,4 @@
+import type { RunBudget } from "./lib/agentBudget";
 /** 会话持久化记录 */
 export interface SessionRecord {
   id: string;
@@ -319,6 +320,40 @@ export interface AgentConfig {
    * 默认关 —— 日志里可能带命令输出，即便后端已脱敏也不该默认落盘。
    */
   trace: boolean;
+  /**
+   * 一轮运行的预算（步数 / 时间 / 输出字符）。用尽即暂停等用户「继续」，不是失败。
+   * 旧配置没有这一项，后端 serde(default) 与前端 normalize 都落到默认（25 步 / 10 分钟 / 输出不限）。
+   */
+  budget: RunBudget;
+  /**
+   * 模型单价表（美元 / 百万 token，按模型名匹配；多条命中取最长的）。
+   * 没命中就只显示 token、不显示钱。旧配置没有这一项时后端给几款价格确定的默认值。
+   */
+  prices: ModelPrice[];
+}
+
+/** 一条模型单价（后端 `usage::ModelPrice`） */
+export interface ModelPrice {
+  /** 模型名里含它（不分大小写）就用这条 */
+  pattern: string;
+  /** 美元 / 百万输入 token */
+  inputPerM: number;
+  /** 美元 / 百万输出 token */
+  outputPerM: number;
+}
+
+/** 一轮对话的用量（`nx://agent/usage/{session}` 与流式问答 `done` 里的 `usage`，后端 `usage::RunUsage`） */
+export interface RunUsage {
+  /** 含缓存命中 / 写入 */
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  /** 服务方没报用量、按字数估的 */
+  estimated: boolean;
+  /** 有单价才有 */
+  costUsd?: number | null;
+  elapsedSecs: number;
 }
 
 /** 某个会话当前的旁路缓冲状态（后端 `BufferStats` 的镜像） */
@@ -336,6 +371,8 @@ export type AgentDoneReason = "stop" | "length" | "cancelled";
 /** `nx://agent/done/{sessionId}` 的载荷 */
 export interface AgentDonePayload {
   reason: AgentDoneReason;
+  /** 这次问答的用量（旧后端没有） */
+  usage?: RunUsage;
 }
 
 /** 聊天面板里的一条消息。纯前端对象，不进 IPC。 */
@@ -354,6 +391,10 @@ export interface AgentMessage {
   approve?: AgentApproveRequest;
   /** 审批结果：true 已允许 / false 已拒绝 / undefined 还在等人 */
   approveResult?: boolean;
+  /** 模型请求用户输入密码（nx_secret）；卡片里有掩码输入框。值只活在卡片组件的本地 state，绝不进这里 */
+  secret?: AgentSecretRequest;
+  /** 密码卡片的结局：submitted 已提交 / skipped 已跳过 / expired 已超时或已失效 / undefined 还在等人 */
+  secretResult?: "submitted" | "skipped" | "expired";
 }
 
 // ———————————————————————————— Agentic（会动手的那种） ————————————————————————————
@@ -362,6 +403,10 @@ export interface AgentMessage {
 export interface AgentTarget {
   id: string;
   label: string;
+  /** 终端当前目录（文件工具补全相对路径用） */
+  cwd?: string | null;
+  /** 重启后找回这个 console 用的线索（托管时传给后端存进 ConsoleRef） */
+  hint?: HostConsoleHint;
 }
 
 /** `agent_run` 的入参 */
@@ -383,6 +428,23 @@ export interface AgentRunRequest {
    * 后端据此提示模型：这类程序的输出抓不到，要用 capture-pane / docker logs 之类的 skill。
    */
   consoleAlt?: boolean;
+  /**
+   * 运行模式。缺省 / null = 普通「对话」一轮；`"steward"` = 托管：模型是手和脑、屏幕识别盯屏，
+   * 预算与审批超时更宽（后端决定），危险命令仍先问人。
+   */
+  mode?: "steward" | null;
+  /** 可选的预算覆盖（后端会夹紧）。缺省用该模式的默认预算 */
+  budget?: AgentRunBudgetOverride | null;
+  /** 这一轮属于哪段对话（按连接分开，见 `convKeyOf`）：模型消息历史与运行摘要按它存取 */
+  conversation?: string;
+}
+
+/** `agent_run` 的预算覆盖（camelCase，与后端 `RunBudgetOverride` 一致）；字段缺省 = 用默认 */
+export interface AgentRunBudgetOverride {
+  maxSteps?: number;
+  maxMinutes?: number;
+  /** 最多花费（微美元），0 = 不限 */
+  maxCostMicros?: number;
 }
 
 /**
@@ -391,7 +453,12 @@ export interface AgentRunRequest {
  * 刻意是「扁平结构 + kind」而不是判别联合：多数字段本就可选，渲染时不用做类型收窄。
  */
 export interface AgentStep {
-  /** plan | tool | exec | result | skip | note | answer | open | export | tab | waiting */
+  /**
+   * plan | tool | exec | result | skip | note | answer | open | export | tab | waiting
+   * | paused（运行暂停，等用户继续 / 停止）| resumed | keys | wait | screen | skill（技能回放的一步，`command` 形如「2/5 执行：…」）| secret（前三者是「手和眼」：发按键 / 等输出 / 读屏幕；
+   * watch（托管：盯屏等待长任务 / 脚本，`output` 为空 = 进行中）；secret 是密码通道：请用户输入密码，`command` 是理由，`secretStatus` 是结局。
+   * `output` 为空 = 进行中，有值（哪怕是空串）= 已收尾，`text` 是一句话结论）
+   */
   kind: string;
   step: number;
   /** kind:"tool" 专用：模型调用的工具名（原始，如 nx_tab） */
@@ -408,6 +475,75 @@ export interface AgentStep {
   reasons?: string[];
   /** kind:"waiting" 专用：命令发出去之后已经等了多少秒，还没收到结果 */
   elapsedSecs?: number;
+  /** 终端此刻停在什么上（对输出尾部的启发式分类），见 `AgentPromptKind` */
+  promptKind?: AgentPromptKind;
+  /**
+   * kind:"secret" 收尾时专用：provided（已输入并写入终端）| declined | timeout | cancelled | failed。
+   * 只有状态——密码本身不会出现在任何事件里。
+   */
+  secretStatus?: AgentSecretStatus;
+  /** kind:"memory" 专用：被新增 / 删除的主机备忘 id（`command` 是操作 add | forget | read） */
+  memoryId?: string;
+  /** kind:"skill"（技能回放进度卡）专用：running | ok | deviated | failed | skipped | declined */
+  skillStatus?: string;
+  /** kind:"paused" 专用：为什么暂停（steps | time | output | user）。`text` 是「做了什么 / 还差什么」 */
+  pauseKind?: string;
+  /** kind=todo：整张计划清单 */
+  todo?: TodoItem[];
+  /**
+   * kind:"gate"（托管门禁卡）：refused（拒绝）| asked（要你批准）| notified（执行后通知）。
+   * `command` 是想做的那一步（已脱敏），`reasons[0]` 是人话原因，`text` 是「屏幕被识别为：…」
+   */
+  gateVerdict?: "refused" | "asked" | "notified";
+  /** kind:"gate"：命中的契约禁止项（内置标签或自定义关键字原文） */
+  denyItem?: string;
+  /** kind:"gate"：命中的是底线项（放不开） */
+  denyLocked?: boolean;
+  /** kind:"gate"：现场暂存 id，「这是误判」时交给 host_report_misread */
+  gateId?: string;
+  /**
+   * kind:"reveal"（交付通道 `nx_reveal`）：交给用户的内容（密码 / 密钥 / 节点链接…），模型看不到它。
+   * **只在内存里**：落盘前 `toPersisted` 会删掉，读回来的卡片没有这个字段（显示「已交付的内容不保存」）。
+   * 同一张卡上 `text` 是标题，`command` 是来源（文件 / 命令），`output` 是「N 行，M 字节」。
+   */
+  revealContent?: string;
+}
+
+/** 计划清单的一项（nx_todo） */
+export interface TodoItem {
+  text: string;
+  status: "pending" | "in_progress" | "done";
+}
+
+/** 终端尾部的交互提示分类（与后端 `prompt::PromptKind` 的 snake_case 名字一致） */
+export type AgentPromptKind =
+  | "password"
+  | "yes_no"
+  | "pager"
+  | "menu"
+  | "repl"
+  | "shell_prompt"
+  | "unknown";
+
+export type AgentSecretStatus = "provided" | "declined" | "timeout" | "cancelled" | "failed";
+
+/**
+ * `nx://agent/secret/{sessionId}` 的载荷：Agent 请用户输入一个密码（`nx_secret`）。
+ *
+ * 用户在掩码输入框里输入后走 `agentSecretAck(requestId, value)`，值**直接进后端、写进 pty**，
+ * 不经过模型。这里**没有**任何值字段。
+ */
+export interface AgentSecretRequest {
+  requestId: string;
+  /** 要往哪个会话输入 */
+  target: string;
+  targetLabel: string;
+  /** 模型给的理由（后端已清洗成单行） */
+  reason: string;
+  /** 请求发出时终端的分类；不是 password 时卡片要提醒「终端似乎没在要密码」 */
+  promptKind?: AgentPromptKind;
+  /** 多少秒内必须答复，超时按拒绝处理 */
+  timeoutSecs: number;
 }
 
 /** `nx://agent/approve/{sessionId}` 的载荷：请人点头 */
@@ -415,14 +551,19 @@ export interface AgentApproveRequest {
   requestId: string;
   /**
    * danger：危险命令（仅审批模式下出现）；
-   * scope：动作超出了本轮作用范围，任何执行模式下都要人点头。
+   * scope：动作超出了本轮作用范围，任何执行模式下都要人点头；
+   * skill：技能回放里的逐步确认（审批模式）/ 偏离后让用户选「继续 / 重试 / 中止」。
    * 缺省按 danger 处理（兼容旧载荷）。
    */
-  kind?: "danger" | "scope";
+  kind?: "danger" | "scope" | "skill" | "file" | "file_sensitive" | "file_read_sensitive";
   command: string;
   target: string;
   targetLabel: string;
   reasons: string[];
+  /** kind=file：写 / 改文件的差异预览 */
+  diff?: string;
+  /** kind=file*：差异预览是否完整（false = 卡上看不到全部修改） */
+  previewComplete?: boolean;
 }
 
 /**
@@ -443,6 +584,20 @@ export interface AgentTabRequest {
   name?: string;
 }
 
+/**
+ * `nx://agent/screen` 的载荷：请前端把某个会话此刻的 xterm 屏幕读出来（`nx_screen`）。
+ * 办完（或办不成）必须回一句 `agentScreenAck`。
+ */
+export interface AgentScreenRequest {
+  requestId: string;
+  /** 发起这次读取的会话，只为定位来源 */
+  sessionId: string;
+  /** 要读哪个会话的屏幕 */
+  target: string;
+  /** 最多回多少字符（取末尾） */
+  maxChars: number;
+}
+
 /** 一个标签页的对外视图（回执里的清单） */
 export interface AgentTabInfo {
   id: string;
@@ -460,7 +615,11 @@ export type AgentRunMode = "ask" | "act";
  *  "confirmed" 是活体确认过「真的没有前台进程了」，"silence" 是静默兜底（问不出确定答案）。 */
 export interface AgentExecResult {
   output: string;
-  reason: "confirmed" | "silence" | "timeout" | "cancelled";
+  /** "awaiting_input"：命令没结束，终端停在一个等待输入的交互提示上（见 `promptKind`）；
+   *  "handover"：终端交给了另一个程序（docker exec / ssh 的新 shell、tmux / vim 等全屏程序） */
+  reason: "confirmed" | "silence" | "timeout" | "awaiting_input" | "handover" | "cancelled";
+  /** 收尾时终端停在什么上；取消时没有 */
+  promptKind?: AgentPromptKind;
 }
 
 /**
@@ -483,3 +642,492 @@ export interface SweepReport {
   apiKeys: number;
 }
 
+// ——————————————————————————————— Skill（Phase 3.1） ———————————————————————————————
+// 与 Rust `agent::skill` 的 serde 形状一一对应（字段 camelCase，枚举值 snake_case）。
+// 模型、校验规则与安全约束见该模块顶部注释。skill 里永远没有密码值：
+// `secret` 步骤只有理由与参数引用名。
+
+export type SkillRisk = "low" | "medium" | "high";
+export type SkillOnUnexpected = "ask" | "stop" | "llm";
+export type SkillSource = "recorded" | "migrated_macro" | "manual" | "imported";
+
+/** 适用主机范围：不限，或「会话 id / 主机名 glob（`*` 通配）」列表 */
+export type SkillHostScope = { kind: "any" } | { kind: "list"; hosts: string[] };
+
+export interface SkillParam {
+  /** `[A-Za-z_][A-Za-z0-9_]*`，≤64 字符，在 skill 内唯一 */
+  name: string;
+  description: string;
+  /** secret 参数不得有默认值 */
+  default?: string;
+  required: boolean;
+  /** 为真：值运行时走密码通道，不随调用传入、不存库、不进模型上下文 */
+  secret: boolean;
+}
+
+/** 每个步骤共有的字段 */
+interface SkillStepCommon {
+  /** 本步最多等多久（100..=600000） */
+  timeoutMs?: number;
+  /** 做完这步后屏幕上应出现的 pattern（子串或 `/regex/i`） */
+  expectAfter?: string;
+  /** 偏离期望时：问用户（缺省）/ 停止 / 交给 LLM */
+  onUnexpected?: SkillOnUnexpected;
+}
+
+export type SkillStep =
+  /** 敲一行命令并等结束；`command` 单行，可含 `{{param}}` */
+  | ({ kind: "exec"; command: string } & SkillStepCommon)
+  /** 原始按键，语法同 `nx_send_keys`（`<C-c>` `<Enter>` `\x03`…） */
+  | ({ kind: "keys"; keys: string } & SkillStepCommon)
+  /** 等屏幕出现 expect 再应答；`secret` 为真时 `respond` 只能是空串或唯一一个 `{{secret 参数}}` */
+  | ({ kind: "expect_respond"; expect: string; respond: string; secret: boolean } & SkillStepCommon)
+  /** 密码占位：运行时由用户输入。没有 value 字段 */
+  | ({ kind: "secret"; reason: string; param?: string } & SkillStepCommon)
+  /** 只检查屏幕 */
+  | ({ kind: "screen_check"; expect: string } & SkillStepCommon);
+
+export interface SkillCheck {
+  expect: string;
+  timeoutMs?: number;
+}
+
+/** 库里的完整 skill。时间为 Unix 秒。 */
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  params: SkillParam[];
+  steps: SkillStep[];
+  verify: SkillCheck | null;
+  /** 后端保证不低于自动评估值（sudo / rm / 重定向覆盖 / 参数决定程序名 → high） */
+  risk: SkillRisk;
+  hostScope: SkillHostScope;
+  source: SkillSource;
+  /** 只有后端回放引擎能增加；步骤 / 参数 / 验证 / 范围被编辑后清零；导入的永远从 0 开始 */
+  successCount: number;
+  failCount: number;
+  lastRunTs: number | null;
+  createdAt: number;
+  updatedAt: number;
+  schemaVersion: number;
+}
+
+/** 创建 / 更新提交的内容：没有 id、计数、时间戳（由后端铸造，无法伪造） */
+export interface SkillInput {
+  name: string;
+  description: string;
+  params: SkillParam[];
+  steps: SkillStep[];
+  verify: SkillCheck | null;
+  risk: SkillRisk;
+  hostScope: SkillHostScope;
+  /** 仅创建时有效（缺省 manual）；更新时忽略 */
+  source?: SkillSource;
+}
+
+// ——————————————————————————————— 旧宏迁移（Phase 3.5） ———————————————————————————————
+// 与 Rust `agent::macro_migrate` 对应。警告从不引用被怀疑为口令的原文。
+
+/** 单条宏的迁移预览（不写库）：有 draft = 会保存的草稿；否则看 skipReason / errors */
+export interface MacroMigrationPreview {
+  macroId: string;
+  macroName: string;
+  draft: SkillInput | null;
+  skipReason: string | null;
+  errors: string[];
+  warnings: string[];
+}
+
+export type MacroMigrationOutcome =
+  | { kind: "migrated"; skillId: string }
+  | { kind: "skipped"; reason: string }
+  | { kind: "failed"; errors: string[] };
+
+export interface MacroMigrationResult {
+  macroId: string;
+  macroName: string;
+  outcome: MacroMigrationOutcome;
+  warnings: string[];
+}
+
+
+// ——————————————————————————————— 主机记忆（Phase 4.5） ———————————————————————————————
+// 与 Rust `agent::hostmem` 对应。备忘按稳定主机键归档（ssh:user@host:port / local / tab:标签名），
+// 主机键由后端推导，前端只传会话 id + 标签名。
+
+export type HostNoteKind = "prompt" | "sudo" | "path" | "quirk" | "other";
+export type HostNoteSource = "agent" | "user";
+
+export interface HostNote {
+  id: string;
+  hostKey: string;
+  text: string;
+  kind: HostNoteKind;
+  source: HostNoteSource;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 会话所属的主机。origin = label 说明没认出主机，只是按标签名归档 */
+export interface HostRef {
+  key: string;
+  display: string;
+  origin: "ssh" | "local" | "label";
+}
+
+export interface HostMemoryView {
+  host: HostRef | null;
+  notes: HostNote[];
+  maxNotes: number;
+  maxChars: number;
+}
+
+// ———————————————————————————— 技能回放（Phase 4.2 / 4.3） ————————————————————————————
+
+/** 单步结果（`status` 为判别字段） */
+export type SkillStepResult =
+  | { status: "ok" }
+  | { status: "deviated"; expected: string; sawTail: string }
+  | { status: "failed"; reason: string }
+  | { status: "skipped" }
+  | { status: "declined" };
+
+/** 整次运行的结局（`kind` 为判别字段） */
+export type SkillRunOutcome =
+  | { kind: "completed" }
+  | { kind: "verify_failed" }
+  | { kind: "deviation_stopped" }
+  | { kind: "aborted_by_user" }
+  | { kind: "aborted_by_llm" }
+  | { kind: "cancelled" }
+  | { kind: "declined" }
+  | { kind: "took_over" }
+  /** 4.4：当前会话超出技能的适用主机范围，没有执行任何操作 */
+  | { kind: "out_of_scope"; reason: string }
+  | { kind: "failed"; reason: string }
+  | { kind: "error"; reason: string };
+
+/** 4.4 信任档位：confirm 每个写步骤都确认；trusted 只读且连续干净成功 N 次（自动模式下免逐步确认）；guarded 非只读，永远逐步确认 */
+export type SkillTrustLevel = "confirm" | "trusted" | "guarded";
+
+/** `skill_trust` 的单项：后端算出的信任结论 + 当前会话是否在适用主机范围内 */
+export interface SkillTrustView {
+  id: string;
+  level: SkillTrustLevel;
+  /** 当前连续干净成功次数 */
+  streak: number;
+  /** 免逐步确认所需次数 */
+  needed: number;
+  /** 中文原因（给 tooltip） */
+  reason: string;
+  /** 传了会话才有：true 在范围内、false 超出（运行会被拒绝）；未传为 null */
+  scopeOk: boolean | null;
+  scopeReason: string | null;
+}
+
+/** `skill_run` 的返回：完整运行报告。`suggestedUpdates` 只是建议，后端不会改 skill。 */
+export interface SkillRunReport {
+  skillId: string;
+  skillName: string;
+  outcome: SkillRunOutcome;
+  steps: {
+    index: number;
+    kind: string;
+    summary: string;
+    result: SkillStepResult;
+    note: string;
+    attempts: number;
+  }[];
+  verify?: { expected: string; ok: boolean; sawTail: string } | null;
+  deviations: { stepIndex: number; expected: string; sawTail: string; resolution: string }[];
+  llmInterventions: number;
+  suggestedUpdates: {
+    stepIndex?: number | null;
+    field: string;
+    message: string;
+    suggestedValue?: string | null;
+  }[];
+  /** true 已记成功 / false 已记失败 / 未记 */
+  recorded?: boolean | null;
+}
+
+// ——————————————————————————————— 连接迁移 ———————————————————————————————
+// 与 Rust `migrate::{ExportSummary, ImportSummary}` 一一对应。只有计数与警告，没有任何凭据。
+
+export interface ConnExportSummary {
+  sessions: number;
+  passwords: number;
+  passphrases: number;
+  totpSeeds: number;
+  keys: number;
+  warnings: string[];
+}
+
+export interface ConnImportSummary {
+  imported: number;
+  /** 与已有连接 (host, port, username, name) 相同而跳过的条数 */
+  skipped: number;
+  passwords: number;
+  passphrases: number;
+  totpSeeds: number;
+  keys: number;
+  warnings: string[];
+}
+
+// ——— 统一托管（host_*，设计见 docs/nexus-host-unified-design.md §2） ———
+
+/** 卡片上的一个选项：按钮文字 + 点了之后作为用户答复送回模型的话 */
+export interface HostCardOption {
+  label: string;
+  reply: string;
+}
+
+/** 完成判据（后端 `host::Check`） */
+export type HostCheck =
+  | { kind: "screenMatches"; re: string }
+  | { kind: "commandOk"; cmd: string }
+  | { kind: "fileExists"; path: string }
+  | { kind: "manual"; text: string };
+
+export interface HostCheckResult {
+  check: HostCheck;
+  passed: boolean;
+  detail: string;
+  /** 没法核验（终端前台不是 shell、又没有旁路通道）：不阻塞完成 */
+  skipped?: boolean;
+}
+
+/** 卡片来源：ask = nx_ask_user / 无动作回复；approve = 写入审批；watchdog / manualCheck 留给 PR7 */
+export type HostCardKind =
+  | { kind: "ask" }
+  | { kind: "approve" }
+  | { kind: "watchdog" }
+  | { kind: "manualCheck"; summary: string; checks: HostCheckResult[] }
+  /** nx_secret：密码在面板的密码卡片里输入，不经 host_answer */
+  | { kind: "secret" }
+  /** 开始托管时模型起草的完成判据，等你编辑 / 接受 */
+  | { kind: "criteriaDraft"; draft: HostCheck[] };
+
+/** 一张等人处理的卡片：永远等下去，没有倒计时、没有默认动作 */
+export interface HostHumanCard {
+  id: string;
+  kind: HostCardKind;
+  question: string;
+  options: HostCardOption[];
+  recommendation?: string | null;
+  reasons: string[];
+  /** 写文件审批卡上的差异预览 */
+  diff?: string | null;
+  /** 写文件审批卡：差异预览是否完整 */
+  previewComplete?: boolean | null;
+  createdWallMs: number;
+}
+
+export interface HostCardReply {
+  cardId: string;
+  text: string;
+  /** 只对审批 / 人工确认卡有意义 */
+  approved?: boolean;
+}
+
+export type HostPauseCause =
+  | { kind: "budget"; reason: string }
+  | { kind: "deadline" }
+  | { kind: "user" }
+  | { kind: "llmDown"; error: string };
+
+/** 后端 `HostPhase`（serde tag = kind；变体内字段保持 snake_case） */
+export type HostPhase =
+  | { kind: "running" }
+  | { kind: "waitingHuman"; card: HostHumanCard }
+  | { kind: "userDriving"; resume_to: HostPhase }
+  | { kind: "paused"; cause: HostPauseCause }
+  | { kind: "suspended"; reason: "appRestart" | "consoleGone" | "llmDown"; resume_to: HostPhase }
+  | { kind: "completed"; summary: string; checks: HostCheckResult[] }
+  | { kind: "failed"; error: string }
+  | { kind: "stopped" };
+
+/** `nx://host/{contractId}` / `nx://host/all` 的载荷，也是 host_status / host_list 的返回 */
+export interface HostStatus {
+  contractId: string;
+  runId: string;
+  consoleId: string;
+  goal: string;
+  state: string;
+  phase: HostPhase;
+  /** 被托管终端的可读名字 */
+  label: string;
+  /** 给人看的提示（例如接驳后降为确认档的原因） */
+  notice?: string | null;
+  /** 计划清单（nx_todo） */
+  todo?: TodoItem[];
+  /** 契约当前的禁止项 */
+  deny: string[];
+  /** 当前授权档位（auto / notify / approve / yolo） */
+  tier?: string;
+  /** 契约级花费（步数 / 时长 / token / 钱） */
+  spent?: HostSpent;
+  /** 本次托管操作的全部终端（主终端在前）；旧后端没有该字段 = 只有 consoleId 一个 */
+  consoles?: HostConsoleStatus[];
+}
+
+/** 托管里的一个终端 */
+export interface HostConsoleStatus {
+  consoleId: string;
+  label: string;
+  /** 主终端：不写 target 的动作落在它上面，判据核验也在它上面跑 */
+  primary: boolean;
+  /** 此刻不在（tab 关了 / 连接断了） */
+  missing: boolean;
+}
+
+/** 托管契约级花费（后端 `checkpoint::Spent`）。token / 钱的字段旧记录没有 */
+export interface HostSpent {
+  steps: number;
+  elapsedSecs: number;
+  outputChars: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  estimated?: boolean;
+  /** 微美元；`priced` 为 false 时无意义 */
+  costMicros?: number;
+  priced?: boolean;
+}
+
+/** 一次托管的「实际改动」：从真正执行了的命令 / 文件写入里提取（后端 `host::changes`），不是模型的说法 */
+export interface HostChangeSummary {
+  /** 写过 / 改过的文件（nx_write / nx_edit 的写法，可能是相对路径或 ~ 开头；含 tee / > 重定向、sed -i） */
+  filesWritten: string[];
+  /** 执行过的命令条数 */
+  commands: number;
+  packages: string[];
+  services: string[];
+  ports: string[];
+  containers: string[];
+  downloads: string[];
+  /** 删除：rm / rmdir 的目标、docker rm / rmi / prune、iptables -F / -X、userdel（旧存档可能没有） */
+  removals?: string[];
+}
+
+/**
+ * 托管第一次写这个文件时的情况：backedUp = 原文已备份（可还原）；created = 托管新建的文件；
+ * skipped = 原文没备份（原因在 note）。旧索引没有该字段 = backedUp
+ */
+export type HostBackupStatus = "backedUp" | "created" | "skipped";
+
+/** 托管改文件前留的原文备份（「还原」用） */
+export interface HostBackupEntry {
+  id: string;
+  /** 解析后的绝对路径 */
+  path: string;
+  consoleId: string;
+  tsMs: number;
+  size: number;
+  sha256: string;
+  restoredAt?: number | null;
+  status?: HostBackupStatus;
+  /** skipped 的原因 */
+  note?: string | null;
+}
+
+/** `host_changes` 的返回 */
+export interface HostChanges {
+  changes: HostChangeSummary;
+  backups: HostBackupEntry[];
+}
+
+/** `host_history` 的一条：结束了的托管 */
+export interface HostHistoryItem {
+  contractId: string;
+  goal: string;
+  label: string;
+  consoleId: string;
+  startedAt: number;
+  endedAt: number;
+  durationMs: number;
+  /** completed / failed / stopped */
+  state: string;
+  summary?: string | null;
+  error?: string | null;
+  checks: HostCheckResult[];
+  /** 契约级花费（含 token / 钱；旧记录没有那几项） */
+  spent: HostSpent & { injections?: number };
+  changes: HostChangeSummary;
+  backups: HostBackupEntry[];
+}
+
+/** 前端给的 console 线索：后端据此存 ConsoleRef，重启后按它给候选 tab 排序 */
+export interface HostConsoleHint {
+  consoleId: string;
+  label?: string;
+  /** 保存的 SSH 连接记录 id；本地 shell 为空 */
+  sessionRecordId?: string | null;
+  cwd?: string | null;
+  tmux?: string | null;
+}
+
+/** 接驳候选：分数越高越像重启前那个 console */
+export interface HostReattachCandidate {
+  consoleId: string;
+  label: string;
+  score: number;
+}
+
+/** 「加预算继续」的新上限；不给的字段不变 */
+export interface HostBudgetGrant {
+  maxSteps?: number;
+  maxMinutes?: number;
+  maxOutputChars?: number;
+  /** 最多花费（微美元），0 = 不限 */
+  maxCostMicros?: number;
+}
+
+/** 开始托管的附加选项：禁止项、基于上一个任务的完成报告继续 */
+export interface HostStartOpts {
+  deny?: string[];
+  followUp?: { goal: string; summary: string };
+  /** 多终端托管：主终端之外一并交给 AI 操作的终端（tab id） */
+  extra?: string[];
+}
+
+export interface HostStartRequest {
+  consoleId: string;
+  goal: string;
+  authorityTier?: string;
+  label?: string;
+  budget?: { maxSteps?: number; maxMinutes?: number; maxCostMicros?: number };
+  consoleText?: string;
+  consoleAlt?: boolean;
+  /** YOLO：直接采用模型起草的完成判据，不经确认就开始（不改档位与禁项） */
+  yolo?: boolean;
+  /** 重启后找回这个 console 用的线索 */
+  consoleRef?: HostConsoleHint;
+  /** 契约禁止项（面板上编辑过的；后端总会补回 secret / permanent_grant） */
+  deny?: string[];
+  /** 基于上一个托管任务的完成报告继续：上一个目标与报告作为新任务的开场上下文 */
+  followUp?: { goal: string; summary: string };
+  /** 多终端托管：主终端之外一并操作的终端（带重启后找回用的线索） */
+  extraConsoles?: HostConsoleHint[];
+}
+
+/** `nx://host/{contractId}/notify`：通知档写入后的通知卡 */
+export interface HostNotice {
+  contractId: string;
+  /** 对应的决策记录 seq（纠正按它找） */
+  seq: number;
+  kind: string;
+  text: string;
+  undoWindowMs: number;
+  tsMs: number;
+}
+
+/** 托管需要人时的提醒设置（后端 settings 表 `host_notify`） */
+export interface HostNotifyConfig {
+  /** 窗口不在前台时弹系统通知 */
+  system: boolean;
+  /** 窗口不在前台时让任务栏 / Dock 图标闪烁 */
+  taskbar: boolean;
+  /** 空 = 不推；否则 POST JSON {title, body, host, state, ts} */
+  webhook: string;
+}

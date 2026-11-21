@@ -143,6 +143,17 @@ export class GhostText {
   /** 画灰字时光标在哪（用于判断还能不能照原样擦掉，见 `clear`） */
   private atX = -1;
   private atY = -1;
+  /**
+   * 灰字的位置还没定下来：`show()` 写出去了，但 xterm 还没解析到那里。
+   *
+   * xterm 的 `write()` 是异步的 —— 缓冲里的光标要等之前排队的数据（比如还没解析完的回显）
+   * 处理完才更新。`show()` 当场读光标会读到**旧**位置，灰字却画在新光标后面；之后 `clear()`
+   * 判「光标被挪走」、一个字节都不敢写，灰字就永久留在已执行的命令行上。
+   * 所以位置改在写队列里取（`write("", cb)` 的回调，正好排在灰字之前）。
+   */
+  private markPending = false;
+  /** 每次 show / clear 换一个号，过期的位置回调不再生效 */
+  private markSeq = 0;
 
   get text(): string {
     return this.shown;
@@ -162,6 +173,8 @@ export class GhostText {
    */
   atMark(term: Terminal): boolean {
     if (!this.active) return false;
+    // 刚画、位置还在写队列里：光标此刻就在灰字前（灰字之后才轮到别的写入）
+    if (this.markPending) return true;
     const buf = term.buffer.active;
     return this.atX === buf.cursorX && this.atY === buf.baseY + buf.cursorY;
   }
@@ -183,7 +196,8 @@ export class GhostText {
   clear(term: Terminal): GhostClear {
     if (!this.shown) return "idle";
     const buf = term.buffer.active;
-    const sameSpot = this.atX === buf.cursorX && this.atY === buf.baseY + buf.cursorY;
+    // 位置还没定（灰字仍在写队列里）：擦除序列排在灰字之后，处理到它时光标正停在灰字前 —— 照原样擦
+    const sameSpot = this.markPending || (this.atX === buf.cursorX && this.atY === buf.baseY + buf.cursorY);
     const cols = this.shownCols;
     const text = this.shown;
     const oldX = this.atX;
@@ -192,6 +206,8 @@ export class GhostText {
     this.shownCols = 0;
     this.atX = -1;
     this.atY = -1;
+    this.markPending = false;
+    this.markSeq++;
     if (sameSpot) {
       term.write(CSI + cols + "X");
       // 画灰字的前提就是「当时光标后没有真字」，光标又没动过，
@@ -238,9 +254,16 @@ export class GhostText {
     if (cleared !== "erased" && !cursorAtLineEnd(term)) return "";
     if (!used) return "";
 
-    const buf = term.buffer.active;
-    this.atX = buf.cursorX;
-    this.atY = buf.baseY + buf.cursorY;
+    // 位置在写队列里取：回调排在灰字之前，触发时之前的数据都已解析、光标正停在灰字的起点
+    const seq = ++this.markSeq;
+    this.markPending = true;
+    term.write("", () => {
+      if (seq !== this.markSeq) return; // 这期间已经 clear / 重画过
+      const b = term.buffer.active;
+      this.atX = b.cursorX;
+      this.atY = b.baseY + b.cursorY;
+      this.markPending = false;
+    });
 
     // 关暗色用 22m 而不是 0m：0m 连前景/背景一起重置，在彩色提示符后面画过一次
     // 灰字，提示符就掉色了。回退格数用列数而非字符数 —— 一个中文字要退两格。

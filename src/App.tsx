@@ -6,6 +6,8 @@ import TerminalView, { clock } from "./components/TerminalView";
 import FileManager from "./components/FileManager";
 import TabBar from "./components/TabBar";
 import StatusBar from "./components/StatusBar";
+import { consoleHintOf, hostTabBadges } from "./lib/host";
+import { useHostRuns } from "./lib/useHostRuns";
 import { AgentPanel } from "./components/AgentPanel";
 import {
   AppearanceDialog,
@@ -17,7 +19,7 @@ import {
 import KeyManagerDialog from "./components/KeyManagerDialog";
 import MacroDialog from "./components/MacroDialog";
 import AuthPromptDialog from "./components/AuthPromptDialog";
-import { api, onAuthPrompt, onAgentTab, stringToBytes } from "./api";
+import { api, onAuthPrompt, onAgentScreen, onAgentTab, stringToBytes } from "./api";
 import { loadAgentConfig } from "./lib/agent";
 import {
   folderMoveItems,
@@ -33,7 +35,19 @@ import {
   stealthInput,
   type TermContext,
 } from "./lib/context";
-import { cellWidth, getTerm, onInput, snapshotConsole, waitForPrompt } from "./lib/termRegistry";
+import {
+  cellWidth,
+  getTerm,
+  onInput,
+  requestFullFrame,
+  setScreenCaptureEnabled,
+  setScreenDeltaSink,
+  setStewardConsoles,
+  setAgentCapture,
+  snapshotConsole,
+  waitForPrompt,
+} from "./lib/termRegistry";
+import { stewardApi, stewardConsoleIds } from "./lib/steward";
 import {
   isTerminalReply,
   runMacro,
@@ -104,6 +118,9 @@ export default function App() {
    * 否则一轮对话的历史会随收起一起丢掉。
    */
   const [agentOpen, setAgentOpen] = useState(false);
+  // 标签栏的「等你」徽标：单独订阅一份托管总表（面板收起时也要亮）
+  const hostRunsAll = useHostRuns();
+  const hostBadges = useMemo(() => hostTabBadges(hostRunsAll.hosts), [hostRunsAll.hosts]);
   /**
    * AI 面板宽度（px），持久化到 localStorage。
    * 拖动左缘手柄改宽；clamp 在 [AGENT_MIN_W, AGENT_MAX_W]，避免拖没或把终端挤没。
@@ -1025,7 +1042,7 @@ export default function App() {
     () =>
       tabs
         .filter((t) => t.status === "connected" || t.status === "reconnecting")
-        .map((t) => ({ id: t.id, label: t.customTitle || t.title || t.id })),
+        .map((t) => ({ id: t.id, label: t.customTitle || t.title || t.id, hint: consoleHintOf(t) })),
     [tabs],
   );
 
@@ -1173,6 +1190,94 @@ export default function App() {
     });
     return () => void un.then((f) => f());
   }, [handleAgentTab]);
+
+  /**
+   * Agent 读屏请求（`nx_screen`）：把目标会话此刻的 xterm 屏幕抓出来回给后端。
+   *
+   * 后端 3 秒等不到回执就退回旁路缓冲，所以**每条分支都必须 ack**（含终端不存在、抓取抛错），
+   * 否则 Agent 会白等满 3 秒。
+   */
+  useEffect(() => {
+    const un = onAgentScreen((req) => {
+      let snap: { text: string; alt: boolean } | null = null;
+      try {
+        snap = snapshotConsole(req.target, req.maxChars);
+      } catch (e) {
+        void api.agentScreenAck(req.requestId, false, undefined, undefined, `读取屏幕出错：${String(e)}`).catch(() => false);
+        return;
+      }
+      if (!snap) {
+        void api
+          .agentScreenAck(req.requestId, false, undefined, undefined, `没有 id 为「${req.target}」的终端`)
+          .catch(() => false);
+        return;
+      }
+      void api.agentScreenAck(req.requestId, true, snap.text, snap.alt).catch(() => false);
+    });
+    return () => void un.then((f) => f());
+  }, []);
+
+  /**
+   * P0 会话织物：把屏幕帧采集接到后端 ScreenStore。
+   *
+   * 采集挂在 termRegistry（TerminalView 持有 xterm 实例），这里只注入 IPC 出口并开闸，
+   * 所以 AgentPanel 关掉 / 浮出 / 最小化都不影响上报。needFull 时立刻重采一帧全量。
+   * 纯本地行为：不出网、不调模型、不写终端。
+   */
+  useEffect(() => {
+    setScreenDeltaSink((delta) => {
+      void stewardApi
+        .screenDelta(delta)
+        .then((ack) => {
+          if (ack.needFull) requestFullFrame(delta.consoleId);
+        })
+        .catch(() => undefined);
+    });
+    setScreenCaptureEnabled(true);
+    return () => {
+      setScreenDeltaSink(null);
+      setScreenCaptureEnabled(false);
+    };
+  }, []);
+
+  /**
+   * 采集 / 心跳只对有托管契约的 console 生效。托管面板只在打开时轮询，
+   * 这里在 App 层兜底：契约开始 / 停止的事件到来时立刻对一次账，另每 5s 慢轮询
+   * 一次（整个 app 一次 IPC，与终端数无关）—— 重新接驳后签回的契约也能接上。
+   */
+  // Agent 运行（对话模式也算）驾驶某个终端期间也采屏幕帧：分类按渲染后的画面认（全屏 / Ink TUI），
+  // 运行结束就停。后端在控制权变化时推 `nx://agent/capture`
+  useEffect(() => {
+    const un = listen<{ session: string; on: boolean }>("nx://agent/capture", (e) => {
+      if (e.payload?.session) setAgentCapture(e.payload.session, !!e.payload.on);
+    });
+    return () => {
+      void un.then((f) => f()).catch(() => undefined);
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    const sync = () => {
+      void stewardApi
+        .status()
+        .then((list) => {
+          if (!disposed) setStewardConsoles(stewardConsoleIds(list));
+        })
+        .catch(() => undefined);
+    };
+    sync();
+    const timer = window.setInterval(sync, 5000);
+    const un = stewardApi.onEvent((e) => {
+      if (e.kind === "contract_started" || e.kind === "contract_stopped") sync();
+    });
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      void un.then((f) => f()).catch(() => undefined);
+      setStewardConsoles([]);
+    };
+  }, []);
 
   const saveSession = useCallback(
     async (payload: NewSession, secrets: SessionSecrets) => {
@@ -1503,6 +1608,7 @@ export default function App() {
         onMove={moveTab}
         agentOpen={agentOpen}
         onToggleAgent={() => setAgentOpen((v) => !v)}
+        hostBadges={hostBadges}
       />
 
       <div className="workspace">
@@ -1655,7 +1761,7 @@ export default function App() {
 
           面板**始终挂载**：整份对话是全局唯一的（助手面向所有会话，
           切标签只换「当前上下文」，不换聊天记录），卸载即丢失。
-          收起只是把 visible 置 false（组件自己返回 null、停掉事件订阅），
+          收起只是把 visible 置 false（组件自己返回 null；事件订阅不断，进行中的一轮照常收得到），
           并把容器宽度归零。
         */}
         <div
@@ -1732,7 +1838,16 @@ export default function App() {
       {settingsWin === "shortcuts" && <ShortcutsDialog onClose={() => setSettingsWin(null)} />}
       {settingsWin === "agent" && <AgentDialog onClose={() => setSettingsWin(null)} />}
       {settingsWin === "keys" && <KeyManagerDialog onClose={() => setSettingsWin(null)} />}
-      {settingsWin === "security" && <SecurityDialog onClose={() => setSettingsWin(null)} />}
+      {settingsWin === "security" && (
+        <SecurityDialog
+          onClose={() => setSettingsWin(null)}
+          // 导入连接后：列表和会话附加设置（登录脚本 / 兼容模式）都要重新拉
+          onImported={() => {
+            void refresh();
+            void loadExtras();
+          }}
+        />
+      )}
 
       {macroOpen && (
         <MacroDialog

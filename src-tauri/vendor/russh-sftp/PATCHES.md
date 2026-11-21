@@ -30,7 +30,23 @@ NexusTerm 空闲时长期占 10% CPU（16 核机器上实测 = 1.3~1.7 个核）
 改法与上游 3.0.1 完全一致：出错即 `break`。后续本文件会自动走到 `rc.cancel()`，
 把写那一侧的循环一并收掉。
 
+## 补丁 2：`posix-rename@openssh.com` 扩展
+
+位置：`src/extensions.rs`（常量 + `PosixRenameExtension`）、`src/client/rawsession.rs`
+（`posix_rename`）、`src/client/session.rs`（`Features::posix_rename` + `SftpSession::posix_rename`）。
+
+SFTPv3 的 `SSH_FXP_RENAME` 在 OpenSSH 上遇到已存在的目标会直接失败，没法「写临时文件
+再改名覆盖」做原子替换。OpenSSH 早就提供了 `posix-rename@openssh.com`（底层就是
+`rename(2)`，原子覆盖），但 2.4.0 的 `SftpSession` 不记录服务器声明的扩展、内部的
+`RawSftpSession` 又是私有的，外面无从发送。
+
+写法照抄同文件里的 `hardlink`：握手时按 `version.extensions` 记下是否支持；
+不支持时返回 `Ok(false)` 不发包。Agent 文件工具（`agent/files.rs`）靠它做远端原子写，
+不支持时才退回「备份 → 改名 → 删备份」。
+
 ## 升级注意事项
 
 升级 `russh-sftp` 前先确认上游是否保留了这处 `break`（3.0.1 已经保留）；丢弃补丁
 等于把这个忙等 bug 放回 app 里。
+
+上游若已原生支持 `posix-rename@openssh.com`，补丁 2 可以丢弃，改调上游的方法即可。
