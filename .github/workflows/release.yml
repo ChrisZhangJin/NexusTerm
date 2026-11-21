@@ -86,7 +86,9 @@ jobs:
           # 手动触发时没有 tag，留空即只构建、不碰 Release
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: "NexusTerm __VERSION__"
-          releaseDraft: true
+          # 直接发正式 Release（不再先存草稿再手动发布）。两个平台各自把安装包传到同一个 Release 上，
+          # 先跑完的平台会先建好 Release，另一个平台的包稍后补上
+          releaseDraft: false
           prerelease: false
           releaseBody: |
             NexusTerm __VERSION__
