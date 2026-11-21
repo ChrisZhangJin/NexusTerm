@@ -23,7 +23,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-14
+          # macos-14 运行机 GitHub 已不再提供（任务一启动就被取消：「configuration 'macos-14-arm64-us-default' is not supported」，
+          # v0.4.0 的 macOS 包就是这样没出来的），改用 macos-15（Apple Silicon，照样构建通用包）
+          - platform: macos-15
             label: macOS universal
             # universal 需要两个架构的 std，构建时各编一遍再 lipo
             target: aarch64-apple-darwin,x86_64-apple-darwin
