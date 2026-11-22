@@ -7,6 +7,9 @@ import type { IDecoration, Terminal } from "@xterm/xterm";
  * - translateToString 粗筛后才逐格建「字符 → 列」映射：CJK / emoji 占 2 列，
  *   直接用字符串下标当列号会错位
  * - marker 随滚动历史裁剪自动释放
+ * - 备用屏（vim / less / tmux 全屏）也画：备用屏只有一屏、没有滚动历史，程序是**原地重绘**的（滚动 / 翻页
+ *   不产生新行），所以每次输出后都要整屏重扫，标记才能跟着内容走；回到主屏时备用屏的 marker 随之释放，
+ *   buffer 切换会触发一次重扫把主屏的标记画回来
  */
 
 export interface MarkRule {
@@ -104,11 +107,12 @@ export class Highlighter {
     this.dispose();
   }
 
-  /** 输出 / 重排后的去抖重扫（无规则时零开销） */
+  /** 输出 / 重排后的去抖重扫（无规则时零开销）。备用屏只有一屏、扫得快，而内容是原地重绘的，等得短一点免得标记落后 */
   refresh(): void {
     if (this.rules.length === 0) return;
     if (this.timer) window.clearTimeout(this.timer);
-    this.timer = window.setTimeout(() => this.scan(), 250);
+    const alt = this.term.buffer.active.type !== "normal";
+    this.timer = window.setTimeout(() => this.scan(), alt ? 60 : 250);
   }
 
   dispose(): void {
@@ -124,8 +128,6 @@ export class Highlighter {
 
     const term = this.term;
     const buf = term.buffer.active;
-    // 备用屏（vim / less / tmux 全屏）不支持装饰，等回到主屏再画
-    if (buf.type !== "normal") return 0;
 
     const norm = (s: string) => (this.caseSensitive ? s : s.toLowerCase());
     const needles = this.rules.map((r) => ({ ...r, n: norm(r.text) }));

@@ -193,6 +193,74 @@ function Meter({
   );
 }
 
+/** 按主机记住查到的公网 IP（null = 查过但没拿到），切回同一主机不再重查 */
+const publicIpCache = new Map<string, string | null>();
+
+/**
+ * 当前主机的公网 IP：切到一个新主机时查一次（SSH 在远端经旁路通道问，本地在本机问），不轮询。
+ * 点击复制，双击重新查询。兼容模式（堡垒机，不开旁路通道）不查。
+ */
+function PublicIp({
+  hostKey,
+  tabId,
+  local,
+  sessionId,
+  onNotify,
+}: {
+  hostKey: string;
+  tabId: string;
+  local: boolean;
+  sessionId?: string | null;
+  onNotify?: (msg: string) => void;
+}) {
+  const [ip, setIp] = useState<string | null | undefined>(() => publicIpCache.get(hostKey));
+  const [busy, setBusy] = useState(false);
+  const compat = !local && getExtras(sessionId).compat;
+  const query = useCallback(async () => {
+    if (compat) return;
+    setBusy(true);
+    try {
+      const r = await api.hostPublicIp(tabId);
+      publicIpCache.set(hostKey, r);
+      setIp(r);
+    } catch {
+      publicIpCache.set(hostKey, null);
+      setIp(null);
+    } finally {
+      setBusy(false);
+    }
+    // tabId 变了（同主机的另一个标签）不必重查：key 按主机
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostKey, compat]);
+  useEffect(() => {
+    if (!publicIpCache.has(hostKey)) void query();
+  }, [hostKey, query]);
+  if (compat) return null;
+  const where = local ? "本机" : "这台主机";
+  return (
+    <span
+      className="sb-item sb-ip"
+      title={
+        ip
+          ? `${where}的公网 IP（出网时对外显示的地址）\n点击复制 · 双击重新查询`
+          : busy
+            ? "正在查询公网 IP…"
+            : `没查到${where}的公网 IP（可能不能出网，或没有 curl / wget）\n双击重新查询`
+      }
+      onClick={() => {
+        if (!ip) return;
+        void api
+          .clipboardWrite(ip)
+          .then(() => onNotify?.(`已复制公网 IP ${ip}`))
+          .catch(() => {});
+      }}
+      onDoubleClick={() => void query()}
+    >
+      公网 {busy && ip === undefined ? "…" : ip ?? "—"}
+    </span>
+  );
+}
+
 /**
  * 按主机共享的最近一次采集结果（key = user@host:port，本机为 "local"）：
  * 切回同主机的另一个标签时立刻显示上次数值，不再闪「采集资源…」。
@@ -573,6 +641,17 @@ export default function StatusBar({
       </span>
       {status === "connected" && <Ecg beat={beat} lastBeat={lastBeat} source={beatSource} />}
       <span className="sb-item">{peer ?? "—"}</span>
+      {statsTarget && (
+        <PublicIp
+          // 同一主机（含本机）的标签共享：切换标签不重查
+          key={`ip:${statsTarget.hostKey}`}
+          hostKey={statsTarget.hostKey}
+          tabId={statsTarget.tabId}
+          local={statsTarget.local}
+          sessionId={statsTarget.sessionId}
+          onNotify={onNotify}
+        />
+      )}
       {prefs.showResources && statsTarget && (
         <ResourceMeters
           // 同一主机（含本机）的标签共享组件与数据：切换时不重采、不闪烁

@@ -218,7 +218,7 @@ fn pump(app: &AppHandle, console: &str, vt: &Arc<Mutex<Vt>>) -> (EventId, Arc<At
 /// 起本地 bash，固定提示符、进 `dir`、清屏，等提示符那一帧落进 ScreenStore。
 fn boot_shell(app: &AppHandle, console: &str, dir: &Path, vt: &Arc<Mutex<Vt>>) {
     let state = app.state::<AppState>();
-    state.local.spawn(console, COLS as u16, ROWS as u16, app).expect("起本地 shell");
+    state.local.spawn(console, COLS as u16, ROWS as u16, None, app).expect("起本地 shell");
     let cmd = format!(" unset HISTFILE PROMPT_COMMAND; export PS1='\\u@e2e:\\w\\$ '; cd '{}'; clear\n", dir.display());
     state.local.write(console, cmd.as_bytes()).expect("写 PTY");
     let t0 = Instant::now();

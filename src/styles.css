@@ -552,6 +552,9 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .sb-connected { color: var(--accent); }
 .sb-error { color: var(--danger); }
 .sb-item { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 公网 IP：点击复制，双击重新查询 */
+.sb-ip { cursor: pointer; font-variant-numeric: tabular-nums; }
+.sb-ip:hover { color: var(--text); }
 .sb-spacer { flex: 1; }
 
 /* 服务端心跳（keepalive@openssh.com）：每次心跳描一遍心电波形。

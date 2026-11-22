@@ -285,6 +285,8 @@ pub fn run() {
             cmd::append_file_b64,
             cmd::append_input_log,
             cmd::local_spawn,
+            cmd::local_probe,
+            cmd::host_public_ip,
             cmd::local_write,
             cmd::local_resize,
             cmd::local_close,

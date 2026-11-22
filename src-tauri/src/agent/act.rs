@@ -2749,7 +2749,7 @@ pub async fn open_session(
         OpenKind::Local => {
             state
                 .local
-                .spawn(&id, default_cols(), default_rows(), app)
+                .spawn(&id, default_cols(), default_rows(), None, app)
                 .map_err(AgentError::BadRequest)?;
         }
         OpenKind::Ssh { session_record_id } => {

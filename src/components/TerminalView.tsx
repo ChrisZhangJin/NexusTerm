@@ -49,6 +49,7 @@ import { isMacOS } from "../lib/platform";
 import { installMacKeyboard, setInputTrace, traceSend } from "../lib/macInput";
 import { SHIFT_ENTER_SEQ, shouldSendMetaEnter, textBeforeCursor, wantsMetaEnter } from "../lib/shiftEnter";
 import { isSftpCommand } from "../lib/sftpCmd";
+import { opensLink } from "../lib/links";
 import { attachZmodem, type ZmodemGate } from "../lib/zmodem";
 import type { ClosedInfo, TerminalTab, Theme } from "../types";
 
@@ -155,6 +156,8 @@ interface Props {
   onDisconnect?: () => void;
   /** 打开 SFTP 文件管理器（仅 SSH） */
   onOpenSftp?: () => void;
+  /** 一行命令被当成真的 shell 命令提交了（行有回显、不在全屏程序里）。本地与 SSH 都会报 */
+  onShellCommand?: (line: string) => void;
   /** 不在前台时收到新输出——标签栏据此点亮提醒动效。只在非活跃时调用。 */
   onBackgroundOutput?: () => void;
 }
@@ -269,6 +272,7 @@ export default function TerminalView({
   onNotify,
   onDisconnect,
   onOpenSftp,
+  onShellCommand,
   onBackgroundOutput,
   peerHost,
   status,
@@ -376,6 +380,8 @@ export default function TerminalView({
   useEffect(() => watchRecording(tabId), [tabId]);
   const onOpenSftpRef = useRef(onOpenSftp);
   onOpenSftpRef.current = onOpenSftp;
+  const onShellCommandRef = useRef(onShellCommand);
+  onShellCommandRef.current = onShellCommand;
   const sftpTimerRef = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(sftpTimerRef.current), []);
   /**
@@ -384,6 +390,7 @@ export default function TerminalView({
    * 稍后打开 / 同步 SFTP 面板。命令本身照常发给远端，这里不拦。
    */
   const onCommandCommitted = useCallback((line: string) => {
+    onShellCommandRef.current?.(line);
     if (kind !== "ssh" || statusRef.current !== "connected") return;
     if (!isSftpCommand(line)) return;
     // 延后一点：别和回车的回显抢；面板内部会再探测 cwd
@@ -608,7 +615,27 @@ export default function TerminalView({
     const unicode = new Unicode11Addon();
     term.loadAddon(unicode);
     term.unicode.activeVersion = "11"; // 中文 / emoji 宽度必须启用
-    term.loadAddon(new WebLinksAddon());
+    // 终端里的链接：Ctrl+点击（macOS 为 ⌘+点击）用系统浏览器打开；单纯点击不打开，免得点一下选文字就跳网页。
+    // 悬停时在终端区域显示提示（xterm 自己会给链接加下划线）
+    term.loadAddon(
+      new WebLinksAddon(
+        (event, uri) => {
+          if (!opensLink(event, isMacOS())) return;
+          event.preventDefault();
+          void import("@tauri-apps/plugin-opener")
+            .then(({ openUrl }) => openUrl(uri))
+            .catch(() => {});
+        },
+        {
+          hover: () => {
+            if (host) host.title = isMacOS() ? "⌘+点击 在浏览器中打开" : "Ctrl+点击 在浏览器中打开";
+          },
+          leave: () => {
+            if (host) host.title = "";
+          },
+        }
+      )
+    );
     const search = new SearchAddon({ highlightLimit: 2000 });
     term.loadAddon(search);
     searchRef.current = search;

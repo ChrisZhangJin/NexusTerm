@@ -10,8 +10,10 @@ export interface TermContext {
   cwd?: string;
   /** 所在 tmux 会话名 */
   tmux?: string;
-  /** 正在前台运行的 docker exec 命令（原样 argv，可直接重放） */
+  /** 正在前台运行的 docker exec / attach / run（原样 argv；只用于提示和标签名，不重放） */
   docker?: { container: string; argv: string[] };
+  /** 正在前台运行的 kubectl exec（进到哪个 pod） */
+  k8s?: { pod: string; namespace?: string; container?: string };
   /** 探测时间 */
   at: number;
 }
@@ -23,6 +25,14 @@ const DOCKER_OPTS_WITH_VALUE = new Set([
   "-u", "--user", "-w", "--workdir", "-e", "--env", "--env-file", "--detach-keys",
 ]);
 
+/** docker run 的带参选项（其后紧跟一个值；--name 单独处理） */
+const DOCKER_RUN_OPTS_WITH_VALUE = new Set([
+  "-u", "--user", "-w", "--workdir", "-e", "--env", "--env-file", "-v", "--volume", "-p", "--publish",
+  "--network", "--net", "--entrypoint", "-h", "--hostname", "--mount", "--platform", "-l", "--label",
+  "--add-host", "--device", "--cpus", "-m", "--memory", "--restart", "--user", "--group-add", "--ulimit",
+  "--log-driver", "--log-opt", "--shm-size", "--cap-add", "--cap-drop", "--security-opt", "--pull",
+]);
+
 function parseDocker(argv: string[]): TermContext["docker"] | undefined {
   const bin = (argv[0] ?? "").split("/").pop();
   let i = 1;
@@ -32,15 +42,78 @@ function parseDocker(argv: string[]): TermContext["docker"] | undefined {
   while (i < argv.length && argv[i].startsWith("-")) {
     i += argv[i].includes("=") ? 1 : 2;
   }
-  if (argv[i] !== "exec") return; // docker run / attach 等无法安全重放
-  i++;
-  while (i < argv.length && argv[i].startsWith("-")) {
-    const opt = argv[i];
-    i += DOCKER_OPTS_WITH_VALUE.has(opt) ? 2 : 1;
+  const sub = argv[i];
+  if (sub === "exec" || sub === "attach") {
+    i++;
+    while (i < argv.length && argv[i].startsWith("-")) {
+      const opt = argv[i];
+      i += DOCKER_OPTS_WITH_VALUE.has(opt) ? 2 : 1;
+    }
+    const container = argv[i];
+    if (!container) return;
+    return { container, argv };
   }
-  const container = argv[i];
-  if (!container) return;
-  return { container, argv };
+  if (sub === "run") {
+    // docker run -it --name web nginx bash：有 --name 用它，否则用镜像名
+    let name: string | undefined;
+    i++;
+    while (i < argv.length && argv[i].startsWith("-")) {
+      const opt = argv[i];
+      if (opt === "--name") {
+        name = argv[i + 1];
+        i += 2;
+      } else if (opt.startsWith("--name=")) {
+        name = opt.slice("--name=".length);
+        i++;
+      } else {
+        i += opt.includes("=") || !DOCKER_RUN_OPTS_WITH_VALUE.has(opt) ? 1 : 2;
+      }
+    }
+    const container = name || argv[i];
+    if (!container) return;
+    return { container, argv };
+  }
+  return;
+}
+
+/** kubectl exec 的带参选项（其后紧跟一个值） */
+const KUBECTL_OPTS_WITH_VALUE = new Set([
+  "-n", "--namespace", "-c", "--container", "--context", "--kubeconfig", "-s", "--server", "--cluster",
+  "--user", "--token", "--as", "--request-timeout", "-f", "--filename", "--pod-running-timeout",
+]);
+
+/** `kubectl exec -it web-7d9f -n prod -c app -- bash`（也认 oc、k3s kubectl、`pod/web-7d9f`） */
+export function parseKubectl(argv: string[]): TermContext["k8s"] | undefined {
+  const bin = (argv[0] ?? "").split("/").pop();
+  let i = 1;
+  if (bin === "k3s" || bin === "microk8s") {
+    if (argv[1] !== "kubectl") return;
+    i = 2;
+  } else if (bin !== "kubectl" && bin !== "oc") return;
+  let namespace: string | undefined;
+  let container: string | undefined;
+  let pod: string | undefined;
+  let seenExec = false;
+  for (; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--") break;
+    if (a.startsWith("-")) {
+      const eq = a.indexOf("=");
+      const key = eq > 0 ? a.slice(0, eq) : a;
+      const val = eq > 0 ? a.slice(eq + 1) : KUBECTL_OPTS_WITH_VALUE.has(key) ? argv[++i] : undefined;
+      if (key === "-n" || key === "--namespace") namespace = val;
+      if (key === "-c" || key === "--container") container = val;
+      continue;
+    }
+    if (!seenExec) {
+      if (a !== "exec" && a !== "attach") return; // 只认进容器的子命令
+      seenExec = true;
+      continue;
+    }
+    if (!pod) pod = a.replace(/^pods?\//, "");
+  }
+  if (!seenExec || !pod) return;
+  return { pod, namespace, container };
 }
 
 export function parseProbe(raw: Record<string, string>): TermContext | null {
@@ -57,9 +130,12 @@ export function parseProbe(raw: Record<string, string>): TermContext | null {
   if (/^(docker|docker-compose|podman)$/.test(fgComm) && fgArgs.length) {
     ctx.docker = parseDocker(fgArgs);
   }
+  if (/^(kubectl|oc|k3s|microk8s)$/.test(fgComm) && fgArgs.length) {
+    ctx.k8s = parseKubectl(fgArgs);
+  }
   // 前台是 vim / less 之类时，其 cwd 与 shell 一致；docker 客户端 cwd 也就是 shell cwd
   ctx.cwd = raw.SHELL_CWD || raw.FG_CWD;
-  return ctx.cwd || ctx.tmux || ctx.docker ? ctx : null;
+  return ctx.cwd || ctx.tmux || ctx.docker || ctx.k8s ? ctx : null;
 }
 
 /** POSIX 单引号转义 */
@@ -128,6 +204,9 @@ export function restoreNotice(
   if (ctx.docker) {
     rows.push(["docker", `原会话在容器 ${ctx.docker.container} 中，未自动进入`]);
   }
+  if (ctx.k8s) {
+    rows.push(["k8s", `原会话在 pod ${ctx.k8s.pod} 中，未自动进入`]);
+  }
   return rows;
 }
 
@@ -136,6 +215,21 @@ export function describe(ctx: TermContext): string {
   const bits: string[] = [];
   if (ctx.tmux) bits.push(`tmux:${ctx.tmux}`);
   if (ctx.docker) bits.push(`docker:${ctx.docker.container}`);
+  if (ctx.k8s) bits.push(`pod:${ctx.k8s.pod}`);
   if (ctx.cwd) bits.push(ctx.cwd);
   return bits.join(" · ");
+}
+
+/**
+ * 标签页自动名：进了 k8s pod 就叫 pod 名，进了容器就叫容器名，在 tmux 里就叫 tmux 会话名；
+ * 都不是（回到普通 shell）返回 undefined，标签恢复原名。用户手动改过的名字始终优先（由调用方处理）。
+ */
+export function autoTitleOf(ctx: TermContext | null | undefined): string | undefined {
+  if (!ctx) return undefined;
+  return ctx.k8s?.pod || ctx.docker?.container || ctx.tmux || undefined;
+}
+
+/** 这条刚提交的命令会不会换掉「前台在哪」（进 / 出 tmux、容器、pod）：是就提前探测一次，不干等 15 秒的轮询 */
+export function changesForeground(line: string): boolean {
+  return /^\s*(sudo\s+(-\S+\s+)*)?(tmux|screen|docker|docker-compose|podman|kubectl|oc|k3s|microk8s|exit|logout)\b/.test(line);
 }
