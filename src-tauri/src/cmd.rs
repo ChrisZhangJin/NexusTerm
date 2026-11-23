@@ -332,6 +332,9 @@ pub async fn host_public_ip(id: String, state: State<'_, AppState>) -> Result<Op
 
 /// 本机公网 IP：与远端脚本问同一组服务，每个 4 秒超时（走系统代理时得到的是代理出口的 IP）。
 async fn local_public_ip() -> Option<String> {
+    // rustls-no-provider：建 Client 前必须先装 crypto provider，否则 reqwest 内部硬 panic
+    // （release 下 panic=abort 会直接杀掉整个进程）。provider 是全局 OnceLock，重复调用安全。
+    crate::agent::llm::ensure_crypto_provider();
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4)).build().ok()?;
     for u in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://ipinfo.io/ip", "https://icanhazip.com"] {
         let Ok(resp) = client.get(u).header("User-Agent", "curl/8").send().await else { continue };

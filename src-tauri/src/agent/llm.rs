@@ -1198,7 +1198,8 @@ async fn read_error_body(resp: reqwest::Response) -> String {
 /// `rustls-no-provider` 把「用哪个 provider」交给调用方，**不装就在建 Client 时
 /// panic**（reqwest 内部是硬 panic）。所以这一步必须在任何 `Client::builder()`
 /// 之前发生，且绝不能失败后继续往下走。
-fn ensure_crypto_provider() {
+/// `pub(crate)`：本机公网 IP 查询（`cmd.rs::local_public_ip`）也自建 Client，必须先过这里。
+pub(crate) fn ensure_crypto_provider() {
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
         // install_default 返回 Err 表示「已经有人装过了」——那正是我们要的状态，
