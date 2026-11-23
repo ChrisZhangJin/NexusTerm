@@ -1,6 +1,7 @@
 /**
- * Console 自动补全的数据层：**完全不碰 DOM / xterm**，只回答一个问题——
- * 根据这个会话的历史，人现在敲的这半句最可能是哪条命令？
+ * Console 命令历史的数据层：**完全不碰 DOM / xterm**。
+ * 记下人在这个会话敲过的命令、并入 shell 自己的历史文件，给 Shift+Tab 历史面板用；
+ * 顺带跟踪「当前正在敲的那一行」（`feedKeys`），回车时据此知道提交的是哪条命令。
  *
  * ## 历史从哪来
  *
@@ -21,8 +22,6 @@
 
 /** 每个 key 记住多少条历史命令。与后端 `histfile::MAX_ITEMS` 保持一致。 */
 const HISTORY_CAP = 1000;
-/** 少于这么多字符就预测的话，噪声远大于帮助 —— 敲一个 `d` 不该猜出 `docker ps -a` */
-const MIN_PREDICT_CHARS = 2;
 
 const CR = 0x0d;
 const DEL = 0x7f;
@@ -205,41 +204,10 @@ export async function loadHistory(key: string, fetch: () => Promise<string[]>): 
   h.items = [...older, ...h.items].slice(-HISTORY_CAP);
 }
 
-/**
- * 历史预测：这半句之后最可能是什么。
- *
- * 返回**完整的一条命令**，调用方减去已输入的部分就是该显示的灰字。
- *
- * 只按「最近用过」排序：终端里的工作是成串的，刚跑过 `tail -f` 下一次多半
- * 还是它 —— 比词频模型简单，也更贴合真实手感。
- */
-export function predictHistory(key: string, line: string): string | null {
-  const prefix = line.trimStart();
-  if (prefix.length < MIN_PREDICT_CHARS || hasControl(prefix)) return null;
-
-  const items = histories.get(key)?.items;
-  if (!items) return null;
-  for (let i = items.length - 1; i >= 0; i--) {
-    const cmd = items[i];
-    // 完全相同的那条跳过：人都已经打完了，再「预测」一遍只是打扰
-    if (cmd.length > prefix.length && cmd.startsWith(prefix)) return cmd;
-  }
-  return null;
-}
-
-/** 历史里所有以 prefix 开头的命令（最近用过的在前）。给下拉列表用。 */
-export function historyMatches(key: string, prefix: string): string[] {
-  const items = histories.get(key)?.items;
-  // 门槛与 `predictHistory` 保持一致：敲一个字符就弹一条完整历史，
-  // 噪声远大于帮助——真正想要的是「接着敲了几个字，像是在找这条」。
-  if (!items || prefix.length < MIN_PREDICT_CHARS) return [];
-  const out: string[] = [];
-  for (let i = items.length - 1; i >= 0; i--) {
-    const cmd = items[i];
-    if (cmd !== prefix && cmd.startsWith(prefix)) out.push(cmd);
-    if (out.length >= 30) break;
-  }
-  return out;
+/** 这个 key 的全部历史，**最近用过的在前**（Shift+Tab 历史面板用）。返回副本。 */
+export function historyItems(key: string): string[] {
+  const items = histories.get(key)?.items ?? [];
+  return [...items].reverse();
 }
 
 /**
@@ -249,25 +217,4 @@ export function historyMatches(key: string, prefix: string): string[] {
  */
 export function dropCompletion(key: string, shared: boolean): void {
   if (!shared) histories.delete(key);
-}
-
-// ——— 合成候选 ———
-
-export interface CompletionItem {
-  /** 主文本：整条历史命令 */
-  label: string;
-  /** 按 Tab 真正补进去的那一段 —— **不含已经敲出来的部分** */
-  insert: string;
-}
-
-/** 候选列表：按当前整行做前缀匹配，不区分命令名/参数阶段。 */
-export function buildCompletions(key: string, line: string): CompletionItem[] {
-  const prefix = line.trimStart();
-  if (!prefix) return [];
-
-  const out: CompletionItem[] = [];
-  for (const cmd of historyMatches(key, prefix)) {
-    out.push({ label: cmd, insert: cmd.slice(prefix.length) });
-  }
-  return out;
 }

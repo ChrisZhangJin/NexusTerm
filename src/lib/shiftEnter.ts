@@ -111,7 +111,7 @@ export function atShellPrompt(ctx: ShiftEnterCtx): boolean {
 /**
  * 屏幕状态是否要求把 Shift+Enter 改成 `ESC \r`：
  *
- * - shell 提示符（两种屏幕都算，tmux 里的 shell 也是）→ 否，当回车（含灰字路径）；
+ * - shell 提示符（两种屏幕都算，tmux 里的 shell 也是）→ 否，当回车；
  * - 光标被关掉（Ink 程序：Claude Code / nanopi，tmux 里跑也一样）→ 是；
  * - 备用屏 + 光标可见（vim 插入模式、less、htop、tmux 里的 shell）→ 否：
  *   `ESC` 会让 vim 退出插入模式，保持今天的 `\r`；
