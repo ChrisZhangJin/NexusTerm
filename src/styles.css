@@ -2681,3 +2681,11 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 .ap-reveal-body { max-height: 240px; overflow: auto; user-select: text; white-space: pre-wrap; word-break: break-all; }
 .ap-reveal-body.masked { user-select: none; color: var(--text-dim); letter-spacing: 1px; }
 .ap-reveal-note { align-self: center; color: var(--text-dim); font-size: 11px; }
+
+.connection-import { width: min(600px, calc(100vw - 32px)); box-sizing: border-box; }
+.connection-import-files { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.connection-import details { color: var(--text-dim); }
+.connection-import summary { cursor: pointer; }
+.connection-import-results { max-height: 36vh; overflow: auto; overflow-wrap: anywhere; }
+.connection-import-results ul { padding-inline-start: 20px; margin: 0; }
+.connection-import-results li { margin-bottom: 6px; }

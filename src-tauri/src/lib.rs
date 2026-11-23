@@ -24,6 +24,7 @@ mod sysstat;
 mod totp;
 mod vault;
 mod xsh;
+mod connection_import;
 
 pub(crate) fn app_data_dir(app: &tauri::AppHandle) -> PathBuf {
     app.path()
@@ -251,6 +252,7 @@ pub fn run() {
             cmd::load_password,
             cmd::reorder_sessions,
             cmd::import_xsh,
+            cmd::preview_connection_import,
             cmd::export_xsh,
             cmd::export_sessions_xsh,
             cmd::export_all_xsh,

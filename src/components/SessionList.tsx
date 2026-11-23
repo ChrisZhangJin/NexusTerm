@@ -32,6 +32,7 @@ interface Props {
     canExportSession: boolean;
     exportSessionHint?: string;
     onImport: () => void;
+    onImportTermius: () => void;
     onExportSession: () => void;
     onExportAll: () => void;
   };
