@@ -54,6 +54,7 @@ import {
   startRecording,
   type MacroRecorder,
 } from "./lib/macro";
+import ConnectionImportDialog from "./components/ConnectionImportDialog";
 import ConfirmDialog, { type ConfirmOptions } from "./components/ConfirmDialog";
 import { describeSftpActivity, sftpActivity } from "./lib/sftpActivity";
 import { resolveAuth } from "./lib/auth";
@@ -100,6 +101,7 @@ const clampAgentWidth = (w: number) =>
   Math.min(AGENT_MAX_W, Math.max(AGENT_MIN_W, Math.round(w)));
 
 export default function App() {
+  const [connectionImportOpen, setConnectionImportOpen] = useState(false);
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeTab, setActiveTab] = useState<string | null>(null);
@@ -1933,6 +1935,10 @@ export default function App() {
         />
       )}
 
+      {connectionImportOpen && (
+        <ConnectionImportDialog sessions={sessions} onClose={() => setConnectionImportOpen(false)} onImported={refresh} />
+      )}
+
       {confirmState && (
         <ConfirmDialog
           opts={confirmState.opts}
@@ -1970,6 +1976,10 @@ export default function App() {
             onImport: () => {
               setSessionPopupOpen(false);
               importXsh();
+            },
+            onImportTermius: () => {
+              setSessionPopupOpen(false);
+              setConnectionImportOpen(true);
             },
             onExportSession: () => {
               setSessionPopupOpen(false);

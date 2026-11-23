@@ -113,6 +113,9 @@ export const api = {
     invoke<void>("save_password", { id, password }),
   loadPassword: (id: string) => invoke<string | null>("load_password", { id }),
 
+  previewConnectionImport: (path: string, format: "ssh" | "csv") =>
+    invoke<{ sessions: NewSession[]; warnings: string[] }>("preview_connection_import", { path, format }),
+
   importXsh: (paths: string[]) =>
     invoke<{ label: string; ok: boolean; error: string | null; passwordImported: boolean }[]>(
       "import_xsh",

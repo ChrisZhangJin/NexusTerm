@@ -1192,3 +1192,11 @@ pub async fn connections_import(
     crate::migrate::apply_import(&state.store, &state.keys_dir, payload).await
 }
 
+
+/// Preview only: parsing runs off the UI thread and does not write to the store.
+#[tauri::command]
+pub async fn preview_connection_import(path: String, format: String) -> Result<crate::connection_import::Preview, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::connection_import::preview(std::path::Path::new(&path), &format))
+        .await
+        .map_err(|_| "连接配置解析任务失败".to_string())?
+}

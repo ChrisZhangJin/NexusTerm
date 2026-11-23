@@ -5,6 +5,7 @@ interface Props {
   /** 「导出当前连接」置灰时的说明 */
   exportSessionHint?: string;
   onImport: () => void;
+  onImportTermius: () => void;
   onExportSession: () => void;
   onExportAll: () => void;
 }
@@ -17,6 +18,7 @@ export default function IOMenu({
   canExportSession,
   exportSessionHint,
   onImport,
+  onImportTermius,
   onExportSession,
   onExportAll,
 }: Props) {
@@ -63,7 +65,7 @@ export default function IOMenu({
         ref={btnRef}
         className={`btn-icon io-btn${open ? " active" : ""}`}
         onClick={toggle}
-        title="导入 / 导出（Xshell .xsh）"
+        title="导入 / 导出"
         aria-haspopup="menu"
         aria-expanded={open}
       >
@@ -87,6 +89,11 @@ export default function IOMenu({
               导入 Xshell 连接 (.xsh)…
               <small>支持多选；同机同用户的密码会自动解密导入</small>
             </span>
+          </button>
+
+          <button className="io-item" role="menuitem" onClick={pick(onImportTermius)}>
+            <span className="io-glyph">⤓</span>
+            <span className="io-text">从 Termius / OpenSSH 导入…<small>选择 SSH config 或主机 CSV，预览后导入</small></span>
           </button>
 
           <div className="io-sep" />
