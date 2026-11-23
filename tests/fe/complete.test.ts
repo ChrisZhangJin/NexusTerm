@@ -14,13 +14,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  buildCompletions,
   dropCompletion,
   feedKeys,
-  historyMatches,
+  historyItems,
   loadHistory,
   newLineState,
-  predictHistory,
   recordCommand,
 } from "../../src/lib/complete";
 import { matchSessions, scanMention } from "../../src/lib/mention";
@@ -32,12 +30,10 @@ import {
   isPlainKeystroke,
 } from "../../src/lib/macInput";
 import { COMMIT_WINDOW_MS, ImeGuard, enterVerdict, isImeKey, keyInfoFrom, type KeyLike } from "../../src/lib/ime";
-import { GhostText, cursorAtLineEnd, cursorFollowsTyped } from "../../src/lib/ghost";
+import { cursorFollowsTyped } from "../../src/lib/echo";
 
-// 注：命令参数（flag）补全那一档 —— `optionsFor` / `matchOptions` / `worthAsking`
-// 与它的后端 `cmd_options` —— 已经整档下线（src/types.ts 的 `CmdOption`、
-// src/api.ts 的 `consoleCommandOptions` 一并删掉了）。当前只剩历史前缀补全，
-// 下面的用例也就只覆盖这一层。
+// 注：行内灰字补全（GhostText / 历史前缀预测）已整体删除，改为 Shift+Tab 历史面板
+// （筛选逻辑的用例在 historyPanel.test.ts）。这里只剩行状态、历史记录与回显判定。
 
 const T = "tab-1";
 
@@ -56,7 +52,7 @@ test("feedKeys 回车交出命令并清空行", () => {
   feedKeys(s, "docker ps");
   assert.equal(feedKeys(s, "\r"), "docker ps");
   assert.equal(s.text, "");
-  assert.equal(predictHistory(T, "x"), null); // 还没记进历史
+  assert.deepEqual(historyItems(T), [], "feedKeys 只交出命令，记不记历史由调用方决定");
 });
 
 test("feedKeys 一次里多个回车只返回第一条", () => {
@@ -156,8 +152,7 @@ test("历史里不会出现只有尾巴的残句", () => {
   feedKeys(s, "ttach");
   const done = feedKeys(s, "\r");
   if (done) recordCommand(id, done);
-  assert.deepEqual(historyMatches(id, "attach"), []);
-  assert.deepEqual(historyMatches(id, "ttach"), []);
+  assert.deepEqual(historyItems(id), ["tmux attach -t 0"], "行未知时回车不交命令，残句不进历史");
 });
 
 test("loadHistory：文件里的命令排在本次敲的之前，重复只留内存那份", async () => {
@@ -166,8 +161,7 @@ test("loadHistory：文件里的命令排在本次敲的之前，重复只留内
   recordCommand(id, "make test");
   await loadHistory(id, async () => ["git pull", "make test", "make build"]);
   // 最近用过的在前：make test（本次敲的，最新）> make build > git pull
-  assert.deepEqual(historyMatches(id, "ma"), ["make test", "make build"]);
-  assert.equal(predictHistory(id, "git p"), "git pull");
+  assert.deepEqual(historyItems(id), ["make test", "make build", "git pull"]);
 });
 
 test("loadHistory：读取失败当没有历史，不抛", async () => {
@@ -177,97 +171,35 @@ test("loadHistory：读取失败当没有历史，不抛", async () => {
   await loadHistory(id, async () => {
     throw new Error("该连接已启用兼容模式");
   });
-  assert.equal(predictHistory(id, "una"), "uname -a");
+  assert.deepEqual(historyItems(id), ["uname -a"]);
 });
 
-// ——— 历史预测 ———
+// ——— 历史记录 ———
 
-test("历史：最近用过的优先，重复输入只算一次", () => {
+test("历史：最近用过的在前，重复输入只留一条", () => {
   const id = "h1";
   recordCommand(id, "tail -f app.log");
   recordCommand(id, "tail -n 100 app.log");
-  recordCommand(id, "tail -f app.log"); // 再次使用 → 应排到最前
-
-  assert.equal(predictHistory(id, "tail -f"), "tail -f app.log");
-
-  // 少敲一个字符，仍能预测；且不会因为重复而给出别的
-  assert.equal(predictHistory(id, "tail -"), "tail -f app.log");
+  recordCommand(id, "tail -f app.log"); // 再次使用 → 排到最前
+  assert.deepEqual(historyItems(id), ["tail -f app.log", "tail -n 100 app.log"]);
 });
 
-test("历史预测有两个字符的门槛：敲一个字母不该弹一堆噪声", () => {
-  const id = "h2";
-  recordCommand(id, "docker ps -a");
-  assert.equal(predictHistory(id, "d"), null);
-  assert.equal(predictHistory(id, "do"), "docker ps -a");
-});
-
-test("已经打完的整条不再预测（不打扰）", () => {
-  const id = "h3";
-  recordCommand(id, "ls -la");
-  assert.equal(predictHistory(id, "ls -la"), null);
-});
-
-test("含控制字符的残句不进历史", () => {
+test("含控制字符的残句、空白都不进历史", () => {
   const id = "h4";
   recordCommand(id, "ls\x1b[Axyz");
   recordCommand(id, "  ");
-  assert.equal(predictHistory(id, "ls"), null);
+  assert.deepEqual(historyItems(id), []);
 });
 
-test("dropCompletion 放掉历史与缓存", () => {
+test("dropCompletion 放掉临时 key 的历史，共享 key 不动", () => {
   const id = "h5";
   recordCommand(id, "uname -a");
-  assert.equal(predictHistory(id, "una"), "uname -a");
+  dropCompletion(id, true);
+  assert.deepEqual(historyItems(id), ["uname -a"]);
   dropCompletion(id, false);
-  assert.equal(predictHistory(id, "una"), null);
+  assert.deepEqual(historyItems(id), []);
 });
 
-// ——— 合成候选（新实现只做历史预测） ———
-//
-// 7fbb27a 之后补全不再去问 `--help` 捞 options，改成整行历史前缀匹配。
-// 这里钉住两条不变式：insert 只补缺的那一段；候选按「最近用过的在前」。
-
-test("命令名阶段：只出历史，insert 只补缺的那一段", () => {
-  const id = "c1";
-  recordCommand(id, "git status --short");
-  recordCommand(id, "git stash list");
-  const items = buildCompletions(id, "git st");
-  assert.ok(items.length >= 2, "两条历史都该出现");
-  const st = items.find((i) => i.label === "git status --short");
-  assert.ok(st);
-  assert.equal(st.insert, "atus --short"); // 不能把已输入的 "git st" 再写一遍
-});
-
-test("insert 绝不含已输入的前缀：token + insert 必须正好补齐整条", () => {
-  const id = "c2";
-  recordCommand(id, "tail --follow /var/log/syslog");
-  for (const typed of ["t", "ta", "tail ", "tail --f"]) {
-    for (const it of buildCompletions(id, typed)) {
-      assert.equal(typed.trimStart() + it.insert, it.label, `${typed} 补出来对不上`);
-      assert.ok(it.insert.length > 0, `${typed} 不该出现空 insert（那就是重复提示）`);
-    }
-  }
-});
-
-test("已经打完的整条不再作为候选", () => {
-  const id = "c3";
-  recordCommand(id, "docker ps -a");
-  assert.deepEqual(buildCompletions(id, "docker ps -a"), []);
-});
-
-test("空行不给任何候选", () => {
-  assert.deepEqual(buildCompletions("c4", ""), []);
-  assert.deepEqual(buildCompletions("c4", "   "), []);
-});
-
-test("historyMatches：最近用过的排前面，且封顶 30 条", () => {
-  const id = "c5";
-  recordCommand(id, "make build");
-  recordCommand(id, "make test");
-  assert.deepEqual(historyMatches(id, "make"), ["make test", "make build"]);
-  for (let i = 0; i < 40; i++) recordCommand(id, `long-${i}`);
-  assert.equal(historyMatches(id, "long-").length, 30);
-});
 
 // ——— `@会话名` 联想 ———
 
@@ -316,145 +248,7 @@ test("matchSessions：结果封顶 8 条，免得标签多的时候糊满屏", (
   assert.equal(matchSessions(many, [], "").length, 8);
 });
 
-// ——— GhostText：灰字的字节序列 ———
-
-/**
- * 假 Terminal：只把 write 的内容攒下来。
- *
- * 带上最小可用的 buffer —— 灰字现在会先问一句「光标是不是在行尾」
- * （见 `cursorAtLineEnd`），没有 buffer 就没法验证这条守卫。
- * 默认光标在行尾、后面没有别的字，也就是「可以画灰字」的那种状态。
- */
-function fakeTerm(opts?: { cursorX?: number; lineText?: string }) {
-  const written: string[] = [];
-  const cells = [...(opts?.lineText ?? "")];
-  const cursorX = opts?.cursorX ?? (opts?.lineText?.length ?? 0);
-  return {
-    written,
-    cols: 80,
-    cursorX,
-    text: () => written.join(""),
-    // 假终端的写入是同步的：回调（xterm 在之前的数据解析完后才调）就该当场触发；
-    // 空写入只用来排队取回调，不算字节
-    write(s: string, cb?: () => void) {
-      if (s) written.push(s);
-      cb?.();
-    },
-    buffer: {
-      active: {
-        type: "normal",
-        cursorX,
-        cursorY: 0,
-        baseY: 0,
-        getLine: (y: number) =>
-          y === 0
-            ? {
-                getCell: (x: number) =>
-                  x < cells.length ? { getChars: () => cells[x] } : undefined,
-              }
-            : undefined,
-      },
-    },
-  };
-}
-const ESC = String.fromCharCode(27);
-
-test("灰字：暗色 → 文本 → 关暗色 → 光标左移 N 格", () => {
-  const term = fakeTerm();
-  const g = new GhostText();
-  const shown = g.show(term as never, "atus --short", 40);
-  assert.equal(shown, "atus --short");
-  assert.equal(term.text(), `${ESC}[2matus --short${ESC}[22m${ESC}[12D`);
-  assert.equal(g.active, true);
-  assert.equal(g.cols, 12);
-});
-
-test("灰字：关暗色用 22m 而不是 0m——0m 会把彩色提示符一起清掉", () => {
-  const term = fakeTerm();
-  new GhostText().show(term as never, "x", 20);
-  assert.ok(!term.text().includes(`${ESC}[0m`));
-});
-
-test("灰字：宽字符按列回退，不是按字符数", () => {
-  const term = fakeTerm();
-  const g = new GhostText();
-  g.show(term as never, "中文", 40);
-  assert.equal(g.cols, 4, "两个中文字占 4 列");
-  assert.ok(term.text().endsWith(`${ESC}[4D`), term.text());
-});
-
-test("灰字：放不下就截断，绝不换行", () => {
-  const term = fakeTerm();
-  const g = new GhostText();
-  const shown = g.show(term as never, "abcdefghij", 4); // room=4 → 预算 3
-  assert.equal(shown, "abc");
-  assert.equal(g.cols, 3);
-});
-
-test("灰字：没有空间就一个字也不画", () => {
-  const term = fakeTerm();
-  const g = new GhostText();
-  assert.equal(g.show(term as never, "abc", 1), "");
-  assert.equal(term.written.length, 0);
-});
-
-test("灰字：clear 只在画过时才擦，重复 show 会先擦旧的", () => {
-  const term = fakeTerm();
-  const g = new GhostText();
-  g.clear(term as never);
-  assert.equal(term.written.length, 0, "没画过就不需要擦");
-
-  g.show(term as never, "abc", 20);
-  const n = term.written.length;
-  g.show(term as never, "de", 20);
-  assert.ok(term.written.length > n, "第二次 show 应先擦再画");
-  // ECH（擦 n 个字符）而不是 EL（擦到行尾）：只抹掉自己画的那几列
-  assert.equal(term.written[n], `${ESC}[3X`);
-  assert.equal(g.cols, 2);
-});
-
-// ——— 行中间编辑：灰字绝不能动光标后面的真字 ———
-
-test("cursorAtLineEnd：光标后面还有字 → 不画灰字", () => {
-  // "abc def" 共 7 字，光标停在 3（"abc| def"）
-  const term = fakeTerm({ lineText: "abc def", cursorX: 3 });
-  assert.equal(cursorAtLineEnd(term as never), false);
-});
-
-test("cursorAtLineEnd：光标贴着行尾 → 可以画", () => {
-  const term = fakeTerm({ lineText: "abc def", cursorX: 7 });
-  assert.equal(cursorAtLineEnd(term as never), true);
-});
-
-test("cursorAtLineEnd：行尾的空格不算内容", () => {
-  const term = fakeTerm({ lineText: "abc     ", cursorX: 3 });
-  assert.equal(cursorAtLineEnd(term as never), true);
-});
-
-test("灰字：人在行中间时一个字节都不写（不覆盖光标后的真字）", () => {
-  const term = fakeTerm({ lineText: "abc def", cursorX: 3 });
-  const g = new GhostText();
-  assert.equal(g.show(term as never, "def", 20), "");
-  assert.equal(term.written.length, 0, "一个字节都不该写");
-  assert.equal(g.active, false);
-});
-
-test("灰字：行中间时连擦除也不该发生（不能拿 CSI K 抹到行尾）", () => {
-  const term = fakeTerm({ lineText: "abc def", cursorX: 7 });
-  const g = new GhostText();
-  g.show(term as never, "gh", 20);
-  assert.equal(g.active, true);
-
-  // 光标被挪到行中间（人按了 ← / Backspace / Home）之后再 clear：
-  // 这时从光标往后那一段已经不是我们画的字了，写了就是删用户的字
-  term.cursorX = 3;
-  term.buffer.active.cursorX = 3;
-  g.clear(term as never);
-  assert.equal(term.written.length, 1, "只有第一次 show 写过的那一次");
-  assert.equal(g.active, false, "状态该清干净，屏幕上的残字交给 shell 自己重绘");
-});
-
-// ——— 回显之后要不要把灰字画回来 ———
+// ——— 这一行有没有被回显过（决定回车时要不要记进历史） ———
 
 /** 造一个能回答「光标前那半行是什么」的假 Terminal */
 function mockTerm(lineText: string, cursorX: number) {
@@ -501,68 +295,6 @@ test("cursorFollowsTyped：真的输出来了（命令行已被顶掉）→ 不�
 test("cursorFollowsTyped：没敲东西时不重画", () => {
   const t = mockTerm("user@host:~$ ", 13);
   assert.equal(cursorFollowsTyped(t as never, ""), false);
-});
-
-test("灰字：clear 之后状态归零", () => {
-  const term = fakeTerm();
-  const g = new GhostText();
-  g.show(term as never, "abc", 20);
-  g.clear(term as never);
-  assert.equal(g.active, false);
-  assert.equal(g.cols, 0);
-  assert.equal(g.text, "");
-});
-
-// ——— 端到端：敲一行命令的完整链路 ———
-
-test("端到端：敲 'tail --f' 到按 Tab，补全的那段正好接上", () => {
-  const id = "e2e";
-  dropCompletion(id, false);
-  const s = newLineState();
-
-  // 先让历史里有一条完整命令
-  for (const ch of "tail --follow /var/log/syslog") feedKeys(s, ch);
-  recordCommand(id, feedKeys(s, "\r") ?? "");
-
-  // 再敲半句
-  for (const ch of "tail --f") feedKeys(s, ch);
-  assert.equal(s.text, "tail --f");
-
-  const items = buildCompletions(id, s.text);
-  assert.equal(items.length, 1);
-  assert.equal(items[0].label, "tail --follow /var/log/syslog");
-  assert.equal(items[0].insert, "ollow /var/log/syslog");
-
-  // 接受：只把缺的那段写进 pty，行状态同步前进
-  s.text += items[0].insert;
-  assert.equal(s.text, "tail --follow /var/log/syslog");
-  assert.ok(s.text.startsWith("tail --f"), "已输入部分不能被改写");
-});
-
-test("端到端：acceptHint 之后行状态与终端内容一致", () => {
-  const id = "e2e2";
-  dropCompletion(id, false);
-  const s = newLineState();
-  recordCommand(id, "kubectl get pods -A");
-
-  for (const ch of "kubectl g") feedKeys(s, ch);
-  const items = buildCompletions(id, s.text);
-  assert.equal(items.length, 1);
-  s.text += items[0].insert;
-  assert.equal(s.text, "kubectl get pods -A");
-
-  // 再回车 → 这条命令被记进历史（且不会因为补全而变成重复项）
-  const committed = feedKeys(s, "\r");
-  assert.equal(committed, "kubectl get pods -A");
-  recordCommand(id, committed);
-  // 去重生效：历史里仍然只有一条，再敲前缀也只提示这一条
-  const again = buildCompletions(id, "kubectl");
-  assert.equal(again.length, 1);
-  assert.equal(again[0].label, "kubectl get pods -A");
-  assert.equal(again[0].insert, " get pods -A");
-
-  // 整条打完 → 不再提示自己
-  assert.deepEqual(buildCompletions(id, "kubectl get pods -A"), []);
 });
 
 // ——— macOS 丢字修复：整条键路接管 ———
@@ -1551,216 +1283,4 @@ test("接管：中文上屏时的回车属于输入法，不能往 pty 里塞一
   host.fire("keydown", plainKey("Enter", { keyCode: 229, timeStamp: 1010 }));
   assert.equal(out.text, "", "中文确认回车不许进 pty");
   un();
-});
-
-
-// ——— 真实 xterm 的 write 是异步的：回归「按 Tab 补全失灵」———
-
-/**
- * 模拟 xterm 5.x 的 write 时序：`write()` 只入队，缓冲在 `flush()` 时才更新。
- * 只有这样能复现「刚 write 完 ECH 就去读 buffer，读到的还是没擦的灰字」。
- * 只解析 GhostText 自己会写的四种序列：文本 / `ESC[nD` / `ESC[nX` / `ESC[2m`·`22m`。
- */
-function asyncTerm(opts?: { cursorX?: number; lineText?: string }) {
-  const written: string[] = [];
-  // 与 xterm 一样：写入先排队，flush 时按顺序解析；回调在它之前的数据解析完后触发
-  const queue: { s: string; cb?: () => void }[] = [];
-  const cells = [...(opts?.lineText ?? "")];
-  let cursorX = opts?.cursorX ?? (opts?.lineText?.length ?? 0);
-  const CSI_RE = new RegExp(`${ESC}\\[(\\d*)(?:;(\\d*))?([DXmH])`, "g");
-  const apply = (s: string) => {
-    let last = 0;
-    for (const m of s.matchAll(CSI_RE)) {
-      for (const ch of s.slice(last, m.index)) cells[cursorX++] = ch;
-      last = (m.index ?? 0) + m[0].length;
-      const cmd = m[3];
-      const n = m[1] === "" ? 1 : parseInt(m[1], 10);
-      if (cmd === "D") cursorX = Math.max(0, cursorX - n);
-      else if (cmd === "X") for (let k = 0; k < n; k++) delete cells[cursorX + k];
-      else if (cmd === "H") {
-        // CUP：helper 只有一行缓冲，只支持第 1 行；列号从 1 起
-        const col = m[2] === "" || m[2] === undefined ? 1 : parseInt(m[2], 10);
-        if (n === 1) cursorX = col - 1;
-      }
-      // m：SGR，不影响字符与光标
-    }
-    for (const ch of s.slice(last)) cells[cursorX++] = ch;
-  };
-  return {
-    written,
-    cols: 80,
-    rows: 24,
-    get cursorX() {
-      return cursorX;
-    },
-    text: () => written.join(""),
-    line: () => cells.map((c) => c ?? "").join(""),
-    move(x: number) {
-      cursorX = x;
-    },
-    flush() {
-      while (queue.length) {
-        const { s, cb } = queue.shift()!;
-        apply(s);
-        cb?.();
-      }
-    },
-    write(s: string, cb?: () => void) {
-      if (s) written.push(s);
-      queue.push({ s, cb });
-    },
-    buffer: {
-      active: {
-        type: "normal",
-        get cursorX() {
-          return cursorX;
-        },
-        cursorY: 0,
-        baseY: 0,
-        getLine: (y: number) =>
-          y === 0
-            ? {
-                getCell: (x: number) => ({
-                  getChars: () => cells[x] ?? "",
-                }),
-              }
-            : undefined,
-      },
-    },
-  };
-}
-
-test("灰字：clear 返回 idle/erased/moved，让调用方免读异步缓冲", () => {
-  const t = asyncTerm({ lineText: "st" });
-  const g = new GhostText();
-  assert.equal(g.clear(t as never), "idle", "没画过就是 idle，一个字节都不写");
-  assert.equal(t.written.length, 0);
-
-  g.show(t as never, "atus", 40);
-  assert.equal(g.clear(t as never), "erased", "光标没动：后面全是我们的灰字");
-  assert.ok(t.written.some((s) => s.includes(`${ESC}[4X`)), "写了 ECH 4");
-  t.flush();
-  assert.equal(t.line(), "st", "flush 后灰字真的没了");
-
-  // 灰字还在写队列里（位置未定）就 clear：擦除排在灰字之后，处理到它时光标正停在灰字前，
-  // 照样擦干净（修复前判 moved、一个字节不写 → 灰字留在已执行的命令行上）。
-  // 「灰字画好之后光标被挪走」见下面 cleaned / moved 两条用例。
-  const t2 = asyncTerm({ lineText: "st" });
-  const g2 = new GhostText();
-  g2.show(t2 as never, "atus", 40);
-  assert.equal(g2.clear(t2 as never), "erased");
-  t2.flush();
-  assert.equal(t2.line(), "st", "灰字没有残留");
-});
-
-test("灰字：ECH 还没 flush 时换建议也能重画（修复前会误判行中间而罢画）", () => {
-  const t = asyncTerm({ lineText: "st" });
-  const g = new GhostText();
-  g.show(t as never, "atus", 40);
-  t.flush(); // 屏幕上是 st|atus（灰字），光标回到 2
-  // ↑↓ 挑了另一条：show 内部先 clear（ECH 入队，未 flush）再判行尾。
-  // 修复前这里会读到旧灰字 → 判「行中间」→ 返回 ""，灰字从此消失。
-  const shown = g.show(t as never, "ew -s x", 40);
-  assert.equal(shown, "ew -s x");
-  t.flush();
-  assert.equal(t.line(), "stew -s x");
-});
-
-test("Tab 接受路径：灰字画着时 clear 的结论不依赖缓冲 flush", () => {
-  // 复现真机时序：下拉+灰字都在 → 按 Tab → acceptHintAt 先 clear 后判行尾
-  const t = asyncTerm({ lineText: "tmux " });
-  const g = new GhostText();
-  g.show(t as never, "attach -t unp", 40);
-  t.flush();
-  assert.equal(g.clear(t as never), "erased", "修复前：异步 ECH 未生效 + 读缓冲 → 误判行中间 → dismiss");
-});
-
-test("Tab 接受决策：ECH 没 flush 时 cursorAtLineEnd 仍读到灰字，决断必须信 clear 的 erased", () => {
-  // 这是「erased 短路」存在的理由本身：clear() 写出的 ECH 此刻还在缓冲队列里，
-  // 紧接着读 buffer 看到的仍是自己刚要擦掉的灰字。若把决策写成
-  // 「clear 之后无条件读 cursorAtLineEnd」，灰字就永远擦不干净 → 永远判行中间。
-  const t = asyncTerm({ lineText: "tmux " });
-  const g = new GhostText();
-  g.show(t as never, "attach -t unp", 40);
-  t.flush();
-  const cleared = g.clear(t as never);
-  assert.equal(cleared, "erased");
-  assert.equal(
-    cursorAtLineEnd(t as never),
-    false,
-    "未 flush 时缓冲里还有灰字，cursorAtLineEnd 必然是 false —— 所以不能用它"
-  );
-  // 正确的决策式（与 TerminalView.acceptHint 一致）：erased ⇒ 当行尾，直接接受
-  const accept = cleared === "erased" || cursorAtLineEnd(t as never);
-  assert.ok(accept, "灰字画着时按 Tab 必须能决断为接受，而不是误判行中间后收起");
-});
-
-test("Tab 接受后 ghost 状态同步清空：再按 Tab 是 idle，不重复擦、不重复插", () => {
-  const t = asyncTerm({ lineText: "tmux " });
-  const g = new GhostText();
-  g.show(t as never, "attach -t unp", 40);
-  t.flush();
-
-  // 第一次 Tab：接受。clear 同步清掉内部状态（不依赖 flush），
-  // 后续的 Tab 判定（ghostRef.active / 再次 clear）必须立刻看到「没灰字了」，
-  // 否则会把刚补进终端的真字再擦一遍 / 再插一遍。
-  assert.equal(g.clear(t as never), "erased");
-  assert.equal(g.active, false, "状态是同步清的，不能等 flush");
-  assert.equal(g.text, "");
-
-  const echWrites = t.written.filter((s) => s.includes(`${ESC}[13X`)).length;
-  assert.equal(echWrites, 1, "ECH 13 只写一次：接受后没有第二次擦除");
-
-  // 第二次 Tab：没有灰字 → clear 是 idle、一个字节都不写，
-  // 组件层的判定直接放行给 shell，不会把建议再插一遍
-  const totalBefore = t.written.length;
-  assert.equal(g.clear(t as never), "idle");
-  assert.equal(t.written.length, totalBefore, "idle 的 clear 不写任何序列");
-});
-
-test("灰字：atMark 按坐标判定，不读缓冲内容", () => {
-  const t = asyncTerm({ lineText: "st" });
-  const g = new GhostText();
-  // 没画过：一律 false（调用方会走 cursorAtLineEnd 分支）
-  assert.equal(g.atMark(t as never), false);
-
-  g.show(t as never, "atus", 40);
-  t.flush();
-  assert.equal(g.atMark(t as never), true, "光标还在作画位置");
-
-  t.move(0); // shell 回显/输出把光标顶走
-  assert.equal(g.atMark(t as never), false);
-});
-
-test("灰字：光标被挪走后 clear 原地核实并擦掉残影（cleaned）", () => {
-  // 这是「Tab 掉回给 shell」那条链的根治用例：状态清了但残影赖在屏幕上，
-  // 下一次 Tab 因 active=false 不被接管，bash 自己的补全就接管了终端。
-  const t = asyncTerm({ lineText: "tmux " });
-  const g = new GhostText();
-  g.show(t as never, "attach -t unp", 40);
-  t.flush();
-  assert.equal(t.line(), "tmux attach -t unp");
-
-  t.move(30); // 回显/输出把光标顶走：sameSpot 不成立
-  assert.equal(g.clear(t as never), "cleaned", "旧位置逐格核实仍是我们画的 → 原地擦除");
-  t.flush();
-  assert.equal(t.line(), "tmux ", "残影被擦干净");
-  assert.equal(t.cursorX, 30, "光标被送回擦除时的位置");
-  assert.ok(t.written.some((s) => s.includes(`${ESC}[1;6H`)), "擦除前先 CUP 到旧位置");
-  assert.equal(g.atMark(t as never), false);
-  assert.equal(g.clear(t as never), "idle");
-});
-
-test("灰字：旧位置被输出盖掉时 clear 返回 moved、一个字节不写", () => {
-  const t = asyncTerm({ lineText: "tmux " });
-  const g = new GhostText();
-  g.show(t as never, "attach -t unp", 40);
-  t.flush();
-  t.move(30);
-  // 模拟别的输出恰好写在残影开头那几格 → 逐格比对失败
-  t.write(`${ESC}[1;6HZZZ`);
-  t.flush();
-  const before = t.written.length;
-  assert.equal(g.clear(t as never), "moved", "认不出是我们画的，不敢写");
-  assert.equal(t.written.length, before, "moved 分支零写入");
 });

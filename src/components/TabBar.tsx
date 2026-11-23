@@ -34,7 +34,7 @@ interface Props {
 
 const appWindow = getCurrentWindow();
 
-const tabLabel = (t: TerminalTab) => t.customTitle || t.title;
+const tabLabel = (t: TerminalTab) => t.customTitle || t.autoTitle || t.title;
 
 /**
  * 标签栏。

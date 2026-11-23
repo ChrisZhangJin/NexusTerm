@@ -32,6 +32,8 @@ import {
   parseProbe,
   restoreCommand,
   restoreNotice,
+  autoTitleOf,
+  changesForeground,
   stealthInput,
   type TermContext,
 } from "./lib/context";
@@ -418,12 +420,16 @@ export default function App() {
   const probeTab = useCallback(
     async (tabId: string) => {
       const tab = tabsRef.current.find((t) => t.id === tabId);
+      if (!tab) return undefined;
       // 兼容模式的连接一条额外通道都不开：probe 本身会立刻返回，留着只是空转
-      if (tab?.sessionId && getExtras(tab.sessionId).compat) return tab.ctx;
+      if (tab.sessionId && getExtras(tab.sessionId).compat) return tab.ctx;
       try {
-        const c = parseProbe(await api.sshProbe(tabId));
-        if (c) patchTab(tabId, { ctx: c });
-        return c ?? tabsRef.current.find((t) => t.id === tabId)?.ctx;
+        const c = parseProbe(await (tab.local ? api.localProbe(tabId) : api.sshProbe(tabId)));
+        // 自动名跟着探测结果走：进了 tmux / 容器 / pod 就换名，回到普通 shell 就清掉（手动改的名字始终优先）
+        const autoTitle = autoTitleOf(c);
+        const cur = tabsRef.current.find((t) => t.id === tabId);
+        if (c || cur?.autoTitle !== autoTitle) patchTab(tabId, { ...(c ? { ctx: c } : {}), autoTitle });
+        return c ?? cur?.ctx;
       } catch (e) {
         // 服务端明确拒绝并行通道 → 这台机器是堡垒机，永久切兼容模式。
         // 否则这条连接上每 15 秒还会再试一次，每次都可能把连接掀掉。
@@ -715,11 +721,27 @@ export default function App() {
     [patchTab]
   );
 
-  // 已连接的 SSH 标签定期探测上下文：断线后就靠这份缓存恢复
+  /**
+   * 刚敲了一条会换掉「前台在哪」的命令（进 / 出 tmux、容器、pod）：稍后探两次，标签名不用干等 15 秒的轮询。
+   * 第一次给远端一点启动时间，第二次兜住慢一点的（拉镜像、kubectl 建连）。
+   */
+  const probeTimers = useRef(new Map<string, number[]>());
+  const probeSoon = useCallback(
+    (tabId: string) => {
+      for (const h of probeTimers.current.get(tabId) ?? []) window.clearTimeout(h);
+      probeTimers.current.set(
+        tabId,
+        [1500, 5000].map((ms) => window.setTimeout(() => void probeTab(tabId), ms))
+      );
+    },
+    [probeTab]
+  );
+
+  // 已连接的标签（SSH 与本地）定期探测上下文：断线后就靠这份缓存恢复，标签自动名也跟着它走
   useEffect(() => {
     const tick = () => {
       for (const t of tabsRef.current) {
-        if (!t.local && t.status === "connected") probeTab(t.id);
+        if (t.status === "connected") probeTab(t.id);
       }
     };
     const first = window.setTimeout(tick, 3000);
@@ -1408,7 +1430,7 @@ export default function App() {
 
   /** 新开一个本地 shell 标签 */
   const newLocalTab = useCallback(
-    (afterId?: string | null) => {
+    (afterId?: string | null, cwd?: string) => {
       const id = nextId();
       // 先开标签再 spawn：TerminalView 挂载后会 fit 并纠正这里的初始尺寸
       insertTab(
@@ -1417,7 +1439,7 @@ export default function App() {
       );
       // 本地终端也走同一条旁路（后端 local 读线程同样会 feed）
       seedAgentAttach(id);
-      api.localSpawn(id, 120, 32).catch((e) => {
+      api.localSpawn(id, 120, 32, cwd).catch((e) => {
         patchTab(id, { status: "error", error: String(e) });
         showToast(`本地终端启动失败：${String(e)}`);
       });
@@ -1435,19 +1457,20 @@ export default function App() {
 
   /**
    * 复制会话：在右侧再开一个同目标的标签。
-   * withState=false 只是对同一主机新开一个干净会话；
-   * withState=true 额外恢复当前目录与 tmux（分组会话，窗口共享、视图独立）。
+   * withState=false：新开一个会话并切到原标签的当前目录（不进 tmux）；
+   * withState=true：额外恢复 tmux（分组会话，窗口共享、视图独立）。
+   * 本地终端：新开的 shell 直接从原标签的当前目录启动。
    */
   const duplicateTab = useCallback(
     async (tabId: string, withState: boolean) => {
       const t = tabsRef.current.find((x) => x.id === tabId);
       if (!t) return;
-      if (t.local) return newLocalTab(tabId);
-      const s = sessionsRef.current.find((x) => x.id === t.sessionId);
-      if (!s) return showToast("该连接配置已被删除，无法复制");
-      if (!withState) return connect(s, tabId);
       // 在线就现探一次拿最新目录；已断开则用缓存
       const c = t.status === "connected" ? await probeTab(tabId) : t.ctx;
+      if (t.local) return newLocalTab(tabId, c?.cwd);
+      const s = sessionsRef.current.find((x) => x.id === t.sessionId);
+      if (!s) return showToast("该连接配置已被删除，无法复制");
+      if (!withState) return connect(s, tabId, c?.cwd ? { cwd: c.cwd, at: c.at } : undefined);
       connect(s, tabId, c, t.customTitle);
     },
     [connect, newLocalTab, showToast, probeTab]
@@ -1651,6 +1674,7 @@ export default function App() {
                 lineHeight={lineHeight}
                 onDisconnect={() => (t.local ? closeTab(t.id) : disconnectTab(t.id))}
                 onOpenSftp={() => openSftp(t.id)}
+                onShellCommand={(line) => changesForeground(line) && probeSoon(t.id)}
                 onBackgroundOutput={() => markTabActivity(t.id)}
                 peerHost={sessions.find((x) => x.id === t.sessionId)?.host}
                 status={t.status}
@@ -1876,7 +1900,7 @@ export default function App() {
           focusId={macroFocus}
           tabReady={activeTabState?.status === "connected"}
           tabLabel={
-            activeTabState ? activeTabState.customTitle || activeTabState.title : null
+            activeTabState ? activeTabState.customTitle || activeTabState.autoTitle || activeTabState.title : null
           }
           sessionId={activeSession?.id ?? null}
           sessionName={activeSession?.name ?? null}

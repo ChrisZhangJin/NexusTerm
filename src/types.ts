@@ -199,6 +199,9 @@ export interface TerminalTab {
   local?: boolean;
   /** 用户手动改的标签名；有值时优先于 title 显示 */
   customTitle?: string;
+  /** 自动名：在 tmux / 容器 / k8s pod 里时取它们的名字（见 `autoTitleOf`），回到普通 shell 就清掉。
+   *  显示优先级：customTitle > autoTitle > title */
+  autoTitle?: string;
   /** 自动重连：当前第几次 / 总次数 */
   reconnectAttempt?: number;
   reconnectMax?: number;

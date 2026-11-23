@@ -209,6 +209,24 @@ awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} /^MemFree:/{f=$2} /^Buffers:/{b=$
 df -kP / 2>/dev/null | awk 'NR==2 { print "DISK_TOTAL=" $2*1024; print "DISK_USED=" $3*1024; print "DISK_MOUNT=" $6 }'
 "#;
 
+/// 公网 IP：依次问几个公开服务（有 curl 用 curl，否则 wget），拿到第一个像 IP 的回答就停。
+/// 只读、每个服务 4 秒超时；远端不能出网时什么都不输出（前端显示「—」）。
+const PUBLIC_IP_SCRIPT: &str = r#"
+for u in https://api.ipify.org https://ifconfig.me/ip https://ipinfo.io/ip https://icanhazip.com; do
+  if command -v curl >/dev/null 2>&1; then ip=$(curl -fsS -m 4 "$u" 2>/dev/null)
+  elif command -v wget >/dev/null 2>&1; then ip=$(wget -qO- -T 4 "$u" 2>/dev/null)
+  else exit 0; fi
+  ip=$(printf '%s' "$ip" | tr -d ' \r\n')
+  case "$ip" in ''|*[!0-9a-fA-F.:]*) ;; *) echo "PUBLIC_IP=$ip"; exit 0 ;; esac
+done
+"#;
+
+/// 一段回答是不是一个合法的 IP（v4 / v6）：防止把出错页面、代理提示当成 IP 显示。
+pub fn valid_public_ip(s: &str) -> Option<String> {
+    let t = s.trim();
+    t.parse::<std::net::IpAddr>().ok().map(|ip| ip.to_string())
+}
+
 /// POSIX 单引号转义
 fn shq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -547,6 +565,12 @@ impl SessionManager {
         if let Some(rt) = self.inner.lock().get_mut(id) {
             rt.sidecar = on;
         }
+    }
+
+    /// 远端主机的公网 IP（旁路 exec 通道里问公开服务）。远端不能出网 / 没有 curl、wget 时为 None。
+    pub async fn public_ip(&self, id: &str) -> Result<Option<String>, SessionError> {
+        let text = self.run_sidecar(id, "exec sh -s", Some(PUBLIC_IP_SCRIPT), 20, "查询公网 IP 超时").await?;
+        Ok(text.lines().find_map(|l| l.strip_prefix("PUBLIC_IP=")).and_then(valid_public_ip))
     }
 
     /// 远端资源快照（CPU / 内存 / 磁盘），供状态栏每 5 秒刷新。同样走旁路 exec 通道。
@@ -1989,5 +2013,19 @@ mod kbi_probe {
             "第二轮应明确告知口令错：{:?}",
             msgs[1]
         );
+    }
+}
+
+#[cfg(test)]
+mod public_ip_tests {
+    use super::valid_public_ip;
+
+    #[test]
+    fn public_ip_answer_must_be_an_ip() {
+        assert_eq!(valid_public_ip("203.0.113.7\n").as_deref(), Some("203.0.113.7"));
+        assert_eq!(valid_public_ip(" 2001:db8::1 ").as_deref(), Some("2001:db8::1"));
+        assert_eq!(valid_public_ip("<html>error</html>"), None);
+        assert_eq!(valid_public_ip(""), None);
+        assert_eq!(valid_public_ip("999.1.1.1"), None);
     }
 }

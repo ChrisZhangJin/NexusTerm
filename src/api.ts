@@ -182,8 +182,13 @@ export const api = {
     invoke<void>("sftp_rename", { id, from, to }),
   sftpClose: (id: string) => invoke<void>("sftp_close", { id }),
 
-  localSpawn: (id: string, cols: number, rows: number) =>
-    invoke<void>("local_spawn", { id, cols, rows }),
+  /** `cwd`：起始目录（复制会话时沿用原标签的目录）；不给或不存在就用家目录 */
+  localSpawn: (id: string, cols: number, rows: number, cwd?: string) =>
+    invoke<void>("local_spawn", { id, cols, rows, cwd: cwd ?? null }),
+  /** 这个标签所在主机的公网 IP（SSH 在远端经旁路通道查，本地在本机查）；拿不到为 null */
+  hostPublicIp: (id: string) => invoke<string | null>("host_public_ip", { id }),
+  /** 本地终端的上下文探测（目录 / 前台程序 / tmux），与 sshProbe 同一组 KEY=VALUE；Windows 上为空 */
+  localProbe: (id: string) => invoke<Record<string, string>>("local_probe", { id }),
   localWrite: (id: string, data: number[]) =>
     invoke<void>("local_write", { id, data }),
   localWriteB64: (id: string, data: string) =>

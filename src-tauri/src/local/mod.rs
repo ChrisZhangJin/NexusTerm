@@ -4,6 +4,8 @@
 //! 与 SSH 通道共用同一套事件协议（`…/data` 发 base64、`…/closed` 发退出码），
 //! 前端因此只需要按 kind 换 API，不需要两套渲染逻辑。
 
+pub mod probe;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -21,6 +23,8 @@ struct LocalSession {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: SharedChild,
+    /// 启动的 shell 的 pid（上下文探测用：它的 cwd 就是终端当前目录）
+    shell_pid: Option<u32>,
 }
 
 pub struct LocalManager {
@@ -35,11 +39,13 @@ impl LocalManager {
     }
 
     /// 开一个本地 shell。可执行文件由 [`default_login_shell`] 按平台决定。
+    /// `cwd`：起始目录（复制会话时沿用原标签的目录）；不给或不是一个存在的目录就用家目录。
     pub fn spawn(
         &self,
         id: &str,
         cols: u16,
         rows: u16,
+        cwd: Option<&str>,
         app: &AppHandle,
     ) -> Result<(), String> {
         // 登录 shell 比非登录 shell 环境变量完整，更接近日常终端体感
@@ -48,7 +54,10 @@ impl LocalManager {
         // Windows 上 $HOME 大多不存在（或为 Git Bash 风格的 /c/Users/xxx），
         // 交给 keys::home_dir() 按平台解析，否则 PTY 会因 cwd 非法直接启动失败
         let home = crate::keys::home_dir();
-        cmd.cwd(&home);
+        match cwd.map(std::path::Path::new).filter(|p| p.is_dir()) {
+            Some(dir) => cmd.cwd(dir),
+            None => cmd.cwd(&home),
+        }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
 
@@ -77,6 +86,7 @@ impl LocalManager {
             .take_writer()
             .map_err(|e| format!("获取 PTY 写端失败：{}", e))?;
 
+        let shell_pid = child.process_id();
         let child = Arc::new(Mutex::new(child));
         {
             let mut guard = self.sessions.lock().unwrap();
@@ -86,6 +96,7 @@ impl LocalManager {
                     master: pair.master,
                     writer,
                     child: Arc::clone(&child),
+                    shell_pid,
                 },
             );
         }
@@ -120,6 +131,18 @@ impl LocalManager {
         });
 
         Ok(())
+    }
+
+    /// 上下文探测要看的东西：（shell pid，PTY 前台进程组）。会话不存在返回 None。
+    /// 只在锁内取这两个值；真正读 /proc、跑 ps / tmux 由调用方在锁外做（[`probe::probe`]）。
+    pub fn probe_target(&self, id: &str) -> Option<(Option<u32>, Option<i32>)> {
+        let guard = self.sessions.lock().unwrap();
+        let s = guard.get(id)?;
+        #[cfg(unix)]
+        let pgid = s.master.process_group_leader().map(|p| p as i32);
+        #[cfg(not(unix))]
+        let pgid: Option<i32> = None;
+        Some((s.shell_pid, pgid))
     }
 
     /// 该本地会话是否存在，供调用方按 id 区分本地 shell 与 SSH 会话。

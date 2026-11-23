@@ -19,15 +19,14 @@ import { parseProbe } from "../lib/context";
 import { getExtras, isSidecarDenied, markCompat } from "../lib/sessionExtras";
 import { viewableKind } from "../lib/viewable";
 import {
-  buildCompletions,
   dropCompletion,
   feedKeys,
+  historyItems,
   loadHistory,
   newLineState,
   recordCommand,
-  type CompletionItem,
 } from "../lib/complete";
-import { GhostText, cursorAtLineEnd, cursorFollowsTyped } from "../lib/ghost";
+import { cursorFollowsTyped } from "../lib/echo";
 import { ImeGuard, type KeyLike } from "../lib/ime";
 import { buildUserCommandReport } from "../lib/userCommand";
 import { captureLineStart, readLogicalLine, recorderTapAction, type LineStart } from "../lib/termLine";
@@ -47,8 +46,11 @@ import {
 import { themeToXterm } from "../lib/theme";
 import { isMacOS } from "../lib/platform";
 import { installMacKeyboard, setInputTrace, traceSend } from "../lib/macInput";
-import { SHIFT_ENTER_SEQ, shouldSendMetaEnter, textBeforeCursor, wantsMetaEnter } from "../lib/shiftEnter";
+import { SHIFT_ENTER_SEQ, lineHasShellPrompt, shouldSendMetaEnter, textBeforeCursor, wantsMetaEnter } from "../lib/shiftEnter";
+import { replaceLineInput } from "../lib/historyPanel";
+import HistoryPanel from "./HistoryPanel";
 import { isSftpCommand } from "../lib/sftpCmd";
+import { opensLink } from "../lib/links";
 import { attachZmodem, type ZmodemGate } from "../lib/zmodem";
 import type { ClosedInfo, TerminalTab, Theme } from "../types";
 
@@ -155,6 +157,8 @@ interface Props {
   onDisconnect?: () => void;
   /** 打开 SFTP 文件管理器（仅 SSH） */
   onOpenSftp?: () => void;
+  /** 一行命令被当成真的 shell 命令提交了（行有回显、不在全屏程序里）。本地与 SSH 都会报 */
+  onShellCommand?: (line: string) => void;
   /** 不在前台时收到新输出——标签栏据此点亮提醒动效。只在非活跃时调用。 */
   onBackgroundOutput?: () => void;
 }
@@ -269,6 +273,7 @@ export default function TerminalView({
   onNotify,
   onDisconnect,
   onOpenSftp,
+  onShellCommand,
   onBackgroundOutput,
   peerHost,
   status,
@@ -301,6 +306,16 @@ export default function TerminalView({
   /** 锁住时被丢掉的按键计数：变化时横幅闪一下，告诉用户「按键没进去」 */
   const [lockNudge, setLockNudge] = useState(0);
   const [markOpen, setMarkOpen] = useState(false);
+  /** Shift+Tab 历史面板：打开时的历史快照、预填的关键字、相对终端容器的位置 */
+  const [hist, setHist] = useState<{
+    items: string[];
+    query: string;
+    pos: { x: number; y: number; above: boolean };
+  } | null>(null);
+  /** mount effect 里的输入处理（记账 + 发字节 + 只读闸）桥给面板的回调 */
+  const handleInputRef = useRef<(d: string) => void>(() => {});
+  /** Shift+Tab：打开历史面板（键盘处理在 mount effect 里，经 ref 调到这里） */
+  const openHistoryRef = useRef<() => void>(() => {});
   /** 当前生效的标记规则数（右上角徽标用） */
   const [markCount, setMarkCount] = useState(0);
   const zmodemRef = useRef<ZmodemGate | null>(null);
@@ -376,6 +391,8 @@ export default function TerminalView({
   useEffect(() => watchRecording(tabId), [tabId]);
   const onOpenSftpRef = useRef(onOpenSftp);
   onOpenSftpRef.current = onOpenSftp;
+  const onShellCommandRef = useRef(onShellCommand);
+  onShellCommandRef.current = onShellCommand;
   const sftpTimerRef = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(sftpTimerRef.current), []);
   /**
@@ -384,6 +401,7 @@ export default function TerminalView({
    * 稍后打开 / 同步 SFTP 面板。命令本身照常发给远端，这里不拦。
    */
   const onCommandCommitted = useCallback((line: string) => {
+    onShellCommandRef.current?.(line);
     if (kind !== "ssh" || statusRef.current !== "connected") return;
     if (!isSftpCommand(line)) return;
     // 延后一点：别和回车的回显抢；面板内部会再探测 cwd
@@ -392,142 +410,53 @@ export default function TerminalView({
       if (statusRef.current === "connected") onOpenSftpRef.current?.();
     }, 300);
   }, [kind]);
-  const ghostRef = useRef(new GhostText());
-  const hintsRef = useRef<CompletionItem[]>([]);
-  /**
-   * 本帧有没有排队的补全重算（rAF 句柄，0 = 没排）。敲键时不当场算候选：算候选
-   * 要读历史、量 DOM、写灰字，同步塞在 `onData` 里会让「发字节给 shell」排在
-   * 它们后头，连着敲有肉眼可见的顿挫。
-   */
-  const hintRaf = useRef(0);
+  /** 面板大小（与样式 `.hist-panel` 一致），用来决定放在光标下方还是上方、别超出右边 */
+  const HIST_W = 560;
+  const HIST_H = 330;
 
-  /** 收起提示：擦掉灰字、清空候选。 */
-  const dismissHints = useCallback(() => {
+  /** Shift+Tab：在光标附近打开历史面板，用命令行上已敲的字预筛 */
+  openHistoryRef.current = () => {
     const term = termRef.current;
-    if (term) ghostRef.current.clear(term);
-    hintsRef.current = [];
-  }, []);
-
-  /**
-   * 把候选列表记下，并把第一条画成行内灰字。
-   *
-   * 灰字只显示「放得下」的那一段（见 `GhostText.show`）——
-   * 宁可提示得短一点也不让它换行把屏幕顶乱。
-   */
-  const publish = useCallback(
-    (items: CompletionItem[]) => {
-      const term = termRef.current;
-      if (!term) return;
-
-      // vim / less / top 用的是 alternate buffer：那里没有 shell 提示符，
-      // 「当前行 = 人敲的命令」这个前提根本不成立。全屏程序里一律不提示，
-      // 否则灰字会直接画在编辑器内容上。
-      if (term.buffer.active.type !== "normal") {
-        dismissHints();
-        return;
-      }
-      // 人在行中间删改时一律不提示：补进去的那段会插到句子中间，
-      // 而且灰字的擦除只敢从光标往后抹 —— 那里有真字就会连真字一起抹掉
-      // （屏幕上看没了、shell 里还在，回车就又冒出来）。
-      // 灰字画着时**不能**扫缓冲：灰字自己就是「光标后面的字」，cursorAtLineEnd
-      // 必判「行中间」，刚画好的提示会被当场收掉、Tab 掉回给 shell（bash 接管
-      // 就成了「Display all 126 possibilities?」）。active 时只看光标是否仍在
-      // 画灰字时的位置；没画才允许读缓冲。
-      if (ghostRef.current.active ? !ghostRef.current.atMark(term) : !cursorAtLineEnd(term)) {
-        dismissHints();
-        return;
-      }
-
-      hintsRef.current = items;
-      // 回显还没到就先不画，等回显到了由 `redrawGhost` 补画。远端关了回显的场合
-      // （密码提示符）回显永远不会到，灰字也就永远不会画 —— 否则敲密码时屏幕上会
-      // 冒出一条历史命令，Tab 一按还会把它当密码发出去。
-      if (items.length && !cursorFollowsTyped(term, lineRef.current.text)) {
-        ghostRef.current.clear(term);
-        return;
-      }
-      // 只画第一条：没有下拉之后建议没有「高亮项」可言，
-      // 想要别的补法就继续敲字把前缀补全。
-      const shownItem = items[0];
-      const room = term.cols - term.buffer.active.cursorX - 1;
-      ghostRef.current.show(term, shownItem ? shownItem.insert : "", room);
-    },
-    [dismissHints]
-  );
-
-  /** 按当前这半行重算候选：历史是本地同步缓存，不用等网络往返。 */
-  const refreshHints = useCallback(
-    (line: string) => {
-      publish(buildCompletions(historyKeyRef.current, line));
-    },
-    [publish]
-  );
-
-  /**
-   * 敲键后的补全刷新：**一帧最多一次**。
-   *
-   * 行状态（`lineRef`）本身就是即时更新的，所以延迟这一帧不会让候选算错 ——
-   * 刷的时候读的是当时的行，早先几帧的中间态直接被跳过，反而更省。
-   */
-  const refreshHintsSoon = useCallback(() => {
-    if (hintRaf.current) return;
-    hintRaf.current = requestAnimationFrame(() => {
-      hintRaf.current = 0;
-      // 行丢了前缀（Tab / 方向键 / 粘贴之后）：补全只认从行首起的前缀，宁可不提示
-      if (!lineRef.current.known) dismissHints();
-      else refreshHints(lineRef.current.text);
+    const host = hostRef.current;
+    const screen = term?.element?.querySelector<HTMLElement>(".xterm-screen");
+    if (!term || !host || !screen) return;
+    const box = (host.offsetParent as HTMLElement | null) ?? host;
+    const r = screen.getBoundingClientRect();
+    const pr = box.getBoundingClientRect();
+    const cellW = r.width / Math.max(term.cols, 1);
+    const cellH = r.height / Math.max(term.rows, 1);
+    const buf = term.buffer.active;
+    const rowTop = r.top - pr.top + buf.cursorY * cellH;
+    const below = rowTop + cellH;
+    const above = below + HIST_H > pr.height && rowTop > HIST_H;
+    const x = Math.max(4, Math.min(r.left - pr.left + buf.cursorX * cellW, pr.width - HIST_W - 4));
+    setHist({
+      items: historyItems(historyKeyRef.current),
+      query: lineRef.current.known ? lineRef.current.text.trimStart() : "",
+      pos: above ? { x, y: pr.height - rowTop, above: true } : { x, y: below, above: false },
     });
-  }, [refreshHints, dismissHints]);
+  };
 
-  // 标签页关掉 / 组件卸载时把没跑完的那一帧撤掉，否则回调会碰已 dispose 的终端
+  // 切走标签就收起历史面板（它属于这个终端的光标位置）
   useEffect(() => {
-    return () => {
-      if (hintRaf.current) cancelAnimationFrame(hintRaf.current);
-      hintRaf.current = 0;
-    };
+    if (!active) setHist(null);
+  }, [active]);
+
+  /** 关面板，焦点还给终端 */
+  const closeHistory = useCallback(() => {
+    setHist(null);
+    termRef.current?.focus();
   }, []);
 
-  /**
-   * Tab：接受灰字建议 —— 把缺的那一段补进终端。
-   *
-   * 两件事必须同时做：写 pty（让远端 shell 真的收到），
-   * 以及更新本地行状态（否则下一次预测还按补完前的半句算）。
-   */
-  const acceptHint = useCallback(() => {
-    const term = termRef.current;
-    if (!term) return;
-    const items = hintsRef.current;
-    if (items.length === 0) {
-      // 灰字还画着但候选没了（理论上只在收起与重算的缝隙里出现）：
-      // 总得把灰字收掉，别让 Tab 白按一场还留着一截灰的
-      dismissHints();
-      return;
-    }
-    // 必须先擦灰字再判行尾：灰字是画在光标后的真实字符，不擦的话
-    // `cursorAtLineEnd` 会把它当成「后面还有字」，按 Tab 反被当成行中间编辑收起。
-    // 但擦除是异步进缓冲的（xterm write 的性质），擦完立刻读缓冲读到的还是
-    // 旧灰字 —— 所以「erased」（光标没动、后面全是灰字）直接当行尾用，
-    // 只有没画过/被挪走时才去读真实缓冲。
-    const cleared = ghostRef.current.clear(term);
-    // 真在行中间（人在改前面敲错的字）：补进去会插在句子中间，收起更安全
-    if (cleared !== "erased" && !cursorAtLineEnd(term)) {
-      dismissHints();
-      return;
-    }
-    const item = items[0];
-    if (!item.insert) {
-      dismissHints();
-      return;
-    }
-    lineRef.current.text += item.insert;
-    // 只写「缺的那一段」：已敲出来的字符早就在 shell 里了，再写一遍会重复
-    void (isLocal
-      ? api.localWrite(tabId, stringToBytes(item.insert))
-      : api.sshWrite(tabId, stringToBytes(item.insert))
-    ).catch(() => {});
-    // 补完重算：`--f` → `--follow` 这类还能接着补，灰字要立刻换成下一截
-    refreshHints(lineRef.current.text);
-  }, [dismissHints, isLocal, refreshHints]);
+  /** 选中一条：换掉命令行上的内容（不回车，跑不跑由人决定），行状态记成这条 */
+  const pickHistory = useCallback((cmd: string) => {
+    setHist(null);
+    const line = lineRef.current;
+    handleInputRef.current(replaceLineInput(line.known ? line.text : null, cmd));
+    // 不管之前知不知道行里是什么，换完之后就是这一条
+    lineRef.current = { text: cmd, known: true, pasting: false };
+    termRef.current?.focus();
+  }, []);
 
   const onCommandCommittedRef = useRef(onCommandCommitted);
   onCommandCommittedRef.current = onCommandCommitted;
@@ -538,32 +467,6 @@ export default function TerminalView({
    * 不是「执行」 —— 吞掉就打不出中文了。判定逻辑见 `lib/ime.ts`。
    */
   const imeRef = useRef<ImeGuard>(new ImeGuard());
-
-  /**
-   * Enter：只运行**人真的敲进终端**的那半句，灰字跟着消失、绝不跟着上车。
-   *
-   * 灰字只是提示、从没进过 pty —— 擅自把它补齐再发回车，就成了「看到 A 执行 B」：
-   * 屏幕上那条命令和 shell 收到的是两回事，跑错命令比少打几个字贵得多。
-   * 想要补全就先按 Tab，再回车。
-   */
-  const runTypedLine = useCallback(() => {
-    dismissHints();
-    // 走的是与「自己敲回车」同一条记账路径：行状态提交 + 进历史，再发 \r。
-    const wasKnown = lineRef.current.known;
-    const committed = feedKeys(lineRef.current, "\r");
-    if (committed) {
-      if (lineEchoedRef.current && termRef.current?.buffer.active.type === "normal") {
-        recordCommand(historyKeyRef.current, committed);
-        onCommandCommitted(committed);
-      }
-      pushUserCommand(tabId, committed, lineEchoedRef.current, termRef.current?.buffer.active.type !== "normal");
-      lineEchoedRef.current = false;
-    }
-    if (termRef.current && isRecording(tabId)) {
-      tapRecorder(tabId, termRef.current, "\r", committed, wasKnown, lineStartRef.current);
-    }
-    sendRef.current("\r");
-  }, [dismissHints, onCommandCommitted]);
 
   /** 把当前行列数同步给后端（SSH 是 window_change，本地是 PTY resize） */
   const syncSize = useCallback(() => {
@@ -608,7 +511,27 @@ export default function TerminalView({
     const unicode = new Unicode11Addon();
     term.loadAddon(unicode);
     term.unicode.activeVersion = "11"; // 中文 / emoji 宽度必须启用
-    term.loadAddon(new WebLinksAddon());
+    // 终端里的链接：Ctrl+点击（macOS 为 ⌘+点击）用系统浏览器打开；单纯点击不打开，免得点一下选文字就跳网页。
+    // 悬停时在终端区域显示提示（xterm 自己会给链接加下划线）
+    term.loadAddon(
+      new WebLinksAddon(
+        (event, uri) => {
+          if (!opensLink(event, isMacOS())) return;
+          event.preventDefault();
+          void import("@tauri-apps/plugin-opener")
+            .then(({ openUrl }) => openUrl(uri))
+            .catch(() => {});
+        },
+        {
+          hover: () => {
+            if (host) host.title = isMacOS() ? "⌘+点击 在浏览器中打开" : "Ctrl+点击 在浏览器中打开";
+          },
+          leave: () => {
+            if (host) host.title = "";
+          },
+        }
+      )
+    );
     const search = new SearchAddon({ highlightLimit: 2000 });
     term.loadAddon(search);
     searchRef.current = search;
@@ -670,81 +593,16 @@ export default function TerminalView({
       host.removeEventListener("compositionend", onImeEnd, true);
       window.removeEventListener("blur", onImeReset);
     });
-    // resize 后灰字记的 atX/atY 立刻过时，`clear` 的 `sameSpot` 永远对不上 ——
-    // 擦不掉的灰字会像真字一样赖在屏幕上，索性收起
-    const resizeSub = term.onResize(() => {
-      hl.refresh();
-      dismissHints();
-    });
+    const resizeSub = term.onResize(() => hl.refresh());
     const bufSub = term.buffer.onBufferChange(() => hl.refresh());
-    // 灰字画在「当时的光标」之后，按 ← / Home 回行中间后它就成了插在句子里的
-    // 半截命令，下一次擦除还会从新光标抹到行尾、把真字一起抹掉。
-    // 只在灰字真的画着时才查 buffer —— 挪光标是很热的路径。
-    const cursorSub = term.onCursorMove(() => {
-      if (!ghostRef.current.active) return;
-      // 同 `publish`：灰字画着时不扫缓冲，只看光标是否离开了作画位置。
-      // 挪走了就收起 —— `clear` 会先逐格核实旧位置、把残影原地擦干净。
-      const stillFine =
-        term.buffer.active.type === "normal" &&
-        (ghostRef.current.atMark(term) || cursorAtLineEnd(term));
-      if (!stillFine) {
-        dismissHints();
-      }
-    });
     cleanups.push(
       () => parsedSub.dispose(),
       () => resizeSub.dispose(),
       () => bufSub.dispose(),
-      () => cursorSub.dispose(),
       () => hl.dispose()
     );
 
-    /**
-     * 把灰字重新画回光标后面，但只在「光标还贴着我们记下的那半行」时
-     * （`cursorFollowsTyped`）。不成立说明这一轮输入已结束（真有输出、或提示符
-     * 被整行重画），收起提示，别把灰字甩到输出中间。
-     */
-    const redrawGhost = () => {
-      const items = hintsRef.current;
-      const typed = lineRef.current.text;
-      if (!items.length || !typed) return;
-      // 灰字画着时用 atMark（坐标），没画时才扫缓冲 —— 理由见 `publish`。
-      const spotOk = ghostRef.current.active
-        ? ghostRef.current.atMark(term)
-        : cursorAtLineEnd(term);
-      if (
-        term.buffer.active.type !== "normal" ||
-        !spotOk ||
-        !cursorFollowsTyped(term, typed)
-      ) {
-        dismissHints();
-        return;
-      }
-      const item = items[0];
-      ghostRef.current.show(term, item.insert, term.cols - term.buffer.active.cursorX - 1);
-    };
-
-    // 灰字画在显示缓冲里，不是 pty 的真实字符：再往屏幕上写东西，它就会变成
-    // 「真」文本赖在那儿并把光标推到后面。所以所有往屏幕写字的地方都必须走
-    // `writeOut` 这一个出口：先擦，写完再补画。
-    //
-    // 补画不是润色 —— shell 回显走的就是这里，不补画灰字只会闪一下就没了
-    // （SSH 一个来回肉眼可见）。按帧合并是因为回显一个字节一块地到，逐块补画
-    // 等于每个字符两次整行重绘。
-    let paintRaf = 0;
-    const scheduleGhostPaint = () => {
-      if (paintRaf) return;
-      paintRaf = requestAnimationFrame(() => {
-        paintRaf = 0;
-        redrawGhost();
-      });
-    };
-    cleanups.push(() => {
-      if (paintRaf) cancelAnimationFrame(paintRaf);
-    });
-
     const writeOut = (data: string | Uint8Array) => {
-      ghostRef.current.clear(term);
       term.write(data);
       // 这行是不是真被回显过。这里当安全边界用，不能按 `cursorFollowsTyped`
       // 默认的「1 个字符就算」：密码首字符撞上提示符末尾的巧合匹配，就会把没
@@ -755,7 +613,6 @@ export default function TerminalView({
       ) {
         lineEchoedRef.current = true;
       }
-      scheduleGhostPaint();
     };
 
     // —— ZMODEM（lrzsz）：远端 rz/sz 的字节流先过 Sentry 嗅探 ——
@@ -882,8 +739,9 @@ export default function TerminalView({
         lineEchoedRef.current = false;
       }
       if (recording) tapRecorder(tabId, term, d, committed, wasKnown, lineStartRef.current);
-      refreshHintsSoon();
     };
+    // 历史面板选中一条时也走这里（只读闸、宏录制、Agent 控制权都照常）
+    handleInputRef.current = handleInput;
 
     // macOS(WKWebView) 上普通字符改由我们在捕获阶段发 —— 详见 lib/macInput。
     // 必须挂在 host 上：xterm 的监听在 textarea 上，捕获阶段我们先到。
@@ -930,8 +788,7 @@ export default function TerminalView({
       if (e.type !== "keydown") return true;
 
       // Shift+Enter → `ESC \r`（Meta+Enter），让 Claude Code / nanopi 这类 TUI 换行而不是提交；
-      // shell 提示符、vim / less 等备用屏程序里保持原样（当回车，含下面的灰字路径）。判定见 `lib/shiftEnter`。
-      // 必须排在灰字块之前：那里对 Shift+Enter 直接 `return true` 交还 xterm。
+      // shell 提示符、vim / less 等备用屏程序里保持原样（当回车）。判定见 `lib/shiftEnter`。
       if (e.key === "Enter" && e.shiftKey) {
         const imeBusy = imeRef.current.captures({
           key: e.key,
@@ -951,20 +808,15 @@ export default function TerminalView({
         );
         if (metaEnter) {
           e.preventDefault();
-          dismissHints();
           handleInput(SHIFT_ENTER_SEQ);
           return false;
         }
       }
 
-      // 只在灰字**真的画着**时才接管 Tab / Enter / Esc：ghost 没显示（放不下、
-      // 已收起、或在全屏程序里）就放行 —— 这几个键本来属于 shell 自己的补全与
-      // 历史，不能被提示层挤掉。按 `hintsRef` 判的话候选非空但灰字没画出来的
-      // 场景会误吞 Tab，表现为「Tab 突然没反应」。
-      // AI 驾驶中不走灰字快捷路径（它直接写 pty、绕过只读闸）；按键交给 xterm → handleInput 丢掉
-      if (ghostRef.current.active && !controlGate.armed) {
-        // 输入法组合中一律不接管：那时回车是「选词上屏」、Esc 是「取消候选」，
-        // 吞了就打不出中文。判定走 `lib/ime.ts`。
+      // Shift+Tab：在 shell 提示符上打开历史面板（按命令行上已敲的字筛）。
+      // 只在确实停在 shell 提示符上时接管 —— Claude Code 用 Shift+Tab 切模式、zsh 用它反向补全、
+      // vim 等全屏程序也有自己的用法，这些场合原样交给程序。AI 驾驶中、输入法组合中也不接管。
+      if (e.key === "Tab" && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
         const info: KeyLike = {
           key: e.key,
           shiftKey: e.shiftKey,
@@ -972,28 +824,15 @@ export default function TerminalView({
           keyCode: e.keyCode ?? 0,
           timeStamp: e.timeStamp,
         };
-
-        if (!imeRef.current.captures(info)) {
-          if (e.key === "Tab") {
-            e.preventDefault();
-            acceptHint();
-            return false;
-          }
-          if (e.key === "Enter") {
-            // "send" 才是真回车；"ime" / "ime-after-commit" 是输入法在收尾，
-            // "pass" 是 Shift+Enter 之类 —— 这几种都交回给终端自己处理。
-            if (imeRef.current.verdict(info) !== "send") return true;
-            e.preventDefault();
-            runTypedLine();
-            return false;
-          }
-          if (e.key === "Escape") {
-            e.preventDefault();
-            dismissHints();
-            return false;
-          }
-          // ↑↓ 不接管：没有下拉就没有「高亮项」可挪，
-          // 方向键还给 shell（历史翻阅）才是正用。
+        if (
+          !controlGate.armed &&
+          !imeRef.current.captures(info) &&
+          !isCursorHidden(term) &&
+          lineHasShellPrompt(textBeforeCursor(term.buffer.active))
+        ) {
+          e.preventDefault();
+          openHistoryRef.current();
+          return false;
         }
       }
 
@@ -1071,7 +910,7 @@ export default function TerminalView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId]);
 
-  // —— 连上之后读一次远端 shell 的历史文件，给灰字补全当候选 ——
+  // —— 连上之后读一次远端 shell 的历史文件，给 Shift+Tab 历史面板当数据 ——
   // 走旁路 exec 通道：兼容模式（堡垒机）一条额外通道都不开，直接跳过；
   // 第一次被服务端拒绝时和状态栏、上下文探测一样，记下「这台只让开一条通道」。
   const remoteHistoryLoaded = useRef(false);
@@ -1123,11 +962,7 @@ export default function TerminalView({
     prevStatus.current = status;
     if (!term || isLocal) return;
     const now = clock(Date.now());
-    // 同样是往屏幕上写字：先把灰字擦掉，否则它会混进这行提示里
-    const out = (s: string) => {
-      ghostRef.current.clear(term);
-      term.write(s);
-    };
+    const out = (s: string) => term.write(s);
     if (status === "reconnecting" && reconnectAttempt) {
       out(
         `\x1b[90mReconnecting to ${peerHost ?? "remote host"} ` +
@@ -1569,6 +1404,10 @@ export default function TerminalView({
           }}
         />
       )}
+      {active && hist && (
+        <HistoryPanel items={hist.items} initialQuery={hist.query} pos={hist.pos} onPick={pickHistory} onClose={closeHistory} />
+      )}
+
       {active && markOpen && hlRef.current && (
         <MarkDialog
           initial={hlRef.current.active}

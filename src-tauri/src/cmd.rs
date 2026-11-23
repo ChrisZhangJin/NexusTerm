@@ -104,10 +104,24 @@ pub fn local_spawn(
     id: String,
     cols: u16,
     rows: u16,
+    cwd: Option<String>,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    state.local.spawn(&id, cols, rows, &app)
+    state.local.spawn(&id, cols, rows, cwd.as_deref(), &app)
+}
+
+/// 本地终端的上下文探测（目录 / 前台程序 / tmux），与 `ssh_probe` 同一组 KEY=VALUE。
+/// 会起 ps / lsof / tmux 子进程，做成 async 放到阻塞线程池里，不占主线程。
+#[tauri::command]
+pub async fn local_probe(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let Some((pid, pgid)) = state.local.probe_target(&id) else { return Ok(Default::default()) };
+    tauri::async_runtime::spawn_blocking(move || crate::local::probe::probe(pid, pgid))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -304,6 +318,34 @@ pub async fn ssh_stats(
     state: State<'_, AppState>,
 ) -> Result<crate::ssh::session::ProbeInfo, SessionError> {
     state.sessions.stats(&id).await
+}
+
+/// 这个标签所在主机的公网 IP：SSH 标签在远端问（旁路通道），本地标签在本机问。拿不到返回 None。
+/// 状态栏只在切到一个新主机时查一次，不轮询。
+#[tauri::command]
+pub async fn host_public_ip(id: String, state: State<'_, AppState>) -> Result<Option<String>, String> {
+    if state.local.contains(&id) {
+        return Ok(local_public_ip().await);
+    }
+    state.sessions.public_ip(&id).await.map_err(|e| e.to_string())
+}
+
+/// 本机公网 IP：与远端脚本问同一组服务，每个 4 秒超时（走系统代理时得到的是代理出口的 IP）。
+async fn local_public_ip() -> Option<String> {
+    // rustls-no-provider：建 Client 前必须先装 crypto provider，否则 reqwest 内部硬 panic
+    // （release 下 panic=abort 会直接杀掉整个进程）。provider 是全局 OnceLock，重复调用安全。
+    crate::agent::llm::ensure_crypto_provider();
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4)).build().ok()?;
+    for u in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://ipinfo.io/ip", "https://icanhazip.com"] {
+        let Ok(resp) = client.get(u).header("User-Agent", "curl/8").send().await else { continue };
+        if !resp.status().is_success() {
+            continue;
+        }
+        if let Some(ip) = resp.text().await.ok().as_deref().and_then(crate::ssh::session::valid_public_ip) {
+            return Some(ip);
+        }
+    }
+    None
 }
 
 /// 本机资源快照（本地终端标签的状态栏用），KEY 与 ssh_stats 一致
