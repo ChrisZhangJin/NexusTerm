@@ -12,7 +12,7 @@ const SAMPLE: Duration = Duration::from_millis(500);
 pub async fn collect() -> Result<Stats, String> {
     tokio::task::spawn_blocking(collect_blocking)
         .await
-        .map_err(|e| format!("资源采集失败：{e}"))?
+        .map_err(|e| crate::tr!("资源采集失败：{e}", "Failed to collect resource stats: {e}"))?
 }
 
 #[cfg(target_os = "windows")]

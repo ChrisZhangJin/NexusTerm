@@ -178,21 +178,21 @@ struct Envelope {
 /// 导出密码的本地校验（前端有同样一份，后端不信前端）。
 pub fn check_password(password: &str) -> Result<(), String> {
     if password.chars().count() < MIN_PASSWORD_CHARS {
-        return Err(format!("导出密码至少 {MIN_PASSWORD_CHARS} 个字符"));
+        return Err(crate::tr!("导出密码至少 {MIN_PASSWORD_CHARS} 个字符", "The export password must be at least {MIN_PASSWORD_CHARS} characters"));
     }
     Ok(())
 }
 
 fn header_aad(h: &Header) -> Result<Vec<u8>, String> {
-    serde_json::to_vec(h).map_err(|_| "文件头序列化失败".to_string())
+    serde_json::to_vec(h).map_err(|_| crate::tr!("文件头序列化失败", "Failed to serialise the file header"))
 }
 
 fn check_kdf(k: &KdfSpec) -> Result<(), String> {
     if k.alg != "argon2id" || k.ver != 0x13 || k.len != 32 {
-        return Err("文件使用了不支持的密钥派生算法".into());
+        return Err(crate::tr!("文件使用了不支持的密钥派生算法", "The file uses an unsupported key derivation algorithm"));
     }
     if k.m > KDF_MAX_M_KIB || k.t > KDF_MAX_T || k.p > KDF_MAX_P || k.t == 0 || k.p == 0 {
-        return Err("文件里的密钥派生参数超出允许范围，已拒绝".into());
+        return Err(crate::tr!("文件里的密钥派生参数超出允许范围，已拒绝", "The file's key derivation parameters are out of the allowed range; rejected"));
     }
     Ok(())
 }
@@ -202,7 +202,7 @@ pub fn seal(plain: &[u8], password: &str, kdf: KdfSpec) -> Result<Vec<u8>, Strin
     check_kdf(&kdf)?;
     let key = kdf
         .derive(password)
-        .map_err(|_| "导出密钥派生失败".to_string())?;
+        .map_err(|_| crate::tr!("导出密钥派生失败", "Export key derivation failed"))?;
     let nonce = Aes256Gcm::generate_nonce(&mut AeadRng);
     let header = Header {
         magic: MAGIC.into(),
@@ -211,30 +211,30 @@ pub fn seal(plain: &[u8], password: &str, kdf: KdfSpec) -> Result<Vec<u8>, Strin
         nonce: b64().encode(nonce),
     };
     let aad = header_aad(&header)?;
-    let cipher = Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| "加密初始化失败".to_string())?;
+    let cipher = Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| crate::tr!("加密初始化失败", "Encryption initialisation failed"))?;
     let ct = cipher
         .encrypt(&nonce, AeadPayload { msg: plain, aad: &aad })
-        .map_err(|_| "加密失败".to_string())?;
+        .map_err(|_| crate::tr!("加密失败", "Encryption failed"))?;
     let env = Envelope {
         header,
         ct: b64().encode(ct),
     };
-    serde_json::to_vec(&env).map_err(|_| "序列化失败".to_string())
+    serde_json::to_vec(&env).map_err(|_| crate::tr!("序列化失败", "Serialisation failed"))
 }
 
 /// [`seal`] 的逆。密码错与被篡改在 AEAD 层不可区分，统一一句话。
 pub fn open(bytes: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>, String> {
     if bytes.len() as u64 > MAX_FILE_BYTES {
-        return Err("文件过大（超过 64 MB），不是有效的连接迁移文件".into());
+        return Err(crate::tr!("文件过大（超过 64 MB），不是有效的连接迁移文件", "File too large (over 64 MB); not a valid connection transfer file"));
     }
     let env: Envelope = serde_json::from_slice(bytes)
-        .map_err(|_| "不是有效的连接迁移文件（.nexusconn）".to_string())?;
+        .map_err(|_| crate::tr!("不是有效的连接迁移文件（.nexusconn）", "Not a valid connection transfer file (.nexusconn)"))?;
     if env.header.magic != MAGIC {
-        return Err("不是有效的连接迁移文件（.nexusconn）".into());
+        return Err(crate::tr!("不是有效的连接迁移文件（.nexusconn）", "Not a valid connection transfer file (.nexusconn)"));
     }
     if env.header.version != VERSION {
-        return Err(format!(
-            "不支持的文件版本 {}（本程序支持 {}），请升级 NexusTerm 后重试",
+        return Err(crate::tr!(
+            "不支持的文件版本 {}（本程序支持 {}），请升级 NexusTerm 后重试", "Unsupported file version {} (this app supports {}). Update NexusTerm and try again",
             env.header.version, VERSION
         ));
     }
@@ -243,19 +243,19 @@ pub fn open(bytes: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>, String> 
         .decode(env.header.nonce.trim())
         .ok()
         .filter(|n| n.len() == NONCE_LEN)
-        .ok_or("文件已损坏（nonce 不合法）")?;
-    let ct = b64().decode(env.ct.trim()).map_err(|_| "文件已损坏（密文不合法）")?;
+        .ok_or_else(|| crate::tr!("文件已损坏（nonce 不合法）", "The file is corrupted (invalid nonce)"))?;
+    let ct = b64().decode(env.ct.trim()).map_err(|_| crate::tr!("文件已损坏（密文不合法）", "The file is corrupted (invalid ciphertext)"))?;
 
     let aad = header_aad(&env.header)?;
     let key = env
         .header
         .kdf
         .derive(password)
-        .map_err(|_| "文件里的密钥派生参数不合法".to_string())?;
-    let cipher = Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| "解密初始化失败".to_string())?;
+        .map_err(|_| crate::tr!("文件里的密钥派生参数不合法", "The file's key derivation parameters are invalid"))?;
+    let cipher = Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| crate::tr!("解密初始化失败", "Decryption initialisation failed"))?;
     let plain = cipher
         .decrypt(Nonce::from_slice(&nonce), AeadPayload { msg: &ct, aad: &aad })
-        .map_err(|_| "导出密码不对，或文件已损坏 / 被篡改。未导入任何内容。".to_string())?;
+        .map_err(|_| crate::tr!("导出密码不对，或文件已损坏 / 被篡改。未导入任何内容。", "Wrong export password, or the file is corrupted / tampered with. Nothing was imported."))?;
     Ok(Zeroizing::new(plain))
 }
 
@@ -269,32 +269,32 @@ fn too_long(s: &str) -> bool {
 /// 而是「导出方版本有 bug / 恶意构造的合法文件」。
 pub fn parse_payload(plain: &[u8]) -> Result<ConnPayload, String> {
     let p: ConnPayload =
-        serde_json::from_slice(plain).map_err(|_| "文件内容格式不对，无法解析".to_string())?;
+        serde_json::from_slice(plain).map_err(|_| crate::tr!("文件内容格式不对，无法解析", "The file content is malformed and cannot be parsed"))?;
     if p.sessions.len() > MAX_SESSIONS {
-        return Err(format!("文件里的连接数超过上限 {MAX_SESSIONS}"));
+        return Err(crate::tr!("文件里的连接数超过上限 {MAX_SESSIONS}", "The file has more than {MAX_SESSIONS} connections"));
     }
     if p.keys.len() > MAX_SESSIONS {
-        return Err("文件里的私钥数量异常".into());
+        return Err(crate::tr!("文件里的私钥数量异常", "The file has an abnormal number of private keys"));
     }
     let key_ids: HashSet<&str> = p.keys.iter().map(|k| k.id.as_str()).collect();
     if key_ids.len() != p.keys.len() {
-        return Err("文件里的私钥引用重复".into());
+        return Err(crate::tr!("文件里的私钥引用重复", "The file has duplicate private key references"));
     }
     for k in &p.keys {
         if k.pem.len() as u64 > MAX_KEY_BYTES || too_long(&k.name) {
-            return Err("文件里有超长的私钥条目".into());
+            return Err(crate::tr!("文件里有超长的私钥条目", "The file has an oversized private key entry"));
         }
     }
     for (i, s) in p.sessions.iter().enumerate() {
         let n = i + 1;
         if s.name.trim().is_empty() || s.host.trim().is_empty() {
-            return Err(format!("第 {n} 条连接缺少名称或主机"));
+            return Err(crate::tr!("第 {n} 条连接缺少名称或主机", "Connection #{n} is missing a name or host"));
         }
         if s.port == 0 {
-            return Err(format!("第 {n} 条连接的端口不合法"));
+            return Err(crate::tr!("第 {n} 条连接的端口不合法", "Connection #{n} has an invalid port"));
         }
         if !matches!(s.auth_type.as_str(), "password" | "key" | "agent") {
-            return Err(format!("第 {n} 条连接的认证方式不认识"));
+            return Err(crate::tr!("第 {n} 条连接的认证方式不认识", "Connection #{n} has an unknown authentication method"));
         }
         let texts = [
             Some(&s.name),
@@ -310,11 +310,11 @@ pub fn parse_payload(plain: &[u8]) -> Result<ConnPayload, String> {
             s.totp_seed.as_ref(),
         ];
         if texts.iter().flatten().any(|t| too_long(t)) {
-            return Err(format!("第 {n} 条连接里有超长字段"));
+            return Err(crate::tr!("第 {n} 条连接里有超长字段", "Connection #{n} has an oversized field"));
         }
         if let Some(r) = &s.key_ref {
             if !key_ids.contains(r.as_str()) {
-                return Err(format!("第 {n} 条连接引用了不存在的私钥"));
+                return Err(crate::tr!("第 {n} 条连接引用了不存在的私钥", "Connection #{n} references a private key that was not found"));
             }
         }
     }
@@ -358,14 +358,24 @@ pub fn import_order(incoming: &[ExportedSession]) -> Vec<usize> {
 
 // ———————————————————————— 导出 ————————————————————————
 
-fn locked_msg(action: &str) -> String {
-    format!("保险库已锁定，无法{action}已保存的凭据。请先在「安全」里输入主密码解锁。")
+fn locked_msg(export: bool) -> String {
+    if export {
+        crate::tr!(
+            "保险库已锁定，无法导出已保存的凭据。请先在「安全」里输入主密码解锁。",
+            "The vault is locked, so saved credentials cannot be exported. Unlock it with the master password under Security first."
+        )
+    } else {
+        crate::tr!(
+            "保险库已锁定，无法导入已保存的凭据。请先在「安全」里输入主密码解锁。",
+            "The vault is locked, so saved credentials cannot be imported. Unlock it with the master password under Security first."
+        )
+    }
 }
 
 /// 从 Store 收集载荷。**不写任何文件、不加密。**
 pub fn collect(store: &Store, include_keys: bool) -> Result<(ConnPayload, ExportSummary), String> {
     if store.vault_locked() {
-        return Err(locked_msg("导出"));
+        return Err(locked_msg(true));
     }
     let sessions = store.list()?;
     let extras = store.all_extras();
@@ -381,7 +391,7 @@ pub fn collect(store: &Store, include_keys: bool) -> Result<(ConnPayload, Export
         let totp_seed = store.get_totp_seed(&s.id);
         if totp_seed.is_none() && store.has_totp_seed(&s.id) {
             sum.warnings
-                .push(format!("「{}」的 TOTP 种子无法解密（可能来自其它机器），未导出", s.name));
+                .push(crate::tr!("「{}」的 TOTP 种子无法解密（可能来自其它机器），未导出", "\"{}\": the TOTP seed cannot be decrypted (maybe from another computer); not exported", s.name));
         }
         sum.passwords += password.is_some() as usize;
         sum.passphrases += passphrase.is_some() as usize;
@@ -392,7 +402,7 @@ pub fn collect(store: &Store, include_keys: bool) -> Result<(ConnPayload, Export
             match s.key_path.as_deref().filter(|p| !p.trim().is_empty()) {
                 None => sum
                     .warnings
-                    .push(format!("「{}」选了密钥认证但没有指定私钥文件", s.name)),
+                    .push(crate::tr!("「{}」选了密钥认证但没有指定私钥文件", "\"{}\" uses key authentication but has no private key file", s.name)),
                 Some(_) if !include_keys => skipped_keys += 1,
                 Some(path) => {
                     let entry = key_refs.entry(path.to_string()).or_insert_with(|| {
@@ -403,7 +413,7 @@ pub fn collect(store: &Store, include_keys: bool) -> Result<(ConnPayload, Export
                                 Some(id)
                             }
                             Err(w) => {
-                                sum.warnings.push(format!("私钥 {path}：{w}，未嵌入"));
+                                sum.warnings.push(crate::tr!("私钥 {path}：{w}，未嵌入", "Private key {path}: {w}; not embedded"));
                                 None
                             }
                         }
@@ -434,8 +444,8 @@ pub fn collect(store: &Store, include_keys: bool) -> Result<(ConnPayload, Export
         });
     }
     if skipped_keys > 0 {
-        sum.warnings.push(format!(
-            "未包含私钥文件：{skipped_keys} 条密钥认证的连接需要在新电脑上自行放好私钥"
+        sum.warnings.push(crate::tr!(
+            "未包含私钥文件：{skipped_keys} 条密钥认证的连接需要在新电脑上自行放好私钥", "Private key files not included: {skipped_keys} key-authenticated connection(s) need their keys placed on the new computer manually"
         ));
     }
     sum.sessions = payload.sessions.len();
@@ -445,17 +455,17 @@ pub fn collect(store: &Store, include_keys: bool) -> Result<(ConnPayload, Export
 
 /// 读一个私钥文件（库内 `<app_data>/keys/<id>` 与外部 `~/.ssh/...` 一视同仁）。
 /// 返回 (展示名, 内容)；错误是给用户看的原因，不含文件内容。
-fn read_key_file(store: &Store, path: &str) -> Result<(String, String), &'static str> {
+fn read_key_file(store: &Store, path: &str) -> Result<(String, String), String> {
     let expanded = keys::expand_tilde(path);
     let p = Path::new(&expanded);
-    let meta = std::fs::metadata(p).map_err(|_| "文件不存在或无法读取")?;
+    let meta = std::fs::metadata(p).map_err(|_| crate::tr!("文件不存在或无法读取", "File not found or unreadable"))?;
     if !meta.is_file() {
-        return Err("不是文件");
+        return Err(crate::tr!("不是文件", "Not a file"));
     }
     if meta.len() > MAX_KEY_BYTES {
-        return Err("文件过大");
+        return Err(crate::tr!("文件过大", "File too large"));
     }
-    let pem = std::fs::read_to_string(p).map_err(|_| "无法读取（不是文本文件？）")?;
+    let pem = std::fs::read_to_string(p).map_err(|_| crate::tr!("无法读取（不是文本文件？）", "Cannot read it (not a text file?)"))?;
     let managed = store
         .list_keys()
         .into_iter()
@@ -491,7 +501,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     })();
     if let Err(e) = res {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("写入失败：{e}"));
+        return Err(crate::tr!("写入失败：{e}", "Write failed: {e}"));
     }
     Ok(())
 }
@@ -516,7 +526,7 @@ fn export_with_kdf(
     check_password(password)?;
     let (payload, summary) = collect(store, include_keys)?;
     let json = Zeroizing::new(
-        serde_json::to_vec(&payload).map_err(|_| "载荷序列化失败".to_string())?,
+        serde_json::to_vec(&payload).map_err(|_| crate::tr!("载荷序列化失败", "Failed to serialise the payload"))?,
     );
     let file = seal(&json, password, kdf)?;
     write_private(dest, &file)?;
@@ -527,11 +537,11 @@ fn export_with_kdf(
 
 /// 读文件并解密、校验。同步（含 Argon2），调用方放到阻塞线程里。
 pub fn read_and_open(path: &Path, password: &str) -> Result<ConnPayload, String> {
-    let meta = std::fs::metadata(path).map_err(|_| "无法读取所选文件".to_string())?;
+    let meta = std::fs::metadata(path).map_err(|_| crate::tr!("无法读取所选文件", "Cannot read the selected file"))?;
     if meta.len() > MAX_FILE_BYTES {
-        return Err("文件过大（超过 64 MB），不是有效的连接迁移文件".into());
+        return Err(crate::tr!("文件过大（超过 64 MB），不是有效的连接迁移文件", "File too large (over 64 MB); not a valid connection transfer file"));
     }
-    let bytes = std::fs::read(path).map_err(|_| "无法读取所选文件".to_string())?;
+    let bytes = std::fs::read(path).map_err(|_| crate::tr!("无法读取所选文件", "Cannot read the selected file"))?;
     let plain = open(&bytes, password)?;
     parse_payload(&plain)
 }
@@ -543,7 +553,7 @@ pub async fn apply_import(
     mut payload: ConnPayload,
 ) -> Result<ImportSummary, String> {
     if store.vault_locked() {
-        return Err(locked_msg("导入"));
+        return Err(locked_msg(false));
     }
     let existing = store.list()?;
     let verdicts = plan_merge(&existing, &payload.sessions);
@@ -568,7 +578,7 @@ pub async fn apply_import(
         for id in &created_keys {
             let _ = keys::delete(store, id).await;
         }
-        return Err(format!("导入失败，已撤销本次导入：{e}"));
+        return Err(crate::tr!("导入失败，已撤销本次导入：{e}", "Import failed and was rolled back: {e}"));
     }
     Ok(sum)
 }
@@ -605,7 +615,7 @@ async fn apply_inner(
                                 Some(info.path)
                             }
                             Err(e) => {
-                                sum.warnings.push(format!("私钥「{}」无法恢复：{e}", k.name));
+                                sum.warnings.push(crate::tr!("私钥「{}」无法恢复：{e}", "Private key \"{}\" could not be restored: {e}", k.name));
                                 None
                             }
                         }
@@ -616,14 +626,14 @@ async fn apply_inner(
             }
             match restored.get(&r).cloned().flatten() {
                 Some(p) => key_path = Some(p),
-                None => sum.warnings.push(format!(
-                    "「{}」的私钥未能恢复，保留原路径，需要手动处理",
+                None => sum.warnings.push(crate::tr!(
+                    "「{}」的私钥未能恢复，保留原路径，需要手动处理", "\"{}\": private key could not be restored; kept the original path, please fix it manually",
                     payload.sessions[i].name
                 )),
             }
         } else if payload.sessions[i].auth_type == "key" {
-            sum.warnings.push(format!(
-                "「{}」的导出文件里没有私钥，路径保持原样，请确认新电脑上该路径存在",
+            sum.warnings.push(crate::tr!(
+                "「{}」的导出文件里没有私钥，路径保持原样，请确认新电脑上该路径存在", "\"{}\": the export file has no private key; the path is unchanged, make sure it exists on this computer",
                 payload.sessions[i].name
             ));
         }

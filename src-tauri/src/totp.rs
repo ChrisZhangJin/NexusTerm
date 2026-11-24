@@ -61,15 +61,16 @@ impl TotpConfig {
 pub fn parse_secret(input: &str) -> Result<TotpConfig, String> {
     let raw = input.trim();
     if raw.is_empty() {
-        return Err("种子为空".into());
+        return Err(crate::tr!("种子为空", "The seed is empty"));
     }
     let lower = raw.to_ascii_lowercase();
     if lower.starts_with("otpauth-migration://") {
-        return Err(
+        return Err(crate::tr!(
             "这是 Google Authenticator 的「导出账号」二维码，里面打包了多个账号，\
-             不是单个种子。请在导出前用「手动添加」查看单个账号的密钥（base32），再填到这里。"
-                .into(),
-        );
+             不是单个种子。请在导出前用「手动添加」查看单个账号的密钥（base32），再填到这里。",
+            "This is a Google Authenticator \"Transfer accounts\" QR code, which bundles several accounts \
+             rather than a single seed. Use \"Add manually\" to view one account's key (base32) and paste it here."
+        ));
     }
     if lower.starts_with("otpauth://") {
         return parse_uri(raw);
@@ -84,7 +85,7 @@ pub fn parse_secret(input: &str) -> Result<TotpConfig, String> {
 
 fn parse_uri(uri: &str) -> Result<TotpConfig, String> {
     if !uri.to_ascii_lowercase().starts_with("otpauth://totp/") {
-        return Err("只支持 otpauth://totp/ 开头的链接（HOTP 不是按时间走的，不适用）".into());
+        return Err(crate::tr!("只支持 otpauth://totp/ 开头的链接（HOTP 不是按时间走的，不适用）", "Only otpauth://totp/ links are supported (HOTP is not time-based)"));
     }
     let query = uri.split_once('?').map(|(_, q)| q).unwrap_or("");
     let mut secret = None;
@@ -105,13 +106,13 @@ fn parse_uri(uri: &str) -> Result<TotpConfig, String> {
                     "SHA1" => Algorithm::Sha1,
                     "SHA256" => Algorithm::Sha256,
                     "SHA512" => Algorithm::Sha512,
-                    other => return Err(format!("不支持的算法：{}", other)),
+                    other => return Err(crate::tr!("不支持的算法：{}", "Unsupported algorithm: {}", other)),
                 }
             }
             _ => {}
         }
     }
-    let secret = secret.ok_or("链接里没有 secret= 参数")?;
+    let secret = secret.ok_or_else(|| crate::tr!("链接里没有 secret= 参数", "The link has no secret= parameter"))?;
     Ok(TotpConfig {
         key: decode_base32(&secret)?,
         digits: clamp_digits(digits),
@@ -141,18 +142,21 @@ fn decode_base32(s: &str) -> Result<Vec<u8>, String> {
         .flat_map(|c| c.to_uppercase())
         .collect();
     if cleaned.is_empty() {
-        return Err("种子为空".into());
+        return Err(crate::tr!("种子为空", "The seed is empty"));
     }
     data_encoding::BASE32_NOPAD
         .decode(cleaned.as_bytes())
         .map_err(|_| {
-            "种子不是合法的 base32。base32 只含 A~Z 和 2~7，注意别把数字 0/1/8 \
-             和字母 O/I/B 看混了"
-                .to_string()
+            crate::tr!(
+                "种子不是合法的 base32。base32 只含 A~Z 和 2~7，注意别把数字 0/1/8 \
+                 和字母 O/I/B 看混了",
+                "The seed is not valid base32. Base32 only uses A–Z and 2–7; don't mix up \
+                 the digits 0/1/8 with the letters O/I/B"
+            )
         })
         .and_then(|k| {
             if k.is_empty() {
-                Err("种子为空".into())
+                Err(crate::tr!("种子为空", "The seed is empty"))
             } else {
                 Ok(k)
             }

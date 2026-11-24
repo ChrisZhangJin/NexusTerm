@@ -660,7 +660,7 @@ where
         Ok(session::KbiOutcome::Unavailable) => {
             abort_session(&session, "服务端未要求二次验证").await;
             Err(OpenError::Auth(
-                session::refusal_message(&auth).to_string(),
+                session::refusal_message(&auth),
             ))
         }
         Err(e) => {
@@ -698,10 +698,13 @@ where
                 })
             }
             // 只有「缺口令」「口令错」值得再问一次；文件读不到、格式不对再问也没用
-            Err(e) if e.contains("需要提供密码") || e.contains("密码不正确") => {
+            Err(e) if crate::keys::is_passphrase_required(&e) || crate::keys::is_passphrase_wrong(&e) => {
                 if attempt == MAX_PASSPHRASE_ASKS {
-                    return Err(OpenError::Auth(if e.contains("密码不正确") {
-                        "私钥密码多次输入不正确，连接已中止".into()
+                    return Err(OpenError::Auth(if crate::keys::is_passphrase_wrong(&e) {
+                        crate::tr!(
+                            "私钥密码多次输入不正确，连接已中止",
+                            "Wrong private key passphrase too many times; connection aborted"
+                        )
                     } else {
                         e
                     }));
@@ -713,17 +716,18 @@ where
                     host: host.to_string(),
                     // 口令问题发生在认证之前，这一步还不知道用户名
                     username: String::new(),
-                    name: "私钥口令".into(),
+                    name: crate::tr!("私钥口令", "Private key passphrase"),
                     instructions: if first_time {
-                        format!(
+                        crate::tr!(
                             "私钥 {} 已加密，请输入解锁它的口令。\n口令只用于解开本地私钥文件，不会发送到服务器。",
+                            "Private key {} is encrypted. Enter the passphrase to unlock it.\nThe passphrase only unlocks the local key file and is never sent to the server.",
                             short_path(path)
                         )
                     } else {
-                        "口令不正确，请重新输入。".to_string()
+                        crate::tr!("口令不正确，请重新输入。", "Wrong passphrase, please try again.")
                     },
                     fields: vec![prompt::AuthPromptField {
-                        prompt: "私钥口令".into(),
+                        prompt: crate::tr!("私钥口令", "Private key passphrase"),
                         echo: false,
                         prefill: None,
                     }],
@@ -733,22 +737,37 @@ where
                     Ok(mut a) if !a.is_empty() => {
                         let typed = a.remove(0);
                         if typed.is_empty() {
-                            return Err(OpenError::Auth("未输入私钥口令，连接已中止".into()));
+                            return Err(OpenError::Auth(crate::tr!(
+                                "未输入私钥口令，连接已中止",
+                                "No passphrase entered; connection aborted"
+                            )));
                         }
                         phrase = Some(typed);
                     }
                     Ok(_) => {
-                        return Err(OpenError::Auth("未输入私钥口令，连接已中止".into()))
+                        return Err(OpenError::Auth(crate::tr!(
+                                "未输入私钥口令，连接已中止",
+                                "No passphrase entered; connection aborted"
+                            )))
                     }
                     Err(prompt::AskAbort::Cancelled) => {
-                        return Err(OpenError::Auth("已取消输入私钥口令，连接中止".into()))
+                        return Err(OpenError::Auth(crate::tr!(
+                            "已取消输入私钥口令，连接中止",
+                            "Passphrase entry cancelled; connection aborted"
+                        )))
                     }
                     Err(prompt::AskAbort::Timeout) => {
-                        return Err(OpenError::Auth("等待私钥口令超时，连接已中止".into()))
+                        return Err(OpenError::Auth(crate::tr!(
+                            "等待私钥口令超时，连接已中止",
+                            "Timed out waiting for the passphrase; connection aborted"
+                        )))
                     }
                     Err(prompt::AskAbort::Unavailable) => {
                         return Err(OpenError::Auth(
-                            "无法显示私钥口令输入框，连接已中止".into(),
+                            crate::tr!(
+                                "无法显示私钥口令输入框，连接已中止",
+                                "Cannot show the passphrase prompt; connection aborted"
+                            ),
                         ))
                     }
                 }

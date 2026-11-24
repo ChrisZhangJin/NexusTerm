@@ -117,7 +117,7 @@ pub struct DocPayload {
 fn open_window(app: &AppHandle, doc: Doc) -> Result<(), String> {
     let id = uuid::Uuid::new_v4().simple().to_string();
     let label = format!("viewer-{id}");
-    let title = format!("浏览 · {}", doc.name);
+    let title = crate::tr!("浏览 · {}", "View · {}", doc.name);
     app.state::<DocStore>().0.lock().insert(id.clone(), doc);
 
     let init = format!("window.__NX_VIEWER__ = {};", serde_json::to_string(&id).unwrap());
@@ -142,7 +142,7 @@ fn open_window(app: &AppHandle, doc: Doc) -> Result<(), String> {
         }
         Err(e) => {
             app.state::<DocStore>().0.lock().remove(&id);
-            Err(format!("无法打开浏览窗口：{e}"))
+            Err(crate::tr!("无法打开浏览窗口：{e}", "Cannot open the viewer window: {e}"))
         }
     }
 }
@@ -156,10 +156,14 @@ fn base_name(path: &str) -> String {
 
 fn require_kind(path: &str) -> Result<DocKind, String> {
     kind_of(path).ok_or_else(|| {
-        "不支持的文件类型。可浏览：Markdown、HTML、图片（png/jpg/gif/webp/bmp/ico/svg/avif）、\
-         音频（mp3/wav/flac/ogg 等）、视频（mp4/webm/mov/mkv/avi 等，≤20MB）、\
-         文本与配置文件（json/yaml/toml/ini/conf/properties/xml/sql/.env 等，无扩展名的文件按纯文本处理）"
-            .to_string()
+        crate::tr!(
+            "不支持的文件类型。可浏览：Markdown、HTML、图片（png/jpg/gif/webp/bmp/ico/svg/avif）、\
+             音频（mp3/wav/flac/ogg 等）、视频（mp4/webm/mov/mkv/avi 等，≤20MB）、\
+             文本与配置文件（json/yaml/toml/ini/conf/properties/xml/sql/.env 等，无扩展名的文件按纯文本处理）",
+            "Unsupported file type. Viewable: Markdown, HTML, images (png/jpg/gif/webp/bmp/ico/svg/avif), \
+             audio (mp3/wav/flac/ogg, etc.), video (mp4/webm/mov/mkv/avi, etc., ≤20 MB), \
+             text and config files (json/yaml/toml/ini/conf/properties/xml/sql/.env, etc.; files without an extension open as plain text)"
+        )
     })
 }
 
@@ -215,16 +219,16 @@ pub async fn viewer_open_local(app: AppHandle, path: String) -> Result<(), Strin
     let p = crate::keys::expand_tilde(&path);
     let meta = tokio::fs::metadata(&p)
         .await
-        .map_err(|e| format!("无法读取「{path}」：{e}"))?;
+        .map_err(|e| crate::tr!("无法读取「{path}」：{e}", "Cannot read \"{path}\": {e}"))?;
     if meta.is_dir() {
-        return Err(format!("「{path}」是目录"));
+        return Err(crate::tr!("「{path}」是目录", "\"{path}\" is a folder"));
     }
     if meta.len() as usize > kind.max_bytes() {
-        return Err(format!("文件超过 {} MB，不适合浏览", kind.max_bytes() / 1024 / 1024));
+        return Err(crate::tr!("文件超过 {} MB，不适合浏览", "File is larger than {} MB, too big to view", kind.max_bytes() / 1024 / 1024));
     }
     let bytes = tokio::fs::read(&p)
         .await
-        .map_err(|e| format!("无法读取「{path}」：{e}"))?;
+        .map_err(|e| crate::tr!("无法读取「{path}」：{e}", "Cannot read \"{path}\": {e}"))?;
     let source = Path::new(&p).display().to_string();
     open_window(
         &app,
@@ -236,7 +240,7 @@ pub async fn viewer_open_local(app: AppHandle, path: String) -> Result<(), Strin
 #[tauri::command]
 pub fn viewer_doc(id: String, store: State<'_, DocStore>) -> Result<DocPayload, String> {
     let map = store.0.lock();
-    let d = map.get(&id).ok_or("文档已关闭或不存在")?;
+    let d = map.get(&id).ok_or_else(|| crate::tr!("文档已关闭或不存在", "Document not found or already closed"))?;
     Ok(DocPayload {
         name: d.name.clone(),
         source: d.source.clone(),

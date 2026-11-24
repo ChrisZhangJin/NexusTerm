@@ -47,14 +47,14 @@ pub enum SftpError {
     Connect(String),
     #[error("{0}")]
     Auth(String),
-    #[error("服务器未启用 SFTP 子系统: {0}")]
+    #[error("{}", crate::tr!("服务器未启用 SFTP 子系统: {}", "SFTP subsystem is not enabled on the server: {}", .0))]
     Subsystem(String),
-    #[error("远端操作失败: {0}")]
+    #[error("{}", crate::tr!("远端操作失败: {}", "Remote operation failed: {}", .0))]
     Remote(String),
-    #[error("会话不存在: {0}")]
+    #[error("{}", crate::tr!("会话不存在: {}", "Session not found: {}", .0))]
     NotFound(String),
     /// 用户主动取消，不是真正的传输失败——调用方据此区分"已取消"与"出错"
-    #[error("已取消")]
+    #[error("{}", crate::tr!("已取消", "Cancelled"))]
     Canceled,
 }
 
@@ -192,10 +192,10 @@ impl SftpManager {
 
         // 走到这里说明没得复用，必须自己认证一次
         let auth = req.auth.as_ref().ok_or_else(|| {
-            SftpError::Auth(
-                "没有可复用的已登录连接，且本地没有保存登录凭据。请先打开该主机的终端标签，或编辑会话保存密码。"
-                    .into(),
-            )
+            SftpError::Auth(crate::tr!(
+                "没有可复用的已登录连接，且本地没有保存登录凭据。请先打开该主机的终端标签，或编辑会话保存密码。",
+                "No logged-in connection to reuse and no saved credentials. Open a terminal tab for this host first, or edit the session to save a password."
+            ))
         })?;
 
         // 文件面板独立拨号时同样要能过二次验证 —— 否则对着要 OTP 的服务器，
@@ -222,11 +222,11 @@ impl SftpManager {
         .map_err(|e| match e {
             crate::ssh::OpenError::Timeout => SftpError::Connect(crate::errors::compose(
                 &crate::errors::timeout_message(&req.host, port, timeout),
-                &format!("等待握手超过 {} 秒", timeout.as_secs()),
+                &crate::tr!("等待握手超过 {} 秒", "Handshake took longer than {} s", timeout.as_secs()),
             )),
             // 指纹冲突：russh 会直接断开，靠旁路标记还原准确原因
             crate::ssh::OpenError::HostKeyMismatch => SftpError::Auth(
-                "主机公钥指纹不匹配，疑似中间人攻击".into(),
+                crate::tr!("主机公钥指纹不匹配，疑似中间人攻击", "Host key fingerprint mismatch: possible man-in-the-middle attack"),
             ),
             crate::ssh::OpenError::Handshake { err, legacy_tried } => SftpError::Connect(
                 crate::errors::handshake_error(&req.host, port, &err, legacy_tried),
@@ -375,7 +375,7 @@ impl SftpManager {
 
             let mut out = tokio::fs::File::create(local)
                 .await
-                .map_err(|e| SftpError::Remote(format!("无法创建本地文件 {}: {}", local, e)))?;
+                .map_err(|e| SftpError::Remote(crate::tr!("无法创建本地文件 {}: {}", "Cannot create local file {}: {}", local, e)))?;
 
             let mut buf = vec![0u8; CHUNK_SIZE];
             let mut transferred = 0u64;
@@ -426,11 +426,11 @@ impl SftpManager {
                 .await
                 .map_err(|e| SftpError::Remote(e.to_string()))?;
             if meta.is_dir() {
-                return Err(SftpError::Remote(format!("「{path}」是目录")));
+                return Err(SftpError::Remote(crate::tr!("「{path}」是目录", "\"{path}\" is a folder")));
             }
             if meta.size.unwrap_or(0) as usize > max {
-                return Err(SftpError::Remote(format!(
-                    "文件超过 {} MB，不适合浏览",
+                return Err(SftpError::Remote(crate::tr!(
+                    "文件超过 {} MB，不适合浏览", "File is larger than {} MB, too big to view",
                     max / 1024 / 1024
                 )));
             }
@@ -446,7 +446,7 @@ impl SftpManager {
             .map_err(|e| SftpError::Remote(e.to_string()))?;
         let _ = file.close().await;
         if buf.len() > max {
-            return Err(SftpError::Remote("文件过大，不适合浏览".into()));
+            return Err(SftpError::Remote(crate::tr!("文件过大，不适合浏览", "File is too big to view")));
         }
         Ok(buf)
     }
@@ -464,7 +464,7 @@ impl SftpManager {
         let result: Result<u64, SftpError> = async {
             let mut src = tokio::fs::File::open(local)
                 .await
-                .map_err(|e| SftpError::Remote(format!("无法读取本地文件 {}: {}", local, e)))?;
+                .map_err(|e| SftpError::Remote(crate::tr!("无法读取本地文件 {}: {}", "Cannot read local file {}: {}", local, e)))?;
             let total = src
                 .metadata()
                 .await
@@ -589,8 +589,8 @@ impl SftpManager {
         let Some(handle) = handle else {
             // 标签没了：顺手把以前开的会话收掉，别让 `held` 替一条该关的连接续命
             self.close(&id).await;
-            return Err(SftpError::NotFound(format!(
-                "终端 {tab_id} 没有可复用的已认证 SSH 连接（未保存会话配置或已断开）"
+            return Err(SftpError::NotFound(crate::tr!(
+                "终端 {tab_id} 没有可复用的已认证 SSH 连接（未保存会话配置或已断开）", "Terminal {tab_id} has no authenticated SSH connection to reuse (no saved session config, or disconnected)"
             )));
         };
 

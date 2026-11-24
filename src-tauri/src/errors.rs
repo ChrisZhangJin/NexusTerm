@@ -16,7 +16,12 @@ pub const MAX_CONNECT_TIMEOUT_SECS: u32 = 600;
 /// 主文案与原始错误之间的分隔符。前端据此把两者拆成大字与小字。
 pub const RAW_SUFFIX: &str = "\n\n原始错误：";
 
-pub const AUTH_FAILED: &str = "认证失败：用户名、密码或密钥不正确";
+pub fn auth_failed() -> String {
+    crate::tr!(
+        "认证失败：用户名、密码或密钥不正确",
+        "Authentication failed: wrong username, password or key"
+    )
+}
 
 /// 把可选的用户配置收敛成一个安全时长。
 pub fn resolve_timeout(secs: Option<u32>) -> Duration {
@@ -39,13 +44,12 @@ pub fn compose(message: &str, detail: &str) -> String {
 
 /// 超时专属文案。tokio 的 Elapsed 不带任何上下文，需要自己补 host/port。
 pub fn timeout_message(host: &str, port: u16, timeout: Duration) -> String {
-    format!(
-        "连接超时：{}:{} 在 {} 秒内没有响应。请检查 IP 是否正确、主机是否开机、\
-         是否在同一网络、防火墙是否放行 {} 端口",
-        host,
-        port,
-        timeout.as_secs(),
-        port
+    let secs = timeout.as_secs();
+    crate::tr!(
+        "连接超时：{host}:{port} 在 {secs} 秒内没有响应。请检查 IP 是否正确、主机是否开机、\
+         是否在同一网络、防火墙是否放行 {port} 端口",
+        "Connection timed out: {host}:{port} did not respond within {secs} s. Check that the IP is correct, \
+         the host is powered on and on the same network, and the firewall allows port {port}"
     )
 }
 
@@ -54,7 +58,7 @@ pub fn connect_error(host: &str, port: u16, err: &russh::Error) -> String {
     match err {
         russh::Error::IO(e) => io_error(host, port, e),
         other => compose(
-            &format!("无法与 {}:{} 建立 SSH 连接", host, port),
+            &crate::tr!("无法与 {host}:{port} 建立 SSH 连接", "Cannot establish an SSH connection to {host}:{port}"),
             &other.to_string(),
         ),
     }
@@ -82,37 +86,57 @@ fn algorithm_mismatch(
 ) -> String {
     let (what, advice) = match kind {
         russh::AlgorithmKind::Kex => (
-            "密钥交换算法",
+            crate::tr!("密钥交换算法", "key exchange algorithm"),
             if legacy_tried {
-                "客户端已启用兼容模式（含 diffie-hellman-group14-sha1 / group1-sha1）仍然没有交集，\
-                 说明服务器端把这类算法也关掉了，或使用了更古老的 SSH 实现（如 OpenSSH 4.x）。\
-                 建议在服务器端升级 OpenSSH 或放开 KexAlgorithms。"
+                crate::tr!(
+                    "客户端已启用兼容模式（含 diffie-hellman-group14-sha1 / group1-sha1）仍然没有交集，\
+                     说明服务器端把这类算法也关掉了，或使用了更古老的 SSH 实现（如 OpenSSH 4.x）。\
+                     建议在服务器端升级 OpenSSH 或放开 KexAlgorithms。",
+                    "Still no match with legacy algorithms enabled (incl. diffie-hellman-group14-sha1 / group1-sha1), \
+                     so the server has disabled these too or runs a very old SSH implementation (e.g. OpenSSH 4.x). \
+                     Upgrade OpenSSH on the server or relax KexAlgorithms."
+                )
             } else {
-                "该服务器只提供已被淘汰的旧算法，请在会话设置中开启「兼容旧版服务器」后重试。"
+                crate::tr!(
+                    "该服务器只提供已被淘汰的旧算法，请在会话设置中开启「兼容旧版服务器」后重试。",
+                    "This server only offers obsolete algorithms. Turn on \"Legacy server compatibility\" in the session settings and retry."
+                )
             },
         ),
         russh::AlgorithmKind::Key => (
-            "主机密钥算法",
-            "服务器可能只提供 ssh-dss 等已废弃的主机密钥，建议在服务器端重新生成 RSA/Ed25519 主机密钥。",
+            crate::tr!("主机密钥算法", "host key algorithm"),
+            crate::tr!(
+                "服务器可能只提供 ssh-dss 等已废弃的主机密钥，建议在服务器端重新生成 RSA/Ed25519 主机密钥。",
+                "The server may only offer deprecated host keys such as ssh-dss. Regenerate RSA/Ed25519 host keys on the server."
+            ),
         ),
         russh::AlgorithmKind::Cipher => (
-            "加密算法",
-            "服务器只提供 3des-cbc / arcfour 等已废弃的加密算法，建议在服务器端开放 aes-ctr 系列算法。",
+            crate::tr!("加密算法", "cipher"),
+            crate::tr!(
+                "服务器只提供 3des-cbc / arcfour 等已废弃的加密算法，建议在服务器端开放 aes-ctr 系列算法。",
+                "The server only offers deprecated ciphers such as 3des-cbc / arcfour. Enable the aes-ctr family on the server."
+            ),
         ),
         russh::AlgorithmKind::Mac => (
-            "消息认证算法",
-            "服务器只提供 hmac-md5 等已废弃的 MAC 算法，建议在服务器端开放 hmac-sha2 系列算法。",
+            crate::tr!("消息认证算法", "MAC algorithm"),
+            crate::tr!(
+                "服务器只提供 hmac-md5 等已废弃的 MAC 算法，建议在服务器端开放 hmac-sha2 系列算法。",
+                "The server only offers deprecated MAC algorithms such as hmac-md5. Enable the hmac-sha2 family on the server."
+            ),
         ),
         russh::AlgorithmKind::Compression => (
-            "压缩算法",
-            "服务器只提供 zlib 之外的压缩算法，建议在服务器端关闭压缩或开放 zlib。",
+            crate::tr!("压缩算法", "compression algorithm"),
+            crate::tr!(
+                "服务器只提供 zlib 之外的压缩算法，建议在服务器端关闭压缩或开放 zlib。",
+                "The server only offers compression other than zlib. Disable compression or enable zlib on the server."
+            ),
         ),
     };
 
     // 主文案已经把「哪一种算法 + 怎么办」说清楚了，不再附英文原文
-    format!(
-        "算法协商失败：{}:{} 找不到双方都支持的{}。{}",
-        host, port, what, advice
+    crate::tr!(
+        "算法协商失败：{host}:{port} 找不到双方都支持的{what}。{advice}",
+        "Algorithm negotiation failed: {host}:{port} has no {what} in common with the client. {advice}"
     )
 }
 
@@ -161,7 +185,7 @@ pub fn io_error(host: &str, port: u16, err: &io::Error) -> String {
         || unresolved_host
     {
         return compose(
-            &format!("无法解析主机名 {}：请检查拼写，或改用 IP 地址", host),
+            &crate::tr!("无法解析主机名 {host}：请检查拼写，或改用 IP 地址", "Cannot resolve host name {host}: check the spelling or use an IP address"),
             &msg,
         );
     }
@@ -174,64 +198,65 @@ pub fn io_error(host: &str, port: u16, err: &io::Error) -> String {
     // 只有原始码能把「超时」和「被拒绝」分开。ErrorKind 作为各平台的兜底。
     if is(ETIMEDOUT) || kind == io::ErrorKind::TimedOut {
         return compose(
-            &format!(
-                "连接超时：{}:{} 无响应。请检查 IP 是否正确、主机是否开机、\
-                 是否在同一网络、防火墙是否放行 {} 端口",
-                host, port, port
+            &crate::tr!(
+                "连接超时：{host}:{port} 无响应。请检查 IP 是否正确、主机是否开机、\
+                 是否在同一网络、防火墙是否放行 {port} 端口",
+                "Connection timed out: {host}:{port} is not responding. Check that the IP is correct, \
+                 the host is powered on and on the same network, and the firewall allows port {port}"
             ),
             &msg,
         );
     }
     if is(ECONNREFUSED) || kind == io::ErrorKind::ConnectionRefused {
         return compose(
-            &format!("连接被拒绝：{}:{} 端口未开放或服务未启动", host, port),
+            &crate::tr!("连接被拒绝：{host}:{port} 端口未开放或服务未启动", "Connection refused: port {port} on {host} is closed or the service is not running"),
             &msg,
         );
     }
     if is(EUNREACH) {
         return compose(
-            &format!("网络不可达：{} 不在可达网段内，请检查本机网络与路由", host),
+            &crate::tr!("网络不可达：{host} 不在可达网段内，请检查本机网络与路由", "Network unreachable: {host} is not reachable from here. Check your network and routes"),
             &msg,
         );
     }
     if is(EHOSTDOWN) {
-        return compose(&format!("主机已关机：{} 无响应", host), &msg);
+        return compose(&crate::tr!("主机已关机：{host} 无响应", "Host is down: {host} is not responding"), &msg);
     }
     if is(ECONNRESET) || kind == io::ErrorKind::ConnectionReset {
         return compose(
-            &format!("连接被重置：{}:{} 主动断开了握手", host, port),
+            &crate::tr!("连接被重置：{host}:{port} 主动断开了握手", "Connection reset: {host}:{port} dropped the handshake"),
             &msg,
         );
     }
     if kind == io::ErrorKind::ConnectionAborted {
         return compose(
-            &format!("连接被中止：{}:{} 未通过防火墙校验", host, port),
+            &crate::tr!("连接被中止：{host}:{port} 未通过防火墙校验", "Connection aborted: {host}:{port} was blocked by a firewall"),
             &msg,
         );
     }
     if kind == io::ErrorKind::PermissionDenied {
         return compose(
-            &format!("本机拒绝发起连接：{}:{}，请检查系统防火墙或 VPN", host, port),
+            &crate::tr!("本机拒绝发起连接：{host}:{port}，请检查系统防火墙或 VPN", "This computer blocked the connection to {host}:{port}. Check the system firewall or VPN"),
             &msg,
         );
     }
     compose(
-        &format!("无法连接到 {}:{}：{}", host, port, kind_label(kind)),
+        &crate::tr!("无法连接到 {}:{}：{}", "Cannot connect to {}:{}: {}", host, port, kind_label(kind)),
         &msg,
     )
 }
 
-fn kind_label(kind: io::ErrorKind) -> &'static str {
+fn kind_label(kind: io::ErrorKind) -> String {
     match kind {
-        io::ErrorKind::TimedOut => "连接超时",
-        io::ErrorKind::ConnectionRefused => "端口未开放",
-        io::ErrorKind::ConnectionReset => "连接被重置",
-        io::ErrorKind::ConnectionAborted => "连接被中止",
-        io::ErrorKind::NotConnected => "网络未连接",
-        io::ErrorKind::AddrNotAvailable => "地址不可用",
-        io::ErrorKind::AddrInUse => "地址被占用",
-        io::ErrorKind::PermissionDenied => "权限不足",
-        _ => "网络错误",
+        io::ErrorKind::TimedOut => crate::tr!("连接超时", "timed out"),
+        io::ErrorKind::ConnectionRefused => crate::tr!("端口未开放", "port closed"),
+        io::ErrorKind::ConnectionReset => crate::tr!("连接被重置", "connection reset"),
+        io::ErrorKind::ConnectionAborted => crate::tr!("连接被中止", "connection aborted"),
+        io::ErrorKind::NotConnected => crate::tr!("网络未连接", "network not connected"),
+        io::ErrorKind::AddrNotAvailable => crate::tr!("地址不可用", "address not available"),
+        io::ErrorKind::AddrInUse => crate::tr!("地址被占用", "address in use"),
+        io::ErrorKind::PermissionDenied => crate::tr!("权限不足", "permission denied"),
+        _ => crate::tr!("网络错误", "network error"),
     }
 }
 
@@ -239,10 +264,11 @@ fn kind_label(kind: io::ErrorKind) -> &'static str {
 /// 出于安全考虑也不该区分，因此统一提示。
 pub fn auth_error(detail: &str) -> String {
     let detail = detail.trim();
-    if detail.is_empty() || detail == AUTH_FAILED {
-        return AUTH_FAILED.to_string();
+    let msg = auth_failed();
+    if detail.is_empty() || detail == msg {
+        return msg;
     }
-    format!("{}{}{}", AUTH_FAILED, RAW_SUFFIX, detail)
+    format!("{}{}{}", msg, RAW_SUFFIX, detail)
 }
 
 #[cfg(test)]
