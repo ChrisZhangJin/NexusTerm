@@ -21,16 +21,16 @@ pub struct Preview {
 
 fn read(path: &Path, remaining: &mut u64) -> Result<String, String> {
     if !path.is_file() {
-        return Err("请选择普通文件".into());
+        return Err(crate::tr!("请选择普通文件", "Please choose a regular file"));
     }
     let mut bytes = Vec::new();
     File::open(path)
         .and_then(|f| f.take(*remaining + 1).read_to_end(&mut bytes))
-        .map_err(|_| "无法读取连接配置文件".to_string())?;
+        .map_err(|_| crate::tr!("无法读取连接配置文件", "Cannot read the connection config file"))?;
     *remaining = remaining
         .checked_sub(bytes.len() as u64)
-        .ok_or("连接配置超过 4 MB 上限")?;
-    let text = String::from_utf8(bytes).map_err(|_| "请选择 UTF-8 编码的连接配置")?;
+        .ok_or_else(|| crate::tr!("连接配置超过 4 MB 上限", "The connection config exceeds the 4 MB limit"))?;
+    let text = String::from_utf8(bytes).map_err(|_| crate::tr!("请选择 UTF-8 编码的连接配置", "Please choose a UTF-8 encoded connection config"))?;
     Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
 }
 
@@ -81,15 +81,15 @@ fn csv_preview(text: &str) -> Result<Preview, String> {
         .from_reader(text.as_bytes());
     let headers: Vec<String> = reader
         .headers()
-        .map_err(|_| "无法读取 CSV 表头")?
+        .map_err(|_| crate::tr!("无法读取 CSV 表头", "Cannot read the CSV header"))?
         .iter()
         .map(|h| h.to_ascii_lowercase().replace([' ', '_', '-'], ""))
         .collect();
     let col = |aliases: &[&str]| headers.iter().position(|h| aliases.contains(&h.as_str()));
     let host = col(&["hostname", "host", "address", "ipaddress", "ip"])
-        .ok_or("CSV 缺少 Hostname/Address 列")?;
+        .ok_or_else(|| crate::tr!("CSV 缺少 Hostname/Address 列", "The CSV has no Hostname/Address column"))?;
     let user =
-        col(&["username", "user", "sshusername", "sshuser"]).ok_or("CSV 缺少 Username 列")?;
+        col(&["username", "user", "sshusername", "sshuser"]).ok_or_else(|| crate::tr!("CSV 缺少 Username 列", "The CSV has no Username column"))?;
     let name = col(&["label", "name", "alias"]);
     let port = col(&["port", "sshport"]);
     let group = col(&["group", "folder", "grouppath"]);
@@ -104,10 +104,10 @@ fn csv_preview(text: &str) -> Result<Preview, String> {
     let mut out = Preview::default();
     for (i, row) in reader.records().enumerate() {
         if i >= MAX_HOSTS {
-            return Err("每次最多读取 1000 个连接".into());
+            return Err(crate::tr!("每次最多读取 1000 个连接", "At most 1000 connections can be read at a time"));
         }
         let Ok(row) = row else {
-            out.warnings.push(format!("第 {} 条：CSV 格式错误", i + 1));
+            out.warnings.push(crate::tr!("第 {} 条：CSV 格式错误", "Entry {}: malformed CSV", i + 1));
             continue;
         };
         let get = |c: Option<usize>| c.and_then(|n| row.get(n)).unwrap_or("");
@@ -117,8 +117,8 @@ fn csv_preview(text: &str) -> Result<Preview, String> {
                 "" | "ssh" | "sftp"
             )
         {
-            out.warnings.push(format!(
-                "第 {} 条：不支持代理/跳板或连接协议，已跳过",
+            out.warnings.push(crate::tr!(
+                "第 {} 条：不支持代理/跳板或连接协议，已跳过", "Entry {}: proxy/jump host or protocol not supported; skipped",
                 i + 1
             ));
             continue;
@@ -147,7 +147,7 @@ fn csv_preview(text: &str) -> Result<Preview, String> {
             Some(s) => out.sessions.push(s),
             None => out
                 .warnings
-                .push(format!("第 {} 条：主机、用户名或端口无效", i + 1)),
+                .push(crate::tr!("第 {} 条：主机、用户名或端口无效", "Entry {}: invalid host, username or port", i + 1)),
         }
     }
     Ok(out)
@@ -165,11 +165,11 @@ fn config_lines(
 ) -> Result<(), String> {
     *count += 1;
     if *count > MAX_FILES || stack.len() >= 16 {
-        return Err("SSH Include 层级或文件数量超过上限".into());
+        return Err(crate::tr!("SSH Include 层级或文件数量超过上限", "Too many nested SSH Includes or included files"));
     }
-    let path = path.canonicalize().map_err(|_| "无法打开 SSH 配置文件")?;
+    let path = path.canonicalize().map_err(|_| crate::tr!("无法打开 SSH 配置文件", "Cannot open the SSH config file"))?;
     if !stack.insert(path.clone()) {
-        return Err("SSH 配置中存在循环 Include".into());
+        return Err(crate::tr!("SSH 配置中存在循环 Include", "The SSH config has a circular Include"));
     }
     for (i, line) in read(&path, remaining)?.lines().enumerate() {
         let line = line.trim();
@@ -209,21 +209,21 @@ fn config_lines(
             rest
         };
         let mut args =
-            shell_words::split(rest).map_err(|_| format!("SSH 配置第 {} 行引号不完整", i + 1))?;
+            shell_words::split(rest).map_err(|_| crate::tr!("SSH 配置第 {} 行引号不完整", "SSH config line {} has unbalanced quotes", i + 1))?;
         if let Some(pos) = args.iter().position(|s| s.starts_with('#')) {
             args.truncate(pos);
         }
         if args.is_empty() {
-            return Err(format!("SSH 配置第 {} 行缺少参数", i + 1));
+            return Err(crate::tr!("SSH 配置第 {} 行缺少参数", "SSH config line {} is missing an argument", i + 1));
         }
         if key == "include" {
             for a in args {
                 let p = base.join(crate::keys::expand_tilde(&a));
-                let matches = glob::glob(p.to_str().ok_or("Include 路径编码无效")?)
-                    .map_err(|_| "Include 模式无效")?;
+                let matches = glob::glob(p.to_str().ok_or_else(|| crate::tr!("Include 路径编码无效", "Invalid Include path encoding"))?)
+                    .map_err(|_| crate::tr!("Include 模式无效", "Invalid Include pattern"))?;
                 for m in matches {
                     config_lines(
-                        &m.map_err(|_| "无法读取 Include 文件")?,
+                        &m.map_err(|_| crate::tr!("无法读取 Include 文件", "Cannot read an Include file"))?,
                         base,
                         remaining,
                         count,
@@ -233,10 +233,10 @@ fn config_lines(
                 }
             }
         } else if key == "match" {
-            return Err(
-                "此配置包含 Match。请提供只含要迁移的 Host 条目的配置副本；Nexus 不执行 Match 条件"
-                    .into(),
-            );
+            return Err(crate::tr!(
+                "此配置包含 Match。请提供只含要迁移的 Host 条目的配置副本；Nexus 不执行 Match 条件",
+                "This config contains Match. Provide a copy with only the Host entries to migrate; Nexus does not evaluate Match conditions"
+            ));
         } else {
             lines.push((key, args));
         }
@@ -278,7 +278,7 @@ fn ssh_preview(lines: &[Directive], fallback_user: &str) -> Result<Preview, Stri
             continue;
         }
         if seen.len() > MAX_HOSTS {
-            return Err("每次最多读取 1000 个连接".into());
+            return Err(crate::tr!("每次最多读取 1000 个连接", "At most 1000 connections can be read at a time"));
         }
         let mut active = true;
         let mut opts = HashMap::new();
@@ -299,8 +299,8 @@ fn ssh_preview(lines: &[Directive], fallback_user: &str) -> Result<Preview, Stri
         .iter()
         .any(|&k| !matches!(get(k).to_ascii_lowercase().as_str(), "" | "none" | "no"))
         {
-            out.warnings.push(format!(
-                "{alias}：含跳板、代理、远端启动命令或主机名重写，已跳过"
+            out.warnings.push(crate::tr!(
+                "{alias}：含跳板、代理、远端启动命令或主机名重写，已跳过", "{alias}: uses a jump host, proxy, remote command or hostname rewrite; skipped"
             ));
             continue;
         }
@@ -311,7 +311,7 @@ fn ssh_preview(lines: &[Directive], fallback_user: &str) -> Result<Preview, Stri
             .replace("%h", alias);
         if host.contains(['%', '$']) {
             out.warnings
-                .push(format!("{alias}：含不支持的 HostName 变量，已跳过"));
+                .push(crate::tr!("{alias}：含不支持的 HostName 变量，已跳过", "{alias}: unsupported HostName variable; skipped"));
             continue;
         }
         let key = get("identityfile");
@@ -321,7 +321,7 @@ fn ssh_preview(lines: &[Directive], fallback_user: &str) -> Result<Preview, Stri
                 Some(k)
             } else {
                 out.warnings
-                    .push(format!("{alias}：IdentityFile 需要手动设置"));
+                    .push(crate::tr!("{alias}：IdentityFile 需要手动设置", "{alias}: IdentityFile must be set manually"));
                 None
             }
         });
@@ -337,7 +337,7 @@ fn ssh_preview(lines: &[Directive], fallback_user: &str) -> Result<Preview, Stri
             Some(s) => out.sessions.push(s),
             None => out
                 .warnings
-                .push(format!("{alias}：主机、用户名或端口无效")),
+                .push(crate::tr!("{alias}：主机、用户名或端口无效", "{alias}: invalid host, username or port")),
         }
     }
     Ok(out)
@@ -363,7 +363,7 @@ pub fn preview(path: &Path, format: &str) -> Result<Preview, String> {
                 .unwrap_or_default();
             ssh_preview(&lines, &user)
         }
-        _ => Err("不支持的连接配置格式".into()),
+        _ => Err(crate::tr!("不支持的连接配置格式", "Unsupported connection config format")),
     }
 }
 

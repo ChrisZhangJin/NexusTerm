@@ -81,7 +81,7 @@ pub fn parse(text: &str, passphrase: Option<&str>) -> Result<PrivateKey, String>
     let encrypted = h.encryption != "none";
 
     if encrypted && phrase.is_empty() {
-        return Err("该私钥已加密，需要提供密码".into());
+        return Err(super::passphrase_required());
     }
 
     let (key, iv, mac_key) = derive_keys(&h, phrase.as_bytes())?;
@@ -129,23 +129,23 @@ impl Headers {
     fn parse(text: &str) -> Result<Self, String> {
         let text = text.trim_start_matches('\u{feff}');
         let lines: Vec<&str> = text.lines().map(|l| l.trim_end_matches('\r')).collect();
-        let first = lines.first().ok_or("PPK 文件为空")?;
+        let first = lines.first().ok_or_else(|| crate::tr!("PPK 文件为空", "The PPK file is empty"))?;
         let (head, algo) = first
             .split_once(':')
-            .ok_or("不是 PPK 文件：缺少 PuTTY-User-Key-File 头")?;
+            .ok_or_else(|| crate::tr!("不是 PPK 文件：缺少 PuTTY-User-Key-File 头", "Not a PPK file: missing the PuTTY-User-Key-File header"))?;
         let version: u32 = head
             .trim()
             .strip_prefix("PuTTY-User-Key-File-")
-            .ok_or("不是 PPK 文件：缺少 PuTTY-User-Key-File 头")?
+            .ok_or_else(|| crate::tr!("不是 PPK 文件：缺少 PuTTY-User-Key-File 头", "Not a PPK file: missing the PuTTY-User-Key-File header"))?
             .parse()
-            .map_err(|_| format!("无法识别的 PPK 版本：{first}"))?;
+            .map_err(|_| crate::tr!("无法识别的 PPK 版本：{first}", "Unrecognised PPK version: {first}"))?;
         if !(1..=3).contains(&version) {
-            return Err(format!("不支持的 PPK 版本：{version}"));
+            return Err(crate::tr!("不支持的 PPK 版本：{version}", "Unsupported PPK version: {version}"));
         }
         // 算法名要参与 MAC 计算，必须和文件里写的完全一致，不能归一化
         let algorithm = header_value(algo).to_string();
         if algorithm.is_empty() {
-            return Err("PPK 头缺少算法名".into());
+            return Err(crate::tr!("PPK 头缺少算法名", "PPK header is missing the algorithm name"));
         }
 
         let mut encryption = String::new();
@@ -171,7 +171,7 @@ impl Headers {
             }
             let (key, value) = line
                 .split_once(':')
-                .ok_or_else(|| format!("PPK 第 {} 行格式不对：{line}", i + 1))?;
+                .ok_or_else(|| crate::tr!("PPK 第 {} 行格式不对：{line}", "PPK line {} is malformed: {line}", i + 1))?;
             // 只吃掉冒号后的那一个空格，其余原样保留（见 header_value）
             let value = header_value(value);
 
@@ -205,10 +205,10 @@ impl Headers {
         }
 
         if public_blob.is_empty() {
-            return Err("PPK 缺少公钥段".into());
+            return Err(crate::tr!("PPK 缺少公钥段", "PPK is missing the public key section"));
         }
         if mac_hex.is_empty() {
-            return Err("PPK 缺少完整性校验字段（Private-MAC）".into());
+            return Err(crate::tr!("PPK 缺少完整性校验字段（Private-MAC）", "PPK is missing the integrity check field (Private-MAC)"));
         }
 
         let argon = if kdf_flavour.is_empty() {
@@ -246,12 +246,12 @@ fn read_blob(lines: &[&str], i: &mut usize, count: usize) -> Result<Vec<u8>, Str
     let end = start
         .checked_add(count)
         .filter(|e| *e <= lines.len())
-        .ok_or("PPK 内容行数不足，文件可能已损坏或被截断")?;
+        .ok_or_else(|| crate::tr!("PPK 内容行数不足，文件可能已损坏或被截断", "PPK has too few lines; the file may be corrupted or truncated"))?;
     let joined: String = lines[start..end].concat();
     *i = end;
     base64::engine::general_purpose::STANDARD
         .decode(joined.trim())
-        .map_err(|e| format!("PPK base64 解码失败：{e}"))
+        .map_err(|e| crate::tr!("PPK base64 解码失败：{e}", "PPK base64 decoding failed: {e}"))
 }
 
 /// 取头部字段的值。
@@ -267,9 +267,9 @@ fn parse_line_count(v: &str) -> Result<usize, String> {
     let n: u32 = v
         .trim()
         .parse()
-        .map_err(|_| format!("PPK 行数字段不是整数：{v}"))?;
+        .map_err(|_| crate::tr!("PPK 行数字段不是整数：{v}", "PPK line count is not an integer: {v}"))?;
     if n == 0 || n > MAX_BLOB_LINES {
-        return Err(format!("PPK 行数字段超出合理范围：{n}"));
+        return Err(crate::tr!("PPK 行数字段超出合理范围：{n}", "PPK line count is out of range: {n}"));
     }
     Ok(n as usize)
 }
@@ -277,7 +277,7 @@ fn parse_line_count(v: &str) -> Result<usize, String> {
 fn parse_u32(v: &str, field: &str) -> Result<u32, String> {
     v.trim()
         .parse()
-        .map_err(|_| format!("PPK 的 {field} 不是整数：{v}"))
+        .map_err(|_| crate::tr!("PPK 的 {field} 不是整数：{v}", "PPK {field} is not an integer: {v}"))
 }
 
 // ——— 密钥派生 ———
@@ -286,13 +286,13 @@ fn derive_keys(h: &Headers, phrase: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)
     let (key_len, iv_len) = match h.encryption.as_str() {
         "none" => (0, 0),
         "aes256-cbc" => (32, 16),
-        other => return Err(format!("不支持的 PPK 加密算法：{other}")),
+        other => return Err(crate::tr!("不支持的 PPK 加密算法：{other}", "Unsupported PPK encryption: {other}")),
     };
 
     match h.version {
         1 | 2 => Ok(derive_legacy(phrase, key_len, iv_len)),
         3 => derive_v3(h, phrase, key_len, iv_len),
-        v => Err(format!("不支持的 PPK 版本：{v}")),
+        v => Err(crate::tr!("不支持的 PPK 版本：{v}", "Unsupported PPK version: {v}")),
     }
 }
 
@@ -340,12 +340,12 @@ fn derive_v3(
     let a = h
         .argon
         .as_ref()
-        .ok_or("PPK v3 缺少 Argon2 派生参数（Key-Derivation）")?;
+        .ok_or_else(|| crate::tr!("PPK v3 缺少 Argon2 派生参数（Key-Derivation）", "PPK v3 is missing the Argon2 parameters (Key-Derivation)"))?;
     let flavour = match a.flavour.as_str() {
         "Argon2id" => KdfFlavour::Argon2id,
         "Argon2i" => KdfFlavour::Argon2i,
         "Argon2d" => KdfFlavour::Argon2d,
-        other => return Err(format!("不支持的 PPK 密钥派生算法：{other}")),
+        other => return Err(crate::tr!("不支持的 PPK 密钥派生算法：{other}", "Unsupported PPK key derivation: {other}")),
     };
 
     let mac_key_len = 32usize;
@@ -353,12 +353,12 @@ fn derive_v3(
 
     // PuTTY 的 Argon2-Memory 单位是 KiB，和 argon2 crate 的 m_cost 一致
     let params = KdfParams::new(a.memory, a.passes, a.parallelism, Some(out_len))
-        .map_err(|e| format!("PPK 的 Argon2 参数不合法：{e}"))?;
+        .map_err(|e| crate::tr!("PPK 的 Argon2 参数不合法：{e}", "Invalid PPK Argon2 parameters: {e}"))?;
     let alg = Argon2::new(flavour, KdfVersion::V0x13, params);
 
     let mut out = vec![0u8; out_len];
     alg.hash_password_into(phrase, &a.salt, &mut out)
-        .map_err(|e| format!("PPK 密钥派生失败：{e}"))?;
+        .map_err(|e| crate::tr!("PPK 密钥派生失败：{e}", "PPK key derivation failed: {e}"))?;
 
     let key = out[..key_len].to_vec();
     let iv = out[key_len..key_len + iv_len].to_vec();
@@ -370,14 +370,14 @@ fn derive_v3(
 
 fn decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
     if data.is_empty() || data.len() % 16 != 0 {
-        return Err("PPK 密文长度不是 AES 分组长度的整数倍".into());
+        return Err(crate::tr!("PPK 密文长度不是 AES 分组长度的整数倍", "PPK ciphertext length is not a multiple of the AES block size"));
     }
     let mut buf = data.to_vec();
     let plain = cbc::Decryptor::<Aes256>::new_from_slices(key, iv)
-        .map_err(|_| "PPK 解密参数错误".to_string())?
+        .map_err(|_| crate::tr!("PPK 解密参数错误", "Invalid PPK decryption parameters"))?
         // 私钥块尾部自带零填充，不按 PKCS#7 剥离
         .decrypt_padded_mut::<NoPadding>(&mut buf)
-        .map_err(|_| "PPK 解密失败".to_string())?;
+        .map_err(|_| crate::tr!("PPK 解密失败", "PPK decryption failed"))?;
     Ok(plain.to_vec())
 }
 
@@ -410,9 +410,9 @@ fn verify_mac(h: &Headers, mac_key: &[u8], plain: &[u8]) -> Result<(), String> {
     if actual != expected {
         // CBC 用错密钥不会报错，只是解出垃圾；所以口令错只能在这里被发现
         return Err(if h.encryption != "none" {
-            "私钥密码不正确".into()
+            super::passphrase_wrong()
         } else {
-            "PPK 文件校验失败，文件可能已损坏".into()
+            crate::tr!("PPK 文件校验失败，文件可能已损坏", "PPK integrity check failed; the file may be corrupted")
         });
     }
     Ok(())
@@ -420,14 +420,14 @@ fn verify_mac(h: &Headers, mac_key: &[u8], plain: &[u8]) -> Result<(), String> {
 
 fn hmac_sha1(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
     let mut m = <Hmac<Sha1> as Mac>::new_from_slice(key)
-        .map_err(|_| "HMAC 初始化失败".to_string())?;
+        .map_err(|_| crate::tr!("HMAC 初始化失败", "HMAC initialisation failed"))?;
     m.update(data);
     Ok(m.finalize().into_bytes().to_vec())
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
     let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key)
-        .map_err(|_| "HMAC 初始化失败".to_string())?;
+        .map_err(|_| crate::tr!("HMAC 初始化失败", "HMAC initialisation failed"))?;
     m.update(data);
     Ok(m.finalize().into_bytes().to_vec())
 }
@@ -436,7 +436,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
 
 fn build_private_key(h: &Headers, plain: &[u8]) -> Result<PrivateKey, String> {
     let public = PublicKey::from_bytes(&h.public_blob)
-        .map_err(|e| format!("PPK 里的公钥无法解析：{e}"))?;
+        .map_err(|e| crate::tr!("PPK 里的公钥无法解析：{e}", "Cannot parse the public key in the PPK: {e}"))?;
     let mut r = Reader::new(plain);
 
     let keypair = match public.key_data() {
@@ -465,7 +465,7 @@ fn build_private_key(h: &Headers, plain: &[u8]) -> Result<PrivateKey, String> {
             let kp = Ed25519Keypair::from_seed(&seed);
             // 字节序一旦搞错公钥必然对不上，这里拦住比事后连不上服务器好排查
             if &kp.public != k {
-                return Err("PPK 里的 Ed25519 私钥与公钥不匹配".into());
+                return Err(crate::tr!("PPK 里的 Ed25519 私钥与公钥不匹配", "The Ed25519 private key in the PPK does not match its public key"));
             }
             KeypairData::Ed25519(kp)
         }
@@ -489,28 +489,28 @@ fn build_private_key(h: &Headers, plain: &[u8]) -> Result<PrivateKey, String> {
             KeypairData::Ecdsa(pair)
         }
         other => {
-            return Err(format!(
-                "暂不支持 {} 类型的 PPK 私钥（DSA 已被 OpenSSH 移除，FIDO 密钥无法从文件复制）",
+            return Err(crate::tr!(
+                "暂不支持 {} 类型的 PPK 私钥（DSA 已被 OpenSSH 移除，FIDO 密钥无法从文件复制）", "{} PPK private keys are not supported (DSA was removed from OpenSSH; FIDO keys cannot be copied from a file)",
                 other.algorithm().as_str()
             ))
         }
     };
 
-    PrivateKey::new(keypair, h.comment.clone()).map_err(|e| format!("构造私钥失败：{e}"))
+    PrivateKey::new(keypair, h.comment.clone()).map_err(|e| crate::tr!("构造私钥失败：{e}", "Failed to build the private key: {e}"))
 }
 
 fn ecdsa_err(e: ssh_key::Error) -> String {
-    format!("PPK 里的 ECDSA 私钥无法解析：{e}")
+    crate::tr!("PPK 里的 ECDSA 私钥无法解析：{e}", "Cannot parse the ECDSA private key in the PPK: {e}")
 }
 
 fn to_mpint(bytes: &[u8]) -> Result<Mpint, String> {
     // 空字节序列在 SSH 里表示 0，但作为 RSA 参数没有意义
     if bytes.is_empty() {
-        return Err("PPK 里的 RSA 参数为空".into());
+        return Err(crate::tr!("PPK 里的 RSA 参数为空", "The RSA parameters in the PPK are empty"));
     }
     // 必须用 `from_positive_bytes`：`from_bytes` 会把最高位为 1 的输入当负数解读，
     // 而 RSA 的 d/p/q 最高位几乎必然是 1，用错会让参数变负值，签名一路失败。
-    Mpint::from_positive_bytes(bytes).map_err(|e| format!("PPK 里的整数不合法：{e}"))
+    Mpint::from_positive_bytes(bytes).map_err(|e| crate::tr!("PPK 里的整数不合法：{e}", "Invalid integer in the PPK: {e}"))
 }
 
 // ——— 字节读取 ———
@@ -529,9 +529,9 @@ impl<'a> Reader<'a> {
         let end = self
             .pos
             .checked_add(n)
-            .ok_or("PPK 私钥块长度溢出")?;
+            .ok_or_else(|| crate::tr!("PPK 私钥块长度溢出", "PPK private key block length overflow"))?;
         if end > self.buf.len() {
-            return Err("PPK 私钥块不完整，可能已损坏".into());
+            return Err(crate::tr!("PPK 私钥块不完整，可能已损坏", "PPK private key block is incomplete; it may be corrupted"));
         }
         let slice = &self.buf[self.pos..end];
         self.pos = end;
@@ -547,7 +547,7 @@ impl<'a> Reader<'a> {
     fn mpint(&mut self) -> Result<Vec<u8>, String> {
         let len = self.u32()? as usize;
         if len > self.buf.len() {
-            return Err("PPK 私钥块里的整数长度异常".into());
+            return Err(crate::tr!("PPK 私钥块里的整数长度异常", "Bad integer length in the PPK private key block"));
         }
         let raw = self.take(len)?;
         let start = raw.iter().position(|&b| b != 0).unwrap_or(raw.len());
@@ -559,7 +559,7 @@ impl<'a> Reader<'a> {
         let start = self.pos;
         let len = self.u32()? as usize;
         if len > self.buf.len() {
-            return Err("PPK 私钥块里的整数长度异常".into());
+            return Err(crate::tr!("PPK 私钥块里的整数长度异常", "Bad integer length in the PPK private key block"));
         }
         self.take(len)?;
         Ok(self.buf[start..self.pos].to_vec())
@@ -569,8 +569,8 @@ impl<'a> Reader<'a> {
     fn le_fixed(&mut self, want: usize) -> Result<Vec<u8>, String> {
         let len = self.u32()? as usize;
         if len != want {
-            return Err(format!(
-                "PPK 私钥字段长度异常：期望 {want} 字节，实际 {len} 字节"
+            return Err(crate::tr!(
+                "PPK 私钥字段长度异常：期望 {want} 字节，实际 {len} 字节", "Bad PPK private key field length: expected {want} bytes, got {len}"
             ));
         }
         Ok(self.take(len)?.to_vec())
@@ -585,7 +585,7 @@ fn push_string(out: &mut Vec<u8>, data: &[u8]) {
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let bytes = s.as_bytes();
     if bytes.len() % 2 != 0 {
-        return Err("PPK 的校验值不是合法的十六进制".into());
+        return Err(crate::tr!("PPK 的校验值不是合法的十六进制", "PPK checksum is not valid hex"));
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
     for pair in bytes.chunks(2) {
@@ -601,7 +601,7 @@ fn hex_val(b: u8) -> Result<u8, String> {
         b'0'..=b'9' => Ok(b - b'0'),
         b'a'..=b'f' => Ok(b - b'a' + 10),
         b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err("PPK 的校验值不是合法的十六进制".into()),
+        _ => Err(crate::tr!("PPK 的校验值不是合法的十六进制", "PPK checksum is not valid hex")),
     }
 }
 

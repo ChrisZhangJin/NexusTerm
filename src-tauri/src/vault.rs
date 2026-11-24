@@ -215,44 +215,47 @@ impl KdfSpec {
 
     /// 序列化成要存进 `settings` 的那一串。
     pub fn to_json(&self) -> Result<String, String> {
-        serde_json::to_string(self).map_err(|e| format!("无法序列化保险库 KDF 参数：{e}"))
+        serde_json::to_string(self).map_err(|e| crate::tr!("无法序列化保险库 KDF 参数：{e}", "Cannot serialise the vault KDF parameters: {e}"))
     }
 
     /// 从 `settings` 里读回来。
     pub fn from_json(s: &str) -> Result<Self, String> {
-        serde_json::from_str(s).map_err(|e| format!("保险库 KDF 参数已损坏：{e}"))
+        serde_json::from_str(s).map_err(|e| crate::tr!("保险库 KDF 参数已损坏：{e}", "The vault KDF parameters are corrupted: {e}"))
     }
 
     /// 由主密码派生 KEK。
     pub(crate) fn derive(&self, password: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
         if self.alg == DAMAGED {
-            return Err("保险库元数据已损坏（settings 里的 vault.kdf 读不出来），\
-                        无法解锁。如果有 nexus.db.pre-vault.bak，可以用它恢复。"
-                .into());
+            return Err(crate::tr!(
+                "保险库元数据已损坏（settings 里的 vault.kdf 读不出来），\
+                 无法解锁。如果有 nexus.db.pre-vault.bak，可以用它恢复。",
+                "The vault metadata is corrupted (vault.kdf in settings cannot be read), so it cannot be unlocked. \
+                 If nexus.db.pre-vault.bak exists, you can restore from it."
+            ));
         }
         if self.alg != "argon2id" {
-            return Err(format!("不支持的保险库密钥派生算法：{}", self.alg));
+            return Err(crate::tr!("不支持的保险库密钥派生算法：{}", "Unsupported vault key derivation algorithm: {}", self.alg));
         }
         if self.ver != 0x13 {
-            return Err(format!("不支持的 Argon2 版本：0x{:x}", self.ver));
+            return Err(crate::tr!("不支持的 Argon2 版本：0x{:x}", "Unsupported Argon2 version: 0x{:x}", self.ver));
         }
         if self.len as usize != KEY_LEN {
-            return Err(format!("保险库密钥长度不对：{}", self.len));
+            return Err(crate::tr!("保险库密钥长度不对：{}", "Wrong vault key length: {}", self.len));
         }
         let salt = b64()
             .decode(self.salt.trim())
-            .map_err(|_| "保险库的盐不是合法 base64".to_string())?;
+            .map_err(|_| crate::tr!("保险库的盐不是合法 base64", "The vault salt is not valid base64"))?;
         if salt.len() < 8 {
-            return Err("保险库的盐过短".into());
+            return Err(crate::tr!("保险库的盐过短", "The vault salt is too short"));
         }
 
         let params = Params::new(self.m, self.t, self.p, Some(KEY_LEN))
-            .map_err(|e| format!("保险库 Argon2 参数不合法：{e}"))?;
+            .map_err(|e| crate::tr!("保险库 Argon2 参数不合法：{e}", "Invalid vault Argon2 parameters: {e}"))?;
         let alg = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
         let mut out = Zeroizing::new([0u8; KEY_LEN]);
         alg.hash_password_into(password.as_bytes(), &salt, out.as_mut())
-            .map_err(|e| format!("保险库密钥派生失败：{e}"))?;
+            .map_err(|e| crate::tr!("保险库密钥派生失败：{e}", "Vault key derivation failed: {e}"))?;
         Ok(out)
     }
 }
@@ -265,7 +268,7 @@ fn seal_raw(key: &[u8; KEY_LEN], aad: &[u8], plain: &[u8]) -> Result<String, Str
     let nonce = Aes256Gcm::generate_nonce(&mut AeadRng);
     let ct = cipher
         .encrypt(&nonce, Payload { msg: plain, aad })
-        .map_err(|_| "保险库加密失败".to_string())?;
+        .map_err(|_| crate::tr!("保险库加密失败", "Vault encryption failed"))?;
 
     let mut blob = Vec::with_capacity(NONCE_LEN + ct.len());
     blob.extend_from_slice(&nonce);
@@ -277,21 +280,21 @@ fn seal_raw(key: &[u8; KEY_LEN], aad: &[u8], plain: &[u8]) -> Result<String, Str
 fn open_raw(key: &[u8; KEY_LEN], aad: &[u8], body: &str) -> Result<Zeroizing<Vec<u8>>, String> {
     let raw = b64()
         .decode(body.trim())
-        .map_err(|_| "保险库密文不是合法 base64".to_string())?;
+        .map_err(|_| crate::tr!("保险库密文不是合法 base64", "The vault ciphertext is not valid base64"))?;
     if raw.len() <= NONCE_LEN {
-        return Err("保险库密文过短，已损坏".into());
+        return Err(crate::tr!("保险库密文过短，已损坏", "The vault ciphertext is too short; it is corrupted"));
     }
     let (nonce, ct) = raw.split_at(NONCE_LEN);
 
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| e.to_string())?;
     let plain = cipher
         .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad })
-        .map_err(|_| "保险库解密失败：密钥不对，或数据已损坏".to_string())?;
+        .map_err(|_| crate::tr!("保险库解密失败：密钥不对，或数据已损坏", "Vault decryption failed: wrong key, or the data is corrupted"))?;
     Ok(Zeroizing::new(plain))
 }
 
 fn to_text(bytes: Zeroizing<Vec<u8>>) -> Result<String, String> {
-    String::from_utf8(bytes.to_vec()).map_err(|_| "保险库解密结果不是合法文本".into())
+    String::from_utf8(bytes.to_vec()).map_err(|_| crate::tr!("保险库解密结果不是合法文本", "Vault decryption result is not valid text"))
 }
 
 // ——— DEK 的生成、包装与校验 ———
@@ -337,11 +340,11 @@ pub fn unwrap_dek(
 ) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
     let kek = kdf.derive(password)?;
     let raw = open_raw(&kek, &dek_aad(kdf_json), wrapped)
-        .map_err(|_| "主密码不正确".to_string())?;
+        .map_err(|_| crate::tr!("主密码不正确", "Wrong master password"))?;
     let dek: [u8; KEY_LEN] = raw
         .as_slice()
         .try_into()
-        .map_err(|_| "保险库数据密钥长度不对".to_string())?;
+        .map_err(|_| crate::tr!("保险库数据密钥长度不对", "The vault data key has the wrong length"))?;
     Ok(Zeroizing::new(dek))
 }
 
@@ -504,7 +507,7 @@ impl Vault {
                 Field::Totp => crate::secret::encrypt(plain),
                 _ => Ok(plain.to_string()),
             },
-            VaultState::Locked { .. } => Err(LOCKED_WRITE.into()),
+            VaultState::Locked { .. } => Err(locked_write()),
         }
     }
 
@@ -529,14 +532,14 @@ impl Vault {
                 VaultState::Unlocked { dek, .. } => {
                     to_text(open_raw(dek, &kind.aad(), &stored[V2.len()..])?)
                 }
-                _ => Err(LOCKED_READ.into()),
+                _ => Err(locked_read()),
             },
             // v1 的密钥在系统凭据服务里，和保险库锁没锁无关。
             Form::Keyring => crate::secret::decrypt(stored),
             // TOTP 这一列从引入起就只存密文，裸值只可能是损坏数据。把它当 base32
             // 种子直接用会安安静静地算出一串错的验证码 —— 报错比那强得多。
             Form::Plain if kind == Field::Totp => {
-                Err("TOTP 种子格式无法识别（缺少版本前缀），请重新填写".into())
+                Err(crate::tr!("TOTP 种子格式无法识别（缺少版本前缀），请重新填写", "Unrecognised TOTP seed format (missing version prefix); please enter it again"))
             }
             // 还没被扫描改写的遗留明文。
             //
@@ -548,8 +551,19 @@ impl Vault {
     }
 }
 
-const LOCKED_WRITE: &str = "保险库已锁定，无法保存凭据。请先输入主密码解锁。";
-const LOCKED_READ: &str = "保险库已锁定，无法读取凭据。请先输入主密码解锁。";
+fn locked_write() -> String {
+    crate::tr!(
+        "保险库已锁定，无法保存凭据。请先输入主密码解锁。",
+        "The vault is locked, so credentials cannot be saved. Enter the master password to unlock it first."
+    )
+}
+
+fn locked_read() -> String {
+    crate::tr!(
+        "保险库已锁定，无法读取凭据。请先输入主密码解锁。",
+        "The vault is locked, so credentials cannot be read. Enter the master password to unlock it first."
+    )
+}
 
 /// 「在本机记住」：把 DEK 交给系统凭据服务，下次启动免输主密码。
 ///
@@ -572,10 +586,10 @@ pub mod remember {
 
     pub fn save(id: &str, dek: &[u8; KEY_LEN]) -> Result<(), String> {
         let entry = keyring::Entry::new(SERVICE, id)
-            .map_err(|e| format!("无法访问系统凭据服务：{e}"))?;
+            .map_err(|e| crate::tr!("无法访问系统凭据服务：{e}", "Cannot access the system credential service: {e}"))?;
         entry
             .set_password(&b64().encode(dek))
-            .map_err(|e| format!("无法记住主密码：{e}"))
+            .map_err(|e| crate::tr!("无法记住主密码：{e}", "Cannot remember the master password: {e}"))
     }
 
     /// 取回记住的 DEK。

@@ -46,7 +46,7 @@ struct XshSession {
 
 /// 读文件并按 BOM 解码：UTF-16LE / UTF-16BE / UTF-8（含 lossy 兜底）。
 fn read_text(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|e| format!("读取失败：{}", e))?;
+    let bytes = fs::read(path).map_err(|e| crate::tr!("读取失败：{}", "Read failed: {}", e))?;
     if bytes.starts_with(&[0xFF, 0xFE]) {
         let units: Vec<u16> = bytes[2..]
             .chunks_exact(2)
@@ -202,7 +202,7 @@ fn parse_xsh(text: &str, fallback_name: &str) -> Result<XshSession, String> {
 
     let host = lookup(&ini, "CONNECTION", "Host")
         .filter(|v| !v.is_empty())
-        .ok_or("缺少 [CONNECTION] Host")?
+        .ok_or_else(|| crate::tr!("缺少 [CONNECTION] Host", "Missing [CONNECTION] Host"))?
         .to_string();
 
     let port = lookup(&ini, "CONNECTION", "Port")
@@ -214,7 +214,7 @@ fn parse_xsh(text: &str, fallback_name: &str) -> Result<XshSession, String> {
         .unwrap_or("SSH")
         .to_uppercase();
     if protocol != "SSH" {
-        return Err(format!("不支持的协议 {}（仅支持 SSH）", protocol));
+        return Err(crate::tr!("不支持的协议 {}（仅支持 SSH）", "Unsupported protocol {} (only SSH is supported)", protocol));
     }
 
     let username = lookup(&ini, "CONNECTION:AUTHENTICATION", "UserName")

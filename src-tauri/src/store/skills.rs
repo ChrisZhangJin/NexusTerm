@@ -104,7 +104,7 @@ fn row_to_skill(r: &Row) -> rusqlite::Result<Skill> {
 fn enum_text<T: serde::Serialize>(v: &T) -> Result<String, String> {
     match serde_json::to_value(v).map_err(|e| e.to_string())? {
         Value::String(s) => Ok(s),
-        other => Err(format!("枚举序列化异常：{other}")),
+        other => Err(crate::tr!("枚举序列化异常：{other}", "Unexpected enum serialisation: {other}")),
     }
 }
 
@@ -177,10 +177,10 @@ impl Store {
         let s = validated(s)?;
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         if count(&conn)? >= MAX_SKILLS {
-            return Err(format!("skill 数量已达上限（{MAX_SKILLS}），请先删除不用的"));
+            return Err(crate::tr!("skill 数量已达上限（{MAX_SKILLS}），请先删除不用的", "You have reached the maximum of {MAX_SKILLS} skills; delete unused ones first"));
         }
         if fetch(&conn, &s.id)?.is_some() {
-            return Err("skill id 已存在".into());
+            return Err(crate::tr!("skill id 已存在", "A skill with this id already exists"));
         }
         insert_row(&conn, &s)?;
         Ok(s)
@@ -190,7 +190,7 @@ impl Store {
     /// 有变化则成功 / 失败计数清零，否则保留。`input.source` 被忽略。
     pub fn skill_update(&self, id: &str, input: SkillInput) -> Result<Skill, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let old = fetch(&conn, id)?.ok_or_else(|| "skill 不存在".to_string())?;
+        let old = fetch(&conn, id)?.ok_or_else(|| crate::tr!("skill 不存在", "Skill not found"))?;
         let keep_stats = old.same_behavior(&input);
         let mut s = input.clone().into_skill(old.id.clone(), now_secs());
         s.source = old.source;
@@ -304,7 +304,7 @@ impl Store {
     ///   才让 `trust_streak` +1 并记下指纹；其余一律清零——失败 / 偏离 / 内容变了都会掉信任。
     pub fn skill_record_run(&self, id: &str, ok: bool, clean: bool, ran_fingerprint: &str) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let cur = fetch(&conn, id)?.ok_or_else(|| "skill 不存在".to_string())?;
+        let cur = fetch(&conn, id)?.ok_or_else(|| crate::tr!("skill 不存在", "Skill not found"))?;
         let fp = skill::trust_fingerprint(&cur);
         let earn = ok && clean && !ran_fingerprint.is_empty() && ran_fingerprint == fp;
         let (streak, hash) = if earn {

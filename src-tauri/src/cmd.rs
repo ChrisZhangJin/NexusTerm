@@ -35,7 +35,7 @@ pub struct AppState {
 /// 通用落盘（ZMODEM 下载用）：数据由前端攒好后一次写入。
 #[tauri::command]
 pub fn write_file(path: String, data: Vec<u8>) -> Result<(), String> {
-    std::fs::write(&path, &data).map_err(|e| format!("写入失败：{}", e))
+    std::fs::write(&path, &data).map_err(|e| crate::tr!("写入失败：{}", "Write failed: {}", e))
 }
 
 /// 大文件落盘（ZMODEM 下载）。前端把字节编成 base64 传来：
@@ -45,8 +45,8 @@ pub fn write_file_b64(path: String, data: String) -> Result<(), String> {
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
-        .map_err(|e| format!("base64 解码失败：{}", e))?;
-    std::fs::write(&path, &bytes).map_err(|e| format!("写入失败：{}", e))
+        .map_err(|e| crate::tr!("base64 解码失败：{}", "base64 decoding failed: {}", e))?;
+    std::fs::write(&path, &bytes).map_err(|e| crate::tr!("写入失败：{}", "Write failed: {}", e))
 }
 
 /// 输入诊断日志落盘（排查 macOS 中文输入法用）。
@@ -62,14 +62,14 @@ pub fn write_file_b64(path: String, data: String) -> Result<(), String> {
 pub fn append_input_log(app: AppHandle, lines: String) -> Result<(), String> {
     use std::io::Write as _;
     let dir = crate::app_data_dir(&app).join("logs");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败：{e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| crate::tr!("创建日志目录失败：{e}", "Failed to create the log folder: {e}"))?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(dir.join("input.log"))
-        .map_err(|e| format!("打开 input.log 失败：{e}"))?;
+        .map_err(|e| crate::tr!("打开 input.log 失败：{e}", "Failed to open input.log: {e}"))?;
     f.write_all(lines.as_bytes())
-        .map_err(|e| format!("写入失败：{e}"))?;
+        .map_err(|e| crate::tr!("写入失败：{e}", "Write failed: {e}"))?;
     Ok(())
 }
 
@@ -81,7 +81,7 @@ pub fn append_file_b64(path: String, data: String, truncate: bool) -> Result<(),
     use std::io::Write as _;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
-        .map_err(|e| format!("base64 解码失败：{}", e))?;
+        .map_err(|e| crate::tr!("base64 解码失败：{}", "base64 decoding failed: {}", e))?;
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).write(true);
     // append 与 truncate 互斥，不能同时设（Windows 上会直接报错）
@@ -92,9 +92,9 @@ pub fn append_file_b64(path: String, data: String, truncate: bool) -> Result<(),
     }
     let mut f = opts
         .open(&path)
-        .map_err(|e| format!("打开文件失败：{}", e))?;
+        .map_err(|e| crate::tr!("打开文件失败：{}", "Failed to open the file: {}", e))?;
     f.write_all(&bytes)
-        .map_err(|e| format!("写入失败：{}", e))?;
+        .map_err(|e| crate::tr!("写入失败：{}", "Write failed: {}", e))?;
     Ok(())
 }
 
@@ -138,7 +138,7 @@ pub fn local_write_b64(id: String, data: String, state: State<'_, AppState>) -> 
     // 先解码再喂：缓冲里必须存原始字节，存 base64 的话快照全是乱码
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
-        .map_err(|e| format!("base64 解码失败：{}", e))?;
+        .map_err(|e| crate::tr!("base64 解码失败：{}", "base64 decoding failed: {}", e))?;
     state.local.write(&id, &bytes)?;
     state.agent.feed(&id, &bytes, StreamKind::In);
     Ok(())
@@ -244,7 +244,7 @@ pub async fn ssh_write_b64(
     // 解码后再喂：缓冲里存原始字节，base64 正文对模型毫无意义
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
-        .map_err(|e| SessionError::Channel(format!("base64 解码失败：{}", e)))?;
+        .map_err(|e| SessionError::Channel(crate::tr!("base64 解码失败：{}", "base64 decoding failed: {}", e)))?;
     let res = state.sessions.write(&id, bytes.clone()).await;
     if res.is_ok() {
         state.agent.feed(&id, &bytes, StreamKind::In);
@@ -380,7 +380,7 @@ pub async fn history_load_remote(
             "exec sh -s",
             Some(crate::histfile::REMOTE_SCRIPT),
             8,
-            "读取历史超时",
+            &crate::tr!("读取历史超时", "Reading history timed out"),
         )
         .await?;
     Ok(crate::histfile::parse(&text))
@@ -422,10 +422,10 @@ fn encode_clipboard_image_to_png() -> Result<Vec<u8>, String> {
         .and_then(|mut c| c.get_image())
         .map_err(|e| e.to_string())?;
     let buf = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())
-        .ok_or_else(|| "剪贴板图片数据尺寸不对，无法解码".to_string())?;
+        .ok_or_else(|| crate::tr!("剪贴板图片数据尺寸不对，无法解码", "Clipboard image data has the wrong size and cannot be decoded"))?;
     let mut bytes: Vec<u8> = Vec::new();
     buf.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
-        .map_err(|e| format!("PNG 编码失败：{e}"))?;
+        .map_err(|e| crate::tr!("PNG 编码失败：{e}", "PNG encoding failed: {e}"))?;
     Ok(bytes)
 }
 
@@ -433,7 +433,7 @@ fn encode_clipboard_image_to_png() -> Result<Vec<u8>, String> {
 /// 终端里的程序认出「刚粘贴的是一张图」的唯一办法（iTerm2 等终端同样如此）。
 fn write_png_bytes_to_local_temp(bytes: &[u8]) -> Result<String, String> {
     let path = std::env::temp_dir().join(format!("nexusterm-paste-{}.png", uuid::Uuid::new_v4().simple()));
-    std::fs::write(&path, bytes).map_err(|e| format!("无法写入临时文件：{e}"))?;
+    std::fs::write(&path, bytes).map_err(|e| crate::tr!("无法写入临时文件：{e}", "Cannot write the temporary file: {e}"))?;
     Ok(path.display().to_string())
 }
 
@@ -574,7 +574,7 @@ pub fn import_xsh(paths: Vec<String>, state: State<AppState>) -> Result<Vec<Impo
     // 整件事挡在门外，而不是「会话建好、密码一条都没进去」。后者更难收拾：
     // 用户看到一屏新连接，以为导完了，实际每一条都要重新填密码。
     if state.store.vault_locked() {
-        return Err("保险库已锁定，请先输入主密码再导入".into());
+        return Err(crate::tr!("保险库已锁定，请先输入主密码再导入", "The vault is locked. Enter the master password before importing"));
     }
     let mut out = Vec::new();
     for parsed in crate::xsh::parse_files(&paths) {
@@ -588,7 +588,7 @@ pub fn import_xsh(paths: Vec<String>, state: State<AppState>) -> Result<Vec<Impo
                     };
                     (true, None, pw_ok)
                 }
-                Err(e) => (false, Some(format!("入库失败：{}", e)), false),
+                Err(e) => (false, Some(crate::tr!("入库失败：{}", "Failed to save: {}", e)), false),
             },
             Err(e) => (false, Some(e.clone()), false),
         };
@@ -619,7 +619,7 @@ pub fn export_xsh(id: String, path: String, state: State<AppState>) -> Result<()
         &s.auth_type,
         s.key_path.as_deref(),
     );
-    std::fs::write(&path, bytes).map_err(|e| format!("写入失败：{}", e))
+    std::fs::write(&path, bytes).map_err(|e| crate::tr!("写入失败：{}", "Write failed: {}", e))
 }
 
 /// 导出指定 id 列表的会话到目录（分组导出用）。
@@ -650,7 +650,7 @@ pub fn export_sessions_xsh(
             target = base.join(format!("{} ({}).xsh", safe, n));
         }
         std::fs::write(&target, bytes)
-            .map_err(|e| format!("写入 {} 失败：{}", target.display(), e))?;
+            .map_err(|e| crate::tr!("写入 {} 失败：{}", "Failed to write {}: {}", target.display(), e))?;
         count += 1;
     }
     Ok(count)
@@ -679,7 +679,7 @@ pub fn export_all_xsh(dir: String, state: State<AppState>) -> Result<usize, Stri
             target = base.join(format!("{} ({}).xsh", safe, n));
         }
         std::fs::write(&target, bytes)
-            .map_err(|e| format!("写入 {} 失败：{}", target.display(), e))?;
+            .map_err(|e| crate::tr!("写入 {} 失败：{}", "Failed to write {}: {}", target.display(), e))?;
         count += 1;
     }
     Ok(count)
@@ -749,7 +749,7 @@ pub async fn generate_key(
 #[tauri::command]
 pub async fn delete_key(id: String, state: State<'_, AppState>) -> Result<(), String> {
     if id.starts_with("file:") {
-        return Err("这是 ~/.ssh 里的密钥，请在系统中管理，本应用不会删除它".into());
+        return Err(crate::tr!("这是 ~/.ssh 里的密钥，请在系统中管理，本应用不会删除它", "This key lives in ~/.ssh. Manage it in your system; this app will not delete it"));
     }
     keys::delete(&state.store, &id).await
 }
@@ -860,7 +860,7 @@ fn list_drives() -> Result<Vec<RemoteEntry>, String> {
         })
         .collect::<Vec<_>>();
     if drives.is_empty() {
-        return Err("没有找到可用的磁盘驱动器".into());
+        return Err(crate::tr!("没有找到可用的磁盘驱动器", "No available disk drives found"));
     }
     Ok(drives)
 }
@@ -917,11 +917,11 @@ pub async fn rename_local(from: String, to: String) -> Result<(), String> {
     let from = crate::keys::expand_tilde(&from);
     let to = crate::keys::expand_tilde(&to);
     if tokio::fs::symlink_metadata(&to).await.is_ok() {
-        return Err(format!("目标已存在：{}", to));
+        return Err(crate::tr!("目标已存在：{}", "Target already exists: {}", to));
     }
     tokio::fs::rename(&from, &to)
         .await
-        .map_err(|e| format!("重命名失败: {}", e))
+        .map_err(|e| crate::tr!("重命名失败: {}", "Rename failed: {}", e))
 }
 
 /// 读取目录内容。`list_local_dir` 与非 Windows 的 `list_drives` 共用；
@@ -929,13 +929,13 @@ pub async fn rename_local(from: String, to: String) -> Result<(), String> {
 async fn read_dir_entries(expanded: String) -> Result<Vec<RemoteEntry>, String> {
     let mut dir = tokio::fs::read_dir(&expanded)
         .await
-        .map_err(|e| format!("无法读取目录 {}: {}", expanded, e))?;
+        .map_err(|e| crate::tr!("无法读取目录 {}: {}", "Cannot read folder {}: {}", expanded, e))?;
 
     let mut entries = Vec::new();
     while let Some(entry) = dir
         .next_entry()
         .await
-        .map_err(|e| format!("读取目录项失败: {}", e))?
+        .map_err(|e| crate::tr!("读取目录项失败: {}", "Failed to read a folder entry: {}", e))?
     {
         let name = entry.file_name().to_string_lossy().to_string();
         let meta = match entry.metadata().await {
@@ -1240,7 +1240,7 @@ pub async fn connections_import(
 pub async fn preview_connection_import(path: String, format: String) -> Result<crate::connection_import::Preview, String> {
     tauri::async_runtime::spawn_blocking(move || crate::connection_import::preview(std::path::Path::new(&path), &format))
         .await
-        .map_err(|_| "连接配置解析任务失败".to_string())?
+        .map_err(|_| crate::tr!("连接配置解析任务失败", "The connection config parsing task failed"))?
 }
 
 /// 前端选定的界面语言（"zh" / "en"）：后端直接显示给用户的提示、AI 回答的语言跟着走。

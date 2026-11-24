@@ -30,10 +30,13 @@ fn parse_private_key(contents: &str, passphrase: Option<&str>) -> Result<Private
     }
 
     let key = PrivateKey::from_openssh(contents.as_bytes()).map_err(|e| {
-        format!(
+        crate::tr!(
             "无法解析私钥：{e}。支持 OpenSSH（-----BEGIN OPENSSH PRIVATE KEY-----）\
              与 PuTTY 的 .ppk；老式 PEM（BEGIN RSA PRIVATE KEY）请先用 \
-             ssh-keygen -m PEM 转换"
+             ssh-keygen -m PEM 转换",
+            "Cannot parse the private key: {e}. Supported formats are OpenSSH \
+             (-----BEGIN OPENSSH PRIVATE KEY-----) and PuTTY .ppk; convert legacy PEM \
+             (BEGIN RSA PRIVATE KEY) with ssh-keygen -m PEM first"
         )
     })?;
 
@@ -42,9 +45,35 @@ fn parse_private_key(contents: &str, passphrase: Option<&str>) -> Result<Private
     }
     let phrase = passphrase
         .filter(|p| !p.is_empty())
-        .ok_or_else(|| "该私钥已加密，需要提供密码".to_string())?;
-    key.decrypt(phrase.as_bytes())
-        .map_err(|_| "私钥密码不正确".to_string())
+        .ok_or_else(passphrase_required)?;
+    key.decrypt(phrase.as_bytes()).map_err(|_| passphrase_wrong())
+}
+
+/// 加密私钥没给口令。英文版必须含 `encrypted` 与 `passphrase`（前端 SessionDialog 按它识别）。
+pub fn passphrase_required() -> String {
+    crate::tr!(
+        "该私钥已加密，需要提供密码",
+        "This private key is encrypted; a passphrase is required"
+    )
+}
+
+/// 私钥口令错误。
+pub fn passphrase_wrong() -> String {
+    crate::tr!("私钥密码不正确", "Wrong private key passphrase")
+}
+
+/// 是不是「缺口令」——两种语言都认（ssh 连接时据此弹口令框）。
+pub fn is_passphrase_required(msg: &str) -> bool {
+    msg.contains("需要提供密码") || msg.contains("a passphrase is required")
+}
+
+/// 是不是「口令错」——两种语言都认。
+pub fn is_passphrase_wrong(msg: &str) -> bool {
+    msg.contains("私钥密码不正确") || msg.contains("Wrong private key passphrase")
+}
+
+fn key_not_found() -> String {
+    crate::tr!("密钥不存在", "Key not found")
 }
 
 /// 只读公钥与加密状态，用于列表展示 —— 不需要口令。
@@ -141,7 +170,7 @@ pub async fn load_private_key(
     let expanded = expand_tilde(path);
     let contents = tokio::fs::read_to_string(&expanded)
         .await
-        .map_err(|e| format!("无法读取私钥 {}: {}", expanded, e))?;
+        .map_err(|e| crate::tr!("无法读取私钥 {}: {}", "Cannot read private key {}: {}", expanded, e))?;
 
     parse_private_key(&contents, passphrase.as_deref())
         .map_err(|e| format!("{e}（{}）", expanded))
@@ -300,12 +329,12 @@ pub async fn import(
 ) -> Result<KeyInfo, String> {
     let src_path = PathBuf::from(expand_tilde(src));
     if !src_path.is_file() {
-        return Err(format!("找不到私钥文件：{}", src_path.to_string_lossy()));
+        return Err(crate::tr!("找不到私钥文件：{}", "Private key file not found: {}", src_path.to_string_lossy()));
     }
 
     let contents = tokio::fs::read_to_string(&src_path)
         .await
-        .map_err(|e| format!("无法读取私钥：{}", e))?;
+        .map_err(|e| crate::tr!("无法读取私钥：{}", "Cannot read private key: {}", e))?;
     let fallback = src_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -330,7 +359,12 @@ pub async fn import_contents(
     passphrase: Option<String>,
 ) -> Result<KeyInfo, String> {
     let (_, encrypted) = read_public(contents)
-        .ok_or("无法解析私钥：无法识别的格式（支持 OpenSSH 与 PuTTY 的 .ppk）")?;
+        .ok_or_else(|| {
+        crate::tr!(
+            "无法解析私钥：无法识别的格式（支持 OpenSSH 与 PuTTY 的 .ppk）",
+            "Cannot parse the private key: unrecognised format (OpenSSH and PuTTY .ppk are supported)"
+        )
+    })?;
 
     // 给了口令就顺带校验一次；没给也允许导入 —— 加密私钥可以等到连接时再问
     if encrypted {
@@ -346,7 +380,7 @@ pub async fn import_contents(
     let dest = vault_file(base, &id);
     tokio::fs::create_dir_all(vault_path(base))
         .await
-        .map_err(|e| format!("无法创建密钥库目录：{}", e))?;
+        .map_err(|e| crate::tr!("无法创建密钥库目录：{}", "Cannot create the key store folder: {}", e))?;
 
     // 原样复制字节，不重新编码：重新编码会丢掉原文件的换行风格与注释，
     // 也会把「带口令」这个状态意外改掉。
@@ -362,11 +396,11 @@ pub async fn import_contents(
         let mut f = opts
             .open(&dest)
             .await
-            .map_err(|e| format!("写入密钥库失败：{}", e))?;
+            .map_err(|e| crate::tr!("写入密钥库失败：{}", "Failed to write to the key store: {}", e))?;
         f.write_all(contents.as_bytes())
             .await
-            .map_err(|e| format!("写入密钥库失败：{}", e))?;
-        f.flush().await.map_err(|e| format!("写入密钥库失败：{}", e))?;
+            .map_err(|e| crate::tr!("写入密钥库失败：{}", "Failed to write to the key store: {}", e))?;
+        f.flush().await.map_err(|e| crate::tr!("写入密钥库失败：{}", "Failed to write to the key store: {}", e))?;
     }
 
     finish_key(store, &dest, id, name, None).await
@@ -385,11 +419,11 @@ pub async fn generate(
         "rsa" => {
             let b = opts.bits.unwrap_or(4096);
             if !(2048..=8192).contains(&b) {
-                return Err("RSA 长度需在 2048–8192 位之间".into());
+                return Err(crate::tr!("RSA 长度需在 2048–8192 位之间", "RSA key size must be 2048–8192 bits"));
             }
             b
         }
-        other => return Err(format!("不支持的密钥算法：{}", other)),
+        other => return Err(crate::tr!("不支持的密钥算法：{}", "Unsupported key algorithm: {}", other)),
     };
 
     let comment = opts.comment.unwrap_or_default();
@@ -417,25 +451,25 @@ pub async fn generate(
         if let Some(p) = passphrase {
             key = key
                 .encrypt(&mut rng, p.as_bytes())
-                .map_err(|e| format!("加密私钥失败：{}", e))?;
+                .map_err(|e| crate::tr!("加密私钥失败：{}", "Failed to encrypt the private key: {}", e))?;
         }
         Ok(key)
     })
     .await
-    .map_err(|e| format!("生成密钥任务失败：{}", e))??;
+    .map_err(|e| crate::tr!("生成密钥任务失败：{}", "Key generation task failed: {}", e))??;
 
     let id = uuid::Uuid::new_v4().to_string();
     let dest = vault_file(base, &id);
     tokio::fs::create_dir_all(vault_path(base))
         .await
-        .map_err(|e| format!("无法创建密钥库目录：{}", e))?;
+        .map_err(|e| crate::tr!("无法创建密钥库目录：{}", "Cannot create the key store folder: {}", e))?;
 
     let pem = generated
         .to_openssh(LineEnding::LF)
-        .map_err(|e| format!("导出私钥失败：{}", e))?;
+        .map_err(|e| crate::tr!("导出私钥失败：{}", "Failed to export the private key: {}", e))?;
     tokio::fs::write(&dest, pem.as_bytes())
         .await
-        .map_err(|e| format!("写入密钥库失败：{}", e))?;
+        .map_err(|e| crate::tr!("写入密钥库失败：{}", "Failed to write to the key store: {}", e))?;
 
     let default_name = format!(
         "{}-{}",
@@ -465,9 +499,9 @@ async fn finish_key(
 ) -> Result<KeyInfo, String> {
     let contents = tokio::fs::read_to_string(path)
         .await
-        .map_err(|e| format!("读取刚写入的私钥失败：{}", e))?;
+        .map_err(|e| crate::tr!("读取刚写入的私钥失败：{}", "Failed to read back the new private key: {}", e))?;
     let (pubkey, encrypted) = read_public(&contents)
-        .ok_or_else(|| format!("解析刚写入的私钥失败：{}", path.display()))?;
+        .ok_or_else(|| crate::tr!("解析刚写入的私钥失败：{}", "Failed to parse the new private key: {}", path.display()))?;
 
     // 私钥文件只能本人可读（Windows 无此语义，由 ACL 兜底）
     #[cfg(unix)]
@@ -499,14 +533,14 @@ async fn finish_key(
 
     describe(path, id, name, "vault", comment, row.created_at)
         .await
-        .ok_or_else(|| "密钥已保存但无法读取元信息".to_string())
+        .ok_or_else(|| crate::tr!("密钥已保存但无法读取元信息", "Key saved, but its details could not be read"))
 }
 
 /// 删除库内密钥（连同 .pub）。外部密钥（`~/.ssh`）拒绝删除 ——
 /// 那是 ssh / git 的资产，不该由本应用悄悄动。
 pub async fn delete(store: &Store, id: &str) -> Result<(), String> {
     let Some(row) = store.delete_key(id) else {
-        return Err("密钥不存在".into());
+        return Err(key_not_found());
     };
     let path = PathBuf::from(&row.path);
     let _ = tokio::fs::remove_file(&path).await;
@@ -518,23 +552,23 @@ pub async fn delete(store: &Store, id: &str) -> Result<(), String> {
 
 /// 导出私钥到指定路径，并在旁边写一份 `.pub`。
 pub async fn export(store: &Store, id: &str, dest: &str) -> Result<(), String> {
-    let row = store.get_key(id).ok_or_else(|| "密钥不存在".to_string())?;
+    let row = store.get_key(id).ok_or_else(key_not_found)?;
     let src = PathBuf::from(&row.path);
     let contents = tokio::fs::read(&src)
         .await
-        .map_err(|e| format!("读取私钥失败：{}", e))?;
+        .map_err(|e| crate::tr!("读取私钥失败：{}", "Failed to read the private key: {}", e))?;
 
     let dest_path = PathBuf::from(expand_tilde(dest));
     if let Some(parent) = dest_path.parent() {
         if !parent.as_os_str().is_empty() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(|e| format!("无法创建导出目录：{}", e))?;
+                .map_err(|e| crate::tr!("无法创建导出目录：{}", "Cannot create the export folder: {}", e))?;
         }
     }
     tokio::fs::write(&dest_path, &contents)
         .await
-        .map_err(|e| format!("写入导出文件失败：{}", e))?;
+        .map_err(|e| crate::tr!("写入导出文件失败：{}", "Failed to write the export file: {}", e))?;
 
     let mut pub_src_os = src.as_os_str().to_owned();
     pub_src_os.push(".pub");
@@ -562,7 +596,7 @@ pub fn update_meta(
 
 /// 读取单条密钥的公钥（属性面板「复制公钥」用）。
 pub async fn public_key_of(store: &Store, id: &str) -> Result<String, String> {
-    let row = store.get_key(id).ok_or_else(|| "密钥不存在".to_string())?;
+    let row = store.get_key(id).ok_or_else(key_not_found)?;
     let info = describe(
         Path::new(&row.path),
         row.id,
@@ -572,13 +606,24 @@ pub async fn public_key_of(store: &Store, id: &str) -> Result<String, String> {
         row.created_at,
     )
     .await
-    .ok_or_else(|| "无法读取密钥".to_string())?;
+    .ok_or_else(|| crate::tr!("无法读取密钥", "Cannot read the key"))?;
     Ok(info.public_key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ssh 连接按这两个判断决定要不要弹口令框：中英文案都得认
+    #[test]
+    fn passphrase_errors_recognised_in_both_languages() {
+        assert!(is_passphrase_required(&passphrase_required()));
+        assert!(is_passphrase_required("This private key is encrypted; a passphrase is required"));
+        assert!(is_passphrase_wrong(&passphrase_wrong()));
+        assert!(is_passphrase_wrong("Wrong private key passphrase"));
+        assert!(!is_passphrase_required("Wrong private key passphrase"));
+        assert!(!is_passphrase_wrong("This private key is encrypted; a passphrase is required"));
+    }
 
     /// 家目录解析错会让「列出 ~/.ssh 密钥」静默返回空列表 —— 用户看到的是
     /// 「没有可用私钥」，很难联想到是 HOME / USERPROFILE 取错了，故锁死。

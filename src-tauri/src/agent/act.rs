@@ -7220,7 +7220,7 @@ async fn oob_exec_with(
         return match state.sessions.run_sidecar(console, &command, stdin.as_deref(), secs, timeout_msg).await {
             Ok(out) => Ok(out),
             Err(crate::ssh::session::SessionError::Channel(m))
-                if m.contains(crate::ssh::session::SIDECAR_OFF) || m.contains(crate::ssh::session::SIDECAR_DENIED) =>
+                if crate::ssh::session::is_sidecar_unavailable(&m) =>
             {
                 Err(OobErr::Unavailable)
             }

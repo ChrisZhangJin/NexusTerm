@@ -79,7 +79,7 @@ impl Store {
         let text = hostmem::validate_note_text(text)?;
         let host_key = host_key.trim();
         if host_key.is_empty() {
-            return Err("无法确定主机，不能保存备忘".into());
+            return Err(crate::tr!("无法确定主机，不能保存备忘", "Cannot determine the host, so the note cannot be saved"));
         }
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         // 去重：同主机、同文本（忽略大小写）
@@ -104,8 +104,8 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM host_memory WHERE host_key = ?1", params![host_key], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         if per_host as usize >= MAX_NOTES_PER_HOST {
-            return Err(format!(
-                "这台主机的备忘已满（{MAX_NOTES_PER_HOST} 条）：请先用 nx_memory forget 删掉不再需要的，再记新的"
+            return Err(crate::tr!(
+                "这台主机的备忘已满（{MAX_NOTES_PER_HOST} 条）：请先用 nx_memory forget 删掉不再需要的，再记新的", "This host already has the maximum of {MAX_NOTES_PER_HOST} notes: delete ones no longer needed (nx_memory forget) before adding new ones"
             ));
         }
         if per_host == 0 {
@@ -113,8 +113,8 @@ impl Store {
                 .query_row("SELECT COUNT(DISTINCT host_key) FROM host_memory", [], |r| r.get(0))
                 .map_err(|e| e.to_string())?;
             if hosts as usize >= MAX_HOSTS {
-                return Err(format!(
-                    "已有 {MAX_HOSTS} 台主机存有备忘，达到上限：请用户在「主机备忘」里清理不用的主机后再记"
+                return Err(crate::tr!(
+                    "已有 {MAX_HOSTS} 台主机存有备忘，达到上限：请用户在「主机备忘」里清理不用的主机后再记", "Host notes exist for {MAX_HOSTS} hosts, the maximum: clear unused hosts in Host notes before adding more"
                 ));
             }
         }
@@ -153,7 +153,7 @@ impl Store {
             .query_row(&format!("SELECT {COLS} FROM host_memory WHERE id = ?1"), params![id], row_to_note)
             .optional()
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| "这条备忘不存在（可能已被删除）".to_string())?;
+            .ok_or_else(|| crate::tr!("这条备忘不存在（可能已被删除）", "Note not found (it may have been deleted)"))?;
         let clash: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM host_memory WHERE host_key = ?1 AND lower(text) = lower(?2) AND id <> ?3",
@@ -162,7 +162,7 @@ impl Store {
             )
             .map_err(|e| e.to_string())?;
         if clash > 0 {
-            return Err("同一台主机上已有内容相同的备忘".into());
+            return Err(crate::tr!("同一台主机上已有内容相同的备忘", "This host already has a note with the same text"));
         }
         let now = now_secs();
         conn.execute(
@@ -219,7 +219,7 @@ impl Store {
             }
         };
         let note = match found.len() {
-            0 => return Err("这台主机上没有这条备忘（id 不对？先用 op=read 查看）".into()),
+            0 => return Err(crate::tr!("这台主机上没有这条备忘（id 不对？先用 op=read 查看）", "Note not found on this host (wrong id? check with op=read first)")),
             1 => found.into_iter().next().unwrap_or_else(|| unreachable!()),
             _ => return Err("id 前缀不唯一，请给更长的 id".into()),
         };

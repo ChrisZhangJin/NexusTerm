@@ -69,22 +69,22 @@ impl LocalManager {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| format!("创建伪终端失败：{}", e))?;
+            .map_err(|e| crate::tr!("创建伪终端失败：{}", "Failed to create a pseudo-terminal: {}", e))?;
 
         let child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| format!("启动本地 shell 失败：{}", e))?;
+            .map_err(|e| crate::tr!("启动本地 shell 失败：{}", "Failed to start the local shell: {}", e))?;
 
         let mut reader = pair
             .master
             .try_clone_reader()
-            .map_err(|e| format!("获取 PTY 读端失败：{}", e))?;
+            .map_err(|e| crate::tr!("获取 PTY 读端失败：{}", "Failed to get the PTY reader: {}", e))?;
         // writer 必须在 slave spawn 之后取，否则写入会落到错误的 fd
         let writer = pair
             .master
             .take_writer()
-            .map_err(|e| format!("获取 PTY 写端失败：{}", e))?;
+            .map_err(|e| crate::tr!("获取 PTY 写端失败：{}", "Failed to get the PTY writer: {}", e))?;
 
         let shell_pid = child.process_id();
         let child = Arc::new(Mutex::new(child));
@@ -158,16 +158,16 @@ impl LocalManager {
 
     pub fn write(&self, id: &str, data: &[u8]) -> Result<(), String> {
         let mut guard = self.sessions.lock().unwrap();
-        let s = guard.get_mut(id).ok_or("本地会话不存在")?;
+        let s = guard.get_mut(id).ok_or_else(|| crate::tr!("本地会话不存在", "Local session not found"))?;
         s.writer
             .write_all(data)
-            .map_err(|e| format!("写入 PTY 失败：{}", e))?;
-        s.writer.flush().map_err(|e| format!("刷新 PTY 失败：{}", e))
+            .map_err(|e| crate::tr!("写入 PTY 失败：{}", "Failed to write to the PTY: {}", e))?;
+        s.writer.flush().map_err(|e| crate::tr!("刷新 PTY 失败：{}", "Failed to flush the PTY: {}", e))
     }
 
     pub fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), String> {
         let guard = self.sessions.lock().unwrap();
-        let s = guard.get(id).ok_or("本地会话不存在")?;
+        let s = guard.get(id).ok_or_else(|| crate::tr!("本地会话不存在", "Local session not found"))?;
         s.master
             .resize(PtySize {
                 rows: rows.max(1),
@@ -175,7 +175,7 @@ impl LocalManager {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| format!("调整 PTY 尺寸失败：{}", e))
+            .map_err(|e| crate::tr!("调整 PTY 尺寸失败：{}", "Failed to resize the PTY: {}", e))
     }
 
     /// 关闭：杀进程并从表里移除。只管 PTY 本体——agent 旁路缓冲的清理由

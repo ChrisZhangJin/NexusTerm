@@ -59,17 +59,17 @@ fn b64() -> base64::engine::general_purpose::GeneralPurpose {
 
 /// 取主密钥；第一次调用时生成并写入系统凭据服务。
 fn master_key() -> Result<[u8; 32], String> {
-    let _guard = KEY_LOCK.lock().map_err(|_| "密钥锁已损坏".to_string())?;
+    let _guard = KEY_LOCK.lock().map_err(|_| crate::tr!("密钥锁已损坏", "The key lock is poisoned"))?;
 
     let entry = keyring::Entry::new(SERVICE, KEY_ENTRY).map_err(unavailable)?;
     match entry.get_password() {
         Ok(stored) => {
             let raw = b64()
                 .decode(stored.trim())
-                .map_err(|_| "系统凭据服务里的主密钥已损坏".to_string())?;
+                .map_err(|_| crate::tr!("系统凭据服务里的主密钥已损坏", "The master key in the system credential service is corrupted"))?;
             let key: [u8; 32] = raw
                 .try_into()
-                .map_err(|_| "系统凭据服务里的主密钥长度不对".to_string())?;
+                .map_err(|_| crate::tr!("系统凭据服务里的主密钥长度不对", "The master key in the system credential service has the wrong length"))?;
             Ok(key)
         }
         Err(keyring::Error::NoEntry) => {
@@ -78,7 +78,7 @@ fn master_key() -> Result<[u8; 32], String> {
             rand_core::OsRng.fill_bytes(&mut key);
             entry
                 .set_password(&b64().encode(key))
-                .map_err(|e| format!("无法把主密钥写入系统凭据服务：{}", e))?;
+                .map_err(|e| crate::tr!("无法把主密钥写入系统凭据服务：{}", "Cannot save the master key to the system credential service: {}", e))?;
             tracing::info!("已生成本机主密钥并存入系统凭据服务");
             Ok(key)
         }
@@ -89,9 +89,12 @@ fn master_key() -> Result<[u8; 32], String> {
 /// 凭据服务整体不可用时的提示。Linux 上最常见：无图形会话 / 没装
 /// gnome-keyring 或 kwallet / keyring 被锁着。
 fn unavailable(e: keyring::Error) -> String {
-    format!(
+    // 尾部的「原始错误：」是前端拆分用的固定分隔符（errors::RAW_SUFFIX），两种语言都不翻
+    crate::tr!(
         "无法访问系统凭据服务，TOTP 种子不能安全保存。\
          Linux 下请确认已登录图形会话且安装了 gnome-keyring 或 kwallet。\n\n原始错误：{}",
+        "Cannot access the system credential service, so TOTP seeds cannot be stored securely. \
+         On Linux, make sure you are logged into a desktop session with gnome-keyring or kwallet installed.\n\n原始错误：{}",
         e
     )
 }
@@ -103,7 +106,7 @@ pub fn encrypt(plain: &str) -> Result<String, String> {
     let nonce = Aes256Gcm::generate_nonce(&mut AeadRng);
     let ct = cipher
         .encrypt(&nonce, plain.as_bytes())
-        .map_err(|_| "加密失败".to_string())?;
+        .map_err(|_| crate::tr!("加密失败", "Encryption failed"))?;
 
     let mut blob = Vec::with_capacity(NONCE_LEN + ct.len());
     blob.extend_from_slice(&nonce);
@@ -118,23 +121,26 @@ pub fn encrypt(plain: &str) -> Result<String, String> {
 pub fn decrypt(blob: &str) -> Result<String, String> {
     let body = blob
         .strip_prefix(V1)
-        .ok_or_else(|| "密文格式无法识别（缺少版本前缀）".to_string())?;
+        .ok_or_else(|| crate::tr!("密文格式无法识别（缺少版本前缀）", "Unrecognised ciphertext format (missing version prefix)"))?;
     let raw = b64()
         .decode(body.trim())
-        .map_err(|_| "密文不是合法的 base64".to_string())?;
+        .map_err(|_| crate::tr!("密文不是合法的 base64", "The ciphertext is not valid base64"))?;
     if raw.len() <= NONCE_LEN {
-        return Err("密文过短，已损坏".into());
+        return Err(crate::tr!("密文过短，已损坏", "The ciphertext is too short; it is corrupted"));
     }
     let (nonce, ct) = raw.split_at(NONCE_LEN);
 
     let key = master_key()?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
     let plain = cipher.decrypt(Nonce::from_slice(nonce), ct).map_err(|_| {
-        "无法解密已保存的 TOTP 种子。密钥存在本机的系统凭据服务里，\
-         数据库换了机器就解不开 —— 请编辑该连接重新填一次种子。"
-            .to_string()
+        crate::tr!(
+            "无法解密已保存的 TOTP 种子。密钥存在本机的系统凭据服务里，\
+             数据库换了机器就解不开 —— 请编辑该连接重新填一次种子。",
+            "Cannot decrypt the saved TOTP seed. Its key lives in this computer's credential service, \
+             so it cannot be decrypted on another machine. Edit the connection and enter the seed again."
+        )
     })?;
-    String::from_utf8(plain).map_err(|_| "解密结果不是合法文本".into())
+    String::from_utf8(plain).map_err(|_| crate::tr!("解密结果不是合法文本", "Decrypted data is not valid text"))
 }
 
 #[cfg(test)]

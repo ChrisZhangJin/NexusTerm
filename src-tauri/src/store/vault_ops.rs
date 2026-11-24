@@ -133,10 +133,10 @@ impl Store {
     /// 启用保险库：建密钥、落元数据、把现有明文凭据全部改写成密文。
     pub fn vault_enable(&self, password: &str, remember_here: bool) -> Result<SweepReport, String> {
         if self.vault.status().enabled {
-            return Err("保险库已经启用过了".into());
+            return Err(crate::tr!("保险库已经启用过了", "The vault is already enabled"));
         }
         if password.is_empty() {
-            return Err("主密码不能为空".into());
+            return Err(crate::tr!("主密码不能为空", "The master password cannot be empty"));
         }
 
         // SQLite 的事务防得住崩溃和断电，防不住这段代码里的逻辑错误。
@@ -176,8 +176,9 @@ impl Store {
                 // 元数据已经落盘了，所以保险库是真的启用了，不能假装没发生过。
                 // 留着 vault.migrating，下次解锁继续。
                 tracing::error!(error = %e, "启用保险库时的全量加密中断");
-                return Err(format!(
-                    "{e}\n\n保险库已经建好，但还有凭据没加密完。重新解锁会从中断处接着扫。"
+                return Err(crate::tr!(
+                    "{e}\n\n保险库已经建好，但还有凭据没加密完。重新解锁会从中断处接着扫。",
+                    "{e}\n\nThe vault was created, but some credentials are not encrypted yet. Unlocking again resumes where it stopped."
                 ));
             }
         };
@@ -196,13 +197,13 @@ impl Store {
 
     /// 用主密码解锁。
     pub fn vault_unlock(&self, password: &str, remember_here: bool) -> Result<(), String> {
-        let meta = self.vault.meta().ok_or("保险库未启用")?;
+        let meta = self.vault.meta().ok_or_else(|| crate::tr!("保险库未启用", "The vault is not enabled"))?;
         if self.vault.status().unlocked {
             return Ok(());
         }
         let wrapped = self
             .get_setting(K_DEK)
-            .ok_or("保险库数据缺失（settings 里没有 vault.dek）")?;
+            .ok_or_else(|| crate::tr!("保险库数据缺失（settings 里没有 vault.dek）", "Vault data is missing (no vault.dek in settings)"))?;
 
         // 解包成功本身就是主密码的校验 —— 密码错会在 GCM tag 上失败。
         let dek = vault::unwrap_dek(password, &meta.kdf, &meta.kdf_json, &wrapped)?;
@@ -275,7 +276,7 @@ impl Store {
     }
 
     fn remember_now(&self, id: &str) -> Result<(), String> {
-        let dek = self.vault.dek().ok_or("保险库未解锁")?;
+        let dek = self.vault.dek().ok_or_else(|| crate::tr!("保险库未解锁", "The vault is not unlocked"))?;
         remember::save(id, &dek)
     }
 
@@ -286,14 +287,14 @@ impl Store {
     /// 必须验旧密码：否则谁摸到这台开着的机器都能把用户锁在自己的库外面。
     pub fn vault_change_password(&self, old: &str, new: &str) -> Result<(), String> {
         if new.is_empty() {
-            return Err("新主密码不能为空".into());
+            return Err(crate::tr!("新主密码不能为空", "The new master password cannot be empty"));
         }
-        let meta = self.vault.meta().ok_or("保险库未启用")?;
+        let meta = self.vault.meta().ok_or_else(|| crate::tr!("保险库未启用", "The vault is not enabled"))?;
         let wrapped = self
             .get_setting(K_DEK)
-            .ok_or("保险库数据缺失（settings 里没有 vault.dek）")?;
+            .ok_or_else(|| crate::tr!("保险库数据缺失（settings 里没有 vault.dek）", "Vault data is missing (no vault.dek in settings)"))?;
         let dek = vault::unwrap_dek(old, &meta.kdf, &meta.kdf_json, &wrapped)
-            .map_err(|_| "原主密码不正确".to_string())?;
+            .map_err(|_| crate::tr!("原主密码不正确", "Wrong current master password"))?;
 
         // 换密码顺手换盐，免得两次派生共用同一份预计算。
         let kdf = fresh_kdf();
@@ -321,10 +322,10 @@ impl Store {
     ///
     /// 要验主密码 —— 这一步会把全库凭据明文化，比读一条密码危险得多。
     pub fn vault_disable(&self, password: &str) -> Result<SweepReport, String> {
-        let meta = self.vault.meta().ok_or("保险库未启用")?;
+        let meta = self.vault.meta().ok_or_else(|| crate::tr!("保险库未启用", "The vault is not enabled"))?;
         let wrapped = self
             .get_setting(K_DEK)
-            .ok_or("保险库数据缺失（settings 里没有 vault.dek）")?;
+            .ok_or_else(|| crate::tr!("保险库数据缺失（settings 里没有 vault.dek）", "Vault data is missing (no vault.dek in settings)"))?;
         let dek = vault::unwrap_dek(password, &meta.kdf, &meta.kdf_json, &wrapped)?;
         let id = meta.id.clone();
         self.vault.unlock(meta, dek);
@@ -363,7 +364,7 @@ impl Store {
     /// 把还是明文的凭据改写成密文。**幂等**，可以反复跑。
     pub fn sweep(&self) -> Result<SweepReport, String> {
         if self.vault.dek().is_none() {
-            return Err("保险库未解锁，无法执行加密扫描".into());
+            return Err(crate::tr!("保险库未解锁，无法执行加密扫描", "The vault is not unlocked; cannot run the encryption pass"));
         }
 
         let rows = self.read_credential_rows()?;
@@ -499,8 +500,12 @@ impl Store {
             // 种子回到「密钥在系统凭据服务」。取不到服务时**直接报错**：
             // 把第二因子降级成明文存在第一因子旁边，等于把二次验证作废。
             let v1 = crate::secret::encrypt(&plain).map_err(|e| {
-                format!("{e}\n\n关闭保险库需要把 TOTP 种子交还给系统凭据服务。\
-                         如果这台机器上没有可用的凭据服务，请先清除这些种子再关闭。")
+                crate::tr!(
+                    "{e}\n\n关闭保险库需要把 TOTP 种子交还给系统凭据服务。\
+                     如果这台机器上没有可用的凭据服务，请先清除这些种子再关闭。",
+                    "{e}\n\nTurning off the vault hands TOTP seeds back to the system credential service. \
+                     If this computer has no credential service, clear those seeds before turning it off."
+                )
             })?;
             plan.push(Rewrite {
                 id: id.clone(),
@@ -532,9 +537,9 @@ impl Store {
         let back = self
             .vault
             .reveal(field, &new)
-            .map_err(|e| format!("加密结果无法解回（{column}）：{e}"))?;
+            .map_err(|e| crate::tr!("加密结果无法解回（{column}）：{e}", "Encrypted value cannot be decrypted back ({column}): {e}"))?;
         if back != plain {
-            return Err(format!("加密结果与原值不一致（{column}），已中止，未改动任何数据"));
+            return Err(crate::tr!("加密结果与原值不一致（{column}），已中止，未改动任何数据", "Encrypted value does not match the original ({column}); aborted, nothing was changed"));
         }
         Ok(Rewrite {
             id: id.to_string(),
@@ -619,13 +624,13 @@ impl Store {
             if !overwrite {
                 return Ok(());
             }
-            std::fs::remove_file(&backup).map_err(|e| format!("无法覆盖旧备份：{e}"))?;
+            std::fs::remove_file(&backup).map_err(|e| crate::tr!("无法覆盖旧备份：{e}", "Cannot overwrite the old backup: {e}"))?;
         }
         // 走一遍 SQLite 自己的备份 API 而不是 fs::copy：WAL 模式下直接拷主文件
         // 可能拿到一份缺了最近写入的副本。
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute("VACUUM INTO ?1", params![backup.to_string_lossy()])
-            .map_err(|e| format!("无法备份数据库：{e}"))?;
+            .map_err(|e| crate::tr!("无法备份数据库：{e}", "Cannot back up the database: {e}"))?;
         drop(conn);
 
         #[cfg(unix)]

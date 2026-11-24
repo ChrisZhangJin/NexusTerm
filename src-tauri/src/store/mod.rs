@@ -255,13 +255,13 @@ impl Store {
         )
         .map_err(|e| e.to_string())?;
 
-        migrate(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
-        agent_history::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
-        skills::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
-        macro_migration::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
-        host_memory::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
-        steward::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
-        host::ensure_schema(&conn).map_err(|e| format!("数据库迁移失败: {}", e))?;
+        migrate(&conn).map_err(|e| crate::tr!("数据库迁移失败: {}", "Database migration failed: {}", e))?;
+        agent_history::ensure_schema(&conn).map_err(|e| crate::tr!("数据库迁移失败: {}", "Database migration failed: {}", e))?;
+        skills::ensure_schema(&conn).map_err(|e| crate::tr!("数据库迁移失败: {}", "Database migration failed: {}", e))?;
+        macro_migration::ensure_schema(&conn).map_err(|e| crate::tr!("数据库迁移失败: {}", "Database migration failed: {}", e))?;
+        host_memory::ensure_schema(&conn).map_err(|e| crate::tr!("数据库迁移失败: {}", "Database migration failed: {}", e))?;
+        steward::ensure_schema(&conn).map_err(|e| crate::tr!("数据库迁移失败: {}", "Database migration failed: {}", e))?;
+        host::ensure_schema(&conn).map_err(|e| crate::tr!("数据库迁移失败: {}", "Database migration failed: {}", e))?;
 
         // 一次主键查找就能判定要不要弹解锁框。刻意不做 KDF、不碰系统凭据服务 ——
         // 这条路径在 `lib.rs` 的 setup 里是 `expect`，不能慢也不能阻塞。
@@ -335,7 +335,7 @@ impl Store {
             params![id],
             row_to_session,
         )
-        .map_err(|_| format!("会话不存在: {}", id))
+        .map_err(|_| crate::tr!("会话不存在: {}", "Session not found: {}", id))
     }
 
     pub fn update(&self, id: &str, s: NewSession) -> Result<SessionRecord, String> {
@@ -391,11 +391,11 @@ impl Store {
     pub fn create_macro(&self, name: &str, steps: &[MacroStep]) -> Result<MacroRecord, String> {
         let name = name.trim();
         if name.is_empty() {
-            return Err("宏名称不能为空".into());
+            return Err(crate::tr!("宏名称不能为空", "Macro name cannot be empty"));
         }
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_secs();
-        let json = serde_json::to_string(steps).map_err(|e| format!("步骤序列化失败: {e}"))?;
+        let json = serde_json::to_string(steps).map_err(|e| crate::tr!("步骤序列化失败: {e}", "Failed to serialise the steps: {e}"))?;
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO macros (id,name,steps,created_at,updated_at) VALUES (?1,?2,?3,?4,?5)",
@@ -413,7 +413,7 @@ impl Store {
             params![id],
             row_to_macro,
         )
-        .map_err(|_| format!("宏不存在: {}", id))
+        .map_err(|_| crate::tr!("宏不存在: {}", "Macro not found: {}", id))
     }
 
     pub fn update_macro(
@@ -424,9 +424,9 @@ impl Store {
     ) -> Result<MacroRecord, String> {
         let name = name.trim();
         if name.is_empty() {
-            return Err("宏名称不能为空".into());
+            return Err(crate::tr!("宏名称不能为空", "Macro name cannot be empty"));
         }
-        let json = serde_json::to_string(steps).map_err(|e| format!("步骤序列化失败: {e}"))?;
+        let json = serde_json::to_string(steps).map_err(|e| crate::tr!("步骤序列化失败: {e}", "Failed to serialise the steps: {e}"))?;
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let n = conn
             .execute(
@@ -435,7 +435,7 @@ impl Store {
             )
             .map_err(|e| e.to_string())?;
         if n == 0 {
-            return Err(format!("宏不存在: {}", id));
+            return Err(crate::tr!("宏不存在: {}", "Macro not found: {}", id));
         }
         drop(conn);
         self.get_macro(id)

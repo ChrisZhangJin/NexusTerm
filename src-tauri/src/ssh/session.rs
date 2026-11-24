@@ -22,12 +22,27 @@ pub enum SessionError {
     Connect(String),
     #[error("{0}")]
     Auth(String),
-    #[error("通道错误: {0}")]
+    #[error("{}", channel_error_text(.0))]
     Channel(String),
-    #[error("会话不存在: {0}")]
+    #[error("{}", not_found_text(.0))]
     NotFound(String),
-    #[error("主机公钥指纹不匹配，疑似中间人攻击")]
+    #[error("{}", host_key_mismatch_text())]
     HostKeyMismatch,
+}
+
+fn channel_error_text(m: &str) -> String {
+    crate::tr!("通道错误: {m}", "Channel error: {m}")
+}
+
+fn not_found_text(id: &str) -> String {
+    crate::tr!("会话不存在: {id}", "Session not found: {id}")
+}
+
+fn host_key_mismatch_text() -> String {
+    crate::tr!(
+        "主机公钥指纹不匹配，疑似中间人攻击",
+        "Host key fingerprint mismatch: possible man-in-the-middle attack"
+    )
 }
 
 // thiserror 派生 Display，这里再补一个统一的序列化形态给前端
@@ -123,10 +138,30 @@ const INPUT_QUEUE: usize = 16;
 /// 前端靠这段文字识别「这台机器只允许一条通道」（企业堡垒机很常见），
 /// 一旦命中就为这个会话配置打开「兼容模式」，以后连上不再开旁路通道 ——
 /// 否则每 3 秒一次的 probe 会把整条连接反复顶掉，表现为「连上几秒就断」。
-pub const SIDECAR_DENIED: &str = "该服务器不支持并行通道（堡垒机限制）";
+/// 英文版必须含 `does not allow parallel channels`（前端 `isSidecarDenied` 按它识别）。
+pub fn sidecar_denied() -> String {
+    crate::tr!(
+        "该服务器不支持并行通道（堡垒机限制）",
+        "This server does not allow parallel channels (bastion host restriction)"
+    )
+}
 
 /// 兼容模式下拒绝旁路请求的文案。不是错误，只是不再尝试。
-pub const SIDECAR_OFF: &str = "该连接已启用兼容模式，不打开旁路通道";
+/// 英文版必须含 `compatibility mode`（前端按它识别）。
+pub fn sidecar_off() -> String {
+    crate::tr!(
+        "该连接已启用兼容模式，不打开旁路通道",
+        "This connection is in compatibility mode, so no side channels are opened"
+    )
+}
+
+/// 旁路通道不可用（兼容模式 / 被服务端拒绝）—— 两种语言的文案都认，
+/// 以免切换语言前后产生的错误对不上。
+pub fn is_sidecar_unavailable(msg: &str) -> bool {
+    ["不支持并行通道", "does not allow parallel channels", "兼容模式", "compatibility mode"]
+        .iter()
+        .any(|k| msg.contains(k))
+}
 
 /// 一个 SSH 会话的运行时句柄
 struct SessionRuntime {
@@ -241,6 +276,23 @@ fn cat_command(path: &str) -> String {
     match path.strip_prefix("~/") {
         Some(rest) => format!("cat -- \"$HOME\"/{}", shq(rest)),
         None => format!("cat -- {}", shq(path)),
+    }
+}
+
+#[cfg(test)]
+mod sidecar_text_tests {
+    /// 两种语言的旁路文案都要被认出来（agent 据此判定「旁路不可用」）
+    #[test]
+    fn sidecar_unavailable_matches_both_languages() {
+        assert!(super::is_sidecar_unavailable(&super::sidecar_denied()));
+        assert!(super::is_sidecar_unavailable(&super::sidecar_off()));
+        assert!(super::is_sidecar_unavailable(
+            "This server does not allow parallel channels (bastion host restriction)"
+        ));
+        assert!(super::is_sidecar_unavailable(
+            "This connection is in compatibility mode, so no side channels are opened"
+        ));
+        assert!(!super::is_sidecar_unavailable("connection reset"));
     }
 }
 
@@ -369,7 +421,10 @@ impl SessionManager {
         // keepalive、以及二次验证的「重连后以 KBI 重试」都在那里处理，
         // SFTP 通道复用同一套逻辑。
         let auth = req.auth.as_ref().ok_or_else(|| {
-            SessionError::Auth("这条连接没有可用的登录凭据，请编辑连接并填写密码或私钥".into())
+            SessionError::Auth(crate::tr!(
+                "这条连接没有可用的登录凭据，请编辑连接并填写密码或私钥",
+                "This connection has no login credentials. Edit it and enter a password or private key"
+            ))
         })?;
 
         super::open_authenticated(
@@ -392,7 +447,7 @@ impl SessionManager {
         .map_err(|e| match e {
             super::OpenError::Timeout => SessionError::Connect(errors::compose(
                 &errors::timeout_message(&req.host, port, timeout),
-                &format!("等待握手超过 {} 秒", timeout.as_secs()),
+                &crate::tr!("等待握手超过 {} 秒", "Handshake took longer than {} s", timeout.as_secs()),
             )),
             super::OpenError::HostKeyMismatch => SessionError::HostKeyMismatch,
             super::OpenError::Handshake { err, legacy_tried } => SessionError::Connect(
@@ -543,9 +598,9 @@ impl SessionManager {
             Err(mpsc::error::TrySendError::Full(msg)) => tx
                 .send(msg)
                 .await
-                .map_err(|_| SessionError::Channel("输入通道已关闭".into())),
+                .map_err(|_| SessionError::Channel(crate::tr!("输入通道已关闭", "Input channel is closed"))),
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                Err(SessionError::Channel("输入通道已关闭".into()))
+                Err(SessionError::Channel(crate::tr!("输入通道已关闭", "Input channel is closed")))
             }
         }
     }
@@ -553,7 +608,7 @@ impl SessionManager {
     /// 探测该标签交互 shell 的工作目录 / 前台进程 / tmux 会话。
     /// 走旁路 exec 通道，不会往用户终端里写任何东西。
     pub async fn probe(&self, id: &str) -> Result<ProbeInfo, SessionError> {
-        self.run_kv_script(id, PROBE_SCRIPT, "探测超时").await
+        self.run_kv_script(id, PROBE_SCRIPT, &crate::tr!("探测超时", "Probe timed out")).await
     }
 
     /// 运行中改旁路通道开关。
@@ -569,13 +624,13 @@ impl SessionManager {
 
     /// 远端主机的公网 IP（旁路 exec 通道里问公开服务）。远端不能出网 / 没有 curl、wget 时为 None。
     pub async fn public_ip(&self, id: &str) -> Result<Option<String>, SessionError> {
-        let text = self.run_sidecar(id, "exec sh -s", Some(PUBLIC_IP_SCRIPT), 20, "查询公网 IP 超时").await?;
+        let text = self.run_sidecar(id, "exec sh -s", Some(PUBLIC_IP_SCRIPT), 20, &crate::tr!("查询公网 IP 超时", "Public IP lookup timed out")).await?;
         Ok(text.lines().find_map(|l| l.strip_prefix("PUBLIC_IP=")).and_then(valid_public_ip))
     }
 
     /// 远端资源快照（CPU / 内存 / 磁盘），供状态栏每 5 秒刷新。同样走旁路 exec 通道。
     pub async fn stats(&self, id: &str) -> Result<ProbeInfo, SessionError> {
-        self.run_kv_script(id, STATS_SCRIPT, "资源采集超时").await
+        self.run_kv_script(id, STATS_SCRIPT, &crate::tr!("资源采集超时", "Resource stats timed out")).await
     }
 
     /// 在同一连接上开 exec 通道跑 `sh -s` 脚本，解析 `k=v` 行输出。
@@ -583,7 +638,7 @@ impl SessionManager {
         &self,
         id: &str,
         script: &'static str,
-        timeout_msg: &'static str,
+        timeout_msg: &str,
     ) -> Result<ProbeInfo, SessionError> {
         let text = self
             .run_sidecar(id, &format!("exec sh -s"), Some(script), 8, timeout_msg)
@@ -612,7 +667,7 @@ impl SessionManager {
         command: &str,
         stdin_script: Option<&str>,
         timeout_secs: u64,
-        timeout_msg: &'static str,
+        timeout_msg: &str,
     ) -> Result<String, SessionError> {
         let (handle, sidecar, last_sidecar) = {
             let map = self.inner.lock();
@@ -624,7 +679,7 @@ impl SessionManager {
         // 兼容模式：一条额外通道都不开。堡垒机收到第二条 CHANNEL_OPEN 就会断开
         // 整条连接，连「试试看」都不允许。
         if !sidecar {
-            return Err(SessionError::Channel(SIDECAR_OFF.into()));
+            return Err(SessionError::Channel(sidecar_off()));
         }
         last_sidecar.store(epoch_ms(), std::sync::atomic::Ordering::Relaxed);
         let run = async move {
@@ -692,8 +747,9 @@ impl SessionManager {
                         out.extend_from_slice(&data);
                         if out.len() > max {
                             let _ = ch.close().await;
-                            return Err(SessionError::Channel(format!(
+                            return Err(SessionError::Channel(crate::tr!(
                                 "文件超过 {} MB，不适合浏览",
+                                "File is larger than {} MB, too big to view",
                                 max / 1024 / 1024
                             )));
                         }
@@ -711,7 +767,7 @@ impl SessionManager {
             if code.unwrap_or(0) != 0 {
                 let msg = String::from_utf8_lossy(&err).trim().to_string();
                 return Err(SessionError::Channel(if msg.is_empty() {
-                    format!("读取失败（退出码 {}）", code.unwrap_or(0))
+                    crate::tr!("读取失败（退出码 {}）", "Read failed (exit code {})", code.unwrap_or(0))
                 } else {
                     msg
                 }));
@@ -720,7 +776,7 @@ impl SessionManager {
         };
         tokio::time::timeout(std::time::Duration::from_secs(30), run)
             .await
-            .map_err(|_| SessionError::Channel("读取文件超时".into()))?
+            .map_err(|_| SessionError::Channel(crate::tr!("读取文件超时", "Reading the file timed out")))?
     }
 
     /// id 是否是一条已登记的远程 SSH 会话（本地终端不在这张表里）。
@@ -743,7 +799,7 @@ impl SessionManager {
             (rt.handle.clone(), rt.sidecar)
         };
         if !sidecar {
-            return Err(SessionError::Channel(SIDECAR_OFF.into()));
+            return Err(SessionError::Channel(sidecar_off()));
         }
         let cmd = format!("cat > {}", shq(remote_path));
         let bytes = bytes.to_vec();
@@ -779,7 +835,7 @@ impl SessionManager {
             if code.unwrap_or(0) != 0 {
                 let msg = String::from_utf8_lossy(&err).trim().to_string();
                 return Err(SessionError::Channel(if msg.is_empty() {
-                    format!("写入远端文件失败（退出码 {}）", code.unwrap_or(0))
+                    crate::tr!("写入远端文件失败（退出码 {}）", "Writing the remote file failed (exit code {})", code.unwrap_or(0))
                 } else {
                     msg
                 }));
@@ -788,7 +844,7 @@ impl SessionManager {
         };
         tokio::time::timeout(std::time::Duration::from_secs(20), run)
             .await
-            .map_err(|_| SessionError::Channel("写入远端文件超时".into()))?
+            .map_err(|_| SessionError::Channel(crate::tr!("写入远端文件超时", "Writing the remote file timed out")))?
     }
 
     pub fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), SessionError> {
@@ -803,7 +859,7 @@ impl SessionManager {
                 pix_w: 0,
                 pix_h: 0,
             })
-            .map_err(|_| SessionError::Channel("会话已关闭".into()))
+            .map_err(|_| SessionError::Channel(crate::tr!("会话已关闭", "Session is closed")))
     }
 }
 
@@ -845,11 +901,16 @@ pub const KBI_MUST_BE_FIRST: &str = "keyboard-interactive 必须是本次连接�
 const MAX_KBI_ROUNDS: u32 = 8;
 
 /// 主认证方式失败时给用户看的文案。
-pub fn refusal_message(auth: &AuthMethod) -> &'static str {
+pub fn refusal_message(auth: &AuthMethod) -> String {
     match auth {
-        AuthMethod::Password { .. } => "认证失败：密码不正确",
-        AuthMethod::PrivateKey { .. } => "认证失败：公钥被拒绝",
-        AuthMethod::Agent => "认证失败：服务器不接受无凭据登录，请改用密码或私钥",
+        AuthMethod::Password { .. } => crate::tr!("认证失败：密码不正确", "Authentication failed: wrong password"),
+        AuthMethod::PrivateKey { .. } => {
+            crate::tr!("认证失败：公钥被拒绝", "Authentication failed: public key rejected")
+        }
+        AuthMethod::Agent => crate::tr!(
+            "认证失败：服务器不接受无凭据登录，请改用密码或私钥",
+            "Authentication failed: the server does not accept login without credentials. Use a password or private key"
+        ),
     }
 }
 
@@ -1109,12 +1170,15 @@ where
                     }
                 }
                 return Err(SessionError::Auth(
-                    "二次验证未通过：验证码错误或已过期".into(),
+                    crate::tr!(
+                        "二次验证未通过：验证码错误或已过期",
+                        "Two-factor verification failed: the code is wrong or expired"
+                    ),
                 ));
             }
             // 只问过密码类问题 → 等价于密码错误
             Resp::Failure => {
-                return Err(SessionError::Auth(refusal_message(auth).to_string()))
+                return Err(SessionError::Auth(refusal_message(auth)))
             }
             Resp::InfoRequest {
                 name,
@@ -1124,7 +1188,10 @@ where
                 round += 1;
                 if round > MAX_KBI_ROUNDS {
                     return Err(SessionError::Auth(
-                        "服务器连续下发过多验证问题，已中止".into(),
+                        crate::tr!(
+                            "服务器连续下发过多验证问题，已中止",
+                            "The server sent too many verification prompts; aborted"
+                        ),
                     ));
                 }
 
@@ -1244,17 +1311,26 @@ where
                             Ok(a) => a,
                             Err(AskAbort::Timeout) => {
                                 return Err(SessionError::Auth(
-                                    "等待验证码输入超时，连接已中止".into(),
+                                    crate::tr!(
+                                        "等待验证码输入超时，连接已中止",
+                                        "Timed out waiting for the verification code; connection aborted"
+                                    ),
                                 ))
                             }
                             Err(AskAbort::Unavailable) => {
                                 return Err(SessionError::Auth(
-                                    "无法显示验证码输入框，连接已中止".into(),
+                                    crate::tr!(
+                                        "无法显示验证码输入框，连接已中止",
+                                        "Cannot show the verification code prompt; connection aborted"
+                                    ),
                                 ))
                             }
                             // 用户点了取消 / 会话被关
                             Err(AskAbort::Cancelled) => {
-                                return Err(SessionError::Auth("已取消二次验证，连接中止".into()))
+                                return Err(SessionError::Auth(crate::tr!(
+                                    "已取消二次验证，连接中止",
+                                    "Two-factor verification cancelled; connection aborted"
+                                )))
                             }
                         }
                     }
@@ -1417,11 +1493,11 @@ fn epoch_ms() -> i64 {
 ///
 /// 关键的区分：**「服务端说不」和「网络断了」是两回事**。前者说明这台机器
 /// 不允许并行通道（堡垒机），前端应当永久切到兼容模式；后者只是临时故障，
-/// 切了反而会把正常服务器误标。只有明确被拒才返回 [`SIDECAR_DENIED`]。
+/// 切了反而会把正常服务器误标。只有明确被拒才返回 [`sidecar_denied`]。
 fn sidecar_error(e: &russh::Error) -> String {
     match e {
         russh::Error::ChannelOpenFailure(_) | russh::Error::RequestDenied => {
-            SIDECAR_DENIED.to_string()
+            sidecar_denied()
         }
         other => other.to_string(),
     }
