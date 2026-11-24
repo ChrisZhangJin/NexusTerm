@@ -11,7 +11,7 @@ import {
   interruptedNote,
   MAX_PERSISTED_MESSAGES,
   mergeRestored,
-  REVEAL_NOT_SAVED,
+  revealNotSaved,
   toPersisted,
 } from "../../src/lib/agentHistory";
 import type { AgentMessage } from "../../src/types";
@@ -186,5 +186,5 @@ test("交付卡（nx_reveal）：内容不落盘，读回来只剩元数据（�
   const back = fromPersisted(JSON.parse(JSON.stringify(live)));
   assert.equal(back[0].step?.revealContent, undefined);
   assert.equal(back[0].step?.kind, "reveal");
-  assert.ok(REVEAL_NOT_SAVED.includes("不保存"));
+  assert.ok(revealNotSaved().includes("不保存"));
 });

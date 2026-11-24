@@ -13,7 +13,7 @@ import { useEffect, useRef, useState } from "react";
 import { MemoryStepCard } from "./HostMemory";
 import { GateCard, type GateHost } from "./GateCard";
 import { isHandEyeKind, maskReveal } from "../lib/agentRun";
-import { REVEAL_NOT_SAVED } from "../lib/agentHistory";
+import { revealNotSaved } from "../lib/agentHistory";
 import { api } from "../api";
 import { t, useLocale } from "../i18n";
 import { localized } from "../lib/localized";
@@ -693,7 +693,7 @@ function RevealCard({ step }: { step: AgentStep }) {
         </div>
       ) : null}
       {content === undefined ? (
-        <div className="ap-step-why">{REVEAL_NOT_SAVED}</div>
+        <div className="ap-step-why">{revealNotSaved()}</div>
       ) : (
         <>
           <pre className={`ap-code ap-out-plain ap-reveal-body${shown ? "" : " masked"}`}>

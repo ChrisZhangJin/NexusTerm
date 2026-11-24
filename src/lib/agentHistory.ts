@@ -21,8 +21,6 @@ export const interruptedNote = () => t("（面板重载前被中断，没有拿�
 
 /** 交付卡（`nx_reveal`）读回来时的占位：内容只在内存里，从不落盘 */
 export const revealNotSaved = () => t("（已交付的内容不保存）", "(Delivered content isn't saved)");
-/** @deprecated 只按中文；用 `revealNotSaved()`（切换语言时跟着变）。留着是为了还没改的调用方 */
-export const REVEAL_NOT_SAVED = "（已交付的内容不保存）";
 
 /** 去掉交付卡的内容（其余字段原样）。没有内容的消息原样返回（同一个引用）。 */
 function withoutRevealContent(m: AgentMessage): AgentMessage {
