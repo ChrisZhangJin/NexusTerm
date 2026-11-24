@@ -31,7 +31,7 @@ import { ImeGuard, type KeyLike } from "../lib/ime";
 import { buildUserCommandReport } from "../lib/userCommand";
 import { captureLineStart, readLogicalLine, recorderTapAction, type LineStart } from "../lib/termLine";
 import { isRecording, watchRecording } from "../lib/useRecorder";
-import { createControlGate, lockedInput } from "../lib/control";
+import { createControlGate, lockedInput, isUserTyping } from "../lib/control";
 
 import {
   api,
@@ -47,7 +47,7 @@ import { themeToXterm } from "../lib/theme";
 import { isMacOS } from "../lib/platform";
 import { installMacKeyboard, setInputTrace, traceSend } from "../lib/macInput";
 import { SHIFT_ENTER_SEQ, lineHasShellPrompt, shouldSendMetaEnter, textBeforeCursor, wantsMetaEnter } from "../lib/shiftEnter";
-import { replaceLineInput } from "../lib/historyPanel";
+import { historyQuery, replaceLineInput } from "../lib/historyPanel";
 import HistoryPanel from "./HistoryPanel";
 import { isSftpCommand } from "../lib/sftpCmd";
 import { opensLink } from "../lib/links";
@@ -432,7 +432,7 @@ export default function TerminalView({
     const x = Math.max(4, Math.min(r.left - pr.left + buf.cursorX * cellW, pr.width - HIST_W - 4));
     setHist({
       items: historyItems(historyKeyRef.current),
-      query: lineRef.current.known ? lineRef.current.text.trimStart() : "",
+      query: historyQuery(lineRef.current, textBeforeCursor(buf)),
       pos: above ? { x, y: pr.height - rowTop, above: true } : { x, y: below, above: false },
     });
   };
@@ -728,7 +728,9 @@ export default function TerminalView({
       const wasKnown = lineRef.current.known;
       if (recording && wasKnown && !lineRef.current.text) lineStartRef.current = captureLineStart(term.buffer.active);
       // 喂键攒行（同步、纯字符串运算），候选留到下一帧再算
-      const committed = feedKeys(lineRef.current, d);
+      // xterm 自己发的应答（光标位置报告、焦点进出、设备属性……）也走这条路，但不是人敲的：
+      // 喂进行状态会被当成「方向键一类的转义序列」把行标成未知，Shift+Tab 就不预筛了
+      const committed = isUserTyping(d) ? feedKeys(lineRef.current, d) : null;
       if (committed) {
         // 全屏程序（vim / less）里敲的不是 shell 命令，不进历史
         if (lineEchoedRef.current && term.buffer.active.type === "normal") {

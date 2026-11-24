@@ -79,6 +79,26 @@ export function lineHasShellPrompt(before: string): boolean {
   return looksLikeShellPrompt(s);
 }
 
+/**
+ * 光标前这段逻辑行里，**提示符后面**已经敲着的命令（去掉首尾空白）；认不出提示符返回 null。
+ * 提示符的判定与 `lineHasShellPrompt` 一致：以空格为界、整体像提示符的前缀。
+ * 用于行状态「未知」时（Tab 补全、↑ 翻历史之后）从屏幕上读回命令行内容。
+ *
+ * 分界必须**唯一**才算数：`➜` 开头一类的提示符在每个词边界上都「像提示符」，
+ * 分不出提示符在哪结束 —— 这时返回 null（不预填），别拿半截提示符当命令去筛。
+ */
+export function typedAfterPrompt(before: string): string | null {
+  const s = before.replace(/\s+$/, "");
+  if (!s) return null;
+  const cuts: number[] = [];
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === " " && i > 0 && s[i - 1] !== " " && looksLikeShellPrompt(s.slice(0, i))) cuts.push(i);
+  }
+  const whole = looksLikeShellPrompt(s);
+  if (cuts.length + (whole ? 1 : 0) !== 1) return null;
+  return whole ? "" : s.slice(cuts[0]).trim();
+}
+
 /** 光标所在逻辑行（顺着自动折行往上接）在光标之前的文字；读不到返回空串 */
 export function textBeforeCursor(buf: BufLike, maxRows = 20): string {
   const cy = buf.baseY + buf.cursorY;

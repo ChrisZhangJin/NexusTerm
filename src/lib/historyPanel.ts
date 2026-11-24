@@ -4,6 +4,8 @@
  * 不碰 DOM / xterm，单测见 tests/fe/historyPanel.test.ts。
  */
 
+import { typedAfterPrompt } from "./shiftEnter";
+
 /** 面板最多列多少条（再多翻不过来，也没必要一次画出来） */
 export const PANEL_LIMIT = 200;
 
@@ -38,4 +40,16 @@ export function searchHistory(items: readonly string[], query: string, limit = P
 export function replaceLineInput(typed: string | null, cmd: string): string {
   if (typed === null) return `\x05\x15${cmd}`;
   return "\x7f".repeat([...typed].length) + cmd;
+}
+
+/**
+ * Shift+Tab 打开面板时预填的关键字：命令行上已经敲了什么。
+ * `line` 是按键攒出来的行状态；`before` 是屏幕上光标前那段逻辑行（含提示符）。
+ *
+ * 行状态已知就用它（逐键记下的，最准）；**未知**时（按过 Tab 补全 / ↑ 翻历史 / 方向键，
+ * shell 改写了这一行而我们看不到）改从屏幕上读提示符后面的那段 —— 否则面板就不筛了。
+ */
+export function historyQuery(line: { known: boolean; text: string }, before: string): string {
+  if (line.known) return line.text.trimStart();
+  return typedAfterPrompt(before) ?? "";
 }
