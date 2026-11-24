@@ -3,6 +3,7 @@
  * 模型的输出在那里被夹紧并校验，这里只负责类型、「直接编辑」用的机械转换、结果文案。
  */
 
+import { t } from "../i18n";
 import type { SkillHostScope, SkillInput } from "../types";
 import type { RecordingDraft } from "./recorder";
 
@@ -52,8 +53,13 @@ export function hostScopeFor(draft: RecordingDraft): SkillHostScope {
 export function mechanicalInput(draft: RecordingDraft): SkillInput {
   const h = hostEntry(draft.host.label);
   return {
-    name: [...(h ? `录制的操作（${h}）` : "录制的操作")].slice(0, MAX_NAME_CHARS).join(""),
-    description: "由终端录制直接生成的草稿，未经整理：没有提取参数、没有期望与验证，请编辑后再保存。",
+    name: [...(h ? t("录制的操作（{h}）", "Recorded actions ({h})", { h }) : t("录制的操作", "Recorded actions"))]
+      .slice(0, MAX_NAME_CHARS)
+      .join(""),
+    description: t(
+      "由终端录制直接生成的草稿，未经整理：没有提取参数、没有期望与验证，请编辑后再保存。",
+      "Draft generated directly from a terminal recording, not tidied up: no parameters, expectations or verification yet. Edit it before saving."
+    ),
     params: [],
     steps: draft.steps,
     verify: null,
@@ -65,10 +71,15 @@ export function mechanicalInput(draft: RecordingDraft): SkillInput {
 
 /** 结果的一行标题（卡片里显示） */
 export function refineHeadline(r: RefinedSkillDraft): string {
-  if (r.fallback) return "整理没有成功，已退回为未整理的录制草稿";
-  const bits = [`整理完成：${r.draft.steps.length} 步`, `${r.draft.params.length} 个参数`];
-  if (r.draft.verify) bits.push("含验证");
-  if (r.attempts > 1) bits.push("经过一次修正重试");
+  if (r.fallback) return t("整理没有成功，已退回为未整理的录制草稿", "Tidy-up failed; fell back to the raw recording draft");
+  const n = r.draft.steps.length;
+  const p = r.draft.params.length;
+  const bits = [
+    t("整理完成：{n} 步", n === 1 ? "Tidied up: {n} step" : "Tidied up: {n} steps", { n }),
+    t("{p} 个参数", p === 1 ? "{p} parameter" : "{p} parameters", { p }),
+  ];
+  if (r.draft.verify) bits.push(t("含验证", "with verification"));
+  if (r.attempts > 1) bits.push(t("经过一次修正重试", "after one corrective retry"));
   return bits.join(" · ");
 }
 

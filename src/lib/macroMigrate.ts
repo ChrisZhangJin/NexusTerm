@@ -1,4 +1,5 @@
 // 旧宏迁移（Phase 3.5）的前端小工具。后端转换见 Rust `agent::macro_migrate`。
+import { t } from "../i18n";
 import type { MacroMigrationPreview, MacroMigrationResult } from "../types";
 
 /** 预览里「真的会保存」的条数 */
@@ -21,5 +22,9 @@ export function summarizeMigration(results: MacroMigrationResult[]): string {
     else if (r.outcome.kind === "skipped") skipped++;
     else failed++;
   }
-  return `已迁移 ${migrated} 条，跳过 ${skipped} 条，失败 ${failed} 条`;
+  return t("已迁移 {migrated} 条，跳过 {skipped} 条，失败 {failed} 条", "Migrated {migrated}, skipped {skipped}, failed {failed}", {
+    migrated,
+    skipped,
+    failed,
+  });
 }

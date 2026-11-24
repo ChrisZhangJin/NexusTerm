@@ -4,6 +4,7 @@
  * 全是纯函数：事件 → 新的 `Conversation`。订阅与 IPC 在 `useAgentRun`，渲染在 `RunFeed`。
  */
 
+import { t } from "../i18n";
 import { nextPause, type PauseKind } from "./agentBudget";
 import type {
   AgentApproveRequest,
@@ -38,12 +39,14 @@ export function withUsage(c: Conversation, u: RunUsage | undefined | null): Conv
 export const EMPTY_CONV: Conversation = { messages: [], busy: false, interrupted: false };
 
 /** 撞到 max_tokens 时追加在答案末尾的说明 */
-export const TRUNCATED_HINT = "\n\n— 回答被长度限制截断，可以让它继续，或缩小问题范围再问一次。";
+export const truncatedHint = () =>
+  t("\n\n— 回答被长度限制截断，可以让它继续，或缩小问题范围再问一次。", "\n\n— The answer was cut off by the length limit. Ask it to continue, or narrow the question and try again.");
 /** 一个字都没收到就 done 了（被过滤 / 空回复）：不能给用户留一个空气泡 */
-export const EMPTY_ANSWER = "（本次没有返回内容）";
-export const CANCELLED_ANSWER = "（已取消）";
+export const emptyAnswer = () => t("（本次没有返回内容）", "(No content returned)");
+export const cancelledAnswer = () => t("（已取消）", "(Cancelled)");
 /** 一轮跑完却没等到结论（多半是用户点了停止）时补的那句话 */
-export const NO_CONCLUSION = "（这一轮没有给出结论：上面的步骤就是它做过的全部事情。）";
+export const noConclusion = () =>
+  t("（这一轮没有给出结论：上面的步骤就是它做过的全部事情。）", "(No conclusion this round: the steps above are everything it did.)");
 
 let seq = 0;
 /** 纯前端的消息 id。不用 crypto.randomUUID：Tauri 的 WebView 不保证是安全上下文。 */
@@ -104,15 +107,15 @@ export function withDone(c: Conversation, reason: AgentDoneReason): Conversation
   return {
     messages: c.messages.map((m) => {
       if (!m.streaming) return m;
-      const text = reason === "length" ? m.text + TRUNCATED_HINT : m.text;
+      const text = reason === "length" ? m.text + truncatedHint() : m.text;
       return {
         ...m,
         streaming: false,
         text: text.trim()
           ? text
           : reason === "cancelled"
-            ? CANCELLED_ANSWER
-            : EMPTY_ANSWER,
+            ? cancelledAnswer()
+            : emptyAnswer(),
       };
     }),
     busy: false,
@@ -319,7 +322,7 @@ export function withConclusion(c: Conversation, text: string): Conversation {
     interrupted: false,
     messages: [
       ...c.messages,
-      { id: uid(), role: "assistant", text: trimmed || EMPTY_ANSWER, ts: Date.now() },
+      { id: uid(), role: "assistant", text: trimmed || emptyAnswer(), ts: Date.now() },
     ],
   };
 }
@@ -330,5 +333,5 @@ export function withConclusion(c: Conversation, text: string): Conversation {
  * 不补这一步界面会永远转圈。
  */
 export function finishWithoutAnswer(c: Conversation): Conversation {
-  return withConclusion(c, NO_CONCLUSION);
+  return withConclusion(c, noConclusion());
 }

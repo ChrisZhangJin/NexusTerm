@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { t, useLocale } from "../i18n";
 import ConfirmDialog, { type ConfirmOptions } from "./ConfirmDialog";
 import SkillManager from "./SkillManager";
 import { HostMemoryDialog } from "./HostMemory";
@@ -82,20 +83,26 @@ function splitSegments(text: string): Segment[] {
 }
 
 /** 清空对话的确认框文案（真删已保存的对话与运行摘要） */
-const CLEAR_CONV_OPTS: ConfirmOptions = {
-  title: "清空对话",
-  message: "将删除本面板的全部对话记录与已保存的运行摘要（含重启后恢复用的那份），助手不再记得之前做过什么。此操作不可恢复。",
-  okText: "清空",
+const clearConvOpts = (): ConfirmOptions => ({
+  title: t("清空对话", "Clear conversation"),
+  message: t(
+    "将删除本面板的全部对话记录与已保存的运行摘要（含重启后恢复用的那份），助手不再记得之前做过什么。此操作不可恢复。",
+    "This deletes all chat history in this panel and the saved run summaries (including the one used to restore after a restart). The assistant will no longer remember what it did. This can't be undone."
+  ),
+  okText: t("清空", "Clear"),
   danger: true,
-};
+});
 
 /** 清空记忆的确认框文案是固定的，提到组件外避免每次渲染新建对象 */
-const CLEAR_OPTS: ConfirmOptions = {
-  title: "清空 AI 记忆",
-  message: "将丢弃该会话已旁路缓存的终端输出，助手会忘掉之前看到的内容。聊天记录保留。",
-  okText: "清空",
+const clearOpts = (): ConfirmOptions => ({
+  title: t("清空 AI 记忆", "Clear AI memory"),
+  message: t(
+    "将丢弃该会话已旁路缓存的终端输出，助手会忘掉之前看到的内容。聊天记录保留。",
+    "This discards the terminal output cached for this session, so the assistant forgets what it has seen. Chat history is kept."
+  ),
+  okText: t("清空", "Clear"),
   danger: true,
-};
+});
 
 export function AgentPanel({
   sessionId,
@@ -107,6 +114,7 @@ export function AgentPanel({
   sessions = [],
   onGetConsole,
 }: AgentPanelProps) {
+  useLocale();
   const cfg = useAgentConfig();
   const ready = isAgentReady(cfg);
   // 对话 / 托管 视图切换（「时间线」页已删，录制按钮挪到了面板头部）
@@ -232,7 +240,7 @@ export function AgentPanel({
       await api.agentClear(sessionId);
       setErr(null);
     } catch (e) {
-      setErr(`清空失败：${toFriendlyError(e).message}`);
+      setErr(t("清空失败：{m}", "Clear failed: {m}", { m: toFriendlyError(e).message }));
     }
   };
 
@@ -245,11 +253,11 @@ export function AgentPanel({
       await api.agentConversationReset(convKey);
       setConv((c) => ({
         ...c,
-        messages: [...c.messages, { id: uid(), role: "assistant" as const, text: "——— 新对话：之后的提问不再接着上面的上下文 ———", ts: Date.now() }],
+        messages: [...c.messages, { id: uid(), role: "assistant" as const, text: t("——— 新对话：之后的提问不再接着上面的上下文 ———", "——— New conversation: questions from here on don't continue the context above ———"), ts: Date.now() }],
       }));
       setErr(null);
     } catch (e) {
-      setErr(`开始新对话失败：${toFriendlyError(e).message}`);
+      setErr(t("开始新对话失败：{m}", "Couldn't start a new conversation: {m}", { m: toFriendlyError(e).message }));
     }
   };
 
@@ -260,7 +268,7 @@ export function AgentPanel({
       setConv((c) => ({ ...c, messages: [], interrupted: false }));
       setErr(null);
     } catch (e) {
-      setErr(`清空对话失败：${toFriendlyError(e).message}`);
+      setErr(t("清空对话失败：{m}", "Couldn't clear the conversation: {m}", { m: toFriendlyError(e).message }));
     }
   };
 
@@ -299,12 +307,12 @@ export function AgentPanel({
     setMention(null);
     if (!q || busy || !sessionId) return;
     if (run.anyBusy) {
-      setErr("另一个连接上的对话还在跑：等它结束（或在那个标签里停止）再问");
+      setErr(t("另一个连接上的对话还在跑：等它结束（或在那个标签里停止）再问", "A chat on another connection is still running. Wait for it to finish (or stop it in that tab), then ask."));
       return;
     }
     if (!ready.ok) {
       // 引导态会盖住输入框，正常到不了这里；真到了就把原因说清楚而不是发一个注定失败的请求
-      patch((c) => withError(c, ready.reason ?? "Nexus AI Agent 尚未配置完成"));
+      patch((c) => withError(c, ready.reason ?? t("Nexus AI Agent 尚未配置完成", "Nexus AI Agent isn't fully set up yet")));
       return;
     }
     // 只有一个 Agent：不再让用户在「问答 / 执行」之间选，它自己决定回答还是动手。
@@ -426,12 +434,12 @@ export function AgentPanel({
   ): Promise<void> => {
     // 托管不占对话：实况进这个终端自己的那一份（别的终端上的托管照常跑、照常看）
     setErr(null);
-    hostFeeds.begin(sid, `托管目标：${goal}`);
+    hostFeeds.begin(sid, t("托管目标：{goal}", "Autopilot goal: {goal}", { goal }));
     setHostStarted((l) => (l.includes(sid) ? l : [...l, sid]));
     // 对话页上一轮恰好订阅着这个终端：让出来，免得同一张密码卡在两处出现
     if (runSession === sid && !busy) setRunSession(null);
     const snap = onGetConsole?.(sid) ?? null;
-    const label = sessions.find((x) => x.id === sid)?.label ?? "当前会话";
+    const label = sessions.find((x) => x.id === sid)?.label ?? t("当前会话", "Current session");
     try {
       await api.hostStart({
         consoleId: sid,
@@ -482,8 +490,8 @@ export function AgentPanel({
     if (!sid || busy || run.anyBusy) return;
     setSkillUi(null);
     setRunSession(sid);
-    startRun(`运行技能「${skill.name}」`);
-    const label = sessions.find((x) => x.id === sid)?.label ?? "当前会话";
+    startRun(t("运行技能「{name}」", "Run skill “{name}”", { name: skill.name }));
+    const label = sessions.find((x) => x.id === sid)?.label ?? t("当前会话", "Current session");
     try {
       await api.skillRun(skill.id, params, sid, label);
     } catch (e) {
@@ -504,7 +512,7 @@ export function AgentPanel({
       await onSendToTerminal(sessionId, cmd);
       setErr(null);
     } catch (e) {
-      setErr(`写入终端失败：${toFriendlyError(e).message}`);
+      setErr(t("写入终端失败：{m}", "Couldn't write to the terminal: {m}", { m: toFriendlyError(e).message }));
     }
   };
 
@@ -563,29 +571,29 @@ export function AgentPanel({
             className={`ap-tab${view === "chat" ? " on" : ""}`}
             onClick={() => setView("chat")}
           >
-            对话
+            {t("对话", "Chat")}
           </button>
           <button
             role="tab"
             aria-selected={view === "steward"}
             className={`ap-tab${view === "steward" ? " on" : ""}`}
             onClick={() => setView("steward")}
-            title="会话织物：终端屏幕状态与托管契约（P0 只观察）"
+            title={t("会话织物：终端屏幕状态与托管契约（P0 只观察）", "Session fabric: terminal screen state and autopilot contracts")}
           >
-            托管
+            {t("托管", "Autopilot")}
           </button>
         </div>
         {/* 录制技能：原来放在「时间线」页头部，时间线页删掉后挪到这里（录制按终端记，切标签各录各的） */}
         {sessionId && <RecorderControls sessionId={sessionId} hostLabel={sessions.find((s) => s.id === sessionId)?.label} />}
-        <button className="ap-skill-btn" onClick={() => setSkillUi({})} title="管理技能（可回放的操作流程）">
-          技能
+        <button className="ap-skill-btn" onClick={() => setSkillUi({})} title={t("管理技能（可回放的操作流程）", "Manage skills (replayable procedures)")}>
+          {t("技能", "Skills")}
         </button>
         {onFloatOut && (
-          <button className="ap-x ap-float" onClick={onFloatOut} title="浮出为独立窗口">
+          <button className="ap-x ap-float" onClick={onFloatOut} title={t("浮出为独立窗口", "Pop out into its own window")}>
             ⧉
           </button>
         )}
-        <button className="ap-x" onClick={onClose} title="关闭面板">
+        <button className="ap-x" onClick={onClose} title={t("关闭面板", "Close panel")}>
           ✕
         </button>
       </div>
@@ -597,37 +605,39 @@ export function AgentPanel({
 
       <div className="ap-status">
         <span className="ap-stat">
-          上下文：当前会话{activeScope.length > 1 ? ` + ${activeScope.length - 1} 个` : ""}
+          {activeScope.length > 1
+            ? t("上下文：当前会话 + {n} 个", "Context: current session + {n} more", { n: activeScope.length - 1 })
+            : t("上下文：当前会话", "Context: current session")}
         </span>
         <button
           className="ap-mini"
           onClick={() => setPending({ kind: "clear" })}
-          title="丢弃该会话已缓存的终端输出，助手会忘掉之前看到的内容"
+          title={t("丢弃该会话已缓存的终端输出，助手会忘掉之前看到的内容", "Discard the cached terminal output for this session; the assistant forgets what it has seen")}
         >
-          清空记忆
+          {t("清空记忆", "Clear memory")}
         </button>
         <button
           className="ap-mini"
           onClick={() => setMemOpen(true)}
-          title="查看 / 编辑助手对这台主机记下的备忘（提示符、sudo 习惯、常用路径……）"
+          title={t("查看 / 编辑助手对这台主机记下的备忘（提示符、sudo 习惯、常用路径……）", "View / edit the notes the assistant keeps for this host (prompt, sudo habits, common paths…)")}
         >
-          主机备忘
+          {t("主机备忘", "Host notes")}
         </button>
         <button
           className="ap-mini"
           disabled={busy}
           onClick={() => void newConversation()}
-          title="之后的提问从头开始（默认会接着之前的上下文追问）；面板上的记录保留"
+          title={t("之后的提问从头开始（默认会接着之前的上下文追问）；面板上的记录保留", "Start fresh from the next question (by default it continues the previous context); the panel history stays")}
         >
-          新对话
+          {t("新对话", "New conversation")}
         </button>
         <button
           className="ap-mini"
           disabled={busy}
           onClick={() => setPending({ kind: "clearConv" })}
-          title="删除本面板的对话记录与已保存的运行摘要（重启后也不会再恢复）"
+          title={t("删除本面板的对话记录与已保存的运行摘要（重启后也不会再恢复）", "Delete this panel's chat history and saved run summaries (they won't come back after a restart)")}
         >
-          清空对话
+          {t("清空对话", "Clear conversation")}
         </button>
       </div>
 
@@ -658,9 +668,16 @@ export function AgentPanel({
           <div className="ap-body" ref={listRef} onScroll={onListScroll}>
             {messages.length === 0 && (
               <div className="ap-empty">
-                <p>助手能看到当前会话的终端内容，可以直接问「刚才那条命令为什么报错」。</p>
                 <p>
-                  需要时它会在终端里执行命令（危险操作先问你）；打 <code>@</code> 可以指定别的会话。
+                  {t(
+                    "助手能看到当前会话的终端内容，可以直接问「刚才那条命令为什么报错」。",
+                    "The assistant can see this session's terminal, so you can just ask “why did that last command fail?”"
+                  )}
+                </p>
+                <p>
+                  {t("需要时它会在终端里执行命令（危险操作先问你）；打 ", "It runs commands in the terminal when needed (asking you first for risky ones). Type ")}
+                  <code>@</code>
+                  {t(" 可以指定别的会话。", " to target another session.")}
                 </p>
               </div>
             )}
@@ -699,7 +716,7 @@ export function AgentPanel({
                       )
                     )}
                     {m.streaming && (
-                      <span className="ap-typing" title="正在回答">
+                      <span className="ap-typing" title={t("正在回答", "Answering")}>
                         <i />
                         <i />
                         <i />
@@ -717,12 +734,12 @@ export function AgentPanel({
                   <i />
                   <i />
                 </span>
-                正在执行…
+                {t("正在执行…", "Working…")}
               </div>
             )}
             {conv.interrupted && (
               <div className="ap-note">
-                上次离开该会话时回答还没结束，上面的内容可能不完整。
+                {t("上次离开该会话时回答还没结束，上面的内容可能不完整。", "The answer hadn't finished when you last left this session; the content above may be incomplete.")}
               </div>
             )}
           </div>
@@ -733,25 +750,25 @@ export function AgentPanel({
             <div className="ap-control paused" role="status">
               <span className="ap-control-text">{pauseBannerText(conv.paused)}</span>
               <button className="btn primary" onClick={() => void run.resumeRun()}>
-                继续
+                {t("继续", "Resume")}
               </button>
             </div>
           ) : pausedIds.length > 0 ? (
             <div className="ap-control paused" role="status">
               <span className="ap-control-text">
-                你正在操作终端，Agent 已暂停（不会往终端里写入）。
+                {t("你正在操作终端，Agent 已暂停（不会往终端里写入）。", "You're using the terminal, so the agent is paused (it won't write to the terminal).")}
               </span>
               <button className="btn primary" onClick={run.handback}>
-                交还
+                {t("交还", "Hand back")}
               </button>
             </div>
           ) : busy && drivingIds.length > 0 ? (
             <div className="ap-control driving" role="status">
               <span className="ap-control-text">
-                Agent 正在操作终端。你在终端里一敲键盘它就会自动暂停。
+                {t("Agent 正在操作终端。你在终端里一敲键盘它就会自动暂停。", "The agent is using the terminal. It pauses automatically as soon as you type in it.")}
               </span>
               <button className="btn" onClick={run.takeover}>
-                接管
+                {t("接管", "Take over")}
               </button>
             </div>
           ) : null}
@@ -759,16 +776,16 @@ export function AgentPanel({
           {/* 作用范围。放在输入框上方而不是藏在卡片里：
               勾选了哪些机器，是下一次发送前**必须**看得见的东西。 */}
           <div className="ap-scope">
-              <span className="ap-scope-label">作用范围</span>
+              <span className="ap-scope-label">{t("作用范围", "Scope")}</span>
               <div className="ap-chips">
                 {activeScope.map((id) => {
-                  const label = sessions.find((s) => s.id === id)?.label ?? "当前会话";
+                  const label = sessions.find((s) => s.id === id)?.label ?? t("当前会话", "Current session");
                   return (
                     <button
                       key={id}
                       className="ap-chip on"
                       disabled={busy}
-                      title={`点击移出作用范围 · ${id}`}
+                      title={t("点击移出作用范围 · {id}", "Click to remove from scope · {id}", { id })}
                       onClick={() => {
                         const next = activeScope.filter((x) => x !== id);
                         // 空了就退回「仅当前会话」—— 一个目标都不给，模型会在个 nullptr 上干活
@@ -786,7 +803,7 @@ export function AgentPanel({
                       key={s.id}
                       className="ap-chip"
                       disabled={busy}
-                      title={`加入作用范围 · ${s.id}`}
+                      title={t("加入作用范围 · {id}", "Add to scope · {id}", { id: s.id })}
                       onClick={() => setScoped([...activeScope, s.id])}
                     >
                       + {s.label}
@@ -794,7 +811,7 @@ export function AgentPanel({
                   ))}
                 {activeScope.length > 1 && (
                   <button className="ap-mini" disabled={busy} onClick={() => setScoped(null)}>
-                    重置
+                    {t("重置", "Reset")}
                   </button>
                 )}
               </div>
@@ -809,8 +826,8 @@ export function AgentPanel({
               disabled={busy}
               placeholder={
                 busy
-                  ? "正在处理…"
-                  : "问点什么，或描述你要它做的事（打 @ 可以指定别的会话）"
+                  ? t("正在处理…", "Working…")
+                  : t("问点什么，或描述你要它做的事（打 @ 可以指定别的会话）", "Ask something, or describe what you want done (type @ to target another session)")
               }
               onChange={(e) => {
                 setInput(e.target.value);
@@ -910,42 +927,42 @@ export function AgentPanel({
                     }}
                   >
                     <span className="ap-mention-name">{s.label}</span>
-                    {activeScope.includes(s.id) && <span className="ap-mention-tag">已在范围</span>}
+                    {activeScope.includes(s.id) && <span className="ap-mention-tag">{t("已在范围", "In scope")}</span>}
                   </button>
                 ))}
               </div>
             )}
             <div className="ap-input-row">
-              <span className="ap-input-hint">Enter 发送 · Shift+Enter 换行</span>
+              <span className="ap-input-hint">{t("Enter 发送 · Shift+Enter 换行", "Enter to send · Shift+Enter for new line")}</span>
               {!busy && conv.lastUsage && (
                 <span className="ap-input-hint ap-usage" title={usageTooltip(fromRunUsage(conv.lastUsage))}>
-                  上一轮 {usageWithTime(fromRunUsage(conv.lastUsage))}
+                  {t("上一轮 {u}", "Last round {u}", { u: usageWithTime(fromRunUsage(conv.lastUsage)) })}
                 </span>
               )}
               {busy ? (
                 <>
                   <label
                     className="ap-stop-ctrlc"
-                    title="停止时同时往正在被驾驶的终端发送 Ctrl-C，打断它正在跑的命令"
+                    title={t("停止时同时往正在被驾驶的终端发送 Ctrl-C，打断它正在跑的命令", "When stopping, also send Ctrl-C to the terminal being driven to interrupt the running command")}
                   >
                     <input
                       type="checkbox"
                       checked={run.stopCtrlC}
                       onChange={(e) => run.toggleStopCtrlC(e.target.checked)}
                     />
-                    同时发 Ctrl-C
+                    {t("同时发 Ctrl-C", "Also send Ctrl-C")}
                   </label>
                   {!conv.paused && (
                     <button
                       className="btn"
-                      title="当前这一步做完后暂停，终端还给你；之后可以「继续」"
+                      title={t("当前这一步做完后暂停，终端还给你；之后可以「继续」", "Pause after the current step and give the terminal back to you; you can Resume later")}
                       onClick={() => void run.pauseRun()}
                     >
-                      暂停
+                      {t("暂停", "Pause")}
                     </button>
                   )}
                   <button className="btn danger" onClick={() => void run.cancel()}>
-                    停止
+                    {t("停止", "Stop")}
                   </button>
                 </>
               ) : (
@@ -954,7 +971,7 @@ export function AgentPanel({
                   onClick={() => void send()}
                   disabled={!input.trim()}
                 >
-                  发送
+                  {t("发送", "Send")}
                 </button>
               )}
             </div>
@@ -962,14 +979,16 @@ export function AgentPanel({
         </>
       ) : (
         <div className="ap-setup">
-          <div className="ap-setup-title">Nexus AI Agent 还没就绪</div>
-          <p className="ap-setup-text">{ready.reason ?? "请先完成 Nexus AI Agent 配置。"}</p>
+          <div className="ap-setup-title">{t("Nexus AI Agent 还没就绪", "Nexus AI Agent isn't ready yet")}</div>
+          <p className="ap-setup-text">{ready.reason ?? t("请先完成 Nexus AI Agent 配置。", "Finish setting up Nexus AI Agent first.")}</p>
           <p className="ap-setup-text">
-            配置好后，助手就能看到你当前会话的终端内容：人继续在终端里干活，
-            助手带着这份上下文回答你的问题，需要时也能直接在里面执行命令。
+            {t(
+              "配置好后，助手就能看到你当前会话的终端内容：人继续在终端里干活，助手带着这份上下文回答你的问题，需要时也能直接在里面执行命令。",
+              "Once set up, the assistant can see your current session's terminal: you keep working there, and it answers your questions with that context, running commands in it when needed."
+            )}
           </p>
           <button className="btn primary" onClick={onOpenSettings}>
-            去设置
+            {t("去设置", "Open settings")}
           </button>
         </div>
       )}
@@ -978,14 +997,14 @@ export function AgentPanel({
         <ConfirmDialog
           opts={
             pending.kind === "clear"
-              ? CLEAR_OPTS
+              ? clearOpts()
               : pending.kind === "clearConv"
-              ? CLEAR_CONV_OPTS
+              ? clearConvOpts()
               : {
-                  title: "确认插入到终端",
-                  message: "以下内容将写入当前会话的终端（只插入，不会自动回车执行）：",
+                  title: t("确认插入到终端", "Insert into terminal?"),
+                  message: t("以下内容将写入当前会话的终端（只插入，不会自动回车执行）：", "The following will be written to this session's terminal (inserted only, not run with Enter):"),
                   detail: pending.cmd,
-                  okText: "插入",
+                  okText: t("插入", "Insert"),
                   danger: true,
                 }
           }
@@ -997,7 +1016,7 @@ export function AgentPanel({
           initialDraft={skillUi.draft}
           onClose={() => setSkillUi(null)}
           onRunSkill={sessionId && !busy ? (sk, p) => void runSkill(sk, p) : undefined}
-          scopeTarget={sessionId ? { sessionId, label: sessions.find((s) => s.id === sessionId)?.label ?? "当前会话" } : undefined}
+          scopeTarget={sessionId ? { sessionId, label: sessions.find((s) => s.id === sessionId)?.label ?? t("当前会话", "Current session") } : undefined}
         />}
       {memOpen && (
         <HostMemoryDialog
@@ -1019,13 +1038,17 @@ function SuggestionCard({
   cmd: string;
   onInsert: (cmd: string) => void;
 }) {
+  useLocale();
   return (
     <div className="ap-sug">
       <div className="ap-sug-head">
-        <span className="ap-sug-tag">建议命令{lang ? ` · ${lang}` : ""}</span>
+        <span className="ap-sug-tag">
+          {t("建议命令", "Suggested command")}
+          {lang ? ` · ${lang}` : ""}
+        </span>
         {/* 安全底线：这里只弹确认框，绝不直接写 pty */}
         <button className="ap-sug-btn" onClick={() => onInsert(cmd)}>
-          插入到终端
+          {t("插入到终端", "Insert into terminal")}
         </button>
       </div>
       <pre className="ap-code">{cmd}</pre>

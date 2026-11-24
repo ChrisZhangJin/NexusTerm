@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { t, useLocale } from "../i18n";
 import { useRecorder } from "../lib/useRecorder";
 import type { SkillInput } from "../types";
 import { cleanLines, mechanicalInput, refineHeadline, type RefinedSkillDraft } from "../lib/skillRefine";
@@ -28,13 +29,14 @@ function useNow(on: boolean): number {
  * 点它不做事，只是让用户在任何视图下都看得到「正在录」。
  */
 export function RecordingBadge({ sessionId }: { sessionId: string }) {
+  useLocale();
   const { status } = useRecorder(sessionId);
   const now = useNow(status.recording);
   if (!status.recording) return null;
   return (
-    <span className="rec-badge" title="正在录制这个终端里的操作">
+    <span className="rec-badge" title={t("正在录制这个终端里的操作", "Recording what you do in this terminal")}>
       <span className="rec-dot" />
-      录制中 {formatElapsed(status.startedAtMs, now)}
+      {t("录制中", "Recording")} {formatElapsed(status.startedAtMs, now)}
     </span>
   );
 }
@@ -47,6 +49,7 @@ export function RecorderControls({
   sessionId: string;
   hostLabel?: string;
 }) {
+  useLocale();
   const { status, busy, start, stop, cancel } = useRecorder(sessionId);
   const now = useNow(status.recording);
   if (!status.recording) {
@@ -55,9 +58,12 @@ export function RecorderControls({
         className="ap-mini rec-btn"
         disabled={busy}
         onClick={() => void start(hostLabel)}
-        title="开始录制：之后你在这个终端里的操作会被整理成一份可复用的步骤草稿"
+        title={t(
+          "开始录制：之后你在这个终端里的操作会被整理成一份可复用的步骤草稿",
+          "Start recording: what you do in this terminal from now on becomes a reusable step draft"
+        )}
       >
-        ● 开始录制
+        ● {t("开始录制", "Start recording")}
       </button>
     );
   }
@@ -67,12 +73,17 @@ export function RecorderControls({
         className="ap-mini rec-btn on"
         disabled={busy}
         onClick={() => void stop()}
-        title="结束录制并生成草稿"
+        title={t("结束录制并生成草稿", "Stop recording and create a draft")}
       >
-        ■ 结束录制 {formatElapsed(status.startedAtMs, now)}
+        ■ {t("结束录制", "Stop recording")} {formatElapsed(status.startedAtMs, now)}
       </button>
-      <button className="ap-mini" disabled={busy} onClick={() => void cancel()} title="放弃这次录制，不生成草稿">
-        取消
+      <button
+        className="ap-mini"
+        disabled={busy}
+        onClick={() => void cancel()}
+        title={t("放弃这次录制，不生成草稿", "Discard this recording without creating a draft")}
+      >
+        {t("取消", "Cancel")}
       </button>
     </>
   );
@@ -93,6 +104,7 @@ export function RecorderDraftCard({
   sessionId: string;
   onOpenSkillDraft?: (draft: SkillInput) => void;
 }) {
+  useLocale();
   const { draft, error, dismissDraft } = useRecorder(sessionId);
   const [showHints, setShowHints] = useState(false);
   const [refineHint, setRefineHint] = useState("");
@@ -121,23 +133,23 @@ export function RecorderDraftCard({
   };
 
   if (error) {
-    return <div className="rec-card rec-err">录制失败：{error}</div>;
+    return <div className="rec-card rec-err">{t("录制失败：{e}", "Recording failed: {e}", { e: error })}</div>;
   }
   if (!draft) return null;
   const secs = Math.round(draftDurationMs(draft) / 1000);
   return (
     <div className="rec-card">
       <div className="rec-card-head">
-        <span className="rec-card-title">录制草稿</span>
+        <span className="rec-card-title">{t("录制草稿", "Recording draft")}</span>
         <span className="tl-dim">
-          {summarizeDraft(draft)} · {secs} 秒
+          {summarizeDraft(draft)} · {t("{n} 秒", "{n}s", { n: secs })}
           {draft.host.label ? ` · ${draft.host.label}` : ""}
         </span>
         <button className="ap-mini" onClick={() => setShowHints((v) => !v)} disabled={draft.hints.length === 0}>
-          {showHints ? "隐藏输出" : "输出提示"}
+          {showHints ? t("隐藏输出", "Hide output") : t("输出提示", "Show output")}
         </button>
-        <button className="ap-mini" onClick={dismissDraft} disabled={refining} title="丢弃这份草稿">
-          丢弃
+        <button className="ap-mini" onClick={dismissDraft} disabled={refining} title={t("丢弃这份草稿", "Discard this draft")}>
+          {t("丢弃", "Discard")}
         </button>
       </div>
       {draft.steps.length > 0 && (
@@ -147,28 +159,31 @@ export function RecorderDraftCard({
             value={refineHint}
             maxLength={500}
             disabled={refining}
-            placeholder="给模型的提示（可选），例如：把主机名做成参数"
+            placeholder={t("给模型的提示（可选），例如：把主机名做成参数", "Hint for the model (optional), e.g. make the hostname a parameter")}
             onChange={(e) => setRefineHint(e.target.value)}
           />
           <button
             className="ap-mini rec-refine"
             disabled={refining}
             onClick={() => void refine()}
-            title="让模型把这份录制整理成可复用的技能：提取参数、加期望与验证。整理结果会再经过后端校验，保存前你可以在编辑器里修改"
+            title={t(
+              "让模型把这份录制整理成可复用的技能：提取参数、加期望与验证。整理结果会再经过后端校验，保存前你可以在编辑器里修改",
+              "Have the model turn this recording into a reusable skill: extract parameters, add expectations and verification. The result is checked by the backend, and you can edit it before saving"
+            )}
           >
-            {refining ? "整理中…" : "✨ 整理为技能"}
+            {refining ? t("整理中…", "Tidying up…") : t("✨ 整理为技能", "✨ Make it a skill")}
           </button>
           <button
             className="ap-mini"
             disabled={refining || !onOpenSkillDraft}
             onClick={() => onOpenSkillDraft?.(mechanicalInput(draft))}
-            title="不经模型，把录制的步骤原样放进编辑器自己改"
+            title={t("不经模型，把录制的步骤原样放进编辑器自己改", "Skip the model and open the recorded steps as-is in the editor")}
           >
-            直接编辑
+            {t("直接编辑", "Edit directly")}
           </button>
         </div>
       )}
-      {refineErr && <div className="rec-err-line">整理失败：{refineErr}</div>}
+      {refineErr && <div className="rec-err-line">{t("整理失败：{e}", "Tidy-up failed: {e}", { e: refineErr })}</div>}
       {refined && (
         <div className={`rec-refined${refined.fallback ? " fb" : ""}`}>
           <div className="rec-refined-head">
@@ -177,9 +192,9 @@ export function RecorderDraftCard({
               className="ap-mini"
               disabled={!onOpenSkillDraft}
               onClick={() => onOpenSkillDraft?.(refined.draft)}
-              title="在技能编辑器里打开整理结果；保存由你在编辑器里确认"
+              title={t("在技能编辑器里打开整理结果；保存由你在编辑器里确认", "Open the result in the skill editor; you confirm saving there")}
             >
-              打开编辑器
+              {t("打开编辑器", "Open editor")}
             </button>
           </div>
           {cleanLines(refined.warnings).length > 0 && (
@@ -206,7 +221,7 @@ export function RecorderDraftCard({
         </ul>
       )}
       {draft.steps.length === 0 ? (
-        <div className="tl-dim">没有可用的步骤。</div>
+        <div className="tl-dim">{t("没有可用的步骤。", "No usable steps.")}</div>
       ) : (
         <ol className="rec-steps">
           {draft.steps.map((s, i) => {
@@ -221,7 +236,7 @@ export function RecorderDraftCard({
           })}
         </ol>
       )}
-      {draft.notes.length > 0 && <div className="tl-dim rec-notes">{draft.notes.join("；")}</div>}
+      {draft.notes.length > 0 && <div className="tl-dim rec-notes">{draft.notes.join(t("；", "; "))}</div>}
     </div>
   );
 }

@@ -11,6 +11,7 @@
  * 归到对应的步骤 / 参数上逐条显示。
  */
 
+import { t } from "../i18n";
 import type {
   Skill,
   SkillCheck,
@@ -79,17 +80,32 @@ export interface SkillForm {
 export const MIN_TIMEOUT_MS = 100;
 export const MAX_TIMEOUT_MS = 600_000;
 
-export const ON_UNEXPECTED_LABEL: Record<SkillOnUnexpected, string> = {
-  ask: "问我",
-  stop: "停止",
-  llm: "交给 AI",
+/** 显示名表的各项都是 getter：读的时候按当前语言取 */
+export const ON_UNEXPECTED_LABEL: Readonly<Record<SkillOnUnexpected, string>> = {
+  get ask() {
+    return t("问我", "Ask me");
+  },
+  get stop() {
+    return t("停止", "Stop");
+  },
+  get llm() {
+    return t("交给 AI", "Hand to AI");
+  },
 };
 
-export const SOURCE_LABEL: Record<SkillSource, string> = {
-  recorded: "录制",
-  migrated_macro: "旧宏迁移",
-  manual: "手写",
-  imported: "导入",
+export const SOURCE_LABEL: Readonly<Record<SkillSource, string>> = {
+  get recorded() {
+    return t("录制", "Recorded");
+  },
+  get migrated_macro() {
+    return t("旧宏迁移", "Migrated macro");
+  },
+  get manual() {
+    return t("手写", "Handwritten");
+  },
+  get imported() {
+    return t("导入", "Imported");
+  },
 };
 
 export const STEP_KINDS: StepKind[] = ["exec", "keys", "expect_respond", "secret", "screen_check"];
@@ -505,11 +521,12 @@ export function groupProblems(problems: readonly string[]): GroupedProblems {
   };
   for (const p of problems) {
     let m: RegExpExecArray | null;
-    if ((m = /^第 (\d+) 步/.exec(p))) push(g.steps, Number(m[1]) - 1, p);
+    if ((m = /^(?:第 (\d+) 步|Step (\d+)\b)/i.exec(p))) push(g.steps, Number(m[1] ?? m[2]) - 1, p);
     else if ((m = /^(?:secret )?参数(?:名)?「(.*?)」/.exec(p))) push(g.params, m[1], p);
+    else if ((m = /^(?:secret )?param(?:eter)?(?: name)? ["“「'](.*?)["”」']/i.exec(p))) push(g.params, m[1], p);
     else if (p.startsWith("verify")) g.verify.push(p);
     else if (p.startsWith("hostScope")) g.hosts.push(p);
-    else if (p.startsWith("风险等级")) g.risk.push(p);
+    else if (p.startsWith("风险等级") || /^risk level\b/i.test(p)) g.risk.push(p);
     else g.general.push(p);
   }
   return g;
@@ -533,19 +550,29 @@ export function riskRaised(submitted: SkillRisk, saved: SkillRisk): boolean {
 
 /** 适用主机的一行描述 */
 export function describeHostScope(scope: SkillHostScope): string {
-  if (scope.kind === "any") return "不限";
-  if (scope.hosts.length === 0) return "（空）";
-  return scope.hosts.length <= 2 ? scope.hosts.join("、") : `${scope.hosts.slice(0, 2).join("、")} 等 ${scope.hosts.length} 项`;
+  if (scope.kind === "any") return t("不限", "Any");
+  if (scope.hosts.length === 0) return t("（空）", "(empty)");
+  const sep = t("、", ", ");
+  return scope.hosts.length <= 2
+    ? scope.hosts.join(sep)
+    : t("{first} 等 {n} 项", "{first} and {more} more", {
+        first: scope.hosts.slice(0, 2).join(sep),
+        n: scope.hosts.length,
+        more: scope.hosts.length - 2,
+      });
 }
 
 /** 上次运行时间（Unix 秒）。`now` 以毫秒传入以便测试。 */
 export function formatLastRun(ts: number | null, now: number = Date.now()): string {
-  if (ts === null || ts <= 0) return "从未运行";
+  if (ts === null || ts <= 0) return t("从未运行", "Never run");
   const diff = Math.max(0, Math.floor(now / 1000) - ts);
-  if (diff < 60) return "刚刚";
-  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
-  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)} 天前`;
+  if (diff < 60) return t("刚刚", "Just now");
+  if (diff < 3600) return t("{n} 分钟前", "{n} min ago", { n: Math.floor(diff / 60) });
+  if (diff < 86400) return t("{n} 小时前", "{n} h ago", { n: Math.floor(diff / 3600) });
+  if (diff < 86400 * 30) {
+    const n = Math.floor(diff / 86400);
+    return t("{n} 天前", n === 1 ? "{n} day ago" : "{n} days ago", { n });
+  }
   const d = new Date(ts * 1000);
   const p = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;

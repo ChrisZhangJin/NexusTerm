@@ -10,15 +10,18 @@
  * - 读回来时，重载前还没收尾的东西要收尾 —— 否则界面上会永远转圈 / 永远等一个已不存在的审批。
  */
 
+import { t } from "../i18n";
 import type { AgentMessage } from "../types";
 
 /** 前端先砍一刀，省得白白把一大坨 IPC 发过去；权威上限在后端。 */
 export const MAX_PERSISTED_MESSAGES = 200;
 
 /** 重载前被打断的步骤卡上补的说明 */
-export const INTERRUPTED_NOTE = "（面板重载前被中断，没有拿到结果）";
+export const interruptedNote = () => t("（面板重载前被中断，没有拿到结果）", "(Interrupted by a panel reload; no result)");
 
 /** 交付卡（`nx_reveal`）读回来时的占位：内容只在内存里，从不落盘 */
+export const revealNotSaved = () => t("（已交付的内容不保存）", "(Delivered content isn't saved)");
+/** @deprecated 只按中文；用 `revealNotSaved()`（切换语言时跟着变）。留着是为了还没改的调用方 */
 export const REVEAL_NOT_SAVED = "（已交付的内容不保存）";
 
 /** 去掉交付卡的内容（其余字段原样）。没有内容的消息原样返回（同一个引用）。 */
@@ -75,12 +78,12 @@ export function fromPersisted(raw: unknown): AgentMessage[] {
     if (m.step) {
       const s = m.step;
       if (s.kind === "exec" && s.output === undefined) {
-        m = { ...m, step: { ...s, kind: "result", output: INTERRUPTED_NOTE } };
+        m = { ...m, step: { ...s, kind: "result", output: interruptedNote() } };
       } else if (
         (s.kind === "keys" || s.kind === "wait" || s.kind === "screen") &&
         s.output === undefined
       ) {
-        m = { ...m, step: { ...s, output: "", text: s.text ?? INTERRUPTED_NOTE } };
+        m = { ...m, step: { ...s, output: "", text: s.text ?? interruptedNote() } };
       } else if (s.kind === "secret" && s.secretStatus === undefined) {
         m = { ...m, step: { ...s, secretStatus: "cancelled" } };
       }

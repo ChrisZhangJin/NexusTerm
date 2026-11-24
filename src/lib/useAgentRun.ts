@@ -6,6 +6,7 @@
  * 同一个审批弹两次的情况。托管视图只是把 `conv.messages` 的一段切出来画（见 `sliceFromMessage`）。
  */
 
+import { t } from "../i18n";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -195,7 +196,7 @@ export function useAgentRun(opts: {
       // 幂等：没有在跑时后端什么都不做
       await api.agentRunCancel(sid, stopCtrlC);
     } catch (e) {
-      onError(`取消失败：${toFriendlyError(e).message}`);
+      onError(t("取消失败：{m}", "Cancel failed: {m}", { m: toFriendlyError(e).message }));
     }
   };
 
@@ -206,7 +207,7 @@ export function useAgentRun(opts: {
     try {
       await api.agentRunPause(sid);
     } catch (e) {
-      onError(`暂停失败：${toFriendlyError(e).message}`);
+      onError(t("暂停失败：{m}", "Pause failed: {m}", { m: toFriendlyError(e).message }));
     }
   };
 
@@ -217,7 +218,7 @@ export function useAgentRun(opts: {
     try {
       await api.agentRunResume(sid);
     } catch (e) {
-      onError(`继续失败：${toFriendlyError(e).message}`);
+      onError(t("继续失败：{m}", "Resume failed: {m}", { m: toFriendlyError(e).message }));
     }
   };
 
@@ -235,7 +236,7 @@ export function useAgentRun(opts: {
     try {
       await api.agentApprove(req.requestId, approved);
     } catch (e) {
-      onError(`提交审批结果失败：${toFriendlyError(e).message}`);
+      onError(t("提交审批结果失败：{m}", "Couldn't submit the approval: {m}", { m: toFriendlyError(e).message }));
       return;
     }
     // 卡片可能在任何一段对话里（不一定是正在跑的那段）：按 requestId 找，找不到的那几段原样不动

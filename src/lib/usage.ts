@@ -8,6 +8,7 @@
  * - 花费上限：输入框里的美元 ↔ 后端的微美元
  */
 
+import { t } from "../i18n";
 import type { HostSpent, ModelPrice, RunUsage } from "../types";
 
 /** 1234 → "1.2k"，12345 → "12.3k"，1234567 → "1.23M"；1000 以下原样 */
@@ -34,11 +35,11 @@ export function fmtUsd(usd: number): string {
 /** 秒 → 「45秒」「12分」「1时05分」 */
 export function fmtElapsed(secs: number): string {
   const s = Math.max(0, Math.floor(Number(secs) || 0));
-  if (s < 60) return `${s}秒`;
+  if (s < 60) return t("{s}秒", "{s}s", { s });
   const m = Math.floor(s / 60);
-  if (m < 60) return `${m}分`;
+  if (m < 60) return t("{m}分", "{m}m", { m });
   const h = Math.floor(m / 60);
-  return `${h}时${String(m % 60).padStart(2, "0")}分`;
+  return t("{h}时{mm}分", "{h}h{mm}m", { h, mm: String(m % 60).padStart(2, "0") });
 }
 
 /** 显示用的用量（对话一轮的 `RunUsage` 与托管的 `HostSpent` 都收敛成它） */
@@ -93,12 +94,28 @@ export function usageWithTime(u: UsageView): string {
 
 /** 悬停说明：输入 / 输出拆分、缓存命中、估算与否、没单价时怎么补 */
 export function usageTooltip(u: UsageView): string {
-  const lines = [`输入 ${fmtTokens(u.inputTokens)} tok · 输出 ${fmtTokens(u.outputTokens)} tok`];
-  if (u.cacheReadTokens) lines.push(`其中缓存命中 ${fmtTokens(u.cacheReadTokens)} tok`);
-  if (u.estimated) lines.push("估算：服务方没有返回用量，按字数估的");
-  if (u.costUsd === null) lines.push("当前模型没有设置单价，只显示 token（可在 AI 设置的「模型单价」里补上）");
-  else lines.push(`花费 ≈${fmtUsd(u.costUsd)}（按设置里的单价折算，不含缓存折扣）`);
-  if (u.elapsedSecs !== undefined && u.elapsedSecs > 0) lines.push(`用时 ${fmtElapsed(u.elapsedSecs)}`);
+  const lines = [
+    t("输入 {i} tok · 输出 {o} tok", "Input {i} tok · Output {o} tok", {
+      i: fmtTokens(u.inputTokens),
+      o: fmtTokens(u.outputTokens),
+    }),
+  ];
+  if (u.cacheReadTokens) lines.push(t("其中缓存命中 {n} tok", "Cache hits: {n} tok", { n: fmtTokens(u.cacheReadTokens) }));
+  if (u.estimated) lines.push(t("估算：服务方没有返回用量，按字数估的", "Estimated: the provider returned no usage, so it's based on text length"));
+  if (u.costUsd === null)
+    lines.push(
+      t(
+        "当前模型没有设置单价，只显示 token（可在 AI 设置的「模型单价」里补上）",
+        "No price set for this model, so only tokens are shown (add one under Model pricing in AI settings)"
+      )
+    );
+  else
+    lines.push(
+      t("花费 ≈{c}（按设置里的单价折算，不含缓存折扣）", "Cost ≈{c} (from the prices in Settings, excluding cache discounts)", {
+        c: fmtUsd(u.costUsd),
+      })
+    );
+  if (u.elapsedSecs !== undefined && u.elapsedSecs > 0) lines.push(t("用时 {e}", "Time {e}", { e: fmtElapsed(u.elapsedSecs) }));
   return lines.join("\n");
 }
 

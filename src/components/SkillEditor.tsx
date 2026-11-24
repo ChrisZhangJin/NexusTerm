@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { api } from "../api";
+import { t, useLocale } from "../i18n";
 import type { Skill, SkillInput, SkillOnUnexpected, SessionRecord } from "../types";
 import { emptySkillInput, STEP_KIND_LABEL, undeclaredParams } from "../lib/skill";
 import {
@@ -72,6 +73,7 @@ const ParamRow = memo(function ParamRow({
   onPatch: (uid: number, fn: (p: ParamForm) => ParamForm) => void;
   onRemove: (uid: number) => void;
 }) {
+  useLocale();
   // 名字用本地草稿、失焦 / 回车才提交：改名会同步改掉所有步骤里的 {{引用}}，
   // 逐字符提交的话敲到一半的名字会把引用改到一个半截的名字上。
   const [nameDraft, setNameDraft] = useState(p.name);
@@ -88,8 +90,11 @@ const ParamRow = memo(function ParamRow({
           className={`sk-input sk-param-name${badName ? " bad" : ""}`}
           value={nameDraft}
           spellCheck={false}
-          placeholder="参数名"
-          title="字母 / 数字 / 下划线，不以数字开头；改名会同步改掉所有 {{引用}}"
+          placeholder={t("参数名", "Parameter name")}
+          title={t(
+            "字母 / 数字 / 下划线，不以数字开头；改名会同步改掉所有 {{引用}}",
+            "Letters, digits and underscores; can't start with a digit. Renaming updates every {{reference}}"
+          )}
           onChange={(e) => setNameDraft(e.target.value)}
           onBlur={commit}
           onKeyDown={(e) => {
@@ -99,7 +104,7 @@ const ParamRow = memo(function ParamRow({
         <input
           className="sk-input sk-param-desc"
           value={p.description}
-          placeholder="说明（给填参数的人看）"
+          placeholder={t("说明（给填参数的人看）", "Description (for whoever fills it in)")}
           onChange={(e) => onPatch(p.uid, (x) => ({ ...x, description: e.target.value }))}
         />
         <input
@@ -107,19 +112,25 @@ const ParamRow = memo(function ParamRow({
           value={p.defaultValue}
           disabled={p.secret}
           spellCheck={false}
-          placeholder={p.secret ? "secret 参数不能有默认值" : "默认值（可空）"}
-          title={p.secret ? "secret 参数的值运行时走密码通道，不存进 skill" : ""}
+          placeholder={p.secret ? t("secret 参数不能有默认值", "Secret parameters can't have a default") : t("默认值（可空）", "Default (optional)")}
+          title={p.secret ? t("secret 参数的值运行时走密码通道，不存进 skill", "Secret values go through the password channel at run time and are never stored in the skill") : ""}
           onChange={(e) => onPatch(p.uid, (x) => ({ ...x, defaultValue: e.target.value }))}
         />
-        <label className="sk-check" title="没有默认值又没传时，回放会报错">
+        <label className="sk-check" title={t("没有默认值又没传时，回放会报错", "Replay fails if there's no default and no value is passed")}>
           <input
             type="checkbox"
             checked={p.required}
             onChange={(e) => onPatch(p.uid, (x) => ({ ...x, required: e.target.checked }))}
           />
-          必填
+          {t("必填", "Required")}
         </label>
-        <label className="sk-check" title="密码类参数：值运行时由用户在密码通道输入，不存库、不进模型上下文">
+        <label
+          className="sk-check"
+          title={t(
+            "密码类参数：值运行时由用户在密码通道输入，不存库、不进模型上下文",
+            "Password-type parameter: the user enters the value in the password channel at run time; it's never stored or shown to the model"
+          )}
+        >
           <input
             type="checkbox"
             checked={p.secret}
@@ -127,11 +138,15 @@ const ParamRow = memo(function ParamRow({
           />
           secret
         </label>
-        <button className="sk-ibtn" title="删除参数" onClick={() => onRemove(p.uid)}>
+        <button className="sk-ibtn" title={t("删除参数", "Remove parameter")} onClick={() => onRemove(p.uid)}>
           ✕
         </button>
       </div>
-      {badName && <div className="sk-err">参数名只能是字母 / 数字 / 下划线，且不以数字开头。</div>}
+      {badName && (
+        <div className="sk-err">
+          {t("参数名只能是字母 / 数字 / 下划线，且不以数字开头。", "Parameter names may only use letters, digits and underscores, and can't start with a digit.")}
+        </div>
+      )}
       {problems?.map((t, i) => (
         <div className="sk-err" key={i}>
           {t}
@@ -160,6 +175,7 @@ interface StepRowProps {
 }
 
 const StepRow = memo(function StepRow(props: StepRowProps) {
+  useLocale();
   const { s, index, total, declared, secretNames, secretList, problems, timeoutBad, onUpdate, onMove, onRemove, onDuplicate } = props;
   const set = <K extends keyof StepForm>(k: K, v: StepForm[K]) => onUpdate(s.uid, (x) => ({ ...x, [k]: v }));
   const chips = (text: string, allowSecret = false) => (
@@ -186,16 +202,16 @@ const StepRow = memo(function StepRow(props: StepRowProps) {
           ))}
         </select>
         <span className="sk-spacer" />
-        <button className="sk-ibtn" title="上移" disabled={index === 0} onClick={() => onMove(s.uid, -1)}>
+        <button className="sk-ibtn" title={t("上移", "Move up")} disabled={index === 0} onClick={() => onMove(s.uid, -1)}>
           ↑
         </button>
-        <button className="sk-ibtn" title="下移" disabled={index === total - 1} onClick={() => onMove(s.uid, 1)}>
+        <button className="sk-ibtn" title={t("下移", "Move down")} disabled={index === total - 1} onClick={() => onMove(s.uid, 1)}>
           ↓
         </button>
-        <button className="sk-ibtn" title="复制这一步" onClick={() => onDuplicate(s.uid)}>
+        <button className="sk-ibtn" title={t("复制这一步", "Duplicate step")} onClick={() => onDuplicate(s.uid)}>
           ⧉
         </button>
-        <button className="sk-ibtn" title="删除这一步" onClick={() => onRemove(s.uid)}>
+        <button className="sk-ibtn" title={t("删除这一步", "Delete step")} onClick={() => onRemove(s.uid)}>
           ✕
         </button>
       </div>
@@ -206,7 +222,7 @@ const StepRow = memo(function StepRow(props: StepRowProps) {
             className="sk-input mono"
             value={s.command}
             spellCheck={false}
-            placeholder="命令（单行，可含 {{参数}}）"
+            placeholder={t("命令（单行，可含 {{参数}}）", "Command (single line, may use {{params}})")}
             onChange={(e) => set("command", e.target.value)}
           />
           {chips(s.command)}
@@ -219,7 +235,7 @@ const StepRow = memo(function StepRow(props: StepRowProps) {
             className="sk-input mono"
             value={s.keys}
             spellCheck={false}
-            placeholder="按键，如 <C-c>  <Enter>  \x03（语法同 nx_send_keys）"
+            placeholder={t("按键，如 <C-c>  <Enter>  \\x03（语法同 nx_send_keys）", "Keys, e.g. <C-c>  <Enter>  \\x03 (same syntax as nx_send_keys)")}
             onChange={(e) => set("keys", e.target.value)}
           />
           {chips(s.keys)}
@@ -229,26 +245,32 @@ const StepRow = memo(function StepRow(props: StepRowProps) {
       {s.kind === "expect_respond" && (
         <>
           <div className="sk-field">
-            <label className="sk-lbl">等到屏幕出现</label>
+            <label className="sk-lbl">{t("等到屏幕出现", "Wait until the screen shows")}</label>
             <input
               className="sk-input mono"
               value={s.expect}
               spellCheck={false}
-              placeholder="子串，或 /正则/i"
+              placeholder={t("子串，或 /正则/i", "Substring, or /regex/i")}
               onChange={(e) => set("expect", e.target.value)}
             />
             {chips(s.expect)}
           </div>
           <div className="sk-field">
             <label className="sk-lbl sk-lbl-row">
-              应答
-              <label className="sk-check" title="应答是密码：不能写字面值，只能引用 secret 参数或运行时现问">
+              {t("应答", "Response")}
+              <label
+                className="sk-check"
+                title={t(
+                  "应答是密码：不能写字面值，只能引用 secret 参数或运行时现问",
+                  "The response is a password: no literal values, only a secret parameter or asking at run time"
+                )}
+              >
                 <input
                   type="checkbox"
                   checked={s.respondSecret}
                   onChange={(e) => onUpdate(s.uid, (x) => setRespondSecret(x, e.target.checked))}
                 />
-                密码（secret）
+                {t("密码（secret）", "Password (secret)")}
               </label>
             </label>
             {s.respondSecret ? (
@@ -257,13 +279,18 @@ const StepRow = memo(function StepRow(props: StepRowProps) {
                 value={s.respond.trim() === "" ? "" : s.respond}
                 onChange={(e) => set("respond", e.target.value)}
               >
-                <option value="">运行时现问（在审批卡里输入）</option>
+                <option value="">{t("运行时现问（在审批卡里输入）", "Ask at run time (enter it in the approval card)")}</option>
                 {secretList.map((n) => (
                   <option key={n} value={`{{${n}}}`}>
-                    引用 secret 参数 {n}
+                    {t("引用 secret 参数 {n}", "Use secret parameter {n}", { n })}
                   </option>
                 ))}
-                {respondOdd && <option value={s.respond}>（无效）{s.respond}</option>}
+                {respondOdd && (
+                  <option value={s.respond}>
+                    {t("（无效）", "(invalid) ")}
+                    {s.respond}
+                  </option>
+                )}
               </select>
             ) : (
               <>
@@ -271,7 +298,7 @@ const StepRow = memo(function StepRow(props: StepRowProps) {
                   className="sk-input mono"
                   value={s.respond}
                   spellCheck={false}
-                  placeholder="要发送的按键，如 y<Enter>（可含 {{参数}}）"
+                  placeholder={t("要发送的按键，如 y<Enter>（可含 {{参数}}）", "Keys to send, e.g. y<Enter> (may use {{params}})")}
                   onChange={(e) => set("respond", e.target.value)}
                 />
                 {chips(s.respond)}
@@ -284,42 +311,52 @@ const StepRow = memo(function StepRow(props: StepRowProps) {
       {s.kind === "secret" && (
         <>
           <div className="sk-field">
-            <label className="sk-lbl">输入理由（给用户看）</label>
+            <label className="sk-lbl">{t("输入理由（给用户看）", "Reason (shown to the user)")}</label>
             <input
               className="sk-input"
               value={s.reason}
-              placeholder="如：sudo 密码"
+              placeholder={t("如：sudo 密码", "e.g. sudo password")}
               onChange={(e) => set("reason", e.target.value)}
             />
           </div>
           <div className="sk-field">
-            <label className="sk-lbl">引用的 secret 参数（可选）</label>
+            <label className="sk-lbl">{t("引用的 secret 参数（可选）", "Secret parameter (optional)")}</label>
             <select
               className="sk-input"
               value={s.param}
               onChange={(e) => set("param", e.target.value)}
             >
-              <option value="">不引用</option>
+              <option value="">{t("不引用", "None")}</option>
               {secretList.map((n) => (
                 <option key={n} value={n}>
                   {n}
                 </option>
               ))}
-              {s.param && !secretList.includes(s.param) && <option value={s.param}>（无效）{s.param}</option>}
+              {s.param && !secretList.includes(s.param) && (
+                <option value={s.param}>
+                  {t("（无效）", "(invalid) ")}
+                  {s.param}
+                </option>
+              )}
             </select>
           </div>
-          <div className="sk-note">skill 里永远不存密码值：回放到这一步时由用户在密码通道输入。</div>
+          <div className="sk-note">
+            {t(
+              "skill 里永远不存密码值：回放到这一步时由用户在密码通道输入。",
+              "Skills never store password values: on replay the user enters it in the password channel at this step."
+            )}
+          </div>
         </>
       )}
 
       {s.kind === "screen_check" && (
         <div className="sk-field">
-          <label className="sk-lbl">屏幕应出现</label>
+          <label className="sk-lbl">{t("屏幕应出现", "Screen should show")}</label>
           <input
             className="sk-input mono"
             value={s.expect}
             spellCheck={false}
-            placeholder="子串，或 /正则/i"
+            placeholder={t("子串，或 /正则/i", "Substring, or /regex/i")}
             onChange={(e) => set("expect", e.target.value)}
           />
           {chips(s.expect)}
@@ -328,28 +365,28 @@ const StepRow = memo(function StepRow(props: StepRowProps) {
 
       <div className="sk-step-opts">
         <label className="sk-opt">
-          <span>超时 ms</span>
+          <span>{t("超时 ms", "Timeout ms")}</span>
           <input
             className={`sk-input sk-num${timeoutBad ? " bad" : ""}`}
             value={s.timeoutMs}
             inputMode="numeric"
-            placeholder="默认"
-            title="100 ~ 600000；留空用默认"
+            placeholder={t("默认", "Default")}
+            title={t("100 ~ 600000；留空用默认", "100 – 600000; leave empty for the default")}
             onChange={(e) => set("timeoutMs", e.target.value)}
           />
         </label>
         <label className="sk-opt sk-opt-grow">
-          <span>做完后应出现</span>
+          <span>{t("做完后应出现", "Then expect")}</span>
           <input
             className="sk-input mono"
             value={s.expectAfter}
             spellCheck={false}
-            placeholder="expectAfter：子串或 /正则/i（可空）"
+            placeholder={t("expectAfter：子串或 /正则/i（可空）", "expectAfter: substring or /regex/i (optional)")}
             onChange={(e) => set("expectAfter", e.target.value)}
           />
         </label>
         <label className="sk-opt">
-          <span>偏离期望时</span>
+          <span>{t("偏离期望时", "If unexpected")}</span>
           <select
             className="sk-input"
             value={s.onUnexpected}
@@ -364,7 +401,7 @@ const StepRow = memo(function StepRow(props: StepRowProps) {
         </label>
       </div>
       {s.expectAfter && chips(s.expectAfter)}
-      {timeoutBad && <div className="sk-err">超时必须是 100 ~ 600000 之间的整数（毫秒），或留空。</div>}
+      {timeoutBad && <div className="sk-err">{timeoutErr()}</div>}
       {problems?.map((t, i) => (
         <div className="sk-err" key={i}>
           {t}
@@ -374,9 +411,13 @@ const StepRow = memo(function StepRow(props: StepRowProps) {
   );
 });
 
+const timeoutErr = () =>
+  t("超时必须是 100 ~ 600000 之间的整数（毫秒），或留空。", "Timeout must be a whole number from 100 to 600000 (ms), or empty.");
+
 // ——————————————————————————————— 编辑器 ———————————————————————————————
 
 export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEditorProps) {
+  useLocale();
   const isNew = !skill;
   // 基线：打开时的内容（走一遍 toForm→toInput 归一化，这样「没动过」就不会被判成有改动）
   const [init] = useState(() => {
@@ -503,7 +544,8 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
     } catch (e) {
       const list = splitProblems(String(e));
       setProblems(list.length ? list : [String(e)]);
-      setSaveErr(`保存失败（${list.length || 1} 个问题）`);
+      const n = list.length || 1;
+      setSaveErr(t("保存失败（{n} 个问题）", n === 1 ? "Save failed (1 problem)" : "Save failed ({n} problems)", { n }));
     } finally {
       setSaving(false);
     }
@@ -522,23 +564,27 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
       >
         <div className="modal sk-modal sk-editor" onMouseDown={(e) => e.stopPropagation()}>
           <h2>
-            {isNew ? (draft ? "新建技能（草稿）" : "新建技能") : "编辑技能"}
-            {dirty && <span className="sk-dirty"> · 未保存</span>}
+            {isNew ? (draft ? t("新建技能（草稿）", "New skill (draft)") : t("新建技能", "New skill")) : t("编辑技能", "Edit skill")}
+            {dirty && <span className="sk-dirty"> · {t("未保存", "Unsaved")}</span>}
           </h2>
 
           <div className="sk-body">
             {skill && (
               <div className="sk-meta">
-                <span>来源：{SOURCE_LABEL[skill.source]}</span>
+                <span>{t("来源：{s}", "Source: {s}", { s: SOURCE_LABEL[skill.source] })}</span>
                 <span>
-                  成功 {skill.successCount} / 失败 {skill.failCount}
+                  {t("成功 {ok} / 失败 {fail}", "{ok} succeeded / {fail} failed", { ok: skill.successCount, fail: skill.failCount })}
                 </span>
-                <span>上次运行：{formatLastRun(skill.lastRunTs)}</span>
+                <span>{t("上次运行：{w}", "Last run: {w}", { w: formatLastRun(skill.lastRunTs) })}</span>
               </div>
             )}
             {init.droppedSecret.length > 0 && (
               <div className="sk-warn">
-                草稿里 secret 参数「{init.droppedSecret.join("、")}」带有默认值，已丢弃（secret 参数不能有默认值）。
+                {t(
+                  "草稿里 secret 参数「{names}」带有默认值，已丢弃（secret 参数不能有默认值）。",
+                  "The draft had defaults for secret parameters “{names}”; they were dropped (secret parameters can't have defaults).",
+                  { names: init.droppedSecret.join(t("、", ", ")) }
+                )}
               </div>
             )}
             {grouped.general.length > 0 && (
@@ -551,31 +597,43 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
 
             <section className="sk-sec">
               <div className="sk-field">
-                <label className="sk-lbl">名称</label>
+                <label className="sk-lbl">{t("名称", "Name")}</label>
                 <input
                   className="sk-input"
                   value={form.name}
                   autoFocus
-                  placeholder="如：部署 web"
+                  placeholder={t("如：部署 web", "e.g. Deploy web")}
                   onChange={(e) => patch({ name: e.target.value })}
                 />
               </div>
               <div className="sk-field">
-                <label className="sk-lbl">描述</label>
+                <label className="sk-lbl">{t("描述", "Description")}</label>
                 <textarea
                   className="sk-input sk-ta"
                   rows={2}
                   value={form.description}
-                  placeholder="这个技能做什么、什么时候该用（AI 也会读它来决定是否调用）"
+                  placeholder={t(
+                    "这个技能做什么、什么时候该用（AI 也会读它来决定是否调用）",
+                    "What this skill does and when to use it (the AI reads this to decide whether to call it)"
+                  )}
                   onChange={(e) => patch({ description: e.target.value })}
                 />
               </div>
               <div className="sk-risk-row">
-                <span className="sk-lbl-inline">风险等级</span>
+                <span className="sk-lbl-inline">{t("风险等级", "Risk level")}</span>
                 <RiskBadge risk={form.risk} />
                 <span className="sk-note">
-                  由后端按步骤内容评估，保存时只会被抬高、不能手动降低
-                  {isNew ? "；这里显示的是草稿自带的值，保存后以后端评估为准" : ""}。
+                  {t(
+                    "由后端按步骤内容评估，保存时只会被抬高、不能手动降低",
+                    "Assessed by the backend from the steps; saving can only raise it, never lower it"
+                  )}
+                  {isNew
+                    ? t(
+                        "；这里显示的是草稿自带的值，保存后以后端评估为准",
+                        ". This is the draft's own value; the backend's assessment applies after saving"
+                      )
+                    : ""}
+                  {t("。", ".")}
                 </span>
               </div>
               {grouped.risk.map((t, i) => (
@@ -587,13 +645,18 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
 
             <section className="sk-sec">
               <div className="sk-sec-head">
-                <h3>参数</h3>
+                <h3>{t("参数", "Parameters")}</h3>
                 <button className="btn sk-small" onClick={() => patch({ params: [...form.params, newParam()] })}>
-                  ＋ 添加参数
+                  {t("＋ 添加参数", "＋ Add parameter")}
                 </button>
               </div>
               {form.params.length === 0 && (
-                <div className="sk-note">没有参数。在命令里写 {"{{名字}}"} 引用参数；密码类参数请勾选 secret。</div>
+                <div className="sk-note">
+                  {t(
+                    "没有参数。在命令里写 {{名字}} 引用参数；密码类参数请勾选 secret。",
+                    "No parameters. Write {{name}} in a command to reference one; tick secret for passwords."
+                  )}
+                </div>
               )}
               {form.params.map((p) => (
                 <ParamRow
@@ -607,12 +670,12 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
               ))}
               {missing.length > 0 && (
                 <div className="sk-warn sk-missing">
-                  引用了未声明的参数：
+                  {t("引用了未声明的参数：", "Undeclared parameters referenced: ")}
                   {missing.map((n) => (
                     <span className="sk-ph bad" key={n}>{`{{${n}}}`}</span>
                   ))}
                   <button className="btn sk-small" onClick={() => setForm((f) => declareMissing(f).form)}>
-                    自动补全声明
+                    {t("自动补全声明", "Declare them")}
                   </button>
                 </div>
               )}
@@ -620,9 +683,9 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
 
             <section className="sk-sec">
               <div className="sk-sec-head">
-                <h3>步骤（{form.steps.length}）</h3>
+                <h3>{t("步骤（{n}）", "Steps ({n})", { n: form.steps.length })}</h3>
               </div>
-              {form.steps.length === 0 && <div className="sk-note">还没有步骤，从下面添加一步。</div>}
+              {form.steps.length === 0 && <div className="sk-note">{t("还没有步骤，从下面添加一步。", "No steps yet. Add one below.")}</div>}
               {form.steps.map((s, i) => (
                 <StepRow
                   key={s.uid}
@@ -641,7 +704,7 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
                 />
               ))}
               <div className="sk-addbar">
-                <span className="sk-lbl-inline">添加：</span>
+                <span className="sk-lbl-inline">{t("添加：", "Add: ")}</span>
                 {STEP_KINDS.map((k) => (
                   <button key={k} className="btn sk-small" onClick={() => addStep(k)}>
                     {STEP_KIND_LABEL[k]}
@@ -652,14 +715,14 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
 
             <section className="sk-sec">
               <div className="sk-sec-head">
-                <h3>验证</h3>
+                <h3>{t("验证", "Verification")}</h3>
                 <label className="sk-check">
                   <input
                     type="checkbox"
                     checked={form.verifyOn}
                     onChange={(e) => patch({ verifyOn: e.target.checked })}
                   />
-                  跑完后检查屏幕
+                  {t("跑完后检查屏幕", "Check the screen when done")}
                 </label>
               </div>
               {form.verifyOn && (
@@ -669,24 +732,24 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
                       className="sk-input mono"
                       value={form.verifyExpect}
                       spellCheck={false}
-                      placeholder="屏幕应出现：子串或 /正则/i"
+                      placeholder={t("屏幕应出现：子串或 /正则/i", "Screen should show: substring or /regex/i")}
                       onChange={(e) => patch({ verifyExpect: e.target.value })}
                     />
                     <PlaceholderChips text={form.verifyExpect} declared={declared} secretNames={secretNames} />
                   </div>
                   <label className="sk-opt">
-                    <span>超时 ms</span>
+                    <span>{t("超时 ms", "Timeout ms")}</span>
                     <input
                       className={`sk-input sk-num${local.verifyTimeout ? " bad" : ""}`}
                       value={form.verifyTimeoutMs}
                       inputMode="numeric"
-                      placeholder="默认"
+                      placeholder={t("默认", "Default")}
                       onChange={(e) => patch({ verifyTimeoutMs: e.target.value })}
                     />
                   </label>
                 </div>
               )}
-              {local.verifyTimeout && <div className="sk-err">超时必须是 100 ~ 600000 之间的整数（毫秒），或留空。</div>}
+              {local.verifyTimeout && <div className="sk-err">{timeoutErr()}</div>}
               {grouped.verify.map((t, i) => (
                 <div className="sk-err" key={i}>
                   {t}
@@ -696,19 +759,19 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
 
             <section className="sk-sec">
               <div className="sk-sec-head">
-                <h3>适用主机</h3>
+                <h3>{t("适用主机", "Hosts")}</h3>
                 <div className="seg sk-seg">
                   <button
                     className={`seg-btn${form.hostMode === "any" ? " active" : ""}`}
                     onClick={() => patch({ hostMode: "any" })}
                   >
-                    不限
+                    {t("不限", "Any")}
                   </button>
                   <button
                     className={`seg-btn${form.hostMode === "list" ? " active" : ""}`}
                     onClick={() => patch({ hostMode: "list" })}
                   >
-                    指定
+                    {t("指定", "Specific")}
                   </button>
                 </div>
               </div>
@@ -719,7 +782,10 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
                     rows={3}
                     value={form.hostsText}
                     spellCheck={false}
-                    placeholder={"每行一项：已保存连接的 ID，或主机名（* 通配，如 *.prod.example.com）"}
+                    placeholder={t(
+                      "每行一项：已保存连接的 ID，或主机名（* 通配，如 *.prod.example.com）",
+                      "One per line: a saved connection ID, or a host name (* wildcard, e.g. *.prod.example.com)"
+                    )}
                     onChange={(e) => patch({ hostsText: e.target.value })}
                   />
                   <div className="sk-hosts">
@@ -733,10 +799,10 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
                         }
                       }}
                     >
-                      <option value="">从已保存连接添加…</option>
+                      <option value="">{t("从已保存连接添加…", "Add from saved connections…")}</option>
                       {sessions.map((s) => (
                         <option key={s.id} value={s.id}>
-                          {s.name}（{s.host}）
+                          {t("{name}（{host}）", "{name} ({host})", { name: s.name, host: s.host })}
                         </option>
                       ))}
                     </select>
@@ -746,7 +812,14 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
                       </span>
                     ))}
                   </div>
-                  {hostEntries.length === 0 && <div className="sk-err">指定主机时至少要有一项（要不限主机请选「不限」）。</div>}
+                  {hostEntries.length === 0 && (
+                    <div className="sk-err">
+                      {t(
+                        "指定主机时至少要有一项（要不限主机请选「不限」）。",
+                        "Add at least one host (choose Any to allow every host)."
+                      )}
+                    </div>
+                  )}
                 </>
               )}
               {grouped.hosts.map((t, i) => (
@@ -762,22 +835,29 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
               {saveErr ? (
                 <span className="sk-err-inline">{saveErr}</span>
               ) : nProblems > 0 ? (
-                <span className="sk-err-inline">{nProblems} 个问题待处理</span>
+                <span className="sk-err-inline">
+                  {t("{n} 个问题待处理", nProblems === 1 ? "1 problem to fix" : "{n} problems to fix", { n: nProblems })}
+                </span>
               ) : hasLocalProblems(local) ? (
-                <span className="sk-err-inline">有无效的超时设置</span>
+                <span className="sk-err-inline">{t("有无效的超时设置", "Some timeouts are invalid")}</span>
               ) : resetsCounts ? (
-                <span className="sk-warn-inline">保存后，步骤 / 参数 / 验证 / 主机范围的改动会让成功 / 失败计数清零</span>
+                <span className="sk-warn-inline">
+                  {t(
+                    "保存后，步骤 / 参数 / 验证 / 主机范围的改动会让成功 / 失败计数清零",
+                    "Saving changes to steps, parameters, verification or hosts resets the success / failure counts"
+                  )}
+                </span>
               ) : null}
             </div>
             <button className="btn" onClick={requestClose} disabled={saving}>
-              取消
+              {t("取消", "Cancel")}
             </button>
             <button
               className="btn primary"
               onClick={() => void save()}
               disabled={saving || hasLocalProblems(local) || (!isNew && !dirty)}
             >
-              {saving ? "保存中…" : "保存"}
+              {saving ? t("保存中…", "Saving…") : t("保存", "Save")}
             </button>
           </div>
         </div>
@@ -786,9 +866,9 @@ export default function SkillEditor({ skill, draft, onSaved, onClose }: SkillEdi
       {confirmClose && (
         <ConfirmDialog
           opts={{
-            title: "放弃修改？",
-            message: "这个技能有未保存的修改，关闭后会丢失。",
-            okText: "放弃修改",
+            title: t("放弃修改？", "Discard changes?"),
+            message: t("这个技能有未保存的修改，关闭后会丢失。", "This skill has unsaved changes that will be lost if you close it."),
+            okText: t("放弃修改", "Discard"),
             danger: true,
           }}
           onResult={(ok) => {
