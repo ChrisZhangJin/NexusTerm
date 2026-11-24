@@ -22,6 +22,7 @@ import Zmodem, {
 } from "zmodem.js";
 
 import { api, bytesToBase64 } from "../api";
+import { t } from "../i18n";
 
 export interface ZmodemHooks {
   /** 写终端（用于显示传输提示） */
@@ -190,17 +191,25 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
   /** 给等待加上限（见 `STALL_MS`） */
   const deadline = <T,>(p: Promise<T>, ms: number, what: string): Promise<T> =>
     new Promise<T>((resolve, reject) => {
-      const t = window.setTimeout(
-        () => reject(new Error(`${what}超时（${Math.round(ms / 1000)} 秒无进展）`)),
+      const timer = window.setTimeout(
+        () =>
+          reject(
+            new Error(
+              t("{what}超时（{s} 秒无进展）", "{what} timed out (no progress for {s}s)", {
+                what,
+                s: Math.round(ms / 1000),
+              })
+            )
+          ),
         ms
       );
       p.then(
         (v) => {
-          window.clearTimeout(t);
+          window.clearTimeout(timer);
           resolve(v);
         },
         (e) => {
-          window.clearTimeout(t);
+          window.clearTimeout(timer);
           reject(e);
         }
       );
@@ -277,11 +286,11 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
       const path = await save({ defaultPath: name });
       if (disposed) return;
       if (!path) {
-        hooks.termWrite(`\r\n\x1b[90m[ZMODEM] 已取消保存 ${name}\x1b[0m\r\n`);
+        hooks.termWrite(`\r\n\x1b[90m[ZMODEM] ${t("已取消保存 {name}", "Save cancelled: {name}", { name })}\x1b[0m\r\n`);
         safeAbort(zsession);
         return;
       }
-      hooks.termWrite(`\r\n\x1b[33m[ZMODEM] 接收 ${name}（${fmtSize(total)}）\x1b[0m\r\n`);
+      hooks.termWrite(`\r\n\x1b[33m[ZMODEM] ${t("接收 {name}（{size}）", "Receiving {name} ({size})", { name, size: fmtSize(total) })}\x1b[0m\r\n`);
 
       await xfer.accept({
         on_input: (payload: ArrayLike<number>) => {
@@ -304,10 +313,10 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
       if (disposed) return;
       progress(name, total || got, total || got, t0);
       hooks.termWrite("\r\n");
-      hooks.termWrite(`\x1b[32m[ZMODEM] ${name} 已保存到 ${path}\x1b[0m\r\n`);
-      hooks.notify(`${name} 下载完成（${fmtSize(total || got)}）`);
+      hooks.termWrite(`\x1b[32m[ZMODEM] ${t("{name} 已保存到 {path}", "{name} saved to {path}", { name, path })}\x1b[0m\r\n`);
+      hooks.notify(t("{name} 下载完成（{size}）", "{name} downloaded ({size})", { name, size: fmtSize(total || got) }));
     })().catch((e) => {
-      hooks.termWrite(`\r\n\x1b[31m[ZMODEM] 接收失败：${String(e)}\x1b[0m\r\n`);
+      hooks.termWrite(`\r\n\x1b[31m[ZMODEM] ${t("接收失败：{e}", "Receive failed: {e}", { e: String(e) })}\x1b[0m\r\n`);
       safeAbort(zsession);
     });
   };
@@ -330,18 +339,18 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
       pending = null;
     } else {
       pending = null;
-      hooks.termWrite(`\r\n\x1b[33m[ZMODEM] 请选择要上传的文件…\x1b[0m\r\n`);
+      hooks.termWrite(`\r\n\x1b[33m[ZMODEM] ${t("请选择要上传的文件…", "Choose files to upload…")}\x1b[0m\r\n`);
       files = await pickFiles();
     }
     if (disposed) return;
     if (files.length === 0) {
-      hooks.termWrite(`\r\n\x1b[90m[ZMODEM] 已取消，正在中止远端 rz…\x1b[0m\r\n`);
+      hooks.termWrite(`\r\n\x1b[90m[ZMODEM] ${t("已取消，正在中止远端 rz…", "Cancelled, aborting remote rz…")}\x1b[0m\r\n`);
       safeAbort(zsession);
       return;
     }
     const total = files.reduce((n, f) => n + f.size, 0);
     hooks.termWrite(
-      `\r\n\x1b[33m[ZMODEM] 上传 ${files.length} 个文件（${fmtSize(total)}）\x1b[0m\r\n`
+      `\r\n\x1b[33m[ZMODEM] ${t("上传 {n} 个文件（{size}）", "Uploading {n} file(s) ({size})", { n: files.length, size: fmtSize(total) })}\x1b[0m\r\n`
     );
     let sent = 0;
     let skipped = 0;
@@ -360,7 +369,7 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
         if (disposed) return;
         if (!xfer) {
           skipped++;
-          hooks.termWrite(`\x1b[90m  跳过 ${f.name}（远端拒收）\x1b[0m\r\n`);
+          hooks.termWrite(`\x1b[90m  ${t("跳过 {name}（远端拒收）", "Skipped {name} (rejected by remote)", { name: f.name })}\x1b[0m\r\n`);
           continue;
         }
         // 每片之后 drain() 是真的背压：后端写命令 await 一个有界队列，队列满时
@@ -377,14 +386,14 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
             // 最后一片：先让积压落到低水位，再把 ZEOF 发出去。
             // 顺序反了的话 ZEOF 会排在几百 MB 数据后面，远端迟迟不确认。
             off = f.size;
-            await deadline(drain(), STALL_MS, "等待发送队列回落");
+            await deadline(drain(), STALL_MS, t("等待发送队列回落", "Waiting for the send queue to drain"));
             progress(f.name, off, f.size, t0);
-            await deadline(xfer.end(piece), STALL_MS, "等待远端确认文件结束");
+            await deadline(xfer.end(piece), STALL_MS, t("等待远端确认文件结束", "Waiting for the remote to confirm end of file"));
             break;
           }
           xfer.send(piece);
           off = end;
-          await deadline(drain(), STALL_MS, "等待发送队列回落");
+          await deadline(drain(), STALL_MS, t("等待发送队列回落", "Waiting for the send queue to drain"));
           const now = performance.now();
           if (now - last > 200) {
             last = now;
@@ -392,7 +401,7 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
           }
         }
         if (f.size === 0) {
-          await deadline(xfer.end(new Uint8Array(0)), STALL_MS, "等待远端确认文件结束");
+          await deadline(xfer.end(new Uint8Array(0)), STALL_MS, t("等待远端确认文件结束", "Waiting for the remote to confirm end of file"));
         }
         sent++;
         progress(f.name, f.size, f.size, t0);
@@ -400,11 +409,13 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
       }
       // 必须显式结束会话（ZFIN / OO），否则远端 rz 一直等待
       await zsession.close();
-      const msg = `上传完成：${sent} 个文件` + (skipped ? `，跳过 ${skipped} 个` : "");
+      const msg =
+        t("上传完成：{n} 个文件", "Upload complete: {n} file(s)", { n: sent }) +
+        (skipped ? t("，跳过 {n} 个", ", {n} skipped", { n: skipped }) : "");
       hooks.termWrite(`\x1b[32m[ZMODEM] ${msg}\x1b[0m\r\n`);
       hooks.notify(msg);
     } catch (e) {
-      hooks.termWrite(`\r\n\x1b[31m[ZMODEM] 上传失败：${String(e)}\x1b[0m\r\n`);
+      hooks.termWrite(`\r\n\x1b[31m[ZMODEM] ${t("上传失败：{e}", "Upload failed: {e}", { e: String(e) })}\x1b[0m\r\n`);
       safeAbort(zsession);
     }
   };
@@ -450,11 +461,11 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
       });
       if (zsession.type === "receive") {
         hardenZfinTail(zsession);
-        hooks.termWrite(`\r\n\x1b[33m[ZMODEM] 检测到远端发送（sz）\x1b[0m`);
+        hooks.termWrite(`\r\n\x1b[33m[ZMODEM] ${t("检测到远端发送（sz）", "Remote send detected (sz)")}\x1b[0m`);
         zsession.on("offer", (x) => handleOffer(zsession, x));
         zsession.start();
       } else {
-        hooks.termWrite(`\r\n\x1b[33m[ZMODEM] 检测到远端接收（rz）\x1b[0m`);
+        hooks.termWrite(`\r\n\x1b[33m[ZMODEM] ${t("检测到远端接收（rz）", "Remote receive detected (rz)")}\x1b[0m`);
         void handleUpload(zsession);
       }
     },
@@ -470,7 +481,7 @@ export function attachZmodem(hooks: ZmodemHooks): ZmodemGate {
       } catch (e) {
         // 协议异常时别把整个终端卡死：复位状态并提示
         active = false;
-        hooks.termWrite(`\r\n\x1b[31m[ZMODEM] 协议错误：${String(e)}\x1b[0m\r\n`);
+        hooks.termWrite(`\r\n\x1b[31m[ZMODEM] ${t("协议错误：{e}", "Protocol error: {e}", { e: String(e) })}\x1b[0m\r\n`);
       }
     },
     isActive: () => active,

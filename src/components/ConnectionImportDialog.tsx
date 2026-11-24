@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { t, useLocale } from "../i18n";
 import { normFolder } from "../lib/folders";
 import type { NewSession, SessionRecord } from "../types";
 
@@ -13,6 +14,7 @@ export default function ConnectionImportDialog({ sessions, onClose, onImported }
   onClose: () => void;
   onImported: () => Promise<unknown>;
 }) {
+  const locale = useLocale();
   const [preview, setPreview] = useState<Preview | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -43,14 +45,14 @@ export default function ConnectionImportDialog({ sessions, onClose, onImported }
     try {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const path = await open(format === "csv"
-        ? { title: "选择主机 CSV", filters: [{ name: "CSV", extensions: ["csv"] }] }
-        : { title: "选择 OpenSSH 配置（例如 ~/.ssh/config）" });
+        ? { title: t("选择主机 CSV", "Choose host CSV"), filters: [{ name: "CSV", extensions: ["csv"] }] }
+        : { title: t("选择 OpenSSH 配置（例如 ~/.ssh/config）", "Choose an OpenSSH config (e.g. ~/.ssh/config)") });
       if (typeof path !== "string") return;
       setFinished(false);
       setPreview(null);
       setPreview(await api.previewConnectionImport(path, format));
     } catch (error) {
-      setMessage(`无法预览：${String(error)}`);
+      setMessage(t("无法预览：{e}", "Can't preview: {e}", { e: String(error) }));
     } finally {
       setBusy(false);
     }
@@ -71,9 +73,20 @@ export default function ConnectionImportDialog({ sessions, onClose, onImported }
     setFinished(true);
     try {
       await onImported();
-      setMessage(`已导入 ${saved} 个连接。${failed.length ? `未保存 ${failed.length} 个：${failed.join("、")}` : ""}`);
+      setMessage(
+        t("已导入 {n} 个连接。", "Imported {n} connection(s).", { n: saved }) +
+          (failed.length
+            ? t("未保存 {n} 个：{list}", " {n} not saved: {list}", { n: failed.length, list: failed.join(t("、", ", ")) })
+            : "")
+      );
     } catch {
-      setMessage(`已保存 ${saved} 个连接，但列表刷新失败。请重新打开连接列表。${failed.length ? `另有 ${failed.length} 个未保存。` : ""}`);
+      setMessage(
+        t(
+          "已保存 {n} 个连接，但列表刷新失败。请重新打开连接列表。",
+          "Saved {n} connection(s), but the list failed to refresh. Reopen the connection list.",
+          { n: saved }
+        ) + (failed.length ? t("另有 {n} 个未保存。", " {n} more not saved.", { n: failed.length }) : "")
+      );
     } finally {
       setBusy(false);
     }
@@ -82,24 +95,49 @@ export default function ConnectionImportDialog({ sessions, onClose, onImported }
   return (
     <div className="modal-backdrop" onMouseDown={() => { if (!busy) onClose(); }}>
       <section className="modal connection-import" role="dialog" aria-modal="true" aria-labelledby="connection-import-title" onMouseDown={(e) => e.stopPropagation()}>
-        <h2 id="connection-import-title">从 Termius / OpenSSH 导入</h2>
-        <p className="confirm-msg">选择已有的 OpenSSH 配置，或从 Termius 迁移时得到的主机 CSV。文件只在本机解析，不读取 Termius 数据库，也不导入密码或私钥内容。</p>
+        <h2 id="connection-import-title">{t("从 Termius / OpenSSH 导入", "Import from Termius / OpenSSH")}</h2>
+        <p className="confirm-msg">
+          {t(
+            "选择已有的 OpenSSH 配置，或从 Termius 迁移时得到的主机 CSV。文件只在本机解析，不读取 Termius 数据库，也不导入密码或私钥内容。",
+            "Pick an existing OpenSSH config, or a host CSV from your Termius migration. The file is parsed locally; the Termius database isn't read, and no passwords or private key contents are imported."
+          )}
+        </p>
         <div className="connection-import-files">
-          <button className="btn" autoFocus disabled={busy} onClick={() => void choose("ssh")}>选择 SSH config</button>
-          <button className="btn" disabled={busy} onClick={() => void choose("csv")}>选择主机 CSV</button>
+          <button className="btn" autoFocus disabled={busy} onClick={() => void choose("ssh")}>{t("选择 SSH config", "Choose SSH config")}</button>
+          <button className="btn" disabled={busy} onClick={() => void choose("csv")}>{t("选择主机 CSV", "Choose host CSV")}</button>
         </div>
         <details>
-          <summary>如何准备迁移文件？</summary>
-          <p>如果已有 OpenSSH 配置，直接选取该文件。若已获得主机 CSV，需包含 <code>Address</code>（或 <code>Hostname</code>）和 <code>Username</code>；可选 <code>Label</code>、<code>Port</code> 和 <code>Group</code>。</p>
-          <p>如果只有 Termius 中的连接信息，可以手工填写上述 CSV 列。导入后可在连接设置中补填密码或选择本机密钥。依赖跳板或代理的条目不会作为直连导入。</p>
+          <summary>{t("如何准备迁移文件？", "How do I prepare the file?")}</summary>
+          {locale === "en" ? (
+            <p>If you have an OpenSSH config, just pick it. A host CSV needs <code>Address</code> (or <code>Hostname</code>) and <code>Username</code>; <code>Label</code>, <code>Port</code> and <code>Group</code> are optional.</p>
+          ) : (
+            <p>如果已有 OpenSSH 配置，直接选取该文件。若已获得主机 CSV，需包含 <code>Address</code>（或 <code>Hostname</code>）和 <code>Username</code>；可选 <code>Label</code>、<code>Port</code> 和 <code>Group</code>。</p>
+          )}
+          <p>
+            {t(
+              "如果只有 Termius 中的连接信息，可以手工填写上述 CSV 列。导入后可在连接设置中补填密码或选择本机密钥。依赖跳板或代理的条目不会作为直连导入。",
+              "If your connections only live in Termius, fill in the CSV columns above by hand. After importing, add passwords or pick local keys in each connection's settings. Entries that go through a jump host or proxy aren't imported as direct connections."
+            )}
+          </p>
         </details>
         {preview && !finished && <>
-          <p>{pending.length} 个可导入 · {rows.length - pending.length} 个重复 · {preview.warnings.length} 条提示</p>
+          <p>
+            {t("{a} 个可导入 · {b} 个重复 · {c} 条提示", "{a} to import · {b} duplicate(s) · {c} note(s)", {
+              a: pending.length,
+              b: rows.length - pending.length,
+              c: preview.warnings.length,
+            })}
+          </p>
           <div className="connection-import-results">
             <ul>
               {rows.map(({ session, duplicate }, i) => (
                 <li key={i}><strong>{session.name}</strong> — {session.username}@{session.host} · {session.port ?? 22}
-                  {session.folder && ` · ${session.folder}`} · {session.authType === "key" ? "私钥路径" : session.authType === "agent" ? "SSH agent" : "待填写密码"}{duplicate && " · 重复，跳过"}
+                  {session.folder && ` · ${session.folder}`} · {session.authType === "key"
+                    ? t("私钥路径", "Private key path")
+                    : session.authType === "agent"
+                      ? "SSH agent"
+                      : t("待填写密码", "Password needed")}
+                  {duplicate && t(" · 重复，跳过", " · duplicate, skipped")}
                 </li>
               ))}
               {preview.warnings.map((warning, i) => <li key={`warning-${i}`}>{warning}</li>)}
@@ -108,8 +146,8 @@ export default function ConnectionImportDialog({ sessions, onClose, onImported }
         </>}
         {message && <p role="status">{message}</p>}
         <div className="modal-actions">
-          <button className="btn" disabled={busy} onClick={onClose}>{finished ? "关闭" : "取消"}</button>
-          {!finished && <button className="btn primary" disabled={busy || !pending.length} onClick={() => void save()}>{busy ? "处理中…" : `导入 ${pending.length} 个连接`}</button>}
+          <button className="btn" disabled={busy} onClick={onClose}>{finished ? t("关闭", "Close") : t("取消", "Cancel")}</button>
+          {!finished && <button className="btn primary" disabled={busy || !pending.length} onClick={() => void save()}>{busy ? t("处理中…", "Working…") : t("导入 {n} 个连接", "Import {n} connection(s)", { n: pending.length })}</button>}
         </div>
       </section>
     </div>

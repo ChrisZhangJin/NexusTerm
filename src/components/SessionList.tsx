@@ -8,6 +8,7 @@ import {
   resolveFolderInput,
 } from "../lib/folders";
 import IOMenu from "./IOMenu";
+import { t, useLocale } from "../i18n";
 
 interface Props {
   sessions: SessionRecord[];
@@ -151,6 +152,7 @@ export default function SessionList({
   onMoveFolder,
   io,
 }: Props) {
+  useLocale();
   const [filter, setFilter] = useState("");
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const panelRef = useRef<HTMLDivElement>(null);
@@ -407,11 +409,11 @@ export default function SessionList({
         <input
           ref={inputRef}
           className="filter"
-          placeholder="搜索连接…"
+          placeholder={t("搜索连接…", "Search connections…")}
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
         />
-        <button className="btn-icon" onClick={onCreate} title="新建连接">
+        <button className="btn-icon" onClick={onCreate} title={t("新建连接", "New connection")}>
           +
         </button>
         <IOMenu {...io} />
@@ -451,7 +453,9 @@ export default function SessionList({
 
         {filtered.length === 0 && (
           <p className="empty">
-            {sessions.length === 0 ? "还没有连接，点 + 新建" : "没有匹配的连接"}
+            {sessions.length === 0
+              ? t("还没有连接，点 + 新建", "No connections yet. Click + to add one")
+              : t("没有匹配的连接", "No matching connections")}
           </p>
         )}
       </div>
@@ -476,7 +480,7 @@ export default function SessionList({
                       onClose();
                     }}
                   >
-                    连接
+                    {t("连接", "Connect")}
                   </button>
                   <button
                     className="ctx-item"
@@ -486,7 +490,7 @@ export default function SessionList({
                       onClose();
                     }}
                   >
-                    编辑 / 改名
+                    {t("编辑 / 改名", "Edit / rename")}
                   </button>
                   <button
                     className="ctx-item"
@@ -495,7 +499,7 @@ export default function SessionList({
                       onExport(s);
                     }}
                   >
-                    导出为 .xsh
+                    {t("导出为 .xsh", "Export as .xsh")}
                   </button>
                   <div className="ctx-sep" />
                   <button
@@ -505,7 +509,7 @@ export default function SessionList({
                       onDelete(s);
                     }}
                   >
-                    删除
+                    {t("删除", "Delete")}
                   </button>
                 </div>
               );
@@ -521,7 +525,7 @@ export default function SessionList({
                       setRenaming(node.path);
                     }}
                   >
-                    改名 / 移动
+                    {t("改名 / 移动", "Rename / move")}
                   </button>
                   <button
                     className="ctx-item"
@@ -530,7 +534,7 @@ export default function SessionList({
                       onExportFolder(collectSessions(node), node.name);
                     }}
                   >
-                    导出分组为 .xsh
+                    {t("导出分组为 .xsh", "Export folder as .xsh")}
                   </button>
                 </div>
               );
@@ -559,6 +563,7 @@ interface TreeViewProps {
 }
 
 function TreeView(props: TreeViewProps) {
+  useLocale();
   const {
     node,
     depth,
@@ -596,7 +601,10 @@ function TreeView(props: TreeViewProps) {
                   className="folder-rename"
                   autoFocus
                   defaultValue={child.name}
-                  title="改名；带 / 的路径可以换层级，如 office/train（相对上级）或 /office/train（从根算起）"
+                  title={t(
+                    "改名；带 / 的路径可以换层级，如 office/train（相对上级）或 /office/train（从根算起）",
+                    "Rename; a path with / moves it, e.g. office/train (relative to parent) or /office/train (from the root)"
+                  )}
                   onFocus={(e) => e.currentTarget.select()}
                   onKeyDown={(e) => {
                     e.stopPropagation();
@@ -631,7 +639,7 @@ function TreeView(props: TreeViewProps) {
                 toggle(child.path);
               }}
               onContextMenu={(e) => onCtx(e, { kind: "folder", node: child })}
-              title={`${child.path}\n按住拖动：移到别的分组下`}
+              title={`${child.path}\n${t("按住拖动：移到别的分组下", "Drag to move into another folder")}`}
               data-drop-folder={child.path}
             >
               <span className="caret">{collapsedNow ? "▸" : "▾"}</span>
@@ -667,7 +675,7 @@ function TreeView(props: TreeViewProps) {
         >
           <span
             className="drag-handle"
-            title="按住拖动：调整顺序 / 移入分组"
+            title={t("按住拖动：调整顺序 / 移入分组", "Drag to reorder / move into a folder")}
             onPointerDown={(e) => onStartDrag(e, { kind: "session", id: s.id })}
           >
             ⠿
@@ -679,8 +687,8 @@ function TreeView(props: TreeViewProps) {
             // 一条分隔线是让多行备注不至于和地址糊成一团的唯一手段。
             title={
               s.note
-                ? `${s.username}@${s.host}:${s.port}  双击连接\n\n${s.note}`
-                : `${s.username}@${s.host}:${s.port}  双击连接`
+                ? `${s.username}@${s.host}:${s.port}  ${t("双击连接", "Double-click to connect")}\n\n${s.note}`
+                : `${s.username}@${s.host}:${s.port}  ${t("双击连接", "Double-click to connect")}`
             }
           >
             <span className="dot" />
@@ -690,7 +698,7 @@ function TreeView(props: TreeViewProps) {
               {s.host}
             </span>
           </button>
-          <button className="btn-row" onClick={() => onConnect(s)} title="连接">
+          <button className="btn-row" onClick={() => onConnect(s)} title={t("连接", "Connect")}>
             ↵
           </button>
         </div>

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { t, useLocale } from "../i18n";
 
 /**
  * 应用内确认框。WebView2 下 window.confirm 不可靠（可能被直接吞掉返回 false），
@@ -22,6 +23,7 @@ export default function ConfirmDialog({
   opts: ConfirmOptions;
   onResult: (ok: boolean, dontAsk: boolean) => void;
 }) {
+  useLocale();
   const [dontAsk, setDontAsk] = useState(false);
   const okRef = useRef<HTMLButtonElement>(null);
 
@@ -55,14 +57,14 @@ export default function ConfirmDialog({
             </label>
           )}
           <button className="btn" onClick={() => onResult(false, false)}>
-            取消
+            {t("取消", "Cancel")}
           </button>
           <button
             ref={okRef}
             className={`btn primary${opts.danger ? " danger" : ""}`}
             onClick={() => onResult(true, dontAsk)}
           >
-            {opts.okText ?? "确定"}
+            {opts.okText ?? t("确定", "OK")}
           </button>
         </div>
       </div>

@@ -1,4 +1,5 @@
 import { api } from "../api";
+import { t } from "../i18n";
 import type { AuthMethod, SessionRecord } from "../types";
 
 /**
@@ -13,12 +14,12 @@ export async function resolveAuth(
 ): Promise<AuthMethod> {
   if (s.authType === "password") {
     const pwd = await api.loadPassword(s.id);
-    if (!pwd) throw new Error("未保存密码，请编辑会话并填写");
+    if (!pwd) throw new Error(t("未保存密码，请编辑会话并填写", "No saved password. Edit the session and enter one."));
     return { kind: "password", password: pwd };
   }
 
   if (s.authType === "key") {
-    if (!s.keyPath) throw new Error("该会话未配置私钥路径");
+    if (!s.keyPath) throw new Error(t("该会话未配置私钥路径", "This session has no private key path set"));
     return { kind: "privateKey", path: s.keyPath, passphrase };
   }
 

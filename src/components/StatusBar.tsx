@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, onTermPulse } from "../api";
+import { t, useLocale } from "../i18n";
 import { setPrefs, usePrefs } from "../lib/prefs";
 import { getOutputCount } from "../lib/termRegistry";
 import { getExtras, isSidecarDenied, markCompat, updateExtras } from "../lib/sessionExtras";
@@ -35,11 +36,11 @@ interface Props {
 }
 
 const LABEL: Record<Props["status"], string> = {
-  idle: "未连接",
-  connecting: "连接中",
-  connected: "已连接",
-  reconnecting: "重连中",
-  error: "连接失败",
+  get idle() { return t("未连接", "Not connected"); },
+  get connecting() { return t("连接中", "Connecting"); },
+  get connected() { return t("已连接", "Connected"); },
+  get reconnecting() { return t("重连中", "Reconnecting"); },
+  get error() { return t("连接失败", "Connection failed"); },
 };
 
 /** 资源刷新间隔 */
@@ -65,6 +66,7 @@ function Ecg({
   lastBeat: number | null;
   source: BeatSource | null;
 }) {
+  useLocale();
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 1000);
@@ -78,8 +80,11 @@ function Ecg({
       className={`sb-ecg${beat > 0 ? " live" : ""}${stale ? " stale" : ""}`}
       title={
         age === null
-          ? "等待链路脉搏：服务端心跳，或一次成功的资源采集"
-          : `链路脉搏：${age} 秒前 · ${source === "stats" ? "资源采集回应" : "服务端心跳"}`
+          ? t("等待链路脉搏：服务端心跳，或一次成功的资源采集", "Waiting for a link pulse: a server keepalive or a successful resource poll")
+          : t("链路脉搏：{s} 秒前 · {src}", "Link pulse: {s}s ago · {src}", {
+              s: age,
+              src: source === "stats" ? t("资源采集回应", "resource poll reply") : t("服务端心跳", "server keepalive"),
+            })
       }
     >
       <svg viewBox="0 0 56 16" width="56" height="16" aria-hidden="true">
@@ -213,6 +218,7 @@ function PublicIp({
   sessionId?: string | null;
   onNotify?: (msg: string) => void;
 }) {
+  useLocale();
   const [ip, setIp] = useState<string | null | undefined>(() => publicIpCache.get(hostKey));
   const [busy, setBusy] = useState(false);
   const compat = !local && getExtras(sessionId).compat;
@@ -236,27 +242,35 @@ function PublicIp({
     if (!publicIpCache.has(hostKey)) void query();
   }, [hostKey, query]);
   if (compat) return null;
-  const where = local ? "本机" : "这台主机";
+  const where = local ? t("本机", "This machine") : t("这台主机", "This host");
   return (
     <span
       className="sb-item sb-ip"
       title={
         ip
-          ? `${where}的公网 IP（出网时对外显示的地址）\n点击复制 · 双击重新查询`
+          ? t(
+              "{where}的公网 IP（出网时对外显示的地址）\n点击复制 · 双击重新查询",
+              "{where}: public IP (the address seen from outside)\nClick to copy · double-click to look up again",
+              { where }
+            )
           : busy
-            ? "正在查询公网 IP…"
-            : `没查到${where}的公网 IP（可能不能出网，或没有 curl / wget）\n双击重新查询`
+            ? t("正在查询公网 IP…", "Looking up public IP…")
+            : t(
+                "没查到{where}的公网 IP（可能不能出网，或没有 curl / wget）\n双击重新查询",
+                "{where}: couldn't find the public IP (no internet access, or no curl / wget)\nDouble-click to try again",
+                { where }
+              )
       }
       onClick={() => {
         if (!ip) return;
         void api
           .clipboardWrite(ip)
-          .then(() => onNotify?.(`已复制公网 IP ${ip}`))
+          .then(() => onNotify?.(t("已复制公网 IP {ip}", "Copied public IP {ip}", { ip })))
           .catch(() => {});
       }}
       onDoubleClick={() => void query()}
     >
-      公网 {busy && ip === undefined ? "…" : ip ?? "—"}
+      {t("公网", "Public IP")} {busy && ip === undefined ? "…" : ip ?? "—"}
     </span>
   );
 }
@@ -285,6 +299,7 @@ function ResourceMeters({
   /** 一次采集成功 = 链路脉搏（对不发 keepalive 的服务器是唯一证据） */
   onBeat: () => void;
 }) {
+  useLocale();
   const [stats, setStats] = useState<Stats | null>(() => statsCache.get(hostKey) ?? null);
   const [pulse, setPulse] = useState(0);
   const [failed, setFailed] = useState(false);
@@ -356,7 +371,7 @@ function ResourceMeters({
     };
   }, [hostKey, local, live, sessionId]);
 
-  const where = local ? "本机" : "远端";
+  const where = local ? t("本机", "This machine") : t("远端", "Remote");
 
   /**
    * 重新检测「是否真的只允许一条通道」。兼容模式一旦记住就永不再试探、会自我固化
@@ -391,20 +406,27 @@ function ResourceMeters({
         onContextMenu={onContextMenu}
         title={
           compatNow
-            ? "该服务器曾被判定只允许一条 SSH 通道（堡垒机），此设置已记住，所以不采集远端资源。\n" +
-              "这是历史记录，不是算法降级 —— 点此重新检测：能取到数据就自动解除。\n" +
-              "（若它确实会掐断第二条通道，检测可能让当前连接断开）"
-            : "右键可关闭实时监控"
+            ? t(
+                "该服务器曾被判定只允许一条 SSH 通道（堡垒机），此设置已记住，所以不采集远端资源。\n这是历史记录，不是算法降级 —— 点此重新检测：能取到数据就自动解除。\n（若它确实会掐断第二条通道，检测可能让当前连接断开）",
+                "This server was found to allow only one SSH channel (bastion host). That's remembered, so remote resources aren't collected.\nIt's a saved record, not a fallback — click to re-check: if data comes back, it's cleared automatically.\n(If the server really kills a second channel, the check may drop the current connection)"
+              )
+            : t("右键可关闭实时监控", "Right-click to turn off live monitoring")
         }
       >
         {compatNow ? (
           <button type="button" className="sb-compat" disabled={retrying} onClick={retry}>
-            {retrying ? "检测通道…" : note === "denied" ? "仅单通道 · 已确认" : "兼容模式 · 重检"}
+            {retrying
+              ? t("检测通道…", "Checking channel…")
+              : note === "denied"
+                ? t("仅单通道 · 已确认", "Single channel · confirmed")
+                : t("兼容模式 · 重检", "Compatibility mode · re-check")}
           </button>
         ) : failed ? (
-          "资源信息不可用"
+          t("资源信息不可用", "Resource info unavailable")
         ) : (
-          <><span className="spinner sm" /> 采集资源…</>
+          <>
+            <span className="spinner sm" /> {t("采集资源…", "Collecting resources…")}
+          </>
         )}
       </span>
     );
@@ -423,45 +445,60 @@ function ResourceMeters({
     <span
       className={`sb-res${failed ? " stale" : ""}${live ? "" : " paused"}`}
       onContextMenu={onContextMenu}
-      title={live ? undefined : `${where} · 实时监控已关闭，显示的是最后一次数值（右键开启）`}
+      title={
+        live
+          ? undefined
+          : t("{where} · 实时监控已关闭，显示的是最后一次数值（右键开启）", "{where} · Live monitoring is off; showing the last values (right-click to turn on)", {
+              where,
+            })
+      }
     >
       {live && (
         <span
           key={pulse}
           className="sb-res-dot"
-          title={`${where} · ${failed ? "最近一次刷新失败" : "每 5 秒刷新"}（右键可关闭实时监控）`}
+          title={`${where} · ${failed ? t("最近一次刷新失败", "Last refresh failed") : t("每 5 秒刷新", "Refreshes every 5s")}${t(
+            "（右键可关闭实时监控）",
+            " (right-click to turn off live monitoring)"
+          )}`}
         />
       )}
-      {local && <span className="sb-res-where">本机</span>}
+      {local && <span className="sb-res-where">{t("本机", "Local")}</span>}
       <Meter
         label="CPU"
         pct={stats.cpuPct}
-        text={stats.cpus ? `${stats.cpus} 核` : ""}
+        text={stats.cpus ? t("{n} 核", "{n} cores", { n: stats.cpus }) : ""}
         title={
-          `CPU：${stats.cpus ?? "?"} 核，当前占用 ${stats.cpuPct?.toFixed(1) ?? "?"}%` +
-          (stats.load ? `\n平均负载（1/5/15 分钟）：${stats.load}` : "")
+          t("CPU：{n} 核，当前占用 {pct}%", "CPU: {n} cores, {pct}% in use", {
+            n: stats.cpus ?? "?",
+            pct: stats.cpuPct?.toFixed(1) ?? "?",
+          }) + (stats.load ? t("\n平均负载（1/5/15 分钟）：{l}", "\nLoad average (1/5/15 min): {l}", { l: stats.load }) : "")
         }
         pulse={pulse}
         animate={live}
       />
       <Meter
-        label="内存"
+        label={t("内存", "Mem")}
         pct={memPct}
         text={
           stats.memTotal !== undefined && stats.memAvail !== undefined
-            ? `可用 ${fmtBytes(stats.memAvail)} / ${fmtBytes(stats.memTotal)}`
+            ? t("可用 {a} / {b}", "{a} free / {b}", { a: fmtBytes(stats.memAvail), b: fmtBytes(stats.memTotal) })
             : ""
         }
         title={
           stats.memTotal !== undefined && stats.memAvail !== undefined
-            ? `内存：总量 ${fmtBytes(stats.memTotal)}，可用 ${fmtBytes(stats.memAvail)}，已用 ${fmtBytes(stats.memTotal - stats.memAvail)}`
-            : "内存信息不可用"
+            ? t("内存：总量 {total}，可用 {free}，已用 {used}", "Memory: {total} total, {free} available, {used} used", {
+                total: fmtBytes(stats.memTotal),
+                free: fmtBytes(stats.memAvail),
+                used: fmtBytes(stats.memTotal - stats.memAvail),
+              })
+            : t("内存信息不可用", "Memory info unavailable")
         }
         pulse={pulse}
         animate={live}
       />
       <Meter
-        label="磁盘"
+        label={t("磁盘", "Disk")}
         pct={diskPct}
         text={
           stats.diskTotal !== undefined && stats.diskUsed !== undefined
@@ -470,8 +507,12 @@ function ResourceMeters({
         }
         title={
           stats.diskTotal !== undefined && stats.diskUsed !== undefined
-            ? `磁盘（${stats.diskMount ?? "/"}）：总量 ${fmtBytes(stats.diskTotal)}，已用 ${fmtBytes(stats.diskUsed)}`
-            : "磁盘信息不可用"
+            ? t("磁盘（{m}）：总量 {total}，已用 {used}", "Disk ({m}): {total} total, {used} used", {
+                m: stats.diskMount ?? "/",
+                total: fmtBytes(stats.diskTotal),
+                used: fmtBytes(stats.diskUsed),
+              })
+            : t("磁盘信息不可用", "Disk info unavailable")
         }
         pulse={pulse}
         animate={live}
@@ -549,6 +590,7 @@ export default function StatusBar({
   onOpenSettings,
   settingsOpen,
 }: Props) {
+  useLocale();
   const prefs = usePrefs();
   const locks = useLockKeys();
   const out = useOutputCount(activeTabId);
@@ -670,23 +712,29 @@ export default function StatusBar({
         <span
           className="sb-item sb-count"
           title={
-            `当前终端累计输出 ${out.chars.toLocaleString()} 个字符（${fmtSize(out.bytes)}）\n` +
-            `导出时仅包含缓冲区内的内容（最多 10000 行滚动历史），实际文件可能更小`
+            t(
+              "当前终端累计输出 {n} 个字符（{size}）\n导出时仅包含缓冲区内的内容（最多 10000 行滚动历史），实际文件可能更小",
+              "This terminal has output {n} characters in total ({size})\nExports only include the buffer (up to 10,000 lines of scrollback), so the file may be smaller",
+              { n: out.chars.toLocaleString(), size: fmtSize(out.bytes) }
+            )
           }
         >
-          字符 {fmtCount(out.chars)}
+          {t("字符", "Chars")} {fmtCount(out.chars)}
         </span>
       )}
       {activeTabId && (
         <button
           type="button"
           className="sb-item sb-id"
-          title="当前会话 id（与 Agent 对话里引用的 target 是同一个值）点击复制"
+          title={t(
+            "当前会话 id（与 Agent 对话里引用的 target 是同一个值）点击复制",
+            "Current session id (the same value the Agent chat uses as target). Click to copy"
+          )}
           onClick={() => {
             api
               .clipboardWrite(activeTabId)
-              .then(() => onNotify?.("已复制会话 id"))
-              .catch((e) => onNotify?.(`复制失败：${String(e)}`));
+              .then(() => onNotify?.(t("已复制会话 id", "Copied session id")))
+              .catch((e) => onNotify?.(t("复制失败：{e}", "Copy failed: {e}", { e: String(e) })));
           }}
         >
           ID {activeTabId}
@@ -694,26 +742,37 @@ export default function StatusBar({
       )}
       <span
         className={`sb-lock${locks?.num ? " on" : ""}`}
-        title={locks ? `NumLock ${locks.num ? "已开启" : "已关闭"}` : "按任意键后显示 NumLock 状态"}
+        title={
+          locks
+            ? `NumLock ${locks.num ? t("已开启", "on") : t("已关闭", "off")}`
+            : t("按任意键后显示 NumLock 状态", "Press any key to show NumLock state")
+        }
       >
         NUM
       </span>
       <span
         className={`sb-lock${locks?.cap ? " on" : ""}`}
-        title={locks ? `CapsLock ${locks.cap ? "已开启（大写）" : "已关闭（小写）"}` : "按任意键后显示 CapsLock 状态"}
+        title={
+          locks
+            ? `CapsLock ${locks.cap ? t("已开启（大写）", "on (uppercase)") : t("已关闭（小写）", "off (lowercase)")}`
+            : t("按任意键后显示 CapsLock 状态", "Press any key to show CapsLock state")
+        }
       >
         CAP
       </span>
-      <span className="sb-item" title={`已打开 ${sessionCount} 个标签，其中 ${connectedCount} 个在线`}>
-        {sessionCount} 会话
-        {connectedCount !== sessionCount ? `（${connectedCount} 在线）` : ""}
+      <span
+        className="sb-item"
+        title={t("已打开 {n} 个标签，其中 {c} 个在线", "{n} tab(s) open, {c} online", { n: sessionCount, c: connectedCount })}
+      >
+        {t("{n} 会话", "{n} sessions", { n: sessionCount })}
+        {connectedCount !== sessionCount ? t("（{c} 在线）", " ({c} online)", { c: connectedCount }) : ""}
       </span>
 
       <div className="sb-settings" ref={settingsMenuRef}>
         <button
           className={`sb-settings-btn${settingsOpen || settingsMenuOpen ? " active" : ""}`}
           onClick={() => setSettingsMenuOpen((v) => !v)}
-          title="设置"
+          title={t("设置", "Settings")}
           aria-haspopup="menu"
           aria-expanded={settingsMenuOpen}
         >
@@ -726,27 +785,27 @@ export default function StatusBar({
             data-tauri-drag-region="false"
           >
             <button className="ctx-item" role="menuitem" onClick={() => pickSettings("appearance")}>
-              外观…
-              <span className="ctx-shortcut">配色 · 字体 · 底部栏</span>
+              {t("外观…", "Appearance…")}
+              <span className="ctx-shortcut">{t("配色 · 字体 · 底部栏", "Colors · font · status bar")}</span>
             </button>
             <button className="ctx-item" role="menuitem" onClick={() => pickSettings("behavior")}>
-              行为…
-              <span className="ctx-shortcut">终端行为 · 宏</span>
+              {t("行为…", "Behavior…")}
+              <span className="ctx-shortcut">{t("终端行为 · 宏", "Terminal behavior · macros")}</span>
             </button>
             <button className="ctx-item" role="menuitem" onClick={() => pickSettings("shortcuts")}>
-              快捷键…
+              {t("快捷键…", "Shortcuts…")}
             </button>
             <button className="ctx-item" role="menuitem" onClick={() => pickSettings("keys")}>
-              密钥管理…
-              <span className="ctx-shortcut">生成 · 导入 · 导出</span>
+              {t("密钥管理…", "Key manager…")}
+              <span className="ctx-shortcut">{t("生成 · 导入 · 导出", "Generate · import · export")}</span>
             </button>
             <button className="ctx-item" role="menuitem" onClick={() => pickSettings("agent")}>
               Nexus AI Agent…
-              <span className="ctx-shortcut">把会话输出旁路给模型</span>
+              <span className="ctx-shortcut">{t("把会话输出旁路给模型", "Share session output with the model")}</span>
             </button>
             <button className="ctx-item" role="menuitem" onClick={() => pickSettings("security")}>
-              安全…
-              <span className="ctx-shortcut">主密码 · 凭据加密</span>
+              {t("安全…", "Security…")}
+              <span className="ctx-shortcut">{t("主密码 · 凭据加密", "Master password · credential encryption")}</span>
             </button>
           </div>
         )}
@@ -770,7 +829,7 @@ export default function StatusBar({
                 setMenu(null);
               }}
             >
-              {live ? "关闭实时监控" : "开启实时监控"}
+              {live ? t("关闭实时监控", "Turn off live monitoring") : t("开启实时监控", "Turn on live monitoring")}
             </button>
             <button
               className="ctx-item"
@@ -779,7 +838,7 @@ export default function StatusBar({
                 setMenu(null);
               }}
             >
-              在底部栏隐藏资源信息
+              {t("在底部栏隐藏资源信息", "Hide resource info in the status bar")}
             </button>
           </div>
         </>

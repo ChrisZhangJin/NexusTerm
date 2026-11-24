@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { normalizeTimeout } from "../lib/errors";
+import { t, useLocale } from "../i18n";
 import { getExtras, updateExtras } from "../lib/sessionExtras";
 import type {
   AuthMethod,
@@ -21,6 +22,7 @@ interface Props {
 }
 
 export default function SessionDialog({ editing, macros, onSave, onClose }: Props) {
+  useLocale();
   const [name, setName] = useState("");
   const [folder, setFolder] = useState("");
   const [host, setHost] = useState("");
@@ -127,7 +129,7 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
     const picked = await open({
       multiple: false,
       directory: false,
-      title: "选择私钥文件（OpenSSH / .ppk）",
+      title: t("选择私钥文件（OpenSSH / .ppk）", "Choose a private key file (OpenSSH / .ppk)"),
       // 不设 filters：私钥通常没有扩展名（id_rsa / id_ed25519），
       // 加了过滤反而会把它们藏起来。
     });
@@ -138,15 +140,21 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
       setEncryptedKey(false);
     } catch (e) {
       // 已加密 = 需要口令；其它错误（格式不对 / 读不到）留给保存后连接时报
-      setEncryptedKey(String(e).includes("需要提供密码") || String(e).includes("已加密"));
+      // 后端文案随界面语言：中文含「需要提供密码 / 已加密」，英文含 encrypted + passphrase
+      const msg = String(e);
+      setEncryptedKey(
+        msg.includes("需要提供密码") ||
+          msg.includes("已加密") ||
+          (/encrypted/i.test(msg) && /passphrase/i.test(msg))
+      );
     }
   };
 
   const testConnection = async () => {
     setTestResult(null);
-    if (!host.trim()) return setTestResult({ ok: false, msg: "主机不能为空" });
-    if (!username.trim()) return setTestResult({ ok: false, msg: "用户名不能为空" });
-    if (authType === "key" && !keyPath) return setTestResult({ ok: false, msg: "请选择私钥" });
+    if (!host.trim()) return setTestResult({ ok: false, msg: t("主机不能为空", "Host is required") });
+    if (!username.trim()) return setTestResult({ ok: false, msg: t("用户名不能为空", "Username is required") });
+    if (authType === "key" && !keyPath) return setTestResult({ ok: false, msg: t("请选择私钥", "Choose a private key") });
 
     const auth: AuthMethod =
       authType === "password"
@@ -169,7 +177,9 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
       });
       setTestResult({
         ok: true,
-        msg: outcome.legacyCrypto ? "连接成功（服务器仅支持旧版密钥交换算法）" : "连接成功",
+        msg: outcome.legacyCrypto
+          ? t("连接成功（服务器仅支持旧版密钥交换算法）", "Connected (the server only supports legacy key exchange algorithms)")
+          : t("连接成功", "Connected"),
       });
     } catch (e) {
       setTestResult({ ok: false, msg: String(e) });
@@ -187,7 +197,8 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
     setTotpChecking(true);
     try {
       const p: TotpPreview = await api.totpPreview(totpSeed.trim());
-      setTotpResult({ ok: true, msg: `当前验证码 ${p.code}（${p.remainingSecs} 秒后刷新）` });
+      setTotpResult({ ok: true, msg: t("当前验证码 {code}（{s} 秒后刷新）", "Current code {code} (refreshes in {s}s)", { code: p.code, s: p.remainingSecs }),
+      });
     } catch (e) {
       setTotpResult({ ok: false, msg: String(e) });
     } finally {
@@ -197,12 +208,12 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
 
   const submit = async () => {
     setError(null);
-    if (!host.trim()) return setError("主机不能为空");
-    if (!username.trim()) return setError("用户名不能为空");
-    if (authType === "key" && !keyPath) return setError("请选择私钥");
-    if (!/^\d+$/.test(connectTimeout.trim())) return setError("连接超时必须是正整数秒");
+    if (!host.trim()) return setError(t("主机不能为空", "Host is required"));
+    if (!username.trim()) return setError(t("用户名不能为空", "Username is required"));
+    if (authType === "key" && !keyPath) return setError(t("请选择私钥", "Choose a private key"));
+    if (!/^\d+$/.test(connectTimeout.trim())) return setError(t("连接超时必须是正整数秒", "Connect timeout must be a whole number of seconds"));
     if (Number(connectTimeout) < 1 || Number(connectTimeout) > 600)
-      return setError("连接超时需在 1–600 秒之间");
+      return setError(t("连接超时需在 1–600 秒之间", "Connect timeout must be between 1 and 600 seconds"));
 
     setSaving(true);
     try {
@@ -239,34 +250,42 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2>{editing ? "编辑连接" : "新建连接"}</h2>
+        <h2>{editing ? t("编辑连接", "Edit connection") : t("新建连接", "New connection")}</h2>
 
         <div className="row">
-          <label>名称</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="留空则自动生成" />
-        </div>
-        <div className="row">
-          <label>分组</label>
+          <label>{t("名称", "Name")}</label>
           <input
-            value={folder}
-            onChange={(e) => setFolder(e.target.value)}
-            placeholder="留空=根目录，多级用 / 分隔，如 生产环境/华东"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder={t("留空则自动生成", "Leave empty to generate one")}
           />
         </div>
         <div className="row">
-          <label>主机</label>
-          <input value={host} onChange={(e) => setHost(e.target.value)} placeholder="192.168.1.10 或 example.com" />
+          <label>{t("分组", "Folder")}</label>
+          <input
+            value={folder}
+            onChange={(e) => setFolder(e.target.value)}
+            placeholder={t("留空=根目录，多级用 / 分隔，如 生产环境/华东", "Empty = root; nest with /, e.g. prod/east")}
+          />
         </div>
         <div className="row">
-          <label>端口</label>
+          <label>{t("主机", "Host")}</label>
+          <input
+            value={host}
+            onChange={(e) => setHost(e.target.value)}
+            placeholder={t("192.168.1.10 或 example.com", "192.168.1.10 or example.com")}
+          />
+        </div>
+        <div className="row">
+          <label>{t("端口", "Port")}</label>
           <input value={port} onChange={(e) => setPort(e.target.value)} placeholder="22" />
         </div>
         <div className="row">
-          <label>用户名</label>
+          <label>{t("用户名", "Username")}</label>
           <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="root" />
         </div>
         <div className="row">
-          <label>连接超时(秒)</label>
+          <label>{t("连接超时(秒)", "Connect timeout (s)")}</label>
           <input
             value={connectTimeout}
             onChange={(e) => setConnectTimeout(e.target.value)}
@@ -275,36 +294,43 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
           />
         </div>
         <p className="hint">
-          TCP 握手超过该秒数即判定主机不可达，默认 10 秒。主机响应慢可适当调大。
+          {t(
+            "TCP 握手超过该秒数即判定主机不可达，默认 10 秒。主机响应慢可适当调大。",
+            "If the TCP handshake takes longer than this, the host is treated as unreachable. Default 10s; raise it for slow hosts."
+          )}
         </p>
 
         <div className="row">
-          <label htmlFor="session-note">备注</label>
+          <label htmlFor="session-note">{t("备注", "Note")}</label>
           <textarea
             id="session-note"
             className="note-input"
             value={note}
             onChange={(e) => setNote(e.target.value)}
             rows={3}
-            placeholder="这台机器是干嘛的、改动前要通知谁、什么时候不能重启…"
+            placeholder={t(
+              "这台机器是干嘛的、改动前要通知谁、什么时候不能重启…",
+              "What this machine is for, who to notify before changes, when it must not be rebooted…"
+            )}
             spellCheck={false}
           />
         </div>
         <p className="hint">
-          可空，纯备忘。在连接列表里悬停这条连接就能看到。
-          <strong>不要往里写密码</strong> —— 这一列不加密，启用主密码也不会保护它。
+          {t("可空，纯备忘。在连接列表里悬停这条连接就能看到。", "Optional, just a memo. Hover the connection in the list to see it. ")}
+          <strong>{t("不要往里写密码", "Don't put passwords here")}</strong>
+          {t(" —— 这一列不加密，启用主密码也不会保护它。", " — this field isn't encrypted, even with a master password.")}
         </p>
 
         <div className="row">
-          <label>认证</label>
+          <label>{t("认证", "Auth")}</label>
           <div className="seg">
-            {(["password", "key", "agent"] as const).map((t) => (
+            {(["password", "key", "agent"] as const).map((k) => (
               <button
-                key={t}
-                className={authType === t ? "seg-btn active" : "seg-btn"}
-                onClick={() => setAuthType(t)}
+                key={k}
+                className={authType === k ? "seg-btn active" : "seg-btn"}
+                onClick={() => setAuthType(k)}
               >
-                {t === "password" ? "密码" : t === "key" ? "私钥" : "Agent"}
+                {k === "password" ? t("密码", "Password") : k === "key" ? t("私钥", "Private key") : "Agent"}
               </button>
             ))}
           </div>
@@ -312,12 +338,12 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
 
         {authType === "password" && (
           <div className="row">
-            <label>密码</label>
+            <label>{t("密码", "Password")}</label>
             <input
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              placeholder="随连接配置保存，可随数据库迁移到其他机器"
+              placeholder={t("随连接配置保存，可随数据库迁移到其他机器", "Saved with the connection; moves with the database to other machines")}
             />
           </div>
         )}
@@ -325,10 +351,10 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
         {authType === "key" && (
           <>
             <div className="row">
-              <label>私钥</label>
+              <label>{t("私钥", "Private key")}</label>
               <div className="key-pick">
                 <select value={keyPath} onChange={(e) => setKeyPath(e.target.value)}>
-                  <option value="">选择密钥…</option>
+                  <option value="">{t("选择密钥…", "Choose a key…")}</option>
                   {keys.map((k) => (
                     <option key={k.id} value={k.path}>
                       {k.name} · {k.keyType}
@@ -339,17 +365,20 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
                   ))}
                   {/* 私钥文件被手工删掉 / 移动过时，别让选择框变成空的不明状态 */}
                   {keyPath && !keys.some((k) => k.path === keyPath) && (
-                    <option value={keyPath}>{keyPath}（不在密钥库中）</option>
+                    <option value={keyPath}>
+                      {keyPath}
+                      {t("（不在密钥库中）", " (not in key library)")}
+                    </option>
                   )}
                 </select>
                 <button type="button" className="btn" onClick={browseKey}>
-                  浏览…
+                  {t("浏览…", "Browse…")}
                 </button>
               </div>
             </div>
             {(keys.find((k) => k.path === keyPath)?.encrypted ?? encryptedKey) && (
               <div className="row">
-                <label>私钥密码</label>
+                <label>{t("私钥密码", "Passphrase")}</label>
                 <input
                   type="password"
                   value={passphrase}
@@ -357,19 +386,23 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
                     setPassphrase(e.target.value);
                     setPassphraseTouched(true);
                   }}
-                  placeholder="留空则连接时再询问"
+                  placeholder={t("留空则连接时再询问", "Leave empty to be asked when connecting")}
                 />
               </div>
             )}
             <p className="hint">
-              密钥库外的文件也可以直接用「浏览…」选，支持 OpenSSH 与 PuTTY 的 .ppk。
-              未填口令时，连接时会弹窗询问，勾选「记住口令」后即保存在本机。
+              {t(
+                "密钥库外的文件也可以直接用「浏览…」选，支持 OpenSSH 与 PuTTY 的 .ppk。未填口令时，连接时会弹窗询问，勾选「记住口令」后即保存在本机。",
+                "Use Browse… to pick files outside the key library; OpenSSH and PuTTY .ppk are supported. Without a passphrase you'll be asked when connecting; tick \"Remember passphrase\" to save it on this machine."
+              )}
             </p>
           </>
         )}
 
         {authType === "agent" && (
-          <p className="hint">使用系统 ssh-agent 中的凭据。需先在终端执行 ssh-add。</p>
+          <p className="hint">
+            {t("使用系统 ssh-agent 中的凭据。需先在终端执行 ssh-add。", "Uses credentials from the system ssh-agent. Run ssh-add in a terminal first.")}
+          </p>
         )}
 
         {/*
@@ -377,7 +410,7 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
           所以这一段放在 authType 的分支之外，任何认证方式下都渲染。
         */}
         <div className="row">
-          <label>二次验证</label>
+          <label>{t("二次验证", "2FA")}</label>
           <div className="key-pick">
             <input
               // 种子是手抄进来的一长串 base32，看不见极易抄错，所以这里配了显示切换
@@ -390,16 +423,16 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
               }}
               placeholder={
                 hasSeed && !totpTouched
-                  ? "已保存（留空不修改）"
+                  ? t("已保存（留空不修改）", "Saved (leave empty to keep)")
                   : hasSeed && !totpSeed.trim()
-                    ? "保存后将清除已存的种子"
-                    : "TOTP 种子，或 otpauth://totp/… 链接"
+                    ? t("保存后将清除已存的种子", "The saved seed will be cleared on save")
+                    : t("TOTP 种子，或 otpauth://totp/… 链接", "TOTP seed or otpauth://totp/… link")
               }
               autoComplete="off"
               spellCheck={false}
             />
             <button type="button" className="btn" onClick={() => setShowSeed((v) => !v)}>
-              {showSeed ? "隐藏" : "显示"}
+              {showSeed ? t("隐藏", "Hide") : t("显示", "Show")}
             </button>
             {hasSeed && (
               <button
@@ -412,7 +445,7 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
                 }}
                 disabled={totpTouched && !totpSeed.trim()}
               >
-                清除
+                {t("清除", "Clear")}
               </button>
             )}
           </div>
@@ -425,23 +458,22 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
             onClick={previewTotp}
             disabled={totpChecking || saving || !totpSeed.trim()}
           >
-            {totpChecking ? "验证中…" : "验证"}
+            {totpChecking ? t("验证中…", "Checking…") : t("验证", "Check")}
           </button>
         </div>
         {totpResult && <p className={totpResult.ok ? "hint" : "error"}>{totpResult.msg}</p>}
 
         <p className="hint">
-          填了种子之后，服务器索要验证码时就不用再掏手机。点「验证」可以算出此刻的码，
-          跟手机上的 app 对一眼再保存 —— 抄错一位的话，不验就得等到下次连接才发现。
-          种子加密保存在本机，把数据库拷到别的机器上解不开，换机器需要重填一次。
-          连接时第一次会自动提交算出的验证码；一旦被服务器拒绝，本次连接剩下的问答就只预填，
-          由你确认后再发 —— 连错几次会锁账号，自动重试只会烧得更快。
+          {t(
+            "填了种子之后，服务器索要验证码时就不用再掏手机。点「验证」可以算出此刻的码，跟手机上的 app 对一眼再保存 —— 抄错一位的话，不验就得等到下次连接才发现。种子加密保存在本机，把数据库拷到别的机器上解不开，换机器需要重填一次。连接时第一次会自动提交算出的验证码；一旦被服务器拒绝，本次连接剩下的问答就只预填，由你确认后再发 —— 连错几次会锁账号，自动重试只会烧得更快。",
+            "With a seed saved, you won't need your phone when the server asks for a code. Click Check to compute the current code and compare it with your phone app before saving — otherwise a typo only shows up on the next connect. The seed is encrypted on this machine and can't be decrypted elsewhere; re-enter it on a new machine. The computed code is submitted automatically the first time; if the server rejects it, the rest of this connection's prompts are only prefilled and wait for you to confirm — repeated failures can lock the account."
+          )}
         </p>
 
         <div className="row">
           <label />
           <button className="btn" onClick={testConnection} disabled={testing || saving}>
-            {testing ? "测试中…" : "测试连接"}
+            {testing ? t("测试中…", "Testing…") : t("测试连接", "Test connection")}
           </button>
         </div>
         {testResult && (
@@ -454,10 +486,10 @@ export default function SessionDialog({ editing, macros, onSave, onClose }: Prop
 
         <div className="modal-actions">
           <button className="btn" onClick={onClose} disabled={saving}>
-            取消
+            {t("取消", "Cancel")}
           </button>
           <button className="btn primary" onClick={submit} disabled={saving}>
-            {saving ? "保存中…" : "保存"}
+            {saving ? t("保存中…", "Saving…") : t("保存", "Save")}
           </button>
         </div>
       </div>
@@ -478,6 +510,7 @@ function AutoRunSection({
   sessionId: string;
   macros: MacroRecord[];
 }) {
+  useLocale();
   const [extras, setExtras] = useState(() => getExtras(sessionId));
 
   useEffect(() => {
@@ -498,29 +531,29 @@ function AutoRunSection({
         <span className="login-path-caret" aria-hidden>
           ▸
         </span>
-        <span>登录后自动执行</span>
+        <span>{t("登录后自动执行", "Run after login")}</span>
         {bound ? (
           <span className="login-path-steps">
             <span className="login-path-chip">
-              {bound.name} · {bound.steps.length} 步
+              {bound.name} · {t("{n} 步", "{n} step(s)", { n: bound.steps.length })}
             </span>
           </span>
         ) : (
-          <span className="login-path-idle">未设置</span>
+          <span className="login-path-idle">{t("未设置", "Not set")}</span>
         )}
-        {extras.compat && <span className="login-path-badge">兼容模式</span>}
+        {extras.compat && <span className="login-path-badge">{t("兼容模式", "Compatibility mode")}</span>}
       </summary>
 
       <div className="login-path-body">
         <div className="row">
-          <label>执行宏</label>
+          <label>{t("执行宏", "Run macro")}</label>
           <select
             value={extras.macroOn ? extras.macroId : ""}
             onChange={(e) =>
               apply({ macroId: e.target.value, macroOn: !!e.target.value })
             }
           >
-            <option value="">不执行</option>
+            <option value="">{t("不执行", "None")}</option>
             {macros.map((m) => (
               <option key={m.id} value={m.id}>
                 {m.name}
@@ -530,8 +563,14 @@ function AutoRunSection({
         </div>
         <p className="hint" style={{ margin: "0 0 8px" }}>
           {macros.length === 0
-            ? "还没有宏。在标签栏右侧「宏」里新建或录制一条，就会出现在这里。"
-            : "连接 / 断线重连成功后自动执行，执行完再恢复上次的目录与 tmux。"}
+            ? t(
+                "还没有宏。在标签栏右侧「宏」里新建或录制一条，就会出现在这里。",
+                "No macros yet. Create or record one under Macros on the right of the tab bar and it will show up here."
+              )
+            : t(
+                "连接 / 断线重连成功后自动执行，执行完再恢复上次的目录与 tmux。",
+                "Runs after connecting or reconnecting, then restores the previous directory and tmux."
+              )}
         </p>
 
         <label className="settings-check login-path-check">
@@ -541,10 +580,12 @@ function AutoRunSection({
             onChange={(e) => apply({ compat: e.target.checked })}
           />
           <span>
-            兼容模式
+            {t("兼容模式", "Compatibility mode")}
             <em>
-              不在该连接上开旁路通道。堡垒机只允许一条通道时会自动打开
-              （否则连上几秒就会被服务端断开）
+              {t(
+                "不在该连接上开旁路通道。堡垒机只允许一条通道时会自动打开（否则连上几秒就会被服务端断开）",
+                "Don't open side channels on this connection. Turned on automatically when a bastion host allows only one channel (otherwise the server drops you after a few seconds)"
+              )}
             </em>
           </span>
         </label>

@@ -71,6 +71,7 @@ import { normalizeTimeout, toFriendlyError } from "./lib/errors";
 import { BUILTIN_THEMES, DEFAULT_THEME, FONT_FAMILIES } from "./lib/theme";
 import { applyChromeVars } from "./lib/chrome";
 import { formatCombo, getPrefs, setPrefs, useShortcuts } from "./lib/prefs";
+import { t, useLocale } from "./i18n";
 import type {
   AgentTabInfo,
   AgentTabRequest,
@@ -103,6 +104,7 @@ const clampAgentWidth = (w: number) =>
   Math.min(AGENT_MAX_W, Math.max(AGENT_MIN_W, Math.round(w)));
 
 export default function App() {
+  useLocale();
   const [connectionImportOpen, setConnectionImportOpen] = useState(false);
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
@@ -280,8 +282,8 @@ export default function App() {
   // TerminalView 自己接管成「粘贴」。
   useEffect(() => {
     const onCtx = (e: MouseEvent) => {
-      const t = e.target as HTMLElement | null;
-      if (t?.closest("input, textarea, select, [contenteditable='true']")) return;
+      const tb = e.target as HTMLElement | null;
+      if (tb?.closest("input, textarea, select, [contenteditable='true']")) return;
       e.preventDefault();
     };
     document.addEventListener("contextmenu", onCtx);
@@ -330,7 +332,7 @@ export default function App() {
   const reconnectCtl = useRef(new Map<string, { cancelled: boolean }>());
 
   const patchTab = useCallback((id: string, patch: Partial<TerminalTab>) => {
-    setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+    setTabs((prev) => prev.map((tb) => (tb.id === id ? { ...tb, ...patch } : tb)));
   }, []);
 
   /**
@@ -340,7 +342,7 @@ export default function App() {
    * 已点亮还 `setTabs` 会让整个标签栏跟着空刷新。
    */
   const markTabActivity = useCallback((tabId: string) => {
-    if (tabsRef.current.find((t) => t.id === tabId)?.hasActivity) return;
+    if (tabsRef.current.find((tb) => tb.id === tabId)?.hasActivity) return;
     patchTab(tabId, { hasActivity: true });
   }, [patchTab]);
 
@@ -352,7 +354,7 @@ export default function App() {
   /** 新标签插到 afterId 右侧；没给就追加到末尾 */
   const insertTab = useCallback((tab: TerminalTab, afterId?: string | null) => {
     setTabs((prev) => {
-      const i = afterId ? prev.findIndex((t) => t.id === afterId) : -1;
+      const i = afterId ? prev.findIndex((tb) => tb.id === afterId) : -1;
       if (i < 0) return [...prev, tab];
       return [...prev.slice(0, i + 1), tab, ...prev.slice(i + 1)];
     });
@@ -414,14 +416,20 @@ export default function App() {
     // 老服务器（CentOS 6.x 的 OpenSSH 5.3 等）会退到 SHA-1 的 DH 组，安全强度偏低，
     // 不阻断使用但要明确告知，避免用户以为是正常连接。
     if (outcome?.legacyCrypto) {
-      showToast(`${s.host} 使用了旧版密钥交换算法（兼容模式），建议升级服务器 OpenSSH`);
+      showToast(
+        t(
+          "{host} 使用了旧版密钥交换算法（兼容模式），建议升级服务器 OpenSSH",
+          "{host} uses a legacy key exchange algorithm (compatibility mode). Consider upgrading OpenSSH on the server",
+          { host: s.host }
+        )
+      );
     }
   }, [showToast]);
 
   /** 探测标签的远端上下文并写回 tab.ctx；失败或无结果返回已缓存的值 */
   const probeTab = useCallback(
     async (tabId: string) => {
-      const tab = tabsRef.current.find((t) => t.id === tabId);
+      const tab = tabsRef.current.find((tb) => tb.id === tabId);
       if (!tab) return undefined;
       // 兼容模式的连接一条额外通道都不开：probe 本身会立刻返回，留着只是空转
       if (tab.sessionId && getExtras(tab.sessionId).compat) return tab.ctx;
@@ -429,7 +437,7 @@ export default function App() {
         const c = parseProbe(await (tab.local ? api.localProbe(tabId) : api.sshProbe(tabId)));
         // 自动名跟着探测结果走：进了 tmux / 容器 / pod 就换名，回到普通 shell 就清掉（手动改的名字始终优先）
         const autoTitle = autoTitleOf(c);
-        const cur = tabsRef.current.find((t) => t.id === tabId);
+        const cur = tabsRef.current.find((tb) => tb.id === tabId);
         if (c || cur?.autoTitle !== autoTitle) patchTab(tabId, { ...(c ? { ctx: c } : {}), autoTitle });
         return c ?? cur?.ctx;
       } catch (e) {
@@ -437,7 +445,10 @@ export default function App() {
         // 否则这条连接上每 15 秒还会再试一次，每次都可能把连接掀掉。
         if (isSidecarDenied(e) && markCompat(tab?.sessionId, tabId)) {
           showToast(
-            "该服务器（堡垒机）不支持并行通道，已切换为兼容模式：不再采集远端资源，下次连接也不会再开额外通道"
+            t(
+              "该服务器（堡垒机）不支持并行通道，已切换为兼容模式：不再采集远端资源，下次连接也不会再开额外通道",
+              "This server (bastion host) doesn't allow parallel channels. Switched to compatibility mode: remote resources are no longer collected, and future connections won't open extra channels"
+            )
           );
         }
         return tab?.ctx;
@@ -508,7 +519,7 @@ export default function App() {
         }
         if (!steps.length) continue;
         try {
-          const m = await api.createMacro(`登录路径 · ${s.name}`, steps);
+          const m = await api.createMacro(t("登录路径 · {name}", "Login path · {name}", { name: s.name }), steps);
           updateExtras(s.id, { loginScript: "", macroId: m.id, macroOn: e.loginScriptOn });
           added.push(m);
         } catch (err) {
@@ -519,7 +530,13 @@ export default function App() {
         // 重新拉一次而不是本地合并：启动时的 listMacros 可能与迁移并发，
         // 它的快照里没有这些新宏，直接合并会被晚到的结果覆盖掉
         await refreshMacros();
-        showToast(`已将 ${added.length} 条跳板机登录路径转成宏，可在「宏」里修改`);
+        showToast(
+          t(
+            "已将 {n} 条跳板机登录路径转成宏，可在「宏」里修改",
+            "Converted {n} jump-host login path(s) to macros; edit them under Macros",
+            { n: added.length }
+          )
+        );
       }
     })();
   }, [sessions.length, showToast, refreshMacros]);
@@ -555,14 +572,15 @@ export default function App() {
     async (tabId: string, macro: MacroRecord, opts: { auto?: boolean } = {}) => {
       // 提示里区分「手动点运行」和「连上就自动跑」：后者失败时用户可能正在干别的，
       // 得让他一眼看出这条消息来自哪个机制
-      const tag = opts.auto ? "自动宏" : "宏";
-      const tab = tabsRef.current.find((t) => t.id === tabId);
+      const tag = opts.auto ? t("自动宏", "Auto macro") : t("宏", "Macro");
+      const mname = macro.name;
+      const tab = tabsRef.current.find((tb) => tb.id === tabId);
       if (!tab || tab.status !== "connected") {
-        showToast(`${tag}「${macro.name}」没有执行：当前标签未连接`);
+        showToast(t("{tag}「{name}」没有执行：当前标签未连接", "{tag} \"{name}\" didn't run: this tab isn't connected", { tag, name: mname }));
         return;
       }
       if (!macro.steps.length) {
-        showToast(`${tag}「${macro.name}」没有任何步骤`);
+        showToast(t("{tag}「{name}」没有任何步骤", "{tag} \"{name}\" has no steps", { tag, name: mname }));
         return;
       }
 
@@ -588,20 +606,28 @@ export default function App() {
             ),
         });
         if (r.ok) {
-          showToast(`${tag}「${macro.name}」执行完成（${r.sent} 步）`);
+          showToast(
+            t("{tag}「{name}」执行完成（{n} 步）", "{tag} \"{name}\" finished ({n} steps)", { tag, name: mname, n: r.sent })
+          );
         } else if (r.reason === "cancelled") {
-          showToast(`${tag}「${macro.name}」已中止`);
+          showToast(t("{tag}「{name}」已中止", "{tag} \"{name}\" stopped", { tag, name: mname }));
         } else if (r.reason === "closed") {
-          showToast(`${tag}「${macro.name}」中断：连接已断开`);
+          showToast(
+            t("{tag}「{name}」中断：连接已断开", "{tag} \"{name}\" interrupted: connection lost", { tag, name: mname })
+          );
         } else {
           const at = (r.step ?? 0) + 1;
           const step = macro.steps[r.step ?? 0];
           const why =
             step?.kind === "wait" && step.pattern
-              ? `等不到「${step.pattern}」`
-              : "等待超时";
+              ? t("等不到「{p}」", " never saw \"{p}\"", { p: step.pattern })
+              : t("等待超时", " timed out");
           showToast(
-            `${tag}「${macro.name}」第 ${at} 步${why}，已停止（后面的步骤没有发出去）`
+            t(
+              "{tag}「{name}」第 {at} 步{why}，已停止（后面的步骤没有发出去）",
+              "{tag} \"{name}\" step {at}{why}; stopped (later steps weren't sent)",
+              { tag, name: mname, at, why }
+            )
           );
         }
       } finally {
@@ -633,7 +659,7 @@ export default function App() {
       setRecording(null);
       setRecSteps(0);
       if (!steps.length) {
-        showToast("没有录到任何操作");
+        showToast(t("没有录到任何操作", "Nothing was recorded"));
         return;
       }
       try {
@@ -641,18 +667,22 @@ export default function App() {
         const hhmm = `${String(stamp.getHours()).padStart(2, "0")}${String(
           stamp.getMinutes()
         ).padStart(2, "0")}`;
-        const m = await createMacro(`录制 ${hhmm}`, steps);
+        const m = await createMacro(t("录制 {hhmm}", "Recording {hhmm}", { hhmm }), steps);
         setMacroFocus(m.id);
         setMacroOpen(true);
-        showToast(`已录成宏「${m.name}」，可以改名或调整等待条件`);
+        showToast(
+          t("已录成宏「{name}」，可以改名或调整等待条件", "Recorded macro \"{name}\"; you can rename it or adjust wait conditions", {
+            name: m.name,
+          })
+        );
       } catch (e) {
-        showToast(`保存宏失败：${String(e)}`);
+        showToast(t("保存宏失败：{e}", "Failed to save macro: {e}", { e: String(e) }));
       }
       return;
     }
-    const tab = tabsRef.current.find((t) => t.id === activeTab);
+    const tab = tabsRef.current.find((tb) => tb.id === activeTab);
     if (!tab || tab.status !== "connected") {
-      showToast("先连接一个会话再录制");
+      showToast(t("先连接一个会话再录制", "Connect a session before recording"));
       return;
     }
     const rec = startRecording(tab.id);
@@ -664,21 +694,21 @@ export default function App() {
   // 录制中的步数：录制器是同步累积的，只有靠轮询才能反映到界面上
   useEffect(() => {
     if (!recording) return;
-    const t = window.setInterval(() => setRecSteps(recording.rec.count()), 400);
-    return () => window.clearInterval(t);
+    const tb = window.setInterval(() => setRecSteps(recording.rec.count()), 400);
+    return () => window.clearInterval(tb);
   }, [recording]);
 
   // 标签断开 / 关掉：收掉宏与录制，别把定时器和输入订阅留着
   useEffect(() => {
     for (const [id, ctl] of [...macroCtl.current]) {
-      const tab = tabs.find((t) => t.id === id);
+      const tab = tabs.find((tb) => tb.id === id);
       if (!tab || tab.status !== "connected") {
         ctl.abort();
         macroCtl.current.delete(id);
       }
     }
     if (recording) {
-      const tab = tabs.find((t) => t.id === recording.tabId);
+      const tab = tabs.find((tb) => tb.id === recording.tabId);
       if (!tab || tab.status !== "connected") {
         recording.rec.cancel();
         setRecording(null);
@@ -707,7 +737,7 @@ export default function App() {
       if (body) {
         const ready = await waitForPrompt(tabId, since);
         const term = getTerm(tabId);
-        const tab = tabsRef.current.find((t) => t.id === tabId);
+        const tab = tabsRef.current.find((tb) => tb.id === tabId);
         if (!ready || !term || tab?.status !== "connected") {
           ok = false;
         } else {
@@ -742,8 +772,8 @@ export default function App() {
   // 已连接的标签（SSH 与本地）定期探测上下文：断线后就靠这份缓存恢复，标签自动名也跟着它走
   useEffect(() => {
     const tick = () => {
-      for (const t of tabsRef.current) {
-        if (t.status === "connected") probeTab(t.id);
+      for (const tb of tabsRef.current) {
+        if (tb.status === "connected") probeTab(tb.id);
       }
     };
     const first = window.setTimeout(tick, 3000);
@@ -773,7 +803,7 @@ export default function App() {
         const since = Date.now();
         await dial(tabId, s);
         // 连接过程中标签被关掉了：把刚建好的会话收掉，避免孤儿连接
-        if (!tabsRef.current.some((t) => t.id === tabId)) {
+        if (!tabsRef.current.some((tb) => tb.id === tabId)) {
           api.sshClose(tabId).catch(() => {});
           return;
         }
@@ -788,7 +818,7 @@ export default function App() {
       } catch (e) {
         // 用户自己关掉了验证码弹窗，不是连接出错，别标成红色错误
         if (authCancelled.current.delete(tabId)) {
-          patchTab(tabId, { status: "closed", error: "已取消二次验证" });
+          patchTab(tabId, { status: "closed", error: t("已取消二次验证", "Verification cancelled") });
           return;
         }
         patchTab(tabId, { status: "error", error: String(e) });
@@ -803,11 +833,11 @@ export default function App() {
    */
   const reconnect = useCallback(
     async (tabId: string, auto: boolean) => {
-      const tab = tabsRef.current.find((t) => t.id === tabId);
+      const tab = tabsRef.current.find((tb) => tb.id === tabId);
       if (!tab || tab.local || !tab.sessionId) return;
       const s = sessionsRef.current.find((x) => x.id === tab.sessionId);
       if (!s) {
-        patchTab(tabId, { status: "closed", error: "该连接配置已被删除，无法重连" });
+        patchTab(tabId, { status: "closed", error: t("该连接配置已被删除，无法重连", "This connection was deleted; can't reconnect") });
         return;
       }
       // 同一标签只允许一个重连循环
@@ -837,7 +867,7 @@ export default function App() {
         try {
           const since = Date.now();
           await dial(tabId, s);
-          if (ctl.cancelled || !tabsRef.current.some((t) => t.id === tabId)) {
+          if (ctl.cancelled || !tabsRef.current.some((tb) => tb.id === tabId)) {
             api.sshClose(tabId).catch(() => {});
             return;
           }
@@ -864,7 +894,7 @@ export default function App() {
           if (interactiveAuth.current.has(tabId)) {
             interactiveAuth.current.delete(tabId);
             authCancelled.current.delete(tabId);
-            lastErr = `${lastErr}。需要重新输入二次验证码，请点「重新连接」`;
+            lastErr = t("{e}。需要重新输入二次验证码，请点「重新连接」", "{e}. A new verification code is needed; click Reconnect", { e: lastErr });
             break;
           }
         }
@@ -909,7 +939,7 @@ export default function App() {
       // 「连上没几秒就掉线」+ 还开着旁路通道 → 多半是堡垒机因第二条 CHANNEL_OPEN
       // 把整条连接掐了（有的实现连拒绝包都不发，我们只看得到 lost）。兜底学习：
       // 自动切兼容模式，否则重连会无限循环「连上→几秒→断开」。
-      const tab = tabsRef.current.find((t) => t.id === tabId);
+      const tab = tabsRef.current.find((tb) => tb.id === tabId);
       const at = connectedAt.current.get(tabId);
       if (
         tab?.sessionId &&
@@ -919,7 +949,10 @@ export default function App() {
         markCompat(tab.sessionId, tabId)
       ) {
         showToast(
-          "连接建立后几秒即断开，已按堡垒机处理：为该会话打开「兼容模式」（不再开旁路通道）。若这是网络问题，可在编辑连接里关掉兼容模式"
+          t(
+            "连接建立后几秒即断开，已按堡垒机处理：为该会话打开「兼容模式」（不再开旁路通道）。若这是网络问题，可在编辑连接里关掉兼容模式",
+            "The connection dropped a few seconds after opening, so it's treated as a bastion host: compatibility mode is on for this session (no side channels). If it was a network issue, turn compatibility mode off in the connection settings"
+          )
         );
       }
 
@@ -959,13 +992,13 @@ export default function App() {
       return next;
     });
     setTabs((prev) => {
-      const t = prev.find((x) => x.id === tabId);
-      if (t?.local) api.localClose(tabId).catch(() => {});
+      const tb = prev.find((x) => x.id === tabId);
+      if (tb?.local) api.localClose(tabId).catch(() => {});
       else api.sshClose(tabId).catch(() => {});
       return prev;
     });
     setTabs((prev) => {
-      const next = prev.filter((t) => t.id !== tabId);
+      const next = prev.filter((tb) => tb.id !== tabId);
       setActiveTab((cur) =>
         cur === tabId ? (next[next.length - 1]?.id ?? null) : cur
       );
@@ -979,13 +1012,13 @@ export default function App() {
    */
   const disconnectTab = useCallback(
     (tabId: string) => {
-      const t = tabsRef.current.find((x) => x.id === tabId);
-      if (!t || t.local) return;
+      const tb = tabsRef.current.find((x) => x.id === tabId);
+      if (!tb || tb.local) return;
       const ctl = reconnectCtl.current.get(tabId);
       if (ctl) ctl.cancelled = true;
       reconnectCtl.current.delete(tabId);
       interactiveAuth.current.delete(tabId);
-      const wasLive = t.status === "connected" || t.status === "reconnecting" || t.status === "connecting";
+      const wasLive = tb.status === "connected" || tb.status === "reconnecting" || tb.status === "connecting";
       api.sshClose(tabId).catch(() => {});
       setAuthPrompts((prev) => prev.filter((p) => p.sessionId !== tabId));
       patchTab(tabId, {
@@ -998,10 +1031,13 @@ export default function App() {
       });
       if (wasLive) {
         // 后端对主动关闭（reason=user）不再回推提示，这里自己写一行留痕
-        const host = sessionsRef.current.find((x) => x.id === t.sessionId)?.host ?? "remote host";
+        const host = sessionsRef.current.find((x) => x.id === tb.sessionId)?.host ?? "remote host";
         getTerm(tabId)?.write(
           `\r\n\r\n\x1b[1;33mDisconnected from remote host(${host}) at ${clock(Date.now())}.\x1b[0m\r\n` +
-            `\x1b[90m会话已断开，标签页保留。右键标签可「重新连接」，不需要时手动关闭。\x1b[0m\r\n`
+            `\x1b[90m${t(
+              "会话已断开，标签页保留。右键标签可「重新连接」，不需要时手动关闭。",
+              "Session disconnected; the tab stays open. Right-click the tab to reconnect, or close it when done."
+            )}\x1b[0m\r\n`
         );
       }
     },
@@ -1011,24 +1047,29 @@ export default function App() {
   /** 关闭标签：会话还活着时先确认（可勾选「不再询问」，存 localStorage） */
   const closeTab = useCallback(
     async (tabId: string) => {
-      const t = tabsRef.current.find((x) => x.id === tabId);
-      if (!t) return;
+      const tb = tabsRef.current.find((x) => x.id === tabId);
+      if (!tb) return;
       const live =
-        t.status === "connected" || t.status === "connecting" || t.status === "reconnecting";
+        tb.status === "connected" || tb.status === "connecting" || tb.status === "reconnecting";
       // 有传输在跑时关标签会连带断开 SFTP：不受「不再询问」约束，一定要确认
       const busy = describeSftpActivity(sftpActivity(tabId));
       if (busy || (live && getPrefs().confirmCloseTab)) {
-        const name = t.customTitle || t.title;
-        const base = t.local
-          ? `关闭「${name}」？本地 shell 及其中运行的程序会被结束。`
-          : `关闭「${name}」？SSH 连接会断开，未在 tmux 中运行的前台程序会被终止。`;
+        const name = tb.customTitle || tb.title;
+        const ask = t("关闭「{name}」？", "Close \"{name}\"? ", { name });
+        const rest = tb.local
+          ? t("本地 shell 及其中运行的程序会被结束。", "The local shell and everything running in it will be ended.")
+          : t(
+              "SSH 连接会断开，未在 tmux 中运行的前台程序会被终止。",
+              "The SSH connection will close, and foreground programs not running in tmux will be terminated."
+            );
+        const base = ask + rest;
         const { ok, dontAsk } = await askConfirm({
-          title: "关闭标签页",
-          message: busy ? `关闭「${name}」？${busy}` : base,
-          detail: busy && live ? base.replace(/^关闭「.*?」？/, "") : undefined,
-          okText: "关闭",
+          title: t("关闭标签页", "Close tab"),
+          message: busy ? ask + busy : base,
+          detail: busy && live ? rest : undefined,
+          okText: t("关闭", "Close"),
           danger: true,
-          dontAskLabel: busy ? undefined : "不再询问（可在 设置 → 外观 中恢复）",
+          dontAskLabel: busy ? undefined : t("不再询问（可在 设置 → 外观 中恢复）", "Don't ask again (restore in Settings → Appearance)"),
         });
         if (!ok) return;
         // 可在「⚙ 设置 → 外观 → 终端行为」重新勾选恢复
@@ -1050,10 +1091,10 @@ export default function App() {
    */
   const sendToTerminal = useCallback(async (tabId: string, text: string) => {
     if (!text) return;
-    const t = tabsRef.current.find((x) => x.id === tabId);
-    if (!t) return;
+    const tb = tabsRef.current.find((x) => x.id === tabId);
+    if (!tb) return;
     const bytes = stringToBytes(text);
-    if (t.local) await api.localWrite(tabId, bytes);
+    if (tb.local) await api.localWrite(tabId, bytes);
     else await api.sshWrite(tabId, bytes);
   }, []);
 
@@ -1072,8 +1113,8 @@ export default function App() {
   const agentSessions: AgentTarget[] = useMemo(
     () =>
       tabs
-        .filter((t) => t.status === "connected" || t.status === "reconnecting")
-        .map((t) => ({ id: t.id, label: t.customTitle || t.title || t.id, hint: consoleHintOf(t) })),
+        .filter((tb) => tb.status === "connected" || tb.status === "reconnecting")
+        .map((tb) => ({ id: tb.id, label: tb.customTitle || tb.title || tb.id, hint: consoleHintOf(tb) })),
     [tabs],
   );
 
@@ -1119,7 +1160,7 @@ export default function App() {
       insertTab(
         {
           id,
-          title: label || (kind === "local" ? "本地终端" : "远端会话"),
+          title: label || (kind === "local" ? t("本地终端", "Local terminal") : t("远端会话", "Remote session")),
           sessionId: null,
           status: "connected",
           local: kind === "local",
@@ -1152,64 +1193,70 @@ export default function App() {
       const ack = (ok: boolean, detail: string, list?: AgentTabInfo[]) =>
         api.agentTabAck(req.requestId, ok, detail, list).catch(() => false);
       const now = tabsRef.current;
-      const nameOf = (t: TerminalTab) => t.customTitle || t.title || t.id;
-      const toInfo = (t: TerminalTab): AgentTabInfo => ({
-        id: t.id,
-        title: nameOf(t),
-        kind: t.local ? "local" : "ssh",
-        status: t.status,
-        active: t.id === activeTabRef.current,
+      const nameOf = (tb: TerminalTab) => tb.customTitle || tb.title || tb.id;
+      const toInfo = (tb: TerminalTab): AgentTabInfo => ({
+        id: tb.id,
+        title: nameOf(tb),
+        kind: tb.local ? "local" : "ssh",
+        status: tb.status,
+        active: tb.id === activeTabRef.current,
       });
 
       if (req.op === "list") {
         const list = now.map(toInfo);
-        await ack(true, `当前共 ${list.length} 个标签页`, list);
+        await ack(true, t("当前共 {n} 个标签页", "{n} tab(s) open", { n: list.length }), list);
         return;
       }
 
-      const target = now.find((t) => t.id === req.target);
+      const target = now.find((tb) => tb.id === req.target);
       if (!target) {
-        await ack(false, `没有 id 为「${req.target ?? "（空）"}」的标签页`);
+        await ack(false, t("没有 id 为「{id}」的标签页", "No tab with id \"{id}\"", { id: req.target ?? t("（空）", "(empty)") }));
         return;
       }
 
       switch (req.op) {
         case "focus":
           setActiveTab(target.id);
-          await ack(true, `已切到「${nameOf(target)}」`);
+          await ack(true, t("已切到「{name}」", "Switched to \"{name}\"", { name: nameOf(target) }));
           return;
         case "rename": {
           const name = (req.name ?? "").trim();
           if (!name) {
-            await ack(false, "新名字为空");
+            await ack(false, t("新名字为空", "The new name is empty"));
             return;
           }
           const before = nameOf(target);
           patchTab(target.id, { customTitle: name });
-          await ack(true, `已把「${before}」改名为「${name}」`);
+          await ack(true, t("已把「{a}」改名为「{b}」", "Renamed \"{a}\" to \"{b}\"", { a: before, b: name }));
           return;
         }
         case "close": {
           const name = nameOf(target);
           closeTabNow(target.id);
-          await ack(true, `已关闭「${name}」及其中的进程`);
+          await ack(true, t("已关闭「{name}」及其中的进程", "Closed \"{name}\" and its processes", { name }));
           return;
         }
         case "reconnect": {
           if (target.local) {
-            await ack(false, "本地终端不需要重连，只能关掉重开");
+            await ack(false, t("本地终端不需要重连，只能关掉重开", "Local terminals can't be reconnected; close and reopen instead"));
             return;
           }
           if (target.status === "connected" || target.status === "connecting") {
-            await ack(false, `「${nameOf(target)}」当前是 ${target.status}，不需要重连`);
+            await ack(
+              false,
+              t("「{name}」当前是 {status}，不需要重连", "\"{name}\" is {status}; no reconnect needed", {
+                name: nameOf(target),
+                status: target.status,
+              })
+            );
             return;
           }
           void reconnect(target.id, false);
-          await ack(true, `已开始重连「${nameOf(target)}」`);
+          await ack(true, t("已开始重连「{name}」", "Reconnecting \"{name}\"", { name: nameOf(target) }));
           return;
         }
         default:
-          await ack(false, `不认识的操作：${req.op}`);
+          await ack(false, t("不认识的操作：{op}", "Unknown operation: {op}", { op: req.op }));
       }
     },
     [closeTabNow, patchTab, reconnect]
@@ -1234,12 +1281,12 @@ export default function App() {
       try {
         snap = snapshotConsole(req.target, req.maxChars);
       } catch (e) {
-        void api.agentScreenAck(req.requestId, false, undefined, undefined, `读取屏幕出错：${String(e)}`).catch(() => false);
+        void api.agentScreenAck(req.requestId, false, undefined, undefined, t("读取屏幕出错：{e}", "Failed to read the screen: {e}", { e: String(e) })).catch(() => false);
         return;
       }
       if (!snap) {
         void api
-          .agentScreenAck(req.requestId, false, undefined, undefined, `没有 id 为「${req.target}」的终端`)
+          .agentScreenAck(req.requestId, false, undefined, undefined, t("没有 id 为「{id}」的终端", "No terminal with id \"{id}\"", { id: req.target }))
           .catch(() => false);
         return;
       }
@@ -1339,9 +1386,11 @@ export default function App() {
   const removeSession = useCallback(
     async (s: SessionRecord) => {
       const { ok } = await askConfirm({
-        title: "删除连接",
-        message: `删除连接「${s.name}」？密码也会一并删除。`,
-        okText: "删除",
+        title: t("删除连接", "Delete connection"),
+        message: t("删除连接「{name}」？密码也会一并删除。", "Delete connection \"{name}\"? Its password will be deleted too.", {
+          name: s.name,
+        }),
+        okText: t("删除", "Delete"),
         danger: true,
       });
       if (!ok) return;
@@ -1358,7 +1407,7 @@ export default function App() {
         await api.reorderSessions(items);
         await refresh();
       } catch (e) {
-        showToast(`调整失败：${String(e)}`);
+        showToast(t("调整失败：{e}", "Couldn't reorder: {e}", { e: String(e) }));
       }
     },
     [refresh, showToast]
@@ -1369,16 +1418,18 @@ export default function App() {
     async (s: SessionRecord) => {
       const { save } = await import("@tauri-apps/plugin-dialog");
       const target = await save({
-        title: "导出为 Xshell 连接",
+        title: t("导出为 Xshell 连接", "Export as Xshell connection"),
         defaultPath: `${s.name}.xsh`,
-        filters: [{ name: "Xshell 连接", extensions: ["xsh"] }],
+        filters: [{ name: t("Xshell 连接", "Xshell connection"), extensions: ["xsh"] }],
       });
       if (!target) return;
       try {
         await api.exportXsh(s.id, target);
-        showToast(`已导出「${s.name}」到 ${target}（不含密码）`);
+        showToast(
+        t("已导出「{name}」到 {path}（不含密码）", "Exported \"{name}\" to {path} (without password)", { name: s.name, path: target })
+      );
       } catch (e) {
-        showToast(`导出失败：${String(e)}`);
+        showToast(t("导出失败：{e}", "Export failed: {e}", { e: String(e) }));
       }
     },
     [showToast]
@@ -1389,13 +1440,19 @@ export default function App() {
     async (list: SessionRecord[], folderName: string) => {
       if (list.length === 0) return;
       const { open } = await import("@tauri-apps/plugin-dialog");
-      const dir = await open({ directory: true, title: `选择「${folderName}」导出目录` });
+      const dir = await open({ directory: true, title: t("选择「{name}」导出目录", "Choose an export folder for \"{name}\"", { name: folderName }) });
       if (!dir || Array.isArray(dir)) return;
       try {
         const n = await api.exportSessionsXsh(list.map((s) => s.id), dir);
-        showToast(`已导出分组「${folderName}」的 ${n} 个连接到 ${dir}（不含密码）`);
+        showToast(
+          t(
+            "已导出分组「{name}」的 {n} 个连接到 {dir}（不含密码）",
+            "Exported {n} connection(s) from folder \"{name}\" to {dir} (without passwords)",
+            { name: folderName, n, dir }
+          )
+        );
       } catch (e) {
-        showToast(`导出失败：${String(e)}`);
+        showToast(t("导出失败：{e}", "Export failed: {e}", { e: String(e) }));
       }
     },
     [showToast]
@@ -1409,7 +1466,7 @@ export default function App() {
       const to = normFolder(newPath);
       if (!from || from === to) return;
       if (isSelfOrDescendant(from, to)) {
-        showToast("不能把分组移到它自己或它的子分组里");
+        showToast(t("不能把分组移到它自己或它的子分组里", "Can't move a folder into itself or one of its subfolders"));
         return;
       }
       const items = folderMoveItems(sessions, from, to);
@@ -1420,11 +1477,14 @@ export default function App() {
         const dest = parentFolder(to);
         showToast(
           parentFolder(from) === dest
-            ? `分组已改名为「${leafFolder(to)}」`
-            : `分组「${leafFolder(from)}」已移到${dest ? `「${dest}」下` : "根目录"}`
+            ? t("分组已改名为「{name}」", "Folder renamed to \"{name}\"", { name: leafFolder(to) })
+            : t("分组「{name}」已移到{dest}", "Folder \"{name}\" moved to {dest}", {
+                name: leafFolder(from),
+                dest: dest ? t("「{d}」下", "\"{d}\"", { d: dest }) : t("根目录", "the root"),
+              })
         );
       } catch (e) {
-        showToast(`移动失败：${String(e)}`);
+        showToast(t("移动失败：{e}", "Move failed: {e}", { e: String(e) }));
       }
     },
     [sessions, refresh, showToast]
@@ -1436,14 +1496,14 @@ export default function App() {
       const id = nextId();
       // 先开标签再 spawn：TerminalView 挂载后会 fit 并纠正这里的初始尺寸
       insertTab(
-        { id, title: "本地终端", sessionId: null, status: "connected", local: true },
+        { id, title: t("本地终端", "Local terminal"), sessionId: null, status: "connected", local: true },
         afterId
       );
       // 本地终端也走同一条旁路（后端 local 读线程同样会 feed）
       seedAgentAttach(id);
       api.localSpawn(id, 120, 32, cwd).catch((e) => {
         patchTab(id, { status: "error", error: String(e) });
-        showToast(`本地终端启动失败：${String(e)}`);
+        showToast(t("本地终端启动失败：{e}", "Local terminal failed to start: {e}", { e: String(e) }));
       });
     },
     [insertTab, seedAgentAttach, patchTab, showToast]
@@ -1465,15 +1525,15 @@ export default function App() {
    */
   const duplicateTab = useCallback(
     async (tabId: string, withState: boolean) => {
-      const t = tabsRef.current.find((x) => x.id === tabId);
-      if (!t) return;
+      const tb = tabsRef.current.find((x) => x.id === tabId);
+      if (!tb) return;
       // 在线就现探一次拿最新目录；已断开则用缓存
-      const c = t.status === "connected" ? await probeTab(tabId) : t.ctx;
-      if (t.local) return newLocalTab(tabId, c?.cwd);
-      const s = sessionsRef.current.find((x) => x.id === t.sessionId);
-      if (!s) return showToast("该连接配置已被删除，无法复制");
+      const c = tb.status === "connected" ? await probeTab(tabId) : tb.ctx;
+      if (tb.local) return newLocalTab(tabId, c?.cwd);
+      const s = sessionsRef.current.find((x) => x.id === tb.sessionId);
+      if (!s) return showToast(t("该连接配置已被删除，无法复制", "This connection was deleted; can't duplicate"));
       if (!withState) return connect(s, tabId, c?.cwd ? { cwd: c.cwd, at: c.at } : undefined);
-      connect(s, tabId, c, t.customTitle);
+      connect(s, tabId, c, tb.customTitle);
     },
     [connect, newLocalTab, showToast, probeTab]
   );
@@ -1489,10 +1549,10 @@ export default function App() {
   const moveTab = useCallback((fromId: string, toId: string, after: boolean) => {
     if (fromId === toId) return;
     setTabs((prev) => {
-      const from = prev.find((t) => t.id === fromId);
+      const from = prev.find((tb) => tb.id === fromId);
       if (!from) return prev;
-      const rest = prev.filter((t) => t.id !== fromId);
-      const j = rest.findIndex((t) => t.id === toId);
+      const rest = prev.filter((tb) => tb.id !== fromId);
+      const j = rest.findIndex((tb) => tb.id === toId);
       if (j < 0) return prev;
       const at = after ? j + 1 : j;
       return [...rest.slice(0, at), from, ...rest.slice(at)];
@@ -1504,8 +1564,8 @@ export default function App() {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const picked = await open({
       multiple: true,
-      title: "选择 Xshell 连接文件",
-      filters: [{ name: "Xshell 连接", extensions: ["xsh"] }],
+      title: t("选择 Xshell 连接文件", "Choose Xshell connection files"),
+      filters: [{ name: t("Xshell 连接", "Xshell connection"), extensions: ["xsh"] }],
     });
     if (!picked) return;
     const paths = Array.isArray(picked) ? picked : [picked];
@@ -1517,55 +1577,67 @@ export default function App() {
       await refresh();
       const parts: string[] = [];
       if (pwOk.length > 0) {
-        parts.push(`成功导入 ${ok.length} 个连接（${pwOk.length} 个已自动导入密码）`);
+        parts.push(
+          t("成功导入 {n} 个连接（{p} 个已自动导入密码）", "Imported {n} connection(s) ({p} with passwords)", {
+            n: ok.length,
+            p: pwOk.length,
+          })
+        );
       } else {
-        parts.push(`成功导入 ${ok.length} 个连接`);
+        parts.push(t("成功导入 {n} 个连接", "Imported {n} connection(s)", { n: ok.length }));
       }
       if (bad.length > 0) {
-        parts.push(`失败 ${bad.length} 个：${bad.map((b) => `${b.label}（${b.error}）`).join("；")}`);
+        parts.push(
+          t("失败 {n} 个：{list}", "{n} failed: {list}", {
+            n: bad.length,
+            list: bad.map((b) => t("{l}（{e}）", "{l} ({e})", { l: b.label, e: b.error ?? "" })).join(t("；", "; ")),
+          })
+        );
       }
-      showToast(parts.join("。"));
+      showToast(parts.join(t("。", ". ")));
     } catch (e) {
-      showToast(`导入失败：${String(e)}`);
+      showToast(t("导入失败：{e}", "Import failed: {e}", { e: String(e) }));
     }
   }, [refresh, showToast]);
 
   const exportSessionXsh = useCallback(async () => {
     // 导出当前激活标签对应的会话
-    const sid = tabs.find((t) => t.id === activeTab)?.sessionId;
+    const sid = tabs.find((tb) => tb.id === activeTab)?.sessionId;
     const s = sessions.find((x) => x.id === sid);
     if (!s) return;
     const { save } = await import("@tauri-apps/plugin-dialog");
     const target = await save({
-      title: "导出为 Xshell 连接",
+      title: t("导出为 Xshell 连接", "Export as Xshell connection"),
       defaultPath: `${s.name}.xsh`,
-      filters: [{ name: "Xshell 连接", extensions: ["xsh"] }],
+      filters: [{ name: t("Xshell 连接", "Xshell connection"), extensions: ["xsh"] }],
     });
     if (!target) return;
     try {
       await api.exportXsh(s.id, target);
-      showToast(`已导出「${s.name}」到 ${target}（不含密码）`);
+      showToast(
+        t("已导出「{name}」到 {path}（不含密码）", "Exported \"{name}\" to {path} (without password)", { name: s.name, path: target })
+      );
     } catch (e) {
-      showToast(`导出失败：${String(e)}`);
+      showToast(t("导出失败：{e}", "Export failed: {e}", { e: String(e) }));
     }
   }, [sessions, activeTab, tabs, showToast]);
 
   const exportAllXsh = useCallback(async () => {
     const { open } = await import("@tauri-apps/plugin-dialog");
-    const dir = await open({ directory: true, title: "选择导出目录" });
+    const dir = await open({ directory: true, title: t("选择导出目录", "Choose export folder") });
     if (!dir || Array.isArray(dir)) return;
     try {
       const n = await api.exportAllXsh(dir);
-      showToast(`已导出 ${n} 个连接到 ${dir}（不含密码）`);
+      showToast(t("已导出 {n} 个连接到 {dir}（不含密码）", "Exported {n} connection(s) to {dir} (without passwords)", { n, dir }));
     } catch (e) {
-      showToast(`导出失败：${String(e)}`);
+      showToast(t("导出失败：{e}", "Export failed: {e}", { e: String(e) }));
     }
   }, [showToast]);
 
   /** 打开某个标签所属连接的 SFTP（标签 / 终端右键菜单） */
   const openSftp = useCallback(
     (tabId: string) => {
-      const sid = tabs.find((t) => t.id === tabId)?.sessionId;
+      const sid = tabs.find((tb) => tb.id === tabId)?.sessionId;
       const s = sessions.find((x) => x.id === sid);
       if (!s) return;
       setActiveTab(tabId);
@@ -1581,9 +1653,9 @@ export default function App() {
     const busy = describeSftpActivity(sftpActivity(tabId));
     if (busy) {
       const { ok } = await askConfirm({
-        title: "关闭 SFTP",
+        title: t("关闭 SFTP", "Close SFTP"),
         message: busy,
-        okText: "关闭并中断",
+        okText: t("关闭并中断", "Close & abort"),
         danger: true,
       });
       if (!ok) return;
@@ -1596,7 +1668,7 @@ export default function App() {
     });
   }, [askConfirm]);
 
-  const activeTabState = tabs.find((t) => t.id === activeTab) ?? null;
+  const activeTabState = tabs.find((tb) => tb.id === activeTab) ?? null;
   const activeSession = activeTabState?.sessionId
     ? sessions.find((s) => s.id === activeTabState.sessionId) ?? null
     : null;
@@ -1605,7 +1677,7 @@ export default function App() {
   // 多个连接并发时按到达顺序逐个问。
   const authPrompt = authPrompts[0] ?? null;
   const authPromptReconnecting = authPrompt
-    ? tabs.find((t) => t.id === authPrompt.sessionId)?.status === "reconnecting"
+    ? tabs.find((tb) => tb.id === authPrompt.sessionId)?.status === "reconnecting"
     : false;
 
   const statusBar: "idle" | "connecting" | "connected" | "reconnecting" | "error" =
@@ -1658,32 +1730,32 @@ export default function App() {
       <div className="workspace">
         <main className="main">
           <div className="term-area">
-            {tabs.map((t) => (
+            {tabs.map((tb) => (
               <TerminalView
-                key={t.id}
-                tabId={t.id}
-                active={t.id === activeTab}
-                kind={t.local ? "local" : "ssh"}
+                key={tb.id}
+                tabId={tb.id}
+                active={tb.id === activeTab}
+                kind={tb.local ? "local" : "ssh"}
                 // 命令历史按会话身份存取：本地固定 'local'，已保存的 SSH
                 // 连接是它的 sessionId；没有保存记录的临时连接退回 tabId
                 // 本身（不持久化，行为与过去的纯内存历史一致）。
-                historyKey={t.local ? "local" : t.sessionId ?? t.id}
-                historyPersist={t.local || !!t.sessionId}
+                historyKey={tb.local ? "local" : tb.sessionId ?? tb.id}
+                historyPersist={tb.local || !!tb.sessionId}
                 onNotify={showToast}
                 theme={theme}
                 fontFamily={fontFamily}
                 fontSize={fontSize}
                 lineHeight={lineHeight}
-                onDisconnect={() => (t.local ? closeTab(t.id) : disconnectTab(t.id))}
-                onOpenSftp={() => openSftp(t.id)}
-                onShellCommand={(line) => changesForeground(line) && probeSoon(t.id)}
-                onBackgroundOutput={() => markTabActivity(t.id)}
-                peerHost={sessions.find((x) => x.id === t.sessionId)?.host}
-                status={t.status}
-                reconnectAttempt={t.reconnectAttempt}
-                reconnectMax={t.reconnectMax}
+                onDisconnect={() => (tb.local ? closeTab(tb.id) : disconnectTab(tb.id))}
+                onOpenSftp={() => openSftp(tb.id)}
+                onShellCommand={(line) => changesForeground(line) && probeSoon(tb.id)}
+                onBackgroundOutput={() => markTabActivity(tb.id)}
+                peerHost={sessions.find((x) => x.id === tb.sessionId)?.host}
+                status={tb.status}
+                reconnectAttempt={tb.reconnectAttempt}
+                reconnectMax={tb.reconnectMax}
                 onClosed={(info) =>
-                  t.local ? patchTab(t.id, { status: "closed" }) : handleClosed(t.id, info)
+                  tb.local ? patchTab(tb.id, { status: "closed" }) : handleClosed(tb.id, info)
                 }
               />
             ))}
@@ -1709,14 +1781,15 @@ export default function App() {
             {activeTabState?.status === "closed" && !activeTabState.local && (
               <div className="reconnect-badge idle">
                 <span>
-                  已断开{activeTabState.closedAt ? ` · ${clock(activeTabState.closedAt)}` : ""}
+                  {t("已断开", "Disconnected")}
+                  {activeTabState.closedAt ? ` · ${clock(activeTabState.closedAt)}` : ""}
                   {activeTabState.error ? ` · ${activeTabState.error}` : ""}
                 </span>
                 <button className="btn-link" onClick={() => reconnect(activeTabState.id, false)}>
-                  重新连接
+                  {t("重新连接", "Reconnect")}
                 </button>
                 <button className="btn-link" onClick={() => closeTab(activeTabState.id)}>
-                  关闭标签
+                  {t("关闭标签", "Close tab")}
                 </button>
               </div>
             )}
@@ -1747,49 +1820,61 @@ export default function App() {
             {macroRun && macroRun.tabId === activeTab && (
               <div
                 className="macro-running"
-                title="点击中止这条宏"
+                title={t("点击中止这条宏", "Click to stop this macro")}
                 onClick={() => macroRun.ctl.abort()}
               >
                 <span className="mr-dot" />
-                宏「{macroRun.name}」{macroRun.step}/{macroRun.total}
-                <span className="mr-hint">点击中止</span>
+                {t("宏「{name}」", "Macro \"{name}\" ", { name: macroRun.name })}
+                {macroRun.step}/{macroRun.total}
+                <span className="mr-hint">{t("点击中止", "Click to stop")}</span>
               </div>
             )}
             {recording && recording.tabId === activeTab && (
               <div
                 className="macro-running rec"
-                title="点击停止录制"
+                title={t("点击停止录制", "Click to stop recording")}
                 onClick={() => void toggleRecording()}
               >
                 <span className="mr-dot" />
-                正在录制宏 · {recSteps} 步
-                <span className="mr-hint">点击停止</span>
+                {t("正在录制宏 · {n} 步", "Recording macro · {n} steps", { n: recSteps })}
+                <span className="mr-hint">{t("点击停止", "Click to stop")}</span>
               </div>
             )}
 
             {tabs.length === 0 && Object.keys(sftpTabs).length === 0 && (
               <div className="welcome">
                 <h1>NexusTerm</h1>
-                <p>跨平台 SSH / SFTP 客户端 · Rust + TypeScript</p>
+                <p>{t("跨平台 SSH / SFTP 客户端 · Rust + TypeScript", "Cross-platform SSH / SFTP client · Rust + TypeScript")}</p>
                 <ul>
-                  <li>点击标签栏最左侧「☰ 连接」打开连接列表，双击即可连接</li>
-                  <li>右键标签或终端选择「SFTP 文件管理」打开文件管理器</li>
-                  <li>右上角「⚙ 设置」调整外观、自定义快捷键</li>
                   <li>
-                    {formatCombo(shortcuts.copy) || "（未设置）"} 复制 ·{" "}
-                    {formatCombo(shortcuts.paste) || "（未设置）"} 粘贴 · Ctrl+C 发送中断信号
+                    {t(
+                      "点击标签栏最左侧「☰ 连接」打开连接列表，双击即可连接",
+                      "Click \"☰ Connections\" at the far left of the tab bar to open the list; double-click to connect"
+                    )}
+                  </li>
+                  <li>
+                    {t(
+                      "右键标签或终端选择「SFTP 文件管理」打开文件管理器",
+                      "Right-click a tab or the terminal and choose \"SFTP file manager\" to browse files"
+                    )}
+                  </li>
+                  <li>{t("右上角「⚙ 设置」调整外观、自定义快捷键", "Use \"⚙ Settings\" to adjust appearance and shortcuts")}</li>
+                  <li>
+                    {formatCombo(shortcuts.copy) || t("（未设置）", "(not set)")} {t("复制", "Copy")} ·{" "}
+                    {formatCombo(shortcuts.paste) || t("（未设置）", "(not set)")} {t("粘贴", "Paste")} ·{" "}
+                    {t("Ctrl+C 发送中断信号", "Ctrl+C sends an interrupt")}
                   </li>
                 </ul>
               </div>
             )}
 
             {tabs
-              .filter((t) => t.status === "error" && t.id === activeTab)
-              .map((t) => (
-                <div key={`err-${t.id}`} className="term-overlay">
+              .filter((tb) => tb.status === "error" && tb.id === activeTab)
+              .map((tb) => (
+                <div key={`err-${tb.id}`} className="term-overlay">
                   <TerminalError
-                    raw={t.error}
-                    onClose={() => closeTab(t.id)}
+                    raw={tb.error}
+                    onClose={() => closeTab(tb.id)}
                   />
                 </div>
               ))}
@@ -1819,7 +1904,7 @@ export default function App() {
             <div
               className="agent-resize"
               onMouseDown={startAgentResize}
-              title="拖动调整面板宽度"
+              title={t("拖动调整面板宽度", "Drag to resize the panel")}
             />
           )}
           <AgentPanel
@@ -1840,7 +1925,7 @@ export default function App() {
         status={statusBar}
         peer={peer}
         sessionCount={tabs.length}
-        connectedCount={tabs.filter((t) => t.status === "connected").length}
+        connectedCount={tabs.filter((tb) => tb.status === "connected").length}
         statsTarget={
           !activeTabState
             ? null
@@ -1996,7 +2081,7 @@ export default function App() {
           onMoveFolder={moveFolder}
           io={{
             canExportSession: canExportActive,
-            exportSessionHint: "当前标签不是 SSH 会话",
+            exportSessionHint: t("当前标签不是 SSH 会话", "The current tab isn't an SSH session"),
             onImport: () => {
               setSessionPopupOpen(false);
               importXsh();
@@ -2026,6 +2111,7 @@ export default function App() {
  * 旁边飘几个"包"表示正在握手/收发数据，纯 CSS，不需要额外图片资源。
  */
 function ConnectingBadge({ host }: { host: string }) {
+  useLocale();
   return (
     <div className="connecting-badge">
       <div className="connecting-box">
@@ -2038,8 +2124,10 @@ function ConnectingBadge({ host }: { host: string }) {
           <div className="runner-leg runner-leg-b" />
           <div className="runner-ground" />
         </div>
-        <div className="connecting-title">正在连接{host ? ` ${host}` : ""}…</div>
-        <div className="connecting-sub">握手 / 认证中，请稍候</div>
+        <div className="connecting-title">
+          {host ? t("正在连接 {host}…", "Connecting to {host}…", { host }) : t("正在连接…", "Connecting…")}
+        </div>
+        <div className="connecting-sub">{t("握手 / 认证中，请稍候", "Handshaking / authenticating, please wait")}</div>
       </div>
     </div>
   );
@@ -2059,6 +2147,7 @@ function ReconnectBadge({
   at: number;
   onCancel: () => void;
 }) {
+  useLocale();
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 250);
@@ -2070,14 +2159,19 @@ function ReconnectBadge({
       <span className="spinner" />
       <span>
         {left > 0
-          ? left >= 60
-            ? `${Math.floor(left / 60)} 分 ${String(left % 60).padStart(2, "0")} 秒后`
-            : `${left} 秒后`
-          : "正在"}
-        重连 {host}（第 {attempt}/{max} 次）
+          ? t("{when}后重连 {host}（第 {a}/{m} 次）", "Reconnecting to {host} in {when} (attempt {a}/{m})", {
+              when:
+                left >= 60
+                  ? t("{m} 分 {s} 秒", "{m}m {s}s", { m: Math.floor(left / 60), s: String(left % 60).padStart(2, "0") })
+                  : t("{s} 秒", "{s}s", { s: left }),
+              host,
+              a: attempt,
+              m: max,
+            })
+          : t("正在重连 {host}（第 {a}/{m} 次）", "Reconnecting to {host} (attempt {a}/{m})", { host, a: attempt, m: max })}
       </span>
       <button className="btn-link" onClick={onCancel}>
-        取消
+        {t("取消", "Cancel")}
       </button>
     </div>
   );
@@ -2091,6 +2185,7 @@ function RestoreCard({
   notice: NonNullable<TerminalTab["notice"]>;
   onClose: () => void;
 }) {
+  useLocale();
   const [hover, setHover] = useState(false);
   // 父组件每次渲染都会给新的 onClose；用 ref 免得计时器被反复重置
   const closeRef = useRef(onClose);
@@ -2101,10 +2196,10 @@ function RestoreCard({
     return () => window.clearTimeout(id);
   }, [hover]);
   const title = !notice.ok
-    ? "未能自动恢复上下文"
+    ? t("未能自动恢复上下文", "Couldn't restore the context automatically")
     : notice.mode === "reconnect"
-      ? "已恢复断线前的工作环境"
-      : "已同步原会话的工作环境";
+      ? t("已恢复断线前的工作环境", "Restored your working environment from before the disconnect")
+      : t("已同步原会话的工作环境", "Synced the original session's working environment");
   return (
     <div
       className={`restore-card${notice.ok ? "" : " warn"}`}
@@ -2114,7 +2209,7 @@ function RestoreCard({
       <div className="restore-head">
         <span className="restore-icon">{notice.ok ? "↻" : "!"}</span>
         <span className="restore-title">{title}</span>
-        <button className="restore-close" onClick={onClose} title="关闭">
+        <button className="restore-close" onClick={onClose} title={t("关闭", "Close")}>
           ×
         </button>
       </div>
@@ -2127,7 +2222,12 @@ function RestoreCard({
         ))}
       </dl>
       {!notice.ok && (
-        <p className="restore-foot">远端提示符迟迟未出现，为避免误输入已跳过，可手动执行。</p>
+        <p className="restore-foot">
+          {t(
+            "远端提示符迟迟未出现，为避免误输入已跳过，可手动执行。",
+            "The remote prompt never appeared, so this was skipped to avoid stray input. You can run it manually."
+          )}
+        </p>
       )}
     </div>
   );
@@ -2135,14 +2235,15 @@ function RestoreCard({
 
 /** 连接失败弹层：大字给人类看，原始错误留作小字便于排障。 */
 function TerminalError({ raw, onClose }: { raw?: string; onClose: () => void }) {
+  useLocale();
   const { message, detail } = toFriendlyError(raw);
   return (
     <div className="term-error">
-      <strong>连接失败</strong>
+      <strong>{t("连接失败", "Connection failed")}</strong>
       <p className="term-error-msg">{message}</p>
       {detail && <pre className="term-error-detail">{detail}</pre>}
       <button className="btn" onClick={onClose}>
-        关闭标签
+        {t("关闭标签", "Close tab")}
       </button>
     </div>
   );

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { AuthPrompt } from "../types";
+import { t, useLocale } from "../i18n";
 
 /**
  * 认证交互框。两类问题共用：服务端二次验证（keyboard-interactive / RFC 4256，后端挂起
@@ -23,6 +24,7 @@ export default function AuthPromptDialog({
   onSubmit: (answers: string[], remember: boolean) => void;
   onCancel: () => void;
 }) {
+  useLocale();
   const isPassphrase = prompt.kind === "passphrase";
   const [values, setValues] = useState<string[]>(() =>
     prompt.fields.map((f) => f.prefill ?? "")
@@ -74,15 +76,15 @@ export default function AuthPromptDialog({
   };
 
   const title = isPassphrase
-    ? "解锁私钥"
+    ? t("解锁私钥", "Unlock private key")
     : reconnecting
-      ? "重连需要二次验证"
-      : "需要二次验证";
+      ? t("重连需要二次验证", "Reconnect needs verification")
+      : t("需要二次验证", "Verification required");
   const subtitle = isPassphrase
-    ? "这把私钥设了口令，解锁后才能用来认证"
+    ? t("这把私钥设了口令，解锁后才能用来认证", "This private key has a passphrase. Unlock it to authenticate")
     : reconnecting
-      ? "连接已中断，重新登录需要再验证一次"
-      : "服务器要求补充一次身份验证";
+      ? t("连接已中断，重新登录需要再验证一次", "The connection dropped; signing in again needs another verification")
+      : t("服务器要求补充一次身份验证", "The server asks for an additional verification");
 
   return (
     <div className="modal-backdrop">
@@ -102,7 +104,7 @@ export default function AuthPromptDialog({
             <p className="auth-sub">{subtitle}</p>
           </div>
           {prompt.round > 1 && !isPassphrase && (
-            <span className="auth-round">第 {prompt.round} 步</span>
+            <span className="auth-round">{t("第 {n} 步", "Step {n}", { n: prompt.round })}</span>
           )}
         </div>
 
@@ -119,7 +121,10 @@ export default function AuthPromptDialog({
 
         {reconnecting && !isPassphrase && (
           <p className="auth-notice warn">
-            断线前用过的验证码已经失效，请输入现在这一刻新生成的码。
+            {t(
+              "断线前用过的验证码已经失效，请输入现在这一刻新生成的码。",
+              "The code used before the disconnect has expired. Enter the one generated right now."
+            )}
           </p>
         )}
         {/*
@@ -140,8 +145,8 @@ export default function AuthPromptDialog({
           return (
             <div className={otp ? "auth-field auth-field-otp" : "auth-field"} key={i}>
               <label htmlFor={`auth-f-${i}`}>
-                {cleanPrompt(f.prompt) || `输入 ${i + 1}`}
-                {otp && <span className="auth-hint">一次性，约 30 秒过期</span>}
+                {cleanPrompt(f.prompt) || t("输入 {n}", "Input {n}", { n: i + 1 })}
+                {otp && <span className="auth-hint">{t("一次性，约 30 秒过期", "One-time, expires in about 30s")}</span>}
               </label>
               <input
                 id={`auth-f-${i}`}
@@ -158,7 +163,7 @@ export default function AuthPromptDialog({
                 autoCorrect="off"
                 spellCheck={false}
                 inputMode={otp ? "numeric" : undefined}
-                placeholder={otp ? "输入验证码" : undefined}
+                placeholder={otp ? t("输入验证码", "Enter code") : undefined}
                 // 验证码不需要密码管理器介入，也避免它误填
                 name={`auth-field-${i}`}
                 disabled={busy}
@@ -175,22 +180,24 @@ export default function AuthPromptDialog({
               onChange={(e) => setRemember(e.target.checked)}
             />
             <span>
-              记住口令
-              <em>保存在本机连接配置里，下次连接不必再输</em>
+              {t("记住口令", "Remember passphrase")}
+              <em>{t("保存在本机连接配置里，下次连接不必再输", "Saved in this machine's connection settings, so you won't need it next time")}</em>
             </span>
           </label>
         )}
 
         <div className="auth-foot">
           <span className="auth-foot-note">
-            {queued > 0 ? `还有 ${queued} 个连接在等待验证` : "Enter 提交 · Esc 取消"}
+            {queued > 0
+              ? t("还有 {n} 个连接在等待验证", "{n} more connection(s) waiting for verification", { n: queued })
+              : t("Enter 提交 · Esc 取消", "Enter submit · Esc cancel")}
           </span>
           <div className="auth-foot-actions">
             <button type="button" className="btn" onClick={onCancel} disabled={busy}>
-              取消
+              {t("取消", "Cancel")}
             </button>
             <button type="submit" className="btn primary" disabled={busy}>
-              {busy ? "验证中…" : "提交"}
+              {busy ? t("验证中…", "Verifying…") : t("提交", "Submit")}
             </button>
           </div>
         </div>

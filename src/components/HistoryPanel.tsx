@@ -7,6 +7,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { searchHistory } from "../lib/historyPanel";
+import { t, useLocale } from "../i18n";
 
 interface Props {
   /** 全部历史，最近用过的在前 */
@@ -46,6 +47,7 @@ function Marked({ text, query }: { text: string; query: string }) {
 }
 
 export default function HistoryPanel({ items, initialQuery, pos, onPick, onClose }: Props) {
+  useLocale();
   const [query, setQuery] = useState(initialQuery);
   const [sel, setSel] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -86,13 +88,13 @@ export default function HistoryPanel({ items, initialQuery, pos, onPick, onClose
       className="hist-panel"
       style={pos.above ? { left: pos.x, bottom: pos.y } : { left: pos.x, top: pos.y }}
       role="dialog"
-      aria-label="命令历史"
+      aria-label={t("命令历史", "Command history")}
     >
       <input
         ref={inputRef}
         className="hist-search"
         value={query}
-        placeholder="筛选历史命令…"
+        placeholder={t("筛选历史命令…", "Filter command history…")}
         spellCheck={false}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={(e) => {
@@ -121,7 +123,9 @@ export default function HistoryPanel({ items, initialQuery, pos, onPick, onClose
       />
       <div ref={listRef} className="hist-list" role="listbox">
         {shown.length === 0 ? (
-          <div className="hist-empty">{items.length === 0 ? "这个会话还没有历史命令" : "没有匹配的历史命令"}</div>
+          <div className="hist-empty">{items.length === 0
+              ? t("这个会话还没有历史命令", "No command history for this session yet")
+              : t("没有匹配的历史命令", "No matching commands")}</div>
         ) : (
           shown.map((cmd, i) => (
             <div
@@ -143,7 +147,7 @@ export default function HistoryPanel({ items, initialQuery, pos, onPick, onClose
           ))
         )}
       </div>
-      <div className="hist-foot">↑↓ 选择 · Enter 放到命令行 · Esc 关闭 · {shown.length} 条</div>
+      <div className="hist-foot">{t("↑↓ 选择 · Enter 放到命令行 · Esc 关闭 · {n} 条", "↑↓ select · Enter puts it on the command line · Esc close · {n}", { n: shown.length })}</div>
     </div>
   );
 }

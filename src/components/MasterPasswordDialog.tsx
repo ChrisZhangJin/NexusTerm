@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
 import { api } from "../api";
+import { t, useLocale } from "../i18n";
 import type { SweepReport } from "../types";
 
 export type MasterPasswordMode = "enable" | "unlock" | "change" | "disable";
@@ -26,6 +27,7 @@ export default function MasterPasswordDialog({
   /** 成功后回调：enable/disable 给 SweepReport；unlock/change 给 null */
   onDone: (result: SweepReport | null) => void;
 }): ReactElement {
+  useLocale();
   // enable/change 里这是「新主密码」，unlock/disable 里这就是主密码本身
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -72,17 +74,17 @@ export default function MasterPasswordDialog({
     if (busy) return;
     // 本地能判出来的错一律不发请求：省一次往返，也避免后端把空密码当成一次失败尝试
     if (mode === "change" && !current) {
-      setErr("请输入当前主密码。");
+      setErr(t("请输入当前主密码。", "Enter your current master password."));
       firstRef.current?.focus();
       return;
     }
     if (!password) {
-      setErr("请输入主密码。");
+      setErr(t("请输入主密码。", "Enter the master password."));
       pwRef.current?.focus();
       return;
     }
     if ((mode === "enable" || mode === "change") && password !== confirm) {
-      setErr("两次输入的主密码不一致。");
+      setErr(t("两次输入的主密码不一致。", "The master passwords don't match."));
       return;
     }
     if (mode === "enable" && !ack) return; // 按钮本来就是灰的，这里只是兜底
@@ -107,28 +109,28 @@ export default function MasterPasswordDialog({
 
   const title =
     mode === "enable"
-      ? "启用主密码保护"
+      ? t("启用主密码保护", "Turn on master password")
       : mode === "unlock"
-        ? "输入主密码"
+        ? t("输入主密码", "Enter master password")
         : mode === "change"
-          ? "修改主密码"
-          : "关闭主密码保护";
+          ? t("修改主密码", "Change master password")
+          : t("关闭主密码保护", "Turn off master password");
   const okText =
     mode === "enable"
-      ? "启用"
+      ? t("启用", "Turn on")
       : mode === "unlock"
-        ? "解锁"
+        ? t("解锁", "Unlock")
         : mode === "change"
-          ? "修改"
-          : "关闭保护";
+          ? t("修改", "Change")
+          : t("关闭保护", "Turn off");
   const busyText =
     mode === "enable"
-      ? "加密中…"
+      ? t("加密中…", "Encrypting…")
       : mode === "unlock"
-        ? "解锁中…"
+        ? t("解锁中…", "Unlocking…")
         : mode === "change"
-          ? "处理中…"
-          : "还原中…";
+          ? t("处理中…", "Working…")
+          : t("还原中…", "Restoring…");
   // 启用时不勾确认项就不给提交 —— 这句警告是整个功能里唯一拦得住数据永久丢失的东西
   const canSubmit = !busy && (mode !== "enable" || ack);
 
@@ -145,19 +147,24 @@ export default function MasterPasswordDialog({
 
         {mode === "enable" && (
           <p className="hint" style={{ margin: "0 0 12px" }}>
-            启用后，已保存的 SSH 密码、私钥口令、LLM API Key 和 TOTP 种子会用这把主密码加密。
-            数据库仍可整个拷到别的机器，输同一个主密码就能全部打开。
+            {t(
+              "启用后，已保存的 SSH 密码、私钥口令、LLM API Key 和 TOTP 种子会用这把主密码加密。数据库仍可整个拷到别的机器，输同一个主密码就能全部打开。",
+              "Saved SSH passwords, key passphrases, LLM API keys and TOTP seeds will be encrypted with this master password. You can still copy the whole database to another machine and open everything with the same master password."
+            )}
           </p>
         )}
         {mode === "change" && (
           <p className="hint" style={{ margin: "0 0 12px" }}>
-            只是用新密码重新包一遍密钥，凭据本身不动，瞬间完成。
+            {t(
+              "只是用新密码重新包一遍密钥，凭据本身不动，瞬间完成。",
+              "This only re-wraps the key with the new password; your credentials stay untouched, so it's instant."
+            )}
           </p>
         )}
 
         {mode === "change" && (
           <div className="row">
-            <label htmlFor="vault-cur">当前密码</label>
+            <label htmlFor="vault-cur">{t("当前密码", "Current password")}</label>
             <input
               id="vault-cur"
               ref={firstRef}
@@ -172,7 +179,9 @@ export default function MasterPasswordDialog({
 
         <div className="row">
           <label htmlFor="vault-pw">
-            {mode === "enable" || mode === "change" ? "新主密码" : "主密码"}
+            {mode === "enable" || mode === "change"
+              ? t("新主密码", "New master password")
+              : t("主密码", "Master password")}
           </label>
           <input
             id="vault-pw"
@@ -189,7 +198,7 @@ export default function MasterPasswordDialog({
 
         {(mode === "enable" || mode === "change") && (
           <div className="row">
-            <label htmlFor="vault-pw2">再输一遍</label>
+            <label htmlFor="vault-pw2">{t("再输一遍", "Confirm")}</label>
             <input
               id="vault-pw2"
               type="password"
@@ -211,9 +220,12 @@ export default function MasterPasswordDialog({
                 disabled={busy}
               />
               <span>
-                我明白<strong>忘记主密码</strong>
-                将导致所有已保存的密码、私钥口令、API Key、TOTP
-                种子永久无法恢复，且没有找回手段。
+                {t("我明白", "I understand that ")}
+                <strong>{t("忘记主密码", "forgetting the master password")}</strong>
+                {t(
+                  "将导致所有已保存的密码、私钥口令、API Key、TOTP种子永久无法恢复，且没有找回手段。",
+                  " makes all saved passwords, key passphrases, API keys and TOTP seeds permanently unrecoverable. There is no way to reset it."
+                )}
               </span>
             </label>
           </div>
@@ -221,14 +233,15 @@ export default function MasterPasswordDialog({
 
         {mode === "disable" && (
           <div className="vault-danger">
-            <strong>关闭后，这些凭据将以明文形式存回 nexus.db。</strong>
+            <strong>{t("关闭后，这些凭据将以明文形式存回 nexus.db。", "Once turned off, these credentials are stored back in nexus.db in plain text.")}</strong>
             <ul>
-              <li>SSH 登录密码</li>
-              <li>私钥口令</li>
+              <li>{t("SSH 登录密码", "SSH login passwords")}</li>
+              <li>{t("私钥口令", "Private key passphrases")}</li>
               <li>LLM API Key</li>
             </ul>
-            TOTP 种子会改回本机密钥加密：仍然是密文，但<strong>不可移植</strong>
-            ，换到别的机器要重新填。
+            {t("TOTP 种子会改回本机密钥加密：仍然是密文，但", "TOTP seeds go back to encryption with this machine's key: still encrypted, but ")}
+            <strong>{t("不可移植", "not portable")}</strong>
+            {t("，换到别的机器要重新填。", " — you'll need to re-enter them on another machine.")}
           </div>
         )}
 
@@ -241,9 +254,14 @@ export default function MasterPasswordDialog({
               disabled={busy}
             />
             <span>
-              在本机记住这把钥匙
+              {t("在本机记住这把钥匙", "Remember the key on this machine")}
               {/* 这句不能省：「记住了就不用记密码」这个误解会直接导致数据永久丢失 */}
-              <em>仅本机有效，换到其它机器仍需输入主密码。请务必自己记住主密码。</em>
+              <em>
+                {t(
+                  "仅本机有效，换到其它机器仍需输入主密码。请务必自己记住主密码。",
+                  "Only on this machine; other machines still need the master password. Make sure you remember it yourself."
+                )}
+              </em>
             </span>
           </label>
         )}
@@ -253,7 +271,7 @@ export default function MasterPasswordDialog({
         <div className="modal-actions">
           {onClose && (
             <button type="button" className="btn" onClick={onClose} disabled={busy}>
-              取消
+              {t("取消", "Cancel")}
             </button>
           )}
           <button

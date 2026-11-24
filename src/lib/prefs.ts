@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { isMacOS } from "./platform";
+import { t } from "../i18n";
 
 /**
  * 应用级偏好 + 快捷键配置。
@@ -49,15 +50,16 @@ export type ShortcutAction =
   | "clearScreen"
   | "exportBuffer";
 
+/** 读取时按当前界面语言取（getter），调用方照旧 `SHORTCUT_LABELS[a]` */
 export const SHORTCUT_LABELS: Record<ShortcutAction, string> = {
-  disconnect: "断开",
-  copy: "复制",
-  paste: "粘贴",
-  softNewline: "软换行（不执行）",
-  find: "查找…",
-  selectAll: "全选",
-  clearScreen: "清屏",
-  exportBuffer: "导出…",
+  get disconnect() { return t("断开", "Disconnect"); },
+  get copy() { return t("复制", "Copy"); },
+  get paste() { return t("粘贴", "Paste"); },
+  get softNewline() { return t("软换行（不执行）", "Soft newline (don't run)"); },
+  get find() { return t("查找…", "Find…"); },
+  get selectAll() { return t("全选", "Select all"); },
+  get clearScreen() { return t("清屏", "Clear screen"); },
+  get exportBuffer() { return t("导出…", "Export…"); },
 };
 
 export const SHORTCUT_ORDER: ShortcutAction[] = [
@@ -210,9 +212,14 @@ export function validateCombo(combo: string): string | null {
   const mods = parts.slice(0, -1);
   const hasCmdMod = mods.some((m) => m === "Ctrl" || m === "Alt" || m === "Meta");
   const isFn = /^F\d{1,2}$/.test(key) || ["Insert", "PageUp", "PageDown"].includes(key);
-  if (!hasCmdMod && !isFn) return "需包含 Ctrl / Alt" + (isMacOS() ? " / ⌘" : "") + " 修饰键，否则会占用正常输入";
+  if (!hasCmdMod && !isFn) {
+    const modNames = "Ctrl / Alt" + (isMacOS() ? " / ⌘" : "");
+    return t("需包含 {mods} 修饰键，否则会占用正常输入", "Must include a {mods} modifier, or it would swallow normal typing", {
+      mods: modNames,
+    });
+  }
   if (!isMacOS() && mods.length === 1 && mods[0] === "Ctrl" && /^[A-Z]$/.test(key)) {
-    return `Ctrl+${key} 是终端控制字符（如 Ctrl+C 中断），建议加 Shift`;
+    return t("Ctrl+{key} 是终端控制字符（如 Ctrl+C 中断），建议加 Shift", "Ctrl+{key} is a terminal control character (like Ctrl+C to interrupt); add Shift", { key });
   }
   return null;
 }
