@@ -720,6 +720,19 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 }
 .ctx-menu.sb-menu { min-width: 170px; }
 
+.sb-language {
+  flex: 0 0 auto;
+  height: 18px;
+  padding: 0 2px;
+  font: inherit;
+  color: inherit;
+  background: var(--bg-panel);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.sb-language:hover, .sb-language:focus-visible { border-color: var(--accent); }
+
 /* ——— 状态栏右下角「设置」齿轮 ——— */
 .sb-settings { position: relative; margin-left: 2px; }
 .sb-settings-btn {

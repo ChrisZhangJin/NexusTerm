@@ -51,6 +51,11 @@ let pref: LocalePref = typeof window === "undefined" ? "system" : storedPref();
 let current: Locale = resolve(pref);
 const listeners = new Set<() => void>();
 
+function subscribe(listener: () => void) {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
 function emit() {
   if (typeof document !== "undefined") document.documentElement.lang = current === "zh" ? "zh-CN" : "en";
   listeners.forEach((f) => f());
@@ -88,9 +93,10 @@ export function initLocale(): void {
   if (typeof window === "undefined") return;
   window.addEventListener("storage", (e) => {
     if (e.key !== LS_KEY) return;
-    pref = storedPref();
-    const next = resolve(pref);
-    if (next === current) return;
+    const nextPref = storedPref();
+    const next = resolve(nextPref);
+    if (nextPref === pref && next === current) return;
+    pref = nextPref;
     current = next;
     emit();
   });
@@ -98,14 +104,12 @@ export function initLocale(): void {
 
 /** 渲染了翻译文案的组件调一次：切换语言时重渲染。返回当前语言 */
 export function useLocale(): Locale {
-  return useSyncExternalStore(
-    (f) => {
-      listeners.add(f);
-      return () => listeners.delete(f);
-    },
-    () => current,
-    () => current
-  );
+  return useSyncExternalStore(subscribe, locale, locale);
+}
+
+/** 选择项可能改变，但生效语言不变（例如英文系统上的 Follow system → English）。 */
+export function useLocalePref(): LocalePref {
+  return useSyncExternalStore(subscribe, localePref, localePref);
 }
 
 /** 中英一对里取当前语言那条；`vars` 替换 `{name}` 占位 */

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, onTermPulse } from "../api";
 import { t, useLocale } from "../i18n";
+import LanguageSelect from "./LanguageSelect";
 import { setPrefs, usePrefs } from "../lib/prefs";
 import { getOutputCount } from "../lib/termRegistry";
 import { getExtras, isSidecarDenied, markCompat, updateExtras } from "../lib/sessionExtras";
@@ -768,6 +769,7 @@ export default function StatusBar({
         {connectedCount !== sessionCount ? t("（{c} 在线）", " ({c} online)", { c: connectedCount }) : ""}
       </span>
 
+      <LanguageSelect compact />
       <div className="sb-settings" ref={settingsMenuRef}>
         <button
           className={`sb-settings-btn${settingsOpen || settingsMenuOpen ? " active" : ""}`}
