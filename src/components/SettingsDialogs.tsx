@@ -19,6 +19,7 @@ import type {
 } from "../types";
 import { normalizeBudget, parseBudgetInput, type RunBudget } from "../lib/agentBudget";
 import { normalizePrice, priceFor } from "../lib/usage";
+import { detectGpu } from "../lib/gpuRender";
 import type { ModelPrice } from "../types";
 import MasterPasswordDialog, { type MasterPasswordMode } from "./MasterPasswordDialog";
 import ConnMigrateDialog, { type ConnMigrateMode } from "./ConnMigrateDialog";
@@ -71,6 +72,7 @@ interface AppearanceProps {
 }
 
 export function AppearanceDialog(p: AppearanceProps) {
+  const gpu = detectGpu();
   const prefs = usePrefs();
   useEsc(p.onClose);
   return (
@@ -142,6 +144,23 @@ export function AppearanceDialog(p: AppearanceProps) {
             {p.fontSize}px / 行高 {p.lineHeight.toFixed(2)} · 中文与 emoji 宽度已启用
           </span>
         </div>
+
+        <label className="settings-check">
+          <input
+            type="checkbox"
+            checked={prefs.gpuRender}
+            disabled={!gpu.ok}
+            onChange={(e) => setPrefs({ gpuRender: e.target.checked })}
+          />
+          <span>
+            GPU 渲染
+            <em>
+              {gpu.ok
+                ? `用显卡绘制终端文字（${gpu.renderer || "WebGL 2"}），大量输出与滚动更流畅、更省电；遇到显示异常可关掉`
+                : `不可用：${gpu.reason ?? "没有可用的 GPU"}，使用 CPU 渲染`}
+            </em>
+          </span>
+        </label>
 
         <div className="settings-section">底部栏</div>
         <label className="settings-check">

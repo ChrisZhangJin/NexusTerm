@@ -23,6 +23,8 @@ export interface Prefs {
    * 对要 OTP / 堡垒机验证的服务器尤其重要。关掉则每次独立拨号，大文件传输不抢带宽。
    */
   shareSftpConnection: boolean;
+  /** 终端用 GPU 渲染（xterm WebGL 渲染器；Mac 上走 Metal）。没有可用 GPU 时自动退回 CPU 渲染 */
+  gpuRender: boolean;
 }
 
 const PREFS_KEY = "nx.prefs";
@@ -32,6 +34,7 @@ const DEFAULT_PREFS: Prefs = {
   copyOnSelect: true,
   confirmCloseTab: true,
   shareSftpConnection: true,
+  gpuRender: true,
 };
 
 // ——— 快捷键 ———

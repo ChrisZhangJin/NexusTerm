@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { CanvasAddon } from "@xterm/addon-canvas";
+import { WebglAddon } from "@xterm/addon-webgl";
+import { MAX_CONTEXT_LOSSES, detectGpu, gpuSlots, wantsGpu } from "../lib/gpuRender";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
@@ -10,6 +12,7 @@ import { countOutput, emitInput, markOutput, registerTerm } from "../lib/termReg
 import {
   formatCombo,
   getPrefs,
+  usePrefs,
   matchShortcut,
   useShortcuts,
   type ShortcutAction,
@@ -458,6 +461,65 @@ export default function TerminalView({
     termRef.current?.focus();
   }, []);
 
+  // ——— GPU 渲染（见 lib/gpuRender）———
+  const prefsNow = usePrefs();
+  /** 当前的渲染器：canvas = CPU，webgl = GPU */
+  const rendererRef = useRef<{ kind: "webgl" | "canvas"; addon: { dispose(): void } } | null>(null);
+  /** 这个终端丢失过几次 GPU 上下文（太多次就不再试） */
+  const gpuLossesRef = useRef(0);
+  /** 上下文丢失后过一会儿再试一次 */
+  const [gpuRetry, setGpuRetry] = useState(0);
+
+  /**
+   * 换渲染器：先卸掉当前的再装新的（同时装两个，卸旧的那一下会把渲染器打回 DOM）。
+   * WebGL 装不上（建上下文失败）就退回 Canvas，并记成「不再试」。换完重新排一次版：两种渲染器量出来的字宽可能差一点
+   */
+  const switchRenderer = useCallback(
+    (kind: "webgl" | "canvas") => {
+      const term = termRef.current;
+      if (!term) return;
+      const cur = rendererRef.current;
+      if (cur?.kind === kind) return;
+      try {
+        cur?.addon.dispose();
+      } catch {
+        /* 已经卸过 */
+      }
+      rendererRef.current = null;
+      if (kind === "webgl") {
+        try {
+          const gl = new WebglAddon();
+          gl.onContextLoss(() => {
+            // 休眠唤醒 / 切换显卡：GPU 上下文没了。立即退回 Canvas（不能白屏），过一会儿再试
+            gpuLossesRef.current++;
+            gpuSlots.release(tabId);
+            switchRendererRef.current("canvas");
+            window.setTimeout(() => setGpuRetry((n) => n + 1), 3000);
+          });
+          term.loadAddon(gl);
+          rendererRef.current = { kind: "webgl", addon: gl };
+        } catch {
+          gpuLossesRef.current = MAX_CONTEXT_LOSSES;
+          gpuSlots.release(tabId);
+        }
+      }
+      if (!rendererRef.current) {
+        const c = new CanvasAddon();
+        term.loadAddon(c);
+        rendererRef.current = { kind: "canvas", addon: c };
+      }
+      try {
+        fitRef.current?.fit();
+      } catch {
+        /* 不可见时量不出尺寸，等显示时的 fit */
+      }
+      syncSizeRef.current();
+    },
+    [tabId]
+  );
+  const switchRendererRef = useRef(switchRenderer);
+  switchRendererRef.current = switchRenderer;
+
   const onCommandCommittedRef = useRef(onCommandCommitted);
   onCommandCommittedRef.current = onCommandCommitted;
   /** 写 pty 的那条路定义在 mount 的 effect 里，用 ref 桥给下面的回调 */
@@ -507,7 +569,10 @@ export default function TerminalView({
 
     const fit = new FitAddon();
     term.loadAddon(fit);
-    term.loadAddon(new CanvasAddon());
+    // 先用 Canvas（CPU）渲染；标签可见时由下面的 GPU 调度换成 WebGL。WebGL 渲染器必须在 open() 之后加载
+    const canvasAddon = new CanvasAddon();
+    term.loadAddon(canvasAddon);
+    rendererRef.current = { kind: "canvas", addon: canvasAddon };
     const unicode = new Unicode11Addon();
     term.loadAddon(unicode);
     term.unicode.activeVersion = "11"; // 中文 / emoji 宽度必须启用
@@ -911,6 +976,25 @@ export default function TerminalView({
     // 字体等外观变化通过下面的 effect 单独应用，不重建实例
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId]);
+
+  // —— GPU 渲染调度 ——
+  // 可见的标签换成 GPU 渲染并占一个名额；名额满了，最久没看的那个标签被挤回 Canvas。
+  // 切到后台的标签不主动换回（来回换要重建字形纹理，反而更慢还会闪）。设置关掉 / 没有 GPU 时一律 Canvas
+  useEffect(() => {
+    if (!termRef.current) return;
+    const gpu = detectGpu();
+    if (wantsGpu({ pref: prefsNow.gpuRender, visible: active, gpu, losses: gpuLossesRef.current })) {
+      gpuSlots.claim(tabId, () => switchRendererRef.current("canvas"));
+      switchRenderer("webgl");
+      if (rendererRef.current?.kind !== "webgl") gpuSlots.release(tabId);
+    } else if (!prefsNow.gpuRender || !gpu.ok) {
+      gpuSlots.release(tabId);
+      switchRenderer("canvas");
+    }
+  }, [active, prefsNow.gpuRender, gpuRetry, tabId, switchRenderer]);
+
+  // 标签关掉：让出 GPU 名额（渲染器本身随终端一起销毁）
+  useEffect(() => () => gpuSlots.release(tabId), [tabId]);
 
   // —— 连上之后读一次远端 shell 的历史文件，给 Shift+Tab 历史面板当数据 ——
   // 走旁路 exec 通道：兼容模式（堡垒机）一条额外通道都不开，直接跳过；
