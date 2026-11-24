@@ -16,7 +16,23 @@ static ENGLISH: AtomicBool = AtomicBool::new(false);
 
 /// 当前界面语言是不是英文
 pub fn is_en() -> bool {
+    #[cfg(test)]
+    if let Some(en) = TEST_EN.with(|c| c.get()) {
+        return en;
+    }
     ENGLISH.load(Ordering::Relaxed)
+}
+
+// 单元测试并行跑在不同线程上：测英文时只改本线程，不碰全局开关，免得别的用例按中文断言时偶发失败
+#[cfg(test)]
+thread_local! {
+    static TEST_EN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// 测试用：只在当前线程里把语言当成 `locale`
+#[cfg(test)]
+pub fn set_locale_for_test(locale: &str) {
+    TEST_EN.with(|c| c.set(Some(locale.eq_ignore_ascii_case("en"))));
 }
 
 pub fn set_locale(locale: &str) {
@@ -50,12 +66,11 @@ pub fn reply_language_note() -> &'static str {
 mod tests {
     #[test]
     fn tr_picks_the_current_language() {
-        // 测试里共用一个全局开关：这条用例自己设回中文，不影响别的用例
         let host = "web1";
-        super::set_locale("en");
+        super::set_locale_for_test("en");
         assert_eq!(crate::tr!("连不上 {host}", "Cannot reach {host}"), "Cannot reach web1");
         assert!(super::reply_language_note().contains("English"));
-        super::set_locale("zh");
+        super::set_locale_for_test("zh");
         assert_eq!(crate::tr!("连不上 {}", "Cannot reach {}", host), "连不上 web1");
         assert_eq!(super::reply_language_note(), "");
     }
