@@ -202,7 +202,8 @@ impl StewardBrain {
                 .filter(|x| x.kind == item.kind && x.id != item.id)
                 .count();
             if n >= MAX_ITEMS_PER_KIND {
-                return Err(format!("{kind} 最多 {MAX_ITEMS_PER_KIND} 条", kind = item.kind));
+                let kind = &item.kind;
+                return Err(crate::tr!("{kind} 最多 {MAX_ITEMS_PER_KIND} 条", "At most {MAX_ITEMS_PER_KIND} {kind} items"));
             }
         }
         let mut inner = self.0.lock();
@@ -409,7 +410,7 @@ impl StewardBrain {
             strength: Some("soft".to_string()),
             scope: Some("global".to_string()),
             source: Some("learned".to_string()),
-            evidence: Some(format!("DecisionRecord #{seq} 被用户纠正")),
+            evidence: Some(crate::tr!("DecisionRecord #{seq} 被用户纠正", "DecisionRecord #{seq} corrected by the user")),
             extra: Some(json!({ "topic": topic })),
             contract_id: None,
             position: None,
@@ -467,17 +468,17 @@ impl CtxItem {
 pub fn validate_text(text: &str) -> Result<String, String> {
     let t = text.trim().to_string();
     if t.is_empty() {
-        return Err("内容不能为空".to_string());
+        return Err(crate::tr!("内容不能为空", "The text can't be empty"));
     }
     if t.chars().count() > MAX_TEXT_CHARS {
-        return Err(format!("内容不能超过 {MAX_TEXT_CHARS} 字"));
+        return Err(crate::tr!("内容不能超过 {MAX_TEXT_CHARS} 字", "The text can't exceed {MAX_TEXT_CHARS} characters"));
     }
     if t.chars().any(|c| c.is_control()) {
-        return Err("内容不能包含换行或控制字符".to_string());
+        return Err(crate::tr!("内容不能包含换行或控制字符", "The text can't contain newlines or control characters"));
     }
     let lower = t.to_lowercase();
     if lower.contains("password:") || lower.contains("passphrase") || lower.contains("private key") {
-        return Err("依据里不能写口令 / 私钥；密码类输入走独立通道".to_string());
+        return Err(crate::tr!("依据里不能写口令 / 私钥；密码类输入走独立通道", "Don't put passwords / private keys in here; passwords go through a separate channel"));
     }
     Ok(t)
 }
@@ -488,7 +489,7 @@ fn normalize_input(input: CtxInput) -> Result<CtxItem, String> {
         kind.as_str(),
         KIND_PREFERENCE | KIND_INTENT | KIND_KNOWLEDGE | KIND_PLAYBOOK
     ) {
-        return Err(format!("不认识的条目类型「{kind}」"));
+        return Err(crate::tr!("不认识的条目类型「{kind}」", "Unknown item type \"{kind}\""));
     }
     let text = validate_text(&input.text)?;
     let ts = now_ms();
@@ -508,14 +509,14 @@ fn normalize_input(input: CtxInput) -> Result<CtxItem, String> {
     // 剧本的回复模板单独校验：它会原样发进终端，必须单行、有限长
     if kind == KIND_PLAYBOOK {
         let spec: PlaybookSpec = serde_json::from_value(extra.clone())
-            .map_err(|e| format!("剧本 extra 格式不对：{e}"))?;
-        validate_text(&spec.answer).map_err(|e| format!("剧本回复：{e}"))?;
+            .map_err(|e| crate::tr!("剧本 extra 格式不对：{e}", "Invalid playbook extra: {e}"))?;
+        validate_text(&spec.answer).map_err(|e| crate::tr!("剧本回复：{e}", "Playbook reply: {e}"))?;
     }
     if kind == KIND_INTENT {
         let spec: IntentSpec = serde_json::from_value(extra.clone())
-            .map_err(|e| format!("意向 extra 格式不对：{e}"))?;
+            .map_err(|e| crate::tr!("意向 extra 格式不对：{e}", "Invalid intent extra: {e}"))?;
         if let Some(tpl) = spec.answer_template.as_deref() {
-            validate_text(tpl).map_err(|e| format!("回复模板：{e}"))?;
+            validate_text(tpl).map_err(|e| crate::tr!("回复模板：{e}", "Reply template: {e}"))?;
         }
         for c in &spec.constraints {
             validate_text(c)?;

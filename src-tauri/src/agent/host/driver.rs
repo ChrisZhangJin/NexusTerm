@@ -112,7 +112,7 @@ impl HostCtx {
             hard: Vec::new(),
             section: String::new(),
             refs: Vec::new(),
-            label: "当前会话".to_string(),
+            label: crate::tr!("当前会话", "Current session"),
             extra: Vec::new(),
         }
     }
@@ -137,6 +137,11 @@ impl HostCtx {
 
     /// 本次托管的终端清单，给人 / 模型看的一行：「A」（主终端）、「B」。
     pub fn terminals_line(&self) -> String {
+        if crate::i18n::is_en() {
+            let mut v = vec![format!("\"{}\" ({}, primary)", self.label, self.contract.console_id)];
+            v.extend(self.extra.iter().map(|c| format!("\"{}\" ({})", c.label, c.console_id)));
+            return v.join(", ");
+        }
         let mut v = vec![format!("「{}」（{}，主终端）", self.label, self.contract.console_id)];
         v.extend(self.extra.iter().map(|c| format!("「{}」（{}）", c.label, c.console_id)));
         v.join("、")
@@ -155,12 +160,14 @@ impl HostCtx {
     /// YOLO 档按越过契约处理 —— 停下来问人，批准即放行这一次。
     pub fn out_of_run(&self, label: &str) -> super::gate::Gate {
         if self.authority.tier == super::super::policy::TIER_YOLO {
-            return super::gate::Gate::Approve(vec![format!(
-                "⛔ 越过契约：操作不在本次托管里的终端「{label}」。YOLO 档只在这种时候问你，批准即放行这一次"
+            return super::gate::Gate::Approve(vec![crate::tr!(
+                "⛔ 越过契约：操作不在本次托管里的终端「{label}」。YOLO 档只在这种时候问你，批准即放行这一次",
+                "⛔ Crosses the contract: acts on terminal \"{label}\", which isn't part of this autopilot run. YOLO only asks you in cases like this; approving allows it this once"
             )]);
         }
-        super::gate::Gate::Deny(format!(
+        super::gate::Gate::Deny(crate::tr!(
             "终端「{label}」不在本次托管里，没有写入。本次托管只能操作：{}；用 target 指明其中之一（不写就是主终端）",
+            "Terminal \"{label}\" isn't part of this autopilot run, nothing written. This run may only act on: {}; set target to one of them (omit it for the primary terminal)",
             self.terminals_line()
         ))
     }
@@ -638,7 +645,11 @@ impl HostShared {
             self.set_criteria(draft.clone(), true);
             return Some(draft);
         }
-        let mut card = HumanCard::ask(card_id, "确认完成判据：编辑后点「接受」开始托管", now_ms);
+        let q = crate::tr!(
+            "确认完成判据：编辑后点「接受」开始托管",
+            "Confirm the completion checks: edit them, then click \"Accept\" to start autopilot"
+        );
+        let mut card = HumanCard::ask(card_id, &q, now_ms);
         card.kind = CardKind::CriteriaDraft { draft };
         match self.ask(card).await {
             ParkEnd::Running => Some(self.ctx().contract.success_criteria),

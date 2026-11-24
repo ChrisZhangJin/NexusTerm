@@ -46,39 +46,55 @@ pub fn attention_for(prev: &HostPhase, next: &HostPhase, label: &str) -> Option<
     if attention_key(prev).as_deref() == Some(key.as_str()) {
         return None;
     }
-    let (kind, head, detail): (&'static str, &str, String) = match next.base() {
+    let (kind, head, detail): (&'static str, String, String) = match next.base() {
         HostPhase::WaitingHuman { card } => {
             let q = card.question.clone();
             match &card.kind {
-                CardKind::Ask => ("waiting", "等你回答", q),
-                CardKind::Approve => ("waiting", "等你批准", q),
-                CardKind::Secret => ("waiting", "等你输入密码", q),
-                CardKind::Watchdog => ("waiting", "看门狗请你看一下", q),
-                CardKind::ManualCheck { summary, .. } => {
-                    ("waiting", "等你确认完成", if summary.trim().is_empty() { q } else { summary.clone() })
+                CardKind::Ask => ("waiting", crate::tr!("等你回答", "Waiting for your answer"), q),
+                CardKind::Approve => ("waiting", crate::tr!("等你批准", "Waiting for your approval"), q),
+                CardKind::Secret => ("waiting", crate::tr!("等你输入密码", "Waiting for your password"), q),
+                CardKind::Watchdog => ("waiting", crate::tr!("看门狗请你看一下", "Watchdog needs a look from you"), q),
+                CardKind::ManualCheck { summary, .. } => (
+                    "waiting",
+                    crate::tr!("等你确认完成", "Waiting for you to confirm completion"),
+                    if summary.trim().is_empty() { q } else { summary.clone() },
+                ),
+                CardKind::CriteriaDraft { .. } => {
+                    ("waiting", crate::tr!("等你确认完成判据", "Waiting for you to confirm the completion checks"), String::new())
                 }
-                CardKind::CriteriaDraft { .. } => ("waiting", "等你确认完成判据", String::new()),
             }
         }
         HostPhase::Paused { cause } => match cause {
-            PauseCause::Budget { reason } => ("paused", "预算用完，已暂停", reason.clone()),
-            PauseCause::Deadline => ("paused", "到了约定期限，已暂停", String::new()),
-            PauseCause::LlmDown { error } => ("paused", "模型服务不可用，已暂停", error.clone()),
+            PauseCause::Budget { reason } => ("paused", crate::tr!("预算用完，已暂停", "Budget used up, paused"), reason.clone()),
+            PauseCause::Deadline => ("paused", crate::tr!("到了约定期限，已暂停", "Deadline reached, paused"), String::new()),
+            PauseCause::LlmDown { error } => {
+                ("paused", crate::tr!("模型服务不可用，已暂停", "Model service unavailable, paused"), error.clone())
+            }
             PauseCause::User => return None,
         },
         HostPhase::Suspended { reason, .. } => match reason {
-            SuspendReason::ConsoleGone => ("suspended", "终端断开，托管已挂起", String::new()),
-            SuspendReason::AppRestart => ("suspended", "应用重启，等你重新接驳", String::new()),
-            SuspendReason::LlmDown => ("suspended", "模型服务连不上，托管已挂起", String::new()),
+            SuspendReason::ConsoleGone => {
+                ("suspended", crate::tr!("终端断开，托管已挂起", "Terminal disconnected, autopilot suspended"), String::new())
+            }
+            SuspendReason::AppRestart => {
+                ("suspended", crate::tr!("应用重启，等你重新接驳", "App restarted, waiting for you to reattach"), String::new())
+            }
+            SuspendReason::LlmDown => {
+                ("suspended", crate::tr!("模型服务连不上，托管已挂起", "Can't reach the model service, autopilot suspended"), String::new())
+            }
         },
-        HostPhase::Completed { summary, .. } => ("completed", "托管完成", summary.clone()),
-        HostPhase::Failed { error } => ("failed", "托管失败", error.clone()),
+        HostPhase::Completed { summary, .. } => ("completed", crate::tr!("托管完成", "Autopilot finished"), summary.clone()),
+        HostPhase::Failed { error } => ("failed", crate::tr!("托管失败", "Autopilot failed"), error.clone()),
         _ => return None,
     };
     let detail = one_line(&detail);
-    let body = if detail.is_empty() { head.to_string() } else { format!("{head}：{detail}") };
+    let body = if detail.is_empty() { head } else { crate::tr!("{head}：{detail}", "{head}: {detail}") };
     let label = one_line(label);
-    let title = if label.is_empty() { "NexusTerm 托管".to_string() } else { format!("NexusTerm 托管 · {label}") };
+    let title = if label.is_empty() {
+        crate::tr!("NexusTerm 托管", "NexusTerm Autopilot")
+    } else {
+        crate::tr!("NexusTerm 托管 · {label}", "NexusTerm Autopilot · {label}")
+    };
     Some(Attention { title, body, kind })
 }
 

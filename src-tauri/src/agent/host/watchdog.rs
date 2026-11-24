@@ -55,15 +55,18 @@ impl Alarm {
     /// L1 追加进 feedback 的提示。
     pub fn hint(&self) -> String {
         match self {
-            Self::Loop { n, .. } => format!(
-                "[看门狗] 同一个动作在局面没变的情况下已重复 {n} 次。换一种做法，或用 nx_ask_user 请用户决定"
+            Self::Loop { n, .. } => crate::tr!(
+                "[看门狗] 同一个动作在局面没变的情况下已重复 {n} 次。换一种做法，或用 nx_ask_user 请用户决定",
+                "[Watchdog] The same action has been repeated {n} times with nothing changing. Try another approach, or let the user decide via nx_ask_user"
             ),
-            Self::NoProgress { steps, ms } => format!(
+            Self::NoProgress { steps, ms } => crate::tr!(
                 "[看门狗] 已经 {steps} 步（{} 秒）屏幕和反馈都没有变化。先 nx_screen 核对现场，确认任务是否还在推进",
+                "[Watchdog] {steps} steps ({} s) with no change on screen or in feedback. Check with nx_screen first and confirm the task is still progressing",
                 ms / 1000
             ),
-            Self::Thrash { rounds } => format!(
-                "[看门狗] 连续 {rounds} 轮没有任何动作。要么下发动作，要么 nx_complete，要么 nx_ask_user"
+            Self::Thrash { rounds } => crate::tr!(
+                "[看门狗] 连续 {rounds} 轮没有任何动作。要么下发动作，要么 nx_complete，要么 nx_ask_user",
+                "[Watchdog] {rounds} rounds in a row without any action. Either act, call nx_complete, or nx_ask_user"
             ),
         }
     }

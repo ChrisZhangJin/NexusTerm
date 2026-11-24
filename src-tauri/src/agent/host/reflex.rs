@@ -79,7 +79,11 @@ pub fn decide(playbook: Option<(CtxItem, PlaybookSpec)>, sit: &Situation, ctx: &
         ctx_refs: vec![CtxRef::of("playbook", &item.id, item.text.clone())],
         candidates: Vec::new(),
         chosen,
-        rationale: format!("[reflex] 剧本 [P:{}] 命中，未调用模型", item.id),
+        rationale: crate::tr!(
+            "[reflex] 剧本 [P:{}] 命中，未调用模型",
+            "[reflex] Playbook [P:{}] matched, model not called",
+            item.id
+        ),
         confidence: 1.0,
         tier: ctx.authority.tier.clone(),
         llm_used: false,

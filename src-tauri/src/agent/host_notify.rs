@@ -49,7 +49,7 @@ pub fn load(store: &Store) -> HostNotifyConfig {
 pub fn normalize(mut c: HostNotifyConfig) -> Result<HostNotifyConfig, String> {
     c.webhook = c.webhook.trim().to_string();
     if !c.webhook.is_empty() && !(c.webhook.starts_with("https://") || c.webhook.starts_with("http://")) {
-        return Err("Webhook 地址要以 http:// 或 https:// 开头".to_string());
+        return Err(crate::tr!("Webhook 地址要以 http:// 或 https:// 开头", "The webhook URL must start with http:// or https://"));
     }
     Ok(c)
 }

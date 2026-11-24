@@ -43,6 +43,19 @@ const BLIND_PICK_YOLO: &str = "没有发送：看不到这个授权卡 / 菜单�
      先 nx_screen 看清选项，再明确按一个**不是**永久授权的选项的序号（如「仅本次允许」）；\
      读屏后选项仍认不出，就用 nx_ask_user 请用户本人选。";
 
+fn blind_pick_yolo() -> String {
+    if crate::i18n::is_en() {
+        "Not sent: the options of this permission prompt / menu can't be seen (no fresh screen frame, or the options \
+         weren't recognized while the screen mentions \"always / don't ask again\"). This number / Enter might select \
+         \"Always allow / Don't ask again\", which is a hard limit (not chosen for the user even in YOLO). Read the \
+         screen with nx_screen first, then press the number of an option that is clearly NOT a permanent grant \
+         (e.g. \"Allow once\"); if the options still can't be recognized, ask the user to choose with nx_ask_user."
+            .to_string()
+    } else {
+        BLIND_PICK_YOLO.to_string()
+    }
+}
+
 /// Hard 偏好正则的编译上限，防止用户写出病态 pattern 拖慢每一次写入。
 const HARD_RE_SIZE_LIMIT: usize = 1 << 16;
 
@@ -121,7 +134,8 @@ fn write_of(a: &AgentAction) -> Result<Option<Write>, String> {
             Some(command.clone()),
         ),
         AgentAction::Keys { keys, .. } => {
-            let bytes = interact::parse_keys(keys).map_err(|e| format!("按键串解析失败，没有写入：{e}"))?;
+            let bytes = interact::parse_keys(keys)
+                .map_err(|e| crate::tr!("按键串解析失败，没有写入：{e}", "Couldn't parse the key sequence, nothing written: {e}"))?;
             Write { category: "keys", lines: typed_lines(&bytes), command: None, keys: Some(bytes) }
         }
         AgentAction::Secret { .. } => w("secret_prompt", vec![], None),
@@ -248,6 +262,16 @@ fn contract_hit(auth: &Authority, w: &Write, sit: Option<&Situation>, vouched: b
 
 /// 禁止项给人看的名字（与前端 `host.ts` 的 `denyLabel` 同口径）；自定义关键字写成「含「…」」。
 pub fn deny_label(tag: &str) -> String {
+    if crate::i18n::is_en() {
+        return match tag {
+            TAG_SECRET => "Typing passwords for you".into(),
+            TAG_PERMANENT_GRANT => "Choosing \"Don't ask again / Always allow\"".into(),
+            TAG_FORCE_PUSH => "Force push (git push -f)".into(),
+            TAG_DELETE => "Deleting (rm / prune / drop …)".into(),
+            TAG_FILE_WRITE => "Writing / editing files".into(),
+            other => format!("Contains \"{other}\""),
+        };
+    }
     match tag {
         TAG_SECRET => "替你输密码".into(),
         TAG_PERMANENT_GRANT => "选「不再询问 / 永久允许」".into(),
@@ -263,19 +287,41 @@ pub fn screen_line(sit: &Situation) -> String {
     use super::super::situation::Program;
     // 程序认不出、或者就是空闲的 shell（「Shell 提示符（Shell）」是废话）时不写程序
     if sit.program == Program::Unknown || (sit.program == Program::Shell && sit.kind == SituationKind::Idle) {
-        format!("屏幕被识别为：{}", sit.kind.label())
+        format!("{}{}", screen_line_head(), sit.kind.label())
+    } else if crate::i18n::is_en() {
+        format!("{}{} ({})", screen_line_head(), sit.kind.label(), sit.program.label())
     } else {
-        format!("屏幕被识别为：{}（{}）", sit.kind.label(), sit.program.label())
+        format!("{}{}（{}）", screen_line_head(), sit.kind.label(), sit.program.label())
+    }
+}
+
+/// [`screen_line`] 的开头（两种语言）；误判样本据此剥掉它
+pub const SCREEN_LINE_HEAD: &str = "屏幕被识别为：";
+pub const SCREEN_LINE_HEAD_EN: &str = "Screen recognized as: ";
+
+fn screen_line_head() -> &'static str {
+    if crate::i18n::is_en() {
+        SCREEN_LINE_HEAD_EN
+    } else {
+        SCREEN_LINE_HEAD
     }
 }
 
 /// 屏幕被认成密码提示时，按键内容一律换成这句（门禁卡、决策记录、trace 都不留原文）。
 pub const KEYS_HIDDEN: &str = "发送按键（屏幕被认成密码提示，按键内容不显示）";
 
+/// [`KEYS_HIDDEN`] 的当前语言版本（给人看）
+pub fn keys_hidden() -> String {
+    crate::tr!(
+        "发送按键（屏幕被认成密码提示，按键内容不显示）",
+        "Send keys (the screen looks like a password prompt, so the keys aren't shown)"
+    )
+}
+
 /// 门禁卡上显示的「想做的那一步」：脱敏；屏幕被认成密码提示时不显示按键内容（真是密码提示的话那就是口令）。
 pub fn shown_write(a: &AgentAction, text: &str, sit: Option<&Situation>) -> String {
     if matches!(a, AgentAction::Keys { .. }) && sit.is_some_and(|s| s.kind == SituationKind::Password) {
-        return KEYS_HIDDEN.to_string();
+        return keys_hidden();
     }
     super::super::redact::redact(text)
 }
@@ -298,9 +344,15 @@ pub struct GateExplain {
 /// Notify（执行后通知）的说明：通知档本来就这样；其他档位是因为这一步有风险但可恢复。
 pub fn notify_reason(tier: &str) -> String {
     if tier == TIER_NOTIFY {
-        "契约档位为「通知」：先执行，再告诉你；不对可以「接管」并写下纠正".to_string()
+        crate::tr!(
+            "契约档位为「通知」：先执行，再告诉你；不对可以「接管」并写下纠正",
+            "The contract's level is \"Notify\": run first, then tell you. If it's wrong, \"Take over\" and write a correction"
+        )
     } else {
-        "有风险但可恢复：先执行，再告诉你；不对可以「接管」并写下纠正".to_string()
+        crate::tr!(
+            "有风险但可恢复：先执行，再告诉你；不对可以「接管」并写下纠正",
+            "Risky but recoverable: run first, then tell you. If it's wrong, \"Take over\" and write a correction"
+        )
     }
 }
 
@@ -330,17 +382,27 @@ pub fn explain_vouched(
     };
     let reason = match (g, &hit) {
         (Gate::Deny(_), Some(Hit::Tag(TAG_SECRET))) => {
-            "屏幕被识别为密码 / 口令提示，替你往里输入是底线（替你输密码），这些按键没有发出去。\
-             如果屏幕上其实不是密码提示，点「这是误判」"
-                .to_string()
+            crate::tr!(
+                "屏幕被识别为密码 / 口令提示，替你往里输入是底线（替你输密码），这些按键没有发出去。\
+                 如果屏幕上其实不是密码提示，点「这是误判」",
+                "The screen was recognized as a password / passphrase prompt. Typing into it for you is a hard limit \
+                 (typing passwords for you), so these keys weren't sent. If the screen isn't actually a password prompt, \
+                 click \"Misread\""
+            )
         }
-        (Gate::Deny(_), Some(Hit::Tag(TAG_PERMANENT_GRANT))) => {
-            "这一步会在授权框里选「不再询问 / 永久允许」，这是底线，没有执行".to_string()
+        (Gate::Deny(_), Some(Hit::Tag(TAG_PERMANENT_GRANT))) => crate::tr!(
+            "这一步会在授权框里选「不再询问 / 永久允许」，这是底线，没有执行",
+            "This step would choose \"Don't ask again / Always allow\" in a permission prompt. That's a hard limit, not run"
+        ),
+        (Gate::Deny(_), Some(Hit::Tag(t))) => {
+            crate::tr!("契约禁止「{}」，没有执行", "The contract blocks \"{}\", not run", deny_label(t))
         }
-        (Gate::Deny(_), Some(Hit::Tag(t))) => format!("契约禁止「{}」，没有执行", deny_label(t)),
-        (Gate::Deny(_), Some(Hit::Keyword(d))) => format!("命令或写入的内容里出现了契约禁止的「{d}」，没有执行"),
+        (Gate::Deny(_), Some(Hit::Keyword(d))) => crate::tr!(
+            "命令或写入的内容里出现了契约禁止的「{d}」，没有执行",
+            "The command or written content contains \"{d}\", which the contract blocks, not run"
+        ),
         (Gate::Deny(why), None) => why.clone(),
-        (Gate::Approve(r), _) => r.join("；"),
+        (Gate::Approve(r), _) => r.join(if crate::i18n::is_en() { "; " } else { "；" }),
         _ => notify_reason(&p.authority.tier),
     };
     let (deny_item, locked) = match hit {
@@ -372,7 +434,10 @@ pub fn authorize_vouched(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation
     let yolo = auth.tier == TIER_YOLO;
     let breach = |why: String| {
         if yolo {
-            Gate::Approve(vec![format!("⛔ 越过契约：{why}。YOLO 档只在这种时候问你，批准即放行这一次")])
+            Gate::Approve(vec![crate::tr!(
+                "⛔ 越过契约：{why}。YOLO 档只在这种时候问你，批准即放行这一次",
+                "⛔ Crosses the contract: {why}. YOLO only asks you in cases like this; approving allows it this once"
+            )])
         } else {
             Gate::Deny(why)
         }
@@ -393,17 +458,21 @@ pub fn authorize_vouched(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation
         if LOCKED_DENY.contains(t) || !yolo {
             return Gate::Deny(format!("契约禁止此类操作：{}（{t}），没有写入。换一个不触及禁项的做法；这一步确实是目标必需的，就用 nx_ask_user 请用户放开（不要给 recommendation，契约只有用户能改）", deny_label(t)));
         }
-        return breach(format!("命中契约禁止项「{}」", deny_label(t)));
+        return breach(crate::tr!("命中契约禁止项「{}」", "Hits the blocked action \"{}\"", deny_label(t)));
     }
     if let Some(Hit::Keyword(d)) = &hit {
-        return breach(format!("命中契约禁项「{d}」，没有写入"));
+        return breach(crate::tr!("命中契约禁项「{d}」，没有写入", "Hits the blocked action \"{d}\", nothing written"));
     }
 
     // 2. Hard 偏好正则（与禁止项同一组行：含按键拼出的提交行、对话框里批准的命令）
     let lines = deny_lines(&w, sit);
     for r in &p.hard {
         if lines.iter().any(|l| r.deny.is_match(l)) {
-            return breach(format!("违反硬偏好 [P:{}]，没有写入", r.pref_id));
+            return breach(crate::tr!(
+                "违反硬偏好 [P:{}]，没有写入",
+                "Violates hard preference [P:{}], nothing written",
+                r.pref_id
+            ));
         }
     }
 
@@ -414,7 +483,7 @@ pub fn authorize_vouched(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation
         host_key: (!p.host_key.trim().is_empty()).then(|| p.host_key.clone()),
     };
     if let Err(e) = check_scope(&scope_of(auth), &who) {
-        return breach(e.replace("技能的适用主机范围", "契约的主机范围"));
+        return breach(e.replace("技能的适用主机范围", "契约的主机范围").replace("the skill's host scope", "the contract's host scope"));
     }
 
     // 4–5. 按键 / 命令的风险。不可逆的（`has_critical` / `danger::critical`）任何档位都停下来问人；
@@ -430,8 +499,10 @@ pub fn authorize_vouched(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation
         match assess_keys(bytes, unpw.as_ref().or(sit)) {
             KeysVerdict::Allow => {}
             // 看不到选项就按选择键（可能正选中「永久允许」）：YOLO 也不替人按 —— 底线不能靠「没看清」蒙过去
-            KeysVerdict::Approve(r) if yolo && has_blind_pick(&r) => return Gate::Deny(BLIND_PICK_YOLO.to_string()),
-            KeysVerdict::Approve(r) if !yolo && (has_critical(&r) || auth.tier == TIER_APPROVE) => return Gate::Approve(r),
+            KeysVerdict::Approve(r) if yolo && has_blind_pick(&r) => return Gate::Deny(blind_pick_yolo()),
+            KeysVerdict::Approve(r) if !yolo && (has_critical(&r) || auth.tier == TIER_APPROVE) => {
+                return Gate::Approve(r.iter().map(|x| super::super::steward_mode::localize_reason(x)).collect())
+            }
             KeysVerdict::Approve(_) => risky = true,
             KeysVerdict::Refuse(t) => return Gate::Deny(t),
         }
@@ -439,14 +510,17 @@ pub fn authorize_vouched(p: &HostPolicy, a: &AgentAction, sit: Option<&Situation
     if let Some(cmd) = &w.command {
         let r = danger::assess(cmd);
         if !yolo && (r.critical || (r.dangerous && auth.tier == TIER_APPROVE)) {
-            return Gate::Approve(r.reasons);
+            return Gate::Approve(r.reasons.iter().map(|x| super::super::danger::localize_reason(x)).collect());
         }
         risky |= r.dangerous;
     }
 
     // 6. 档位（YOLO：危险的发通知卡留痕，其余直接放行；都不停）
     match auth.tier.as_str() {
-        TIER_APPROVE => Gate::Approve(vec!["契约档位为「确认」：每次写入都需要批准".to_string()]),
+        TIER_APPROVE => Gate::Approve(vec![crate::tr!(
+            "契约档位为「确认」：每次写入都需要批准",
+            "The contract's level is \"Ask first\": every write needs approval"
+        )]),
         _ if risky => Gate::Notify,
         TIER_AUTO | TIER_YOLO => Gate::Allow,
         _ if allowed(auth, &w) => Gate::Allow,

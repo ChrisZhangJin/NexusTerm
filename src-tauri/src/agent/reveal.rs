@@ -26,8 +26,10 @@ pub const MAX_BYTES: usize = 64 * 1024;
 pub const CMD_TIMEOUT_SECS: u64 = 60;
 /// 标题最多多少字
 const TITLE_MAX: usize = 80;
-/// 标题缺省
-const DEFAULT_TITLE: &str = "交付内容";
+/// 标题缺省（卡片上给人看，跟界面语言走）
+fn default_title() -> String {
+    crate::tr!("交付内容", "Delivered content")
+}
 
 /// 内容从哪儿来。`Invalid` = 参数不合法（两个都给 / 都没给），执行层直接把原因反馈给模型。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,9 +43,9 @@ impl RevealSource {
     /// 卡片 / 决策记录 / 回执里的「来源」一句话（只有路径或命令本身，没有内容）
     pub fn describe(&self) -> String {
         match self {
-            Self::Path(p) => format!("文件 {p}"),
-            Self::Command(c) => format!("命令 `{}`", one_line(c, 200)),
-            Self::Invalid(_) => "参数无效".to_string(),
+            Self::Path(p) => crate::tr!("文件 {p}", "file {p}"),
+            Self::Command(c) => crate::tr!("命令 `{}`", "command `{}`", one_line(c, 200)),
+            Self::Invalid(_) => crate::tr!("参数无效", "invalid arguments"),
         }
     }
 }
@@ -97,12 +99,16 @@ pub fn tool_spec() -> llm::ToolSpec {
 pub fn parse(args: &serde_json::Value) -> (Option<String>, String, RevealSource) {
     let s = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
     let target = s("target");
-    let title = s("title").map(|t| one_line(&t, TITLE_MAX)).unwrap_or_else(|| DEFAULT_TITLE.to_string());
+    let title = s("title").map(|t| one_line(&t, TITLE_MAX)).unwrap_or_else(default_title);
     let source = match (s("path"), s("command")) {
         (Some(p), None) => RevealSource::Path(p),
         (None, Some(c)) => RevealSource::Command(c),
-        (Some(_), Some(_)) => RevealSource::Invalid("path 与 command 只能给一个".into()),
-        (None, None) => RevealSource::Invalid("缺少 path 或 command（二选一）".into()),
+        (Some(_), Some(_)) => {
+            RevealSource::Invalid(crate::tr!("path 与 command 只能给一个", "give only one of path and command"))
+        }
+        (None, None) => {
+            RevealSource::Invalid(crate::tr!("缺少 path 或 command（二选一）", "missing path or command (give one of them)"))
+        }
     };
     (target, title, source)
 }
@@ -134,24 +140,40 @@ impl RevealErr {
     /// 给模型的一句话原因（不含任何内容；`Failed` 的原文也不给）
     fn for_model(&self) -> String {
         match self {
-            Self::Empty => "内容为空".into(),
-            Self::TooLarge(n) => format!("内容过大（{n} 字节，上限 {MAX_BYTES} 字节）：请只交付用户真正需要的那几行"),
-            Self::Binary => "内容看起来是二进制（含 NUL 或不是 UTF-8 文本），只能交付文本".into(),
-            Self::Denied(p) => format!("「{p}」是受保护文件，用户没有批准读取"),
+            // 这些原因卡片上也显示（for_user），跟界面语言走
+            Self::Empty => crate::tr!("内容为空", "The content is empty"),
+            Self::TooLarge(n) => crate::tr!(
+                "内容过大（{n} 字节，上限 {MAX_BYTES} 字节）：请只交付用户真正需要的那几行",
+                "Content too large ({n} bytes, limit {MAX_BYTES} bytes): deliver only the lines the user actually needs"
+            ),
+            Self::Binary => crate::tr!(
+                "内容看起来是二进制（含 NUL 或不是 UTF-8 文本），只能交付文本",
+                "The content looks binary (contains NUL or isn't UTF-8 text); only text can be delivered"
+            ),
+            Self::Denied(p) => crate::tr!("「{p}」是受保护文件，用户没有批准读取", "\"{p}\" is a protected file and reading it was not approved"),
             Self::File(e) => e.clone(),
-            Self::Exit(Some(rc)) => format!("命令退出码 {rc}（失败）。为免泄露，失败时的输出既不交付也不给你看：请先用不打印秘密的命令排查"),
-            Self::Exit(None) => "没拿到命令的退出码（可能被截断或让 shell 提前退出），为稳妥起见没有交付".into(),
-            Self::Unavailable => "这个会话没有可用的旁路执行通道（SSH 兼容模式 / 堡垒机 / 本平台不支持）：请改用 path 交付一个文件".into(),
-            Self::Timeout => format!("命令 {CMD_TIMEOUT_SECS} 秒内没有结束"),
-            Self::Cancelled => "用户取消了这一轮".into(),
-            Self::Failed(_) => "旁路通道出错（连接问题），没有交付".into(),
+            Self::Exit(Some(rc)) => crate::tr!(
+                "命令退出码 {rc}（失败）。为免泄露，失败时的输出既不交付也不给你看：请先用不打印秘密的命令排查",
+                "Command exited with code {rc} (failed). To avoid leaks, output from a failed command is neither delivered nor shown to you: investigate with commands that don't print the secret first"
+            ),
+            Self::Exit(None) => crate::tr!(
+                "没拿到命令的退出码（可能被截断或让 shell 提前退出），为稳妥起见没有交付",
+                "Couldn't get the command's exit code (output may have been cut off, or the shell exited early), so nothing was delivered to be safe"
+            ),
+            Self::Unavailable => crate::tr!(
+                "这个会话没有可用的旁路执行通道（SSH 兼容模式 / 堡垒机 / 本平台不支持）：请改用 path 交付一个文件",
+                "This session has no side channel for running commands (SSH compatibility mode / bastion host / unsupported on this platform): deliver a file via path instead"
+            ),
+            Self::Timeout => crate::tr!("命令 {CMD_TIMEOUT_SECS} 秒内没有结束", "The command didn't finish within {CMD_TIMEOUT_SECS} seconds"),
+            Self::Cancelled => crate::tr!("用户取消了这一轮", "The user cancelled this round"),
+            Self::Failed(_) => crate::tr!("旁路通道出错（连接问题），没有交付", "Side channel error (connection problem); nothing was delivered"),
         }
     }
 
     /// 给用户看的原因（卡片上）
     pub fn for_user(&self) -> String {
         match self {
-            Self::Failed(e) => format!("旁路通道出错：{e}"),
+            Self::Failed(e) => crate::tr!("旁路通道出错：{e}", "Side channel error: {e}"),
             other => other.for_model(),
         }
     }
@@ -191,10 +213,11 @@ pub async fn fetch_file<A: Approver>(ops: &FileOps<'_>, path: &str, approver: &m
         Err(FileError::ReadDenied { path, size }) => {
             let req = WriteApproval {
                 path: path.clone(),
-                summary: format!("读取受保护路径 {path}，交付给你"),
+                summary: crate::tr!("读取受保护路径 {path}，交付给你", "Read protected path {path} and deliver it to you"),
                 diff: String::new(),
-                reasons: vec![format!(
-                    "「{path}」在受保护清单里（密钥 / 凭据，{size} 字节）：批准即允许读取这一次，内容只放进「交付给你」卡片，不会给模型"
+                reasons: vec![crate::tr!(
+                    "「{path}」在受保护清单里（密钥 / 凭据，{size} 字节）：批准即允许读取这一次，内容只放进「交付给你」卡片，不会给模型",
+                    "\"{path}\" is on the protected list (keys / credentials, {size} bytes): approving allows reading it this once; the content only goes into the \"Delivered to you\" card, never to the model"
                 )],
                 sensitive_path: false,
                 read: true,
@@ -230,7 +253,7 @@ impl std::fmt::Debug for RevealContent {
 
 /// 「N 行，M 字节」
 pub fn size_note(content: &str) -> String {
-    format!("{} 行，{} 字节", content.lines().count(), content.len())
+    crate::tr!("{} 行，{} 字节", "{} lines, {} bytes", content.lines().count(), content.len())
 }
 
 /// 交付成功后喂回模型的回执。**签名里就没有内容**：只拿行数与字节数。
@@ -248,7 +271,7 @@ pub fn failure_feedback(title: &str, source: &RevealSource, err: &RevealErr) -> 
 
 /// 决策记录 / 门禁卡上的一句话：只有标题与来源
 pub fn decision_text(title: &str, source: &RevealSource) -> String {
-    format!("交付给用户「{title}」（{}）", source.describe())
+    crate::tr!("交付给用户「{title}」（{}）", "Deliver \"{title}\" to the user ({})", source.describe())
 }
 
 #[cfg(test)]
@@ -289,7 +312,7 @@ mod tests {
         assert!(matches!(src, RevealSource::Invalid(_)));
         let (_, title, src) = parse(&serde_json::json!({"path": " ", "command": ""}));
         assert!(matches!(src, RevealSource::Invalid(_)));
-        assert_eq!(title, DEFAULT_TITLE);
+        assert_eq!(title, default_title());
     }
 
     #[test]

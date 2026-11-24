@@ -498,7 +498,10 @@ pub fn next_action(
         StepEnd::Cancelled => Next::Stop(RunOutcome::Cancelled),
         StepEnd::TookOver => Next::Stop(RunOutcome::TookOver),
         StepEnd::Deviated(_) if attempts >= MAX_ATTEMPTS_PER_STEP => Next::Stop(RunOutcome::Failed {
-            reason: format!("同一步骤已尝试 {attempts} 次仍未达到期望，停止"),
+            reason: crate::tr!(
+                "同一步骤已尝试 {attempts} 次仍未达到期望，停止",
+                "The same step was tried {attempts} times without meeting the expectation; stopping"
+            ),
         }),
         StepEnd::Deviated(_) => match on_unexpected {
             OnUnexpected::Stop => Next::Stop(RunOutcome::DeviationStopped),
@@ -576,8 +579,8 @@ impl HostIdentity {
     fn display(&self) -> String {
         match (&self.host_key, self.label.trim()) {
             (Some(k), _) => host_display(k),
-            (None, l) if !l.is_empty() => format!("标签「{l}」"),
-            _ => format!("会话 {}", self.session_id),
+            (None, l) if !l.is_empty() => crate::tr!("标签「{l}」", "tab \"{l}\""),
+            _ => crate::tr!("会话 {}", "session {}", self.session_id),
         }
     }
 }
@@ -592,9 +595,11 @@ pub fn check_scope(scope: &HostScope, who: &HostIdentity) -> Result<(), String> 
     if hit {
         return Ok(());
     }
-    Err(format!(
+    // 英文须含 `the skill's host scope`：托管闸门（host/gate.rs）把它替换成「契约的主机范围」
+    Err(crate::tr!(
         "超出技能的适用主机范围：该技能只适用于 {}，当前会话是 {}。没有执行任何操作",
-        hosts.join("、"),
+        "Outside the skill's host scope: this skill only applies to {}, the current session is {}. Nothing was run",
+        hosts.join(if crate::i18n::is_en() { ", " } else { "、" }),
         who.display()
     ))
 }
@@ -647,18 +652,19 @@ fn clip(s: &str, max: usize) -> String {
 /// 步骤的一行摘要（卡片 / 报告 / 给 LLM 看）。只含渲染后的文本，没有 secret 值。
 pub fn summarize(step: &RenderedStep) -> String {
     match &step.action {
-        RenderedAction::Exec { command } => format!("执行：{}", clip(command, SUMMARY_CHARS)),
-        RenderedAction::Keys { keys } => format!("按键：{}", clip(keys, SUMMARY_CHARS)),
+        RenderedAction::Exec { command } => crate::tr!("执行：{}", "Run: {}", clip(command, SUMMARY_CHARS)),
+        RenderedAction::Keys { keys } => crate::tr!("按键：{}", "Keys: {}", clip(keys, SUMMARY_CHARS)),
         RenderedAction::ExpectRespond { expect, respond } => match respond {
-            Respond::Keys { keys } => format!(
+            Respond::Keys { keys } => crate::tr!(
                 "等到「{}」后按键：{}",
+                "Wait for \"{}\", then press: {}",
                 clip(expect, 40),
                 clip(keys, 40)
             ),
-            Respond::Secret { .. } => format!("等到「{}」后输入密码", clip(expect, 40)),
+            Respond::Secret { .. } => crate::tr!("等到「{}」后输入密码", "Wait for \"{}\", then enter a password", clip(expect, 40)),
         },
-        RenderedAction::Secret { reason, .. } => format!("输入密码：{}", clip(reason, 60)),
-        RenderedAction::ScreenCheck { expect } => format!("检查屏幕：{}", clip(expect, 60)),
+        RenderedAction::Secret { reason, .. } => crate::tr!("输入密码：{}", "Enter password: {}", clip(reason, 60)),
+        RenderedAction::ScreenCheck { expect } => crate::tr!("检查屏幕：{}", "Check screen: {}", clip(expect, 60)),
     }
 }
 
@@ -716,8 +722,8 @@ impl LlmDecision {
 
 /// 从模型回复里抠出裁决：容忍 ``` 围栏与前后废话，要求恰好是一个合法的 JSON 对象。
 pub fn parse_decision(text: &str) -> Result<LlmDecision, String> {
-    let obj = first_json_object(text).ok_or_else(|| "回复里没有 JSON 对象".to_string())?;
-    serde_json::from_str::<LlmDecision>(obj).map_err(|e| format!("裁决不合契约：{e}"))
+    let obj = first_json_object(text).ok_or_else(|| crate::tr!("回复里没有 JSON 对象", "no JSON object in the reply"))?;
+    serde_json::from_str::<LlmDecision>(obj).map_err(|e| crate::tr!("裁决不合契约：{e}", "the verdict doesn't match the expected format: {e}"))
 }
 
 /// 第一个括号配平的 `{…}`（识别字符串与转义，字符串里的花括号不算）。
@@ -754,18 +760,21 @@ fn first_json_object(text: &str) -> Option<&str> {
 /// 以及**屏幕正停在密码提示上**（密码只能走密码通道，不能让模型代打）。返回解析好的字节。
 pub fn validate_llm_keys(keys: &str, prompt_kind: Option<&str>) -> Result<Vec<u8>, String> {
     if keys.trim().is_empty() {
-        return Err("按键为空".into());
+        return Err(crate::tr!("按键为空", "the keys are empty"));
     }
     if keys.len() > MAX_LLM_KEYS_BYTES {
-        return Err(format!("按键过长（>{MAX_LLM_KEYS_BYTES} 字节）"));
+        return Err(crate::tr!("按键过长（>{MAX_LLM_KEYS_BYTES} 字节）", "the keys are too long (>{MAX_LLM_KEYS_BYTES} bytes)"));
     }
     if residual_placeholder(keys).is_some() {
-        return Err("按键里含未代入的参数占位符".into());
+        return Err(crate::tr!("按键里含未代入的参数占位符", "the keys contain an unfilled parameter placeholder"));
     }
     if prompt_kind == Some("password") {
-        return Err("终端正停在密码提示上，密码只能经密码通道由用户输入，不能让模型代发按键".into());
+        return Err(crate::tr!(
+            "终端正停在密码提示上，密码只能经密码通道由用户输入，不能让模型代发按键",
+            "the terminal is at a password prompt; passwords can only be entered by the user through the password channel, not sent by the model"
+        ));
     }
-    interact::parse_keys(keys).map_err(|e| format!("按键串无效：{e}"))
+    interact::parse_keys(keys).map_err(|e| crate::tr!("按键串无效：{e}", "invalid key sequence: {e}"))
 }
 
 const LLM_SYSTEM: &str = "你是终端自动化回放的「偏离裁判」。一份已保存的操作流程（skill）在回放时，\
@@ -837,27 +846,43 @@ pub fn suggest_updates(
     let mut out: Vec<SuggestedUpdate> = Vec::new();
     for d in deviations {
         let n = d.step_index + 1;
-        let resolved_ok = d.resolution.contains("继续") || d.resolution.contains("恢复");
+        // 中英两种「判定可继续 / 已恢复」的处理说明（见 Engine::ask / consult_llm）
+        let res_lc = d.resolution.to_lowercase();
+        let resolved_ok = d.resolution.contains("继续")
+            || d.resolution.contains("恢复")
+            || res_lc.contains("continu")
+            || res_lc.contains("recovered");
         let last = tail_lines(&redact(&d.saw_tail), 1);
         let step = skill.steps.get(d.step_index);
-        if d.expected == EXEC_TIMEOUT_EXPECTED {
+        if d.expected == EXEC_TIMEOUT_EXPECTED || d.expected == EXEC_TIMEOUT_EXPECTED_EN {
             out.push(SuggestedUpdate {
                 step_index: Some(d.step_index),
                 field: "timeoutMs",
-                message: format!("第 {n} 步的命令没有在限定时间内结束；若它本来就慢，可以调大 timeoutMs，或在命令里加超时 / 后台化。"),
+                message: crate::tr!(
+                    "第 {n} 步的命令没有在限定时间内结束；若它本来就慢，可以调大 timeoutMs，或在命令里加超时 / 后台化。",
+                    "Step {n}'s command didn't finish in time; if it's just slow, raise timeoutMs, or add a timeout / run it in the background."
+                ),
                 suggested_value: None,
             });
         } else {
             let field = "expectAfter";
-            let mut msg = format!(
+            let mut msg = crate::tr!(
                 "第 {n} 步的期望「{}」没有出现。",
+                "Step {n}'s expected \"{}\" didn't appear. ",
                 clip(&d.expected, 80)
             );
             let suggested = if resolved_ok && !last.is_empty() {
-                msg.push_str(&format!("这次偏离被判定可以继续；实际停在「{}」，若这是正常现象，可以把期望改成它里面稳定的那部分。", clip(&last, 80)));
+                msg.push_str(&crate::tr!(
+                    "这次偏离被判定可以继续；实际停在「{}」，若这是正常现象，可以把期望改成它里面稳定的那部分。",
+                    "This deviation was judged OK to continue; it actually stopped at \"{}\". If that's normal, change the expectation to its stable part.",
+                    clip(&last, 80)
+                ));
                 Some(clip(&last, 80))
             } else {
-                msg.push_str("若这是正常现象，可以放宽期望（换成实际会出现的稳定文本）或调大 timeoutMs。");
+                msg.push_str(&crate::tr!(
+                    "若这是正常现象，可以放宽期望（换成实际会出现的稳定文本）或调大 timeoutMs。",
+                    "If that's normal, loosen the expectation (use stable text that actually appears) or raise timeoutMs."
+                ));
                 None
             };
             out.push(SuggestedUpdate { step_index: Some(d.step_index), field, message: msg, suggested_value: suggested });
@@ -866,7 +891,10 @@ pub fn suggest_updates(
             out.push(SuggestedUpdate {
                 step_index: Some(d.step_index),
                 field: "onUnexpected",
-                message: format!("第 {n} 步偏离后直接停下了；若希望遇到这种情况能被处理，可改成 ask（问人）或 llm（交给模型判断）。"),
+                message: crate::tr!(
+                    "第 {n} 步偏离后直接停下了；若希望遇到这种情况能被处理，可改成 ask（问人）或 llm（交给模型判断）。",
+                    "Step {n} stopped right after deviating; to have this handled, change it to ask (ask you) or llm (let the model decide)."
+                ),
                 suggested_value: Some("ask".into()),
             });
         }
@@ -876,10 +904,15 @@ pub fn suggest_updates(
         out.push(SuggestedUpdate {
             step_index: None,
             field: "verify",
-            message: format!(
+            message: crate::tr!(
                 "验证「{}」没有满足。若流程实际已完成，可以改成屏幕上真正会出现的结果文本{}。",
+                "Verification \"{}\" wasn't met. If the flow actually finished, change it to the result text that really appears on screen{}.",
                 clip(&v.expected, 80),
-                if last.is_empty() { String::new() } else { format!("（当前停在「{}」）", clip(&last, 80)) }
+                if last.is_empty() {
+                    String::new()
+                } else {
+                    crate::tr!("（当前停在「{}」）", " (it's currently at \"{}\")", clip(&last, 80))
+                }
             ),
             suggested_value: None,
         });
@@ -889,43 +922,95 @@ pub fn suggest_updates(
 
 /// exec 没写期望、却没在限定时间内结束时的「期望」文案（也用来识别这种偏离）。
 const EXEC_TIMEOUT_EXPECTED: &str = "命令在限定时间内结束";
+const EXEC_TIMEOUT_EXPECTED_EN: &str = "The command finishes in time";
+
+fn exec_timeout_expected() -> &'static str {
+    if crate::i18n::is_en() {
+        EXEC_TIMEOUT_EXPECTED_EN
+    } else {
+        EXEC_TIMEOUT_EXPECTED
+    }
+}
 
 /// 给面板的收尾总结（一段人话）。
 pub fn report_text(r: &SkillRunReport) -> String {
     let done = r.steps.iter().filter(|s| matches!(s.result, StepResult::Ok | StepResult::Deviated { .. })).count();
     let head = match &r.outcome {
-        RunOutcome::Completed => format!("技能「{}」运行完成（{done}/{} 步）。", r.skill_name, r.steps.len()),
-        RunOutcome::VerifyFailed => format!("技能「{}」的步骤都做完了，但最终验证没有通过。", r.skill_name),
-        RunOutcome::DeviationStopped => format!("技能「{}」在偏离预期后停止（已完成 {done}/{} 步）。", r.skill_name, r.steps.len()),
-        RunOutcome::AbortedByUser => format!("技能「{}」已按你的选择中止（已完成 {done}/{} 步）。", r.skill_name, r.steps.len()),
-        RunOutcome::AbortedByLlm => format!("技能「{}」被模型判断无法继续而中止（已完成 {done}/{} 步）。", r.skill_name, r.steps.len()),
-        RunOutcome::Cancelled => format!("技能「{}」已取消（已完成 {done}/{} 步）。", r.skill_name, r.steps.len()),
-        RunOutcome::Declined => format!("技能「{}」有一步没有获批，已停止（已完成 {done}/{} 步）。", r.skill_name, r.steps.len()),
-        RunOutcome::TookOver => format!("技能「{}」运行中你接管了终端且一直没交还，已停止（已完成 {done}/{} 步）。", r.skill_name, r.steps.len()),
-        RunOutcome::Failed { reason } => format!("技能「{}」运行失败：{reason}", r.skill_name),
-        RunOutcome::Error { reason } => format!("技能「{}」运行出错：{reason}", r.skill_name),
-        RunOutcome::OutOfScope { reason } => format!("技能「{}」没有运行：{reason}", r.skill_name),
+        RunOutcome::Completed => crate::tr!(
+            "技能「{}」运行完成（{done}/{} 步）。",
+            "Skill \"{}\" finished ({done}/{} steps).",
+            r.skill_name,
+            r.steps.len()
+        ),
+        RunOutcome::VerifyFailed => crate::tr!(
+            "技能「{}」的步骤都做完了，但最终验证没有通过。",
+            "Skill \"{}\" ran every step, but the final verification failed.",
+            r.skill_name
+        ),
+        RunOutcome::DeviationStopped => crate::tr!(
+            "技能「{}」在偏离预期后停止（已完成 {done}/{} 步）。",
+            "Skill \"{}\" stopped after deviating from the expectation ({done}/{} steps done).",
+            r.skill_name,
+            r.steps.len()
+        ),
+        RunOutcome::AbortedByUser => crate::tr!(
+            "技能「{}」已按你的选择中止（已完成 {done}/{} 步）。",
+            "Skill \"{}\" was aborted as you chose ({done}/{} steps done).",
+            r.skill_name,
+            r.steps.len()
+        ),
+        RunOutcome::AbortedByLlm => crate::tr!(
+            "技能「{}」被模型判断无法继续而中止（已完成 {done}/{} 步）。",
+            "Skill \"{}\" was aborted because the model judged it couldn't go on ({done}/{} steps done).",
+            r.skill_name,
+            r.steps.len()
+        ),
+        RunOutcome::Cancelled => crate::tr!(
+            "技能「{}」已取消（已完成 {done}/{} 步）。",
+            "Skill \"{}\" was cancelled ({done}/{} steps done).",
+            r.skill_name,
+            r.steps.len()
+        ),
+        RunOutcome::Declined => crate::tr!(
+            "技能「{}」有一步没有获批，已停止（已完成 {done}/{} 步）。",
+            "Skill \"{}\" stopped because a step wasn't approved ({done}/{} steps done).",
+            r.skill_name,
+            r.steps.len()
+        ),
+        RunOutcome::TookOver => crate::tr!(
+            "技能「{}」运行中你接管了终端且一直没交还，已停止（已完成 {done}/{} 步）。",
+            "Skill \"{}\" stopped because you took over the terminal and didn't hand it back ({done}/{} steps done).",
+            r.skill_name,
+            r.steps.len()
+        ),
+        RunOutcome::Failed { reason } => crate::tr!("技能「{}」运行失败：{reason}", "Skill \"{}\" failed: {reason}", r.skill_name),
+        RunOutcome::Error { reason } => crate::tr!("技能「{}」运行出错：{reason}", "Skill \"{}\" ran into an error: {reason}", r.skill_name),
+        RunOutcome::OutOfScope { reason } => crate::tr!("技能「{}」没有运行：{reason}", "Skill \"{}\" didn't run: {reason}", r.skill_name),
     };
+    let en = crate::i18n::is_en();
     let mut s = head;
     if !r.deviations.is_empty() {
-        s.push_str(&format!("\n出现 {} 次偏离", r.deviations.len()));
+        s.push_str(&crate::tr!("\n出现 {} 次偏离", "\n{} deviations", r.deviations.len()));
         if r.llm_interventions > 0 {
-            s.push_str(&format!("（模型介入 {} 次）", r.llm_interventions));
+            s.push_str(&crate::tr!("（模型介入 {} 次）", " (model stepped in {} times)", r.llm_interventions));
         }
-        s.push('：');
+        s.push_str(if en { ":" } else { "：" });
         for d in &r.deviations {
-            s.push_str(&format!("\n- 第 {} 步：{}", d.step_index + 1, d.resolution));
+            s.push_str(&crate::tr!("\n- 第 {} 步：{}", "\n- Step {}: {}", d.step_index + 1, d.resolution));
         }
     }
     if !r.suggested_updates.is_empty() {
-        s.push_str("\n对技能的修改建议（不会自动应用，请在编辑器里自行决定）：");
+        s.push_str(&crate::tr!(
+            "\n对技能的修改建议（不会自动应用，请在编辑器里自行决定）：",
+            "\nSuggested changes to the skill (not applied automatically; decide in the editor):"
+        ));
         for u in &r.suggested_updates {
             s.push_str(&format!("\n- {}", u.message));
         }
     }
     match r.recorded {
-        Some(true) => s.push_str("\n已记入成功次数。"),
-        Some(false) => s.push_str("\n已记入失败次数。"),
+        Some(true) => s.push_str(&crate::tr!("\n已记入成功次数。", "\nCounted as a success.")),
+        Some(false) => s.push_str(&crate::tr!("\n已记入失败次数。", "\nCounted as a failure.")),
         None => {}
     }
     s
@@ -1007,7 +1092,7 @@ pub async fn execute<I: SkillIo>(
     eng.io.mark();
     // 适用主机范围（4.4）：在任何写之前拒绝，原因推给面板（步骤卡）并写进报告
     let (outcome, verify) = if let Some(reason) = &opts.scope_violation {
-        eng.note(0, format!("已拒绝运行：{reason}"));
+        eng.note(0, crate::tr!("已拒绝运行：{reason}", "Refused to run: {reason}"));
         (RunOutcome::OutOfScope { reason: reason.clone() }, None)
     } else {
         eng.drive(params).await
@@ -1022,7 +1107,7 @@ pub async fn execute<I: SkillIo>(
             total: eng.total,
             summary: summary.clone(),
             status: ProgressStatus::Skipped,
-            text: "未执行（前面的步骤已停止）".into(),
+            text: crate::tr!("未执行（前面的步骤已停止）", "Not run (an earlier step stopped)"),
         });
         eng.records.push(StepRecord {
             index: i,
@@ -1078,7 +1163,11 @@ impl<I: SkillIo> Engine<'_, I> {
                     total: self.total,
                     summary: summary.clone(),
                     status: ProgressStatus::Running,
-                    text: if attempts > 1 { format!("重试（第 {attempts} 次）……") } else { "执行中……".into() },
+                    text: if attempts > 1 {
+                        crate::tr!("重试（第 {attempts} 次）……", "Retrying (attempt {attempts})…")
+                    } else {
+                        crate::tr!("执行中……", "Running…")
+                    },
                 });
                 let end = self.run_step(i, &rendered).await;
                 let next = next_action(&end, rendered.on_unexpected, self.llm_used, self.opts.max_llm_interventions, attempts);
@@ -1090,7 +1179,9 @@ impl<I: SkillIo> Engine<'_, I> {
                             StepEnd::Declined(r) => (StepResult::Declined, r),
                             StepEnd::Deviated(d) => {
                                 let why = match &o {
-                                    RunOutcome::DeviationStopped => "按设定（onUnexpected: stop）停止".to_string(),
+                                    RunOutcome::DeviationStopped => {
+                                        crate::tr!("按设定（onUnexpected: stop）停止", "Stopped as configured (onUnexpected: stop)")
+                                    }
                                     RunOutcome::Failed { reason } => reason.clone(),
                                     _ => String::new(),
                                 };
@@ -1098,12 +1189,12 @@ impl<I: SkillIo> Engine<'_, I> {
                                     step_index: i,
                                     expected: d.expected.clone(),
                                     saw_tail: d.saw_tail.clone(),
-                                    resolution: "已停止".into(),
+                                    resolution: crate::tr!("已停止", "Stopped"),
                                 });
                                 (StepResult::Deviated { expected: d.expected, saw_tail: d.saw_tail }, why)
                             }
-                            StepEnd::Cancelled => (StepResult::Failed { reason: "已取消".into() }, "已取消".into()),
-                            StepEnd::TookOver => (StepResult::Failed { reason: "用户接管了终端".into() }, "用户接管了终端".into()),
+                            StepEnd::Cancelled => (StepResult::Failed { reason: crate::tr!("已取消", "Cancelled") }, crate::tr!("已取消", "Cancelled")),
+                            StepEnd::TookOver => (StepResult::Failed { reason: crate::tr!("用户接管了终端", "You took over the terminal") }, crate::tr!("用户接管了终端", "You took over the terminal")),
                             StepEnd::Ok => (StepResult::Ok, String::new()),
                         };
                         note = why;
@@ -1149,7 +1240,7 @@ impl<I: SkillIo> Engine<'_, I> {
                         }
                     }
                     // AskUser / AskLlm 只会从 Deviated 来；防御性处理
-                    (_, _) => break (StepResult::Failed { reason: "内部状态错误".into() }, Some(RunOutcome::Failed { reason: "内部状态错误".into() })),
+                    (_, _) => break (StepResult::Failed { reason: crate::tr!("内部状态错误", "Internal state error") }, Some(RunOutcome::Failed { reason: crate::tr!("内部状态错误", "Internal state error") })),
                 }
             };
             let status = match &result {
@@ -1160,8 +1251,8 @@ impl<I: SkillIo> Engine<'_, I> {
                 StepResult::Declined => ProgressStatus::Declined,
             };
             let text = match (&result, note.is_empty()) {
-                (StepResult::Ok, true) => "完成".to_string(),
-                (StepResult::Ok, false) => format!("完成（{note}）"),
+                (StepResult::Ok, true) => crate::tr!("完成", "Done"),
+                (StepResult::Ok, false) => crate::tr!("完成（{note}）", "Done ({note})"),
                 (_, false) => note.clone(),
                 (r, true) => r.code().to_string(),
             };
@@ -1197,7 +1288,8 @@ impl<I: SkillIo> Engine<'_, I> {
     /// 检查 `expect`。`screen_first`：先看整屏（`screen_check` 与 `verify` 用）；
     /// 否则先等「自上次写入起的新输出」，超时后再看屏幕（全屏程序看整屏，否则只看底部几行）。
     async fn check(&mut self, expect: &str, timeout_ms: u64, screen_first: bool) -> Result<Check, String> {
-        let pat = Pattern::parse(expect).map_err(|e| format!("期望「{}」无效：{e}", clip(expect, 60)))?;
+        let pat = Pattern::parse(expect)
+            .map_err(|e| crate::tr!("期望「{}」无效：{e}", "Invalid expectation \"{}\": {e}", clip(expect, 60)))?;
         if screen_first {
             let s = self.io.screen().await;
             if screen_hits(&pat, &s, true) {
@@ -1247,7 +1339,7 @@ impl<I: SkillIo> Engine<'_, I> {
         }
         let scope = self.io.gate_scope(&w.what, &w.reasons).await;
         if scope == ScopeVerdict::Refused {
-            return Gate::Declined("超出作用范围且没有获批".into());
+            return Gate::Declined(crate::tr!("超出作用范围且没有获批", "Outside the allowed scope and not approved"));
         }
         // 越界弹窗已经把危险原因并在同一张卡里，批准即同时覆盖两件事，不再弹第二次
         let covered = scope == ScopeVerdict::Crossed && w.dangerous;
@@ -1256,11 +1348,17 @@ impl<I: SkillIo> Engine<'_, I> {
             let reasons = if !w.reasons.is_empty() {
                 w.reasons.clone()
             } else if self.opts.approval_mode {
-                vec!["技能回放：审批模式下每个写步骤都需要确认".to_string()]
+                vec![crate::tr!(
+                    "技能回放：审批模式下每个写步骤都需要确认",
+                    "Skill playback: in approval mode every write step needs confirmation"
+                )]
             } else if !self.opts.trust_note.is_empty() {
-                vec![format!("技能回放：{}", self.opts.trust_note)]
+                vec![crate::tr!("技能回放：{}", "Skill playback: {}", self.opts.trust_note)]
             } else {
-                vec!["技能回放：这个技能还没有获得免确认的信任，每个写步骤都需要确认".to_string()]
+                vec![crate::tr!(
+                    "技能回放：这个技能还没有获得免确认的信任，每个写步骤都需要确认",
+                    "Skill playback: this skill isn't trusted to skip confirmation yet, so every write step needs confirmation"
+                )]
             };
             let ask = ApprovalAsk {
                 kind: if w.dangerous { "danger" } else { "skill" },
@@ -1268,7 +1366,7 @@ impl<I: SkillIo> Engine<'_, I> {
                 reasons,
             };
             if !self.io.ask_approval(&ask).await {
-                return Gate::Declined("用户没有批准（拒绝或超时）".into());
+                return Gate::Declined(crate::tr!("用户没有批准（拒绝或超时）", "Not approved (declined or timed out)"));
             }
         }
         // 审批都过了、真要写之前最后看一眼：别往用户正在打的字里插
@@ -1276,7 +1374,7 @@ impl<I: SkillIo> Engine<'_, I> {
             PauseWait::Ready => Gate::Go,
             PauseWait::Cancelled => Gate::Cancelled,
             PauseWait::TookOver => Gate::TookOver,
-            PauseWait::Refused => Gate::Declined(super::control::HOSTED_BUSY.into()),
+            PauseWait::Refused => Gate::Declined(super::control::hosted_busy()),
         }
     }
 
@@ -1308,7 +1406,9 @@ impl<I: SkillIo> Engine<'_, I> {
                 }
                 let sent = match respond {
                     Respond::Keys { keys } => self.do_keys(keys, false).await,
-                    Respond::Secret { param } => self.do_secret("技能步骤需要密码", param.as_deref()).await,
+                    Respond::Secret { param } => {
+                        self.do_secret(&crate::tr!("技能步骤需要密码", "A skill step needs a password"), param.as_deref()).await
+                    }
                 };
                 match sent {
                     Ok(()) => self.after(step).await,
@@ -1335,17 +1435,18 @@ impl<I: SkillIo> Engine<'_, I> {
 
     async fn do_exec(&mut self, step: &RenderedStep, command: &str) -> StepEnd {
         if let Some(name) = residual_placeholder(command) {
-            return StepEnd::Failed(format!(
-                "命令里还有未代入的参数「{{{{{name}}}}}」（secret 参数从不代入命令；密码请用 secret 步骤）"
+            return StepEnd::Failed(crate::tr!(
+                "命令里还有未代入的参数「{{{{{name}}}}}」（secret 参数从不代入命令；密码请用 secret 步骤）",
+                "The command still has an unfilled parameter \"{{{{{name}}}}}\" (secret parameters are never filled into commands; use a secret step for passwords)"
             ));
         }
         if let Some(why) = reject_command(command) {
-            return StepEnd::Failed(format!("命令被拒绝：{why}"));
+            return StepEnd::Failed(crate::tr!("命令被拒绝：{why}", "Command rejected: {why}"));
         }
         // 渲染之后才评估：模板安全、代入后危险的命令照样拦
         let risk = danger::assess(command);
         let mut req = WriteReq {
-            what: format!("执行：{}", command.trim()),
+            what: crate::tr!("执行：{}", "Run: {}", command.trim()),
             reasons: if risk.dangerous { risk.reasons } else { Vec::new() },
             dangerous: risk.dangerous,
             always_ask: false,
@@ -1375,7 +1476,7 @@ impl<I: SkillIo> Engine<'_, I> {
                 // 命令没在限定时间内结束才算偏离；停在交互提示上（AwaitingInput）不是——下一步可能正是去应答它
                 if rep.end == ExecEnd::Timeout {
                     StepEnd::Deviated(Dev {
-                        expected: EXEC_TIMEOUT_EXPECTED.into(),
+                        expected: exec_timeout_expected().into(),
                         saw_tail: tail_chars(rep.output.trim(), SAW_TAIL_CHARS),
                         recheck: None,
                         pre_write: false,
@@ -1387,7 +1488,9 @@ impl<I: SkillIo> Engine<'_, I> {
             Some(exp) => {
                 let pat = match Pattern::parse(exp) {
                     Ok(p) => p,
-                    Err(e) => return StepEnd::Failed(format!("期望「{}」无效：{e}", clip(exp, 60))),
+                    Err(e) => {
+                        return StepEnd::Failed(crate::tr!("期望「{}」无效：{e}", "Invalid expectation \"{}\": {e}", clip(exp, 60)))
+                    }
                 };
                 // 先看这条命令自己的输出（不含命令回显）
                 if pat.is_match(&rep.output) {
@@ -1418,12 +1521,13 @@ impl<I: SkillIo> Engine<'_, I> {
     /// `from_llm`：来自模型——一律要人批准。
     async fn do_keys(&mut self, keys: &str, from_llm: bool) -> Result<(), StepEnd> {
         if let Some(name) = residual_placeholder(keys) {
-            return Err(StepEnd::Failed(format!(
-                "按键里还有未代入的参数「{{{{{name}}}}}」（secret 参数从不代入；密码请用 secret 步骤）"
+            return Err(StepEnd::Failed(crate::tr!(
+                "按键里还有未代入的参数「{{{{{name}}}}}」（secret 参数从不代入；密码请用 secret 步骤）",
+                "The keys still have an unfilled parameter \"{{{{{name}}}}}\" (secret parameters are never filled in; use a secret step for passwords)"
             )));
         }
         let bytes = interact::parse_keys(keys)
-            .map_err(|e| StepEnd::Failed(format!("按键串无效：{e}")))?;
+            .map_err(|e| StepEnd::Failed(crate::tr!("按键串无效：{e}", "Invalid key sequence: {e}")))?;
         self.write_keys(&bytes, from_llm).await
     }
 
@@ -1433,7 +1537,7 @@ impl<I: SkillIo> Engine<'_, I> {
         let risk = keys_risk(bytes);
         let dangerous = risk.as_ref().is_some_and(|r| r.len() > 1);
         let mut req = WriteReq {
-            what: format!("发送按键：{shown}"),
+            what: crate::tr!("发送按键：{shown}", "Send keys: {shown}"),
             reasons: risk.clone().unwrap_or_default(),
             dangerous,
             // 没有回车的按键步骤不用问（与 Agentic 循环一致）；模型给的按键一律问
@@ -1457,13 +1561,13 @@ impl<I: SkillIo> Engine<'_, I> {
                 return Err(StepEnd::Cancelled);
             }
             if self.io.gate_scope(&req.what, &[]).await == ScopeVerdict::Refused {
-                return Err(StepEnd::Declined("超出作用范围且没有获批".into()));
+                return Err(StepEnd::Declined(crate::tr!("超出作用范围且没有获批", "Outside the allowed scope and not approved")));
             }
             match self.io.gate_drive().await {
                 PauseWait::Ready => {}
                 PauseWait::Cancelled => return Err(StepEnd::Cancelled),
                 PauseWait::TookOver => return Err(StepEnd::TookOver),
-                PauseWait::Refused => return Err(StepEnd::Declined(super::control::HOSTED_BUSY.into())),
+                PauseWait::Refused => return Err(StepEnd::Declined(super::control::hosted_busy())),
             }
         } else {
             match self.gate_write(&req).await {
@@ -1479,13 +1583,16 @@ impl<I: SkillIo> Engine<'_, I> {
         if self.io.is_cancelled() {
             return Err(StepEnd::Cancelled);
         }
-        if self.io.gate_scope(&format!("请你输入密码：{}", clip(reason, 80)), &[]).await == ScopeVerdict::Refused {
-            return Err(StepEnd::Declined("超出作用范围且没有获批".into()));
+        let what = crate::tr!("请你输入密码：{}", "Enter a password: {}", clip(reason, 80));
+        if self.io.gate_scope(&what, &[]).await == ScopeVerdict::Refused {
+            return Err(StepEnd::Declined(crate::tr!("超出作用范围且没有获批", "Outside the allowed scope and not approved")));
         }
         match self.io.ask_secret(reason, param).await {
             SecretStatus::Provided => Ok(()),
-            SecretStatus::Declined => Err(StepEnd::Declined("用户选择跳过，没有输入密码".into())),
-            SecretStatus::TimedOut => Err(StepEnd::Declined("等待超时，用户没有输入密码".into())),
+            SecretStatus::Declined => Err(StepEnd::Declined(crate::tr!("用户选择跳过，没有输入密码", "You skipped it; no password was entered"))),
+            SecretStatus::TimedOut => {
+                Err(StepEnd::Declined(crate::tr!("等待超时，用户没有输入密码", "Timed out waiting; no password was entered")))
+            }
             SecretStatus::Cancelled => Err(StepEnd::Cancelled),
             SecretStatus::WriteFailed(why) => Err(StepEnd::IoError(why)),
         }
@@ -1504,9 +1611,10 @@ impl<I: SkillIo> Engine<'_, I> {
             note,
         };
         match self.io.ask_user(&q).await {
-            UserChoice::Continue => Resolution::Advance("用户选择继续".into()),
-            UserChoice::Retry => Resolution::Retry("用户选择重试该步骤".into()),
-            UserChoice::Abort => Resolution::Stop(RunOutcome::AbortedByUser, "用户选择中止".into()),
+            // 英文「可继续」类说明须含 continu / recovered：suggest_updates 据此判断
+            UserChoice::Continue => Resolution::Advance(crate::tr!("用户选择继续", "You chose to continue")),
+            UserChoice::Retry => Resolution::Retry(crate::tr!("用户选择重试该步骤", "You chose to retry the step")),
+            UserChoice::Abort => Resolution::Stop(RunOutcome::AbortedByUser, crate::tr!("用户选择中止", "You chose to abort")),
         }
     }
 
@@ -1528,59 +1636,98 @@ impl<I: SkillIo> Engine<'_, I> {
         let raw = match self.io.llm_decide(&system, &user).await {
             Ok(t) => t,
             Err(e) => {
-                self.note(idx, format!("模型没能给出裁决（{}），改问你。", clip(&e, 120)));
-                return self.ask(idx, &summary, dev, Some(format!("模型调用失败：{}", clip(&e, 120)))).await;
+                self.note(idx, crate::tr!("模型没能给出裁决（{}），改问你。", "The model couldn't give a verdict ({}); asking you instead.", clip(&e, 120)));
+                return self
+                    .ask(idx, &summary, dev, Some(crate::tr!("模型调用失败：{}", "Model call failed: {}", clip(&e, 120))))
+                    .await;
             }
         };
         let decision = match parse_decision(&raw) {
             Ok(d) => d,
             Err(e) => {
-                self.note(idx, format!("模型的回答不合契约（{e}），改问你。"));
-                return self.ask(idx, &summary, dev, Some(format!("模型的回答无法解析：{e}"))).await;
+                self.note(idx, crate::tr!("模型的回答不合契约（{e}），改问你。", "The model's answer wasn't in the expected format ({e}); asking you instead."));
+                return self
+                    .ask(idx, &summary, dev, Some(crate::tr!("模型的回答无法解析：{e}", "Couldn't parse the model's answer: {e}")))
+                    .await;
             }
         };
         let why = clip(decision.reason(), 160);
         match decision {
-            LlmDecision::Continue { .. } => Resolution::Advance(format!("模型判断可继续：{why}")),
-            LlmDecision::Retry { .. } => Resolution::Retry(format!("模型建议重试该步骤：{why}")),
-            LlmDecision::Abort { .. } => Resolution::Stop(RunOutcome::AbortedByLlm, format!("模型判断应中止：{why}")),
+            LlmDecision::Continue { .. } => {
+                Resolution::Advance(crate::tr!("模型判断可继续：{why}", "The model judged it can continue: {why}"))
+            }
+            LlmDecision::Retry { .. } => {
+                Resolution::Retry(crate::tr!("模型建议重试该步骤：{why}", "The model suggested retrying the step: {why}"))
+            }
+            LlmDecision::Abort { .. } => Resolution::Stop(
+                RunOutcome::AbortedByLlm,
+                crate::tr!("模型判断应中止：{why}", "The model judged it should abort: {why}"),
+            ),
             LlmDecision::AskUser { .. } => {
-                self.ask(idx, &summary, dev, Some(format!("模型拿不准：{why}"))).await
+                self.ask(idx, &summary, dev, Some(crate::tr!("模型拿不准：{why}", "The model isn't sure: {why}"))).await
             }
             LlmDecision::SendKeys { keys, .. } => {
                 let bytes = match validate_llm_keys(&keys, screen.prompt_kind.as_deref()) {
                     Ok(b) => b,
                     Err(e) => {
-                        self.note(idx, format!("模型建议的按键没有执行：{e}"));
-                        return self.ask(idx, &summary, dev, Some(format!("模型建议的按键被拒绝：{e}"))).await;
+                        self.note(idx, crate::tr!("模型建议的按键没有执行：{e}", "The keys the model suggested weren't sent: {e}"));
+                        return self
+                            .ask(idx, &summary, dev, Some(crate::tr!("模型建议的按键被拒绝：{e}", "The keys the model suggested were rejected: {e}")))
+                            .await;
                     }
                 };
                 let shown = interact::display_keys(&bytes);
-                self.note(idx, format!("模型建议先发送按键 {shown}：{why}"));
+                self.note(idx, crate::tr!("模型建议先发送按键 {shown}：{why}", "The model suggested sending keys {shown} first: {why}"));
                 match self.write_keys(&bytes, true).await {
                     Ok(()) => {}
                     Err(StepEnd::Declined(_)) => {
                         return self
-                            .ask(idx, &summary, dev, Some(format!("模型建议的按键 {shown} 你没有批准，未发送")))
+                            .ask(
+                                idx,
+                                &summary,
+                                dev,
+                                Some(crate::tr!(
+                                    "模型建议的按键 {shown} 你没有批准，未发送",
+                                    "You didn't approve the suggested keys {shown}, so they weren't sent"
+                                )),
+                            )
                             .await;
                     }
-                    Err(StepEnd::Cancelled) => return Resolution::Stop(RunOutcome::Cancelled, "已取消".into()),
-                    Err(StepEnd::TookOver) => return Resolution::Stop(RunOutcome::TookOver, "用户接管了终端".into()),
+                    Err(StepEnd::Cancelled) => return Resolution::Stop(RunOutcome::Cancelled, crate::tr!("已取消", "Cancelled")),
+                    Err(StepEnd::TookOver) => return Resolution::Stop(RunOutcome::TookOver, crate::tr!("用户接管了终端", "You took over the terminal")),
                     Err(StepEnd::IoError(e)) => return Resolution::Stop(RunOutcome::Error { reason: e.clone() }, e),
                     Err(StepEnd::Failed(e)) => return Resolution::Stop(RunOutcome::Failed { reason: e.clone() }, e),
                     Err(_) => {}
                 }
                 if dev.pre_write {
                     // 写之前的偏离：按键补完后整步重来（等 expect → 应答）
-                    return Resolution::Retry(format!("已按模型建议补发按键 {shown}，重新执行该步骤"));
+                    return Resolution::Retry(crate::tr!(
+                        "已按模型建议补发按键 {shown}，重新执行该步骤",
+                        "Sent keys {shown} as the model suggested; retrying the step"
+                    ));
                 }
                 match dev.recheck.as_deref() {
-                    None => Resolution::Advance(format!("已按模型建议补发按键 {shown}（无可复查的期望），继续")),
+                    None => Resolution::Advance(crate::tr!(
+                        "已按模型建议补发按键 {shown}（无可复查的期望），继续",
+                        "Sent keys {shown} as the model suggested (no expectation to recheck); continuing"
+                    )),
                     Some(p) => match self.check(p, DEFAULT_TIMEOUT_MS.min(self.opts.default_timeout_ms), false).await {
-                        Ok(Check::Hit) => Resolution::Advance(format!("已按模型建议补发按键 {shown}，期望出现，已恢复")),
-                        Ok(Check::Cancelled) => Resolution::Stop(RunOutcome::Cancelled, "已取消".into()),
+                        Ok(Check::Hit) => Resolution::Advance(crate::tr!(
+                            "已按模型建议补发按键 {shown}，期望出现，已恢复",
+                            "Sent keys {shown} as the model suggested; the expectation appeared, recovered"
+                        )),
+                        Ok(Check::Cancelled) => Resolution::Stop(RunOutcome::Cancelled, crate::tr!("已取消", "Cancelled")),
                         Ok(Check::Miss(_)) | Err(_) => {
-                            self.ask(idx, &summary, dev, Some(format!("补发按键 {shown} 之后期望仍没出现"))).await
+                            self.ask(
+                                idx,
+                                &summary,
+                                dev,
+                                Some(crate::tr!(
+                                    "补发按键 {shown} 之后期望仍没出现",
+                                    "The expectation still didn't appear after sending keys {shown}"
+                                )),
+                            )
+                            .await
                         }
                     },
                 }
@@ -1616,7 +1763,7 @@ impl TauriIo<'_> {
     }
 
     fn tl_note(&self) -> String {
-        format!("技能「{}」", clip(&self.skill_name, 40))
+        crate::tr!("技能「{}」", "Skill \"{}\"", clip(&self.skill_name, 40))
     }
 }
 
@@ -1745,7 +1892,7 @@ impl SkillIo for TauriIo<'_> {
         timeline::finish(self.app, &self.state.agent, &self.target, tl, &tail, Some(&guess), false);
         emit_interact(
             self.app, &self.run, "keys", self.step, &self.target, &self.label, Some(shown),
-            Some("已发送".into()), Some(tail.clone()), Some(&guess),
+            Some(crate::tr!("已发送", "Sent")), Some(tail.clone()), Some(&guess),
         );
         Ok(tail)
     }
@@ -1796,7 +1943,7 @@ impl SkillIo for TauriIo<'_> {
     async fn ask_secret(&mut self, reason: &str, _param: Option<&str>) -> SecretStatus {
         let reason = secret::clean_reason(Some(reason));
         if !session_alive(self.state, &self.target) {
-            return SecretStatus::WriteFailed("会话不存在或已关闭".into());
+            return SecretStatus::WriteFailed(crate::tr!("会话不存在或已关闭", "Session not found or already closed"));
         }
         self.state.agent.set_enabled(&self.target, true);
         // 卡片上提示终端是否真的在要密码：不是时输入可能被回显
@@ -1805,7 +1952,7 @@ impl SkillIo for TauriIo<'_> {
         let rx = self.runtime.register_secret(&request_id);
         emit_interact(
             self.app, &self.run, "secret", self.step, &self.target, &self.label, Some(&reason),
-            Some("等待用户输入密码……".into()), None, Some(&guess),
+            Some(crate::tr!("等待用户输入密码……", "Waiting for you to enter the password…")), None, Some(&guess),
         );
         let _ = self.app.emit(
             &format!("nx://agent/secret/{}", self.run),
@@ -1827,8 +1974,19 @@ impl SkillIo for TauriIo<'_> {
         match gate_drive(self.app, self.runtime, &self.run, &self.target, &self.cancel).await {
             PauseWait::Ready => {}
             PauseWait::Cancelled => return SecretStatus::Cancelled,
-            PauseWait::TookOver => return SecretStatus::WriteFailed("用户接管了终端，密码没有写入".into()),
-            PauseWait::Refused => return SecretStatus::WriteFailed(format!("{}，密码没有写入", super::control::HOSTED_BUSY)),
+            PauseWait::TookOver => {
+                return SecretStatus::WriteFailed(crate::tr!(
+                    "用户接管了终端，密码没有写入",
+                    "You took over the terminal; the password wasn't written"
+                ))
+            }
+            PauseWait::Refused => {
+                return SecretStatus::WriteFailed(crate::tr!(
+                    "{}，密码没有写入",
+                    "{}; the password wasn't written",
+                    super::control::hosted_busy()
+                ))
+            }
         }
 
         // 写入前记起点：之后的才是这个密码引出的输出
@@ -1872,16 +2030,26 @@ impl SkillIo for TauriIo<'_> {
     async fn ask_user(&mut self, q: &UserQuestion) -> UserChoice {
         // 面板只有「批准 / 拒绝」两个按钮：用两次连续的二选一表达三种选择
         //（继续？否 → 重试？否 → 中止；超时 / 窗口没了都按拒绝，即最终中止）。
-        let mut reasons = vec![format!("期望出现：{}", clip(&q.expected, 120))];
+        let mut reasons = vec![crate::tr!("期望出现：{}", "Expected: {}", clip(&q.expected, 120))];
         if let Some(n) = &q.note {
             reasons.push(n.clone());
         }
         if !q.saw_tail.trim().is_empty() {
-            reasons.push(format!("当前屏幕尾部：{}", tail_chars(q.saw_tail.trim(), 300).replace('\n', " ⏎ ")));
+            reasons.push(crate::tr!(
+                "当前屏幕尾部：{}",
+                "End of the screen now: {}",
+                tail_chars(q.saw_tail.trim(), 300).replace('\n', " ⏎ ")
+            ));
         }
         let first = ApprovalAsk {
             kind: "skill",
-            command: format!("第 {}/{} 步偏离预期（{}）。批准 = 忽略并继续下一步；拒绝 = 再选重试 / 中止", q.step_no, q.total, q.summary),
+            command: crate::tr!(
+                "第 {}/{} 步偏离预期（{}）。批准 = 忽略并继续下一步；拒绝 = 再选重试 / 中止",
+                "Step {}/{} deviated from the expectation ({}). Approve = ignore and go on to the next step; Reject = then choose retry / abort",
+                q.step_no,
+                q.total,
+                q.summary
+            ),
             reasons: reasons.clone(),
         };
         if self.ask_approval(&first).await {
@@ -1889,7 +2057,13 @@ impl SkillIo for TauriIo<'_> {
         }
         let second = ApprovalAsk {
             kind: "skill",
-            command: format!("重新执行第 {}/{} 步（{}）？批准 = 重试；拒绝 = 中止技能运行", q.step_no, q.total, q.summary),
+            command: crate::tr!(
+                "重新执行第 {}/{} 步（{}）？批准 = 重试；拒绝 = 中止技能运行",
+                "Run step {}/{} ({}) again? Approve = retry; Reject = abort the skill run",
+                q.step_no,
+                q.total,
+                q.summary
+            ),
             reasons,
         };
         if self.ask_approval(&second).await {
@@ -1973,13 +2147,16 @@ pub async fn run_skill(
     let mut opts = opts;
     let resolved = resolve_params(&skill.params, params).map_err(|e| e.join("\n"))?;
     if skill.steps.is_empty() {
-        return Err("技能没有步骤".into());
+        return Err(crate::tr!("技能没有步骤", "The skill has no steps"));
     }
     if target_session.trim().is_empty() || !session_alive(ctx.state, target_session) {
-        return Err("目标会话不存在或已关闭".into());
+        return Err(crate::tr!("目标会话不存在或已关闭", "Target session not found or already closed"));
     }
     let Some(cancel) = ctx.runtime.begin(target_session) else {
-        return Err("该会话已有一轮在运行，请先等它结束或点停止".into());
+        return Err(crate::tr!(
+            "该会话已有一轮在运行，请先等它结束或点停止",
+            "This session already has a run in progress; wait for it to finish or click Stop"
+        ));
     };
     let _inflight = InflightGuard { rt: ctx.runtime, id: target_session.to_string() };
     // 这一轮开始驾驶目标会话；任何出口 drop 时都会还给用户
@@ -1987,7 +2164,7 @@ pub async fn run_skill(
     if let Some(st) = ctx.runtime.control.acquire(target_session, target_session) {
         emit_control(ctx.app, target_session, &[target_session.to_string()], st);
     }
-    ctx.runtime.runlog.start(target_session, &format!("运行技能「{}」", skill.name));
+    ctx.runtime.runlog.start(target_session, &crate::tr!("运行技能「{}」", "Run skill \"{}\"", skill.name));
     let _runlog = RunLogGuard { state: ctx.state, run: target_session.to_string(), conversation: String::new() };
 
     // 信任与范围（4.4）：都由后端按 skill 自己的状态定，调用方给的只能更严、不能更宽
@@ -2010,7 +2187,7 @@ pub async fn run_skill(
         cfg: ctx.cfg,
         run: target_session.to_string(),
         target: target_session.to_string(),
-        label: if target_label.trim().is_empty() { "当前会话".into() } else { target_label.trim().to_string() },
+        label: if target_label.trim().is_empty() { crate::tr!("当前会话", "Current session") } else { target_label.trim().to_string() },
         targets: vec![AgentTarget { id: target_session.to_string(), label: target_label.trim().to_string(), cwd: None }],
         cancel,
         mark: 0,
@@ -2064,10 +2241,10 @@ pub async fn run_skill_in_round(
     let mut opts = opts;
     let resolved = resolve_params(&skill.params, params).map_err(|e| e.join("\n"))?;
     if skill.steps.is_empty() {
-        return Err("技能没有步骤".into());
+        return Err(crate::tr!("技能没有步骤", "The skill has no steps"));
     }
     if target_session.trim().is_empty() || !session_alive(ctx.state, target_session) {
-        return Err("目标会话不存在或已关闭".into());
+        return Err(crate::tr!("目标会话不存在或已关闭", "Target session not found or already closed"));
     }
     // 信任与范围（4.4），与 `run_skill` 一致：由后端按 skill 自己的状态定，模型 / 调用方只能更严
     let trust = trust_info(skill);
@@ -2088,7 +2265,7 @@ pub async fn run_skill_in_round(
         cfg: ctx.cfg,
         run: run_session.to_string(),
         target: target_session.to_string(),
-        label: if target_label.trim().is_empty() { "当前会话".into() } else { target_label.trim().to_string() },
+        label: if target_label.trim().is_empty() { crate::tr!("当前会话", "Current session") } else { target_label.trim().to_string() },
         targets: std::mem::take(targets),
         cancel,
         mark: 0,

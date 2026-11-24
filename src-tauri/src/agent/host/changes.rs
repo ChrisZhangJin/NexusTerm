@@ -111,21 +111,31 @@ fn push(v: &mut Vec<String>, s: String) {
 /// 「删除」最多列多少条（`rm` 一大串路径时只列前面的）
 pub const MAX_REMOVALS: usize = 30;
 const MORE_REMOVALS: &str = "……还有更多删除，未全部列出";
+const MORE_REMOVALS_EN: &str = "…more removals not listed";
+
+/// 「还有更多」那一行（两种语言都认：合并的摘要可能是切换语言前写的）
+fn is_more(s: &str) -> bool {
+    s == MORE_REMOVALS || s == MORE_REMOVALS_EN
+}
+
+fn en() -> bool {
+    crate::i18n::is_en()
+}
 
 fn push_removal(v: &mut Vec<String>, s: String) {
-    if s == MORE_REMOVALS || v.contains(&s) {
-        if s == MORE_REMOVALS && !v.iter().any(|x| x == MORE_REMOVALS) {
+    if is_more(&s) || v.contains(&s) {
+        if is_more(&s) && !v.iter().any(|x| is_more(x)) {
             v.push(s);
         }
         return;
     }
-    let n = v.iter().filter(|x| *x != MORE_REMOVALS).count();
+    let n = v.iter().filter(|x| !is_more(x)).count();
     if n < MAX_REMOVALS {
         // 「还有更多」始终在最后
-        let at = v.iter().position(|x| x == MORE_REMOVALS).unwrap_or(v.len());
+        let at = v.iter().position(|x| is_more(x)).unwrap_or(v.len());
         v.insert(at, s);
-    } else if !v.iter().any(|x| x == MORE_REMOVALS) {
-        v.push(MORE_REMOVALS.to_string());
+    } else if !v.iter().any(|x| is_more(x)) {
+        v.push(if en() { MORE_REMOVALS_EN } else { MORE_REMOVALS }.to_string());
     }
 }
 
@@ -150,11 +160,12 @@ pub fn summarize(records: &[DecisionRecord]) -> ChangeSummary {
         match r.chosen.kind.as_str() {
             "exec" => {
                 s.commands += 1;
-                let cmd = text.strip_prefix("（旁路）").unwrap_or(text);
+                // 决策记录按当时的界面语言写：两种前缀都认
+                let cmd = text.strip_prefix("（旁路）").or_else(|| text.strip_prefix("(side channel) ")).unwrap_or(text);
                 analyze_script(cmd, &mut s);
             }
             "open" => {
-                if let Some((_, cmd)) = text.split_once("并执行：") {
+                if let Some((_, cmd)) = text.split_once("并执行：").or_else(|| text.split_once(" and run: ")) {
                     s.commands += 1;
                     analyze_script(cmd, &mut s);
                 }
@@ -171,7 +182,17 @@ pub fn summarize(records: &[DecisionRecord]) -> ChangeSummary {
 }
 
 /// `FileCall::summary()` 的写法：`写入 <path>（N 字节）` / `修改 <path>` / `修改 <path>（全部替换）`。
+/// 英文界面下是 `Write <path> (N bytes)` / `Edit <path>` / `Edit <path> (replace all)`。
 fn file_write_path(text: &str) -> Option<String> {
+    if let Some(rest) = text.strip_prefix("Write ").or_else(|| text.strip_prefix("Edit ")) {
+        let path = rest.strip_suffix(" (replace all)").unwrap_or(rest);
+        let path = match path.rfind(" (") {
+            Some(i) if path.ends_with(" bytes)") => &path[..i],
+            _ => path,
+        };
+        let path = path.trim();
+        return (!path.is_empty()).then(|| path.to_string());
+    }
     let rest = text.strip_prefix("写入 ").or_else(|| text.strip_prefix("修改 "))?;
     let path = match rest.rfind('（') {
         Some(i) if rest.ends_with('）') => &rest[..i],
@@ -652,10 +673,16 @@ fn positionals<'a>(args: &'a [String], takes_value: &[&str]) -> Vec<&'a str> {
 }
 
 fn pkg_line(s: &mut ChangeSummary, install: bool, tool: &str, names: &[&str]) {
-    let verb = if install { "安装" } else { "卸载" };
+    let verb = match (install, en()) {
+        (true, false) => "安装",
+        (false, false) => "卸载",
+        (true, true) => "Install",
+        (false, true) => "Uninstall",
+    };
     for n in names {
         // 安装串里可能带凭据（`git+https://user:TOKEN@host/…`）
-        push(&mut s.packages, format!("{verb} {}（{tool}）", super::super::redact::redact(n)));
+        let n = super::super::redact::redact(n);
+        push(&mut s.packages, crate::tr!("{verb} {n}（{tool}）", "{verb} {n} ({tool})"));
     }
 }
 
@@ -715,12 +742,14 @@ fn analyze_cmd(prog: &str, args: &[String], s: &mut ChangeSummary, depth: u8) {
             match sub {
                 Some("install" | "i" | "add" | "ci") => {
                     if names.is_empty() {
-                        push(&mut s.packages, format!("安装 package.json 里的依赖（{prog}）"));
+                        push(&mut s.packages, crate::tr!("安装 package.json 里的依赖（{prog}）", "Install dependencies from package.json ({prog})"));
                     } else {
                         pkg_line(s, true, prog, &names);
                     }
                 }
-                None if prog == "yarn" && args.is_empty() => push(&mut s.packages, "安装 package.json 里的依赖（yarn）".into()),
+                None if prog == "yarn" && args.is_empty() => {
+                    push(&mut s.packages, crate::tr!("安装 package.json 里的依赖（yarn）", "Install dependencies from package.json (yarn)"))
+                }
                 Some("uninstall" | "remove" | "rm" | "un" | "r") => pkg_line(s, false, prog, &names),
                 _ => {}
             }
@@ -742,7 +771,12 @@ fn analyze_cmd(prog: &str, args: &[String], s: &mut ChangeSummary, depth: u8) {
                     push(&mut s.services, format!("{verb} {u}"));
                 }
                 if matches!(*sub, "enable" | "disable") && args.iter().any(|a| a == "--now") {
-                    let now = if *sub == "enable" { "启动" } else { "停止" };
+                    let now = match (*sub == "enable", en()) {
+                        (true, false) => "启动",
+                        (false, false) => "停止",
+                        (true, true) => "Start",
+                        (false, true) => "Stop",
+                    };
                     for u in units {
                         push(&mut s.services, format!("{now} {u}"));
                     }
@@ -814,7 +848,11 @@ fn analyze_cmd(prog: &str, args: &[String], s: &mut ChangeSummary, depth: u8) {
                     a == "--recursive" || (a.starts_with('-') && !a.starts_with("--") && a.contains(['r', 'R']))
                 });
             for t in positionals(args, &[]) {
-                let line = if recursive { format!("删除 {t}（递归）") } else { format!("删除 {t}") };
+                let line = if recursive {
+                    crate::tr!("删除 {t}（递归）", "Delete {t} (recursive)")
+                } else {
+                    crate::tr!("删除 {t}", "Delete {t}")
+                };
                 push_removal(&mut s.removals, line);
             }
         }
@@ -822,7 +860,13 @@ fn analyze_cmd(prog: &str, args: &[String], s: &mut ChangeSummary, depth: u8) {
             let p = positionals(args, &["-R", "--root", "-P", "--prefix", "--conf"]);
             if let Some(u) = p.first() {
                 let home = args.iter().any(|a| matches!(a.as_str(), "-r" | "--remove" | "--remove-home"));
-                push_removal(&mut s.removals, format!("删除用户 {u}{}", if home { "（连同主目录）" } else { "" }));
+                let line = match (home, en()) {
+                    (true, false) => format!("删除用户 {u}（连同主目录）"),
+                    (false, false) => format!("删除用户 {u}"),
+                    (true, true) => format!("Delete user {u} (with home directory)"),
+                    (false, true) => format!("Delete user {u}"),
+                };
+                push_removal(&mut s.removals, line);
             }
         }
         _ => {}
@@ -885,6 +929,20 @@ fn sed_in_place_files(args: &[String]) -> Vec<&str> {
 }
 
 fn service_verb(sub: &str) -> Option<&'static str> {
+    if en() {
+        return Some(match sub {
+            "start" => "Start",
+            "stop" => "Stop",
+            "restart" | "try-restart" | "condrestart" => "Restart",
+            "reload" | "reload-or-restart" => "Reload",
+            "enable" => "Enable at boot",
+            "disable" => "Disable at boot",
+            "mask" => "Mask",
+            "unmask" => "Unmask",
+            "kill" => "Kill",
+            _ => return None,
+        });
+    }
     Some(match sub {
         "start" => "启动",
         "stop" => "停止",
@@ -914,7 +972,13 @@ fn pip(tool: &str, args: &[String], s: &mut ChangeSummary) {
             "-r" | "--requirement" => {
                 if let Some(f) = rest.get(i + 1) {
                     let f = super::super::redact::redact(f);
-                    push(&mut s.packages, format!("{} {f} 里的依赖（{tool}）", if install { "安装" } else { "卸载" }));
+                    let line = match (install, en()) {
+                        (true, false) => format!("安装 {f} 里的依赖（{tool}）"),
+                        (false, false) => format!("卸载 {f} 里的依赖（{tool}）"),
+                        (true, true) => format!("Install dependencies from {f} ({tool})"),
+                        (false, true) => format!("Uninstall dependencies from {f} ({tool})"),
+                    };
+                    push(&mut s.packages, line);
                 }
                 i += 1;
             }
@@ -939,24 +1003,30 @@ fn ufw(args: &[String], s: &mut ChangeSummary) {
     let Some((sub, rest)) = p.split_first() else { return };
     let (verb, rest, deleted) = match *sub {
         "delete" => match rest.split_first() {
-            Some((n, _)) if n.chars().all(|c| c.is_ascii_digit()) => return push(&mut s.ports, format!("删除 ufw 规则 {n}")),
+            Some((n, _)) if n.chars().all(|c| c.is_ascii_digit()) => {
+                return push(&mut s.ports, crate::tr!("删除 ufw 规则 {n}", "Delete ufw rule {n}"))
+            }
             Some((v, r)) => (*v, r, true),
             None => return,
         },
-        "enable" => return push(&mut s.ports, "启用防火墙（ufw）".into()),
-        "disable" => return push(&mut s.ports, "关闭防火墙（ufw）".into()),
-        "reset" => return push(&mut s.ports, "重置防火墙规则（ufw）".into()),
+        "enable" => return push(&mut s.ports, crate::tr!("启用防火墙（ufw）", "Enable firewall (ufw)")),
+        "disable" => return push(&mut s.ports, crate::tr!("关闭防火墙（ufw）", "Disable firewall (ufw)")),
+        "reset" => return push(&mut s.ports, crate::tr!("重置防火墙规则（ufw）", "Reset firewall rules (ufw)")),
         "insert" | "prepend" => match rest.get(1) {
             Some(v) => (*v, &rest[2..], false),
             None => return,
         },
         v => (v, rest, false),
     };
-    let word = match verb {
-        "allow" => "放行",
-        "deny" => "拒绝",
-        "reject" => "拒绝",
-        "limit" => "限速",
+    let word = match (verb, en()) {
+        ("allow", false) => "放行",
+        ("deny", false) => "拒绝",
+        ("reject", false) => "拒绝",
+        ("limit", false) => "限速",
+        ("allow", true) => "Allow",
+        ("deny", true) => "Deny",
+        ("reject", true) => "Reject",
+        ("limit", true) => "Rate-limit",
         _ => return,
     };
     // `ufw allow from x to any port 22 proto tcp` / `ufw allow 80/tcp` / `ufw allow OpenSSH` / `ufw allow from 10.0.0.0/8`
@@ -985,14 +1055,26 @@ fn ufw(args: &[String], s: &mut ChangeSummary) {
         }
         None => None,
     };
-    let mut spec = port.unwrap_or_else(|| "全部端口".to_string());
-    let peers: Vec<String> = [from.map(|f| format!("来源 {f}")), to.map(|t| format!("目标 {t}"))].into_iter().flatten().collect();
+    let all_ports = port.is_none();
+    let mut spec = port.unwrap_or_else(|| crate::tr!("全部端口", "all ports"));
+    let peers: Vec<String> = [
+        from.map(|f| crate::tr!("来源 {f}", "from {f}")),
+        to.map(|t| crate::tr!("目标 {t}", "to {t}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     if !peers.is_empty() {
-        spec = format!("{spec}，{}", peers.join("，"));
-    } else if spec == "全部端口" {
+        let sep = if en() { ", " } else { "，" };
+        spec = format!("{spec}{sep}{}", peers.join(sep));
+    } else if all_ports {
         return;
     }
-    let line = if deleted { format!("删除规则：{word} {spec}（ufw）") } else { format!("{word} {spec}（ufw）") };
+    let line = if deleted {
+        crate::tr!("删除规则：{word} {spec}（ufw）", "Delete rule: {word} {spec} (ufw)")
+    } else {
+        crate::tr!("{word} {spec}（ufw）", "{word} {spec} (ufw)")
+    };
     push(&mut s.ports, line);
 }
 
@@ -1004,11 +1086,15 @@ fn firewall_cmd(args: &[String], s: &mut ChangeSummary) {
             Some((k, v)) => (k, Some(v.to_string())),
             None => (a, args.get(i + 1).filter(|n| !n.starts_with('-')).cloned()),
         };
-        let word = match key {
-            "--add-port" => Some("放行"),
-            "--remove-port" => Some("关闭"),
-            "--add-service" => Some("放行服务"),
-            "--remove-service" => Some("关闭服务"),
+        let word = match (key, en()) {
+            ("--add-port", false) => Some("放行"),
+            ("--remove-port", false) => Some("关闭"),
+            ("--add-service", false) => Some("放行服务"),
+            ("--remove-service", false) => Some("关闭服务"),
+            ("--add-port", true) => Some("Allow"),
+            ("--remove-port", true) => Some("Close"),
+            ("--add-service", true) => Some("Allow service"),
+            ("--remove-service", true) => Some("Close service"),
             _ => None,
         };
         if let Some(w) = word {
@@ -1016,7 +1102,7 @@ fn firewall_cmd(args: &[String], s: &mut ChangeSummary) {
                 if !a.contains('=') {
                     i += 1;
                 }
-                push(&mut s.ports, format!("{w} {v}（firewalld）"));
+                push(&mut s.ports, crate::tr!("{w} {v}（firewalld）", "{w} {v} (firewalld)"));
             }
         }
         i += 1;
@@ -1042,28 +1128,34 @@ fn iptables(prog: &str, args: &[String], s: &mut ChangeSummary) {
                 i += 1;
             }
             "-F" | "--flush" | "-X" | "--delete-chain" => {
-                let what = if matches!(a, "-F" | "--flush") { "清空规则" } else { "删除自定义链" };
+                let flush = matches!(a, "-F" | "--flush");
+                let what = match (flush, en()) {
+                    (true, false) => "清空规则",
+                    (false, false) => "删除自定义链",
+                    (true, true) => "Flush rules",
+                    (false, true) => "Delete custom chains",
+                };
                 let chain = chain_arg(next);
                 if chain.is_some() {
                     i += 1;
                 }
                 let scope = match (&chain, table) {
-                    (Some(c), Some(t)) => format!("{t} 表 {c} 链"),
-                    (Some(c), None) => format!("{c} 链"),
-                    (None, Some(t)) => format!("{t} 表全部"),
-                    (None, None) => "全部".to_string(),
+                    (Some(c), Some(t)) => crate::tr!("{t} 表 {c} 链", "{t} table, {c} chain"),
+                    (Some(c), None) => crate::tr!("{c} 链", "{c} chain"),
+                    (None, Some(t)) => crate::tr!("{t} 表全部", "all of {t} table"),
+                    (None, None) => crate::tr!("全部", "all"),
                 };
-                push_removal(&mut s.removals, format!("{what}（{scope}，{prog}）"));
+                push_removal(&mut s.removals, crate::tr!("{what}（{scope}，{prog}）", "{what} ({scope}, {prog})"));
             }
             "-P" | "--policy" => {
                 if let (Some(c), Some(p)) = (next, args.get(i + 2)) {
-                    push(&mut s.ports, format!("默认策略 {c} → {p}（{prog}）"));
+                    push(&mut s.ports, crate::tr!("默认策略 {c} → {p}（{prog}）", "Default policy {c} → {p} ({prog})"));
                     i += 1;
                 }
                 i += 1;
             }
             "-A" | "--append" | "-I" | "--insert" | "-D" | "--delete" => {
-                op = Some(if matches!(a, "-D" | "--delete") { "删除" } else { "添加" });
+                op = Some(matches!(a, "-D" | "--delete"));
                 chain = next.unwrap_or("");
                 i += 1;
             }
@@ -1089,7 +1181,13 @@ fn iptables(prog: &str, args: &[String], s: &mut ChangeSummary) {
             None => port.to_string(),
         };
         let tgt = target.map(|t| format!(" → {t}")).unwrap_or_default();
-        push(&mut s.ports, format!("{op}规则 {chain} {spec}{tgt}（{prog}）"));
+        let line = match (op, en()) {
+            (true, false) => format!("删除规则 {chain} {spec}{tgt}（{prog}）"),
+            (false, false) => format!("添加规则 {chain} {spec}{tgt}（{prog}）"),
+            (true, true) => format!("Delete rule {chain} {spec}{tgt} ({prog})"),
+            (false, true) => format!("Add rule {chain} {spec}{tgt} ({prog})"),
+        };
+        push(&mut s.ports, line);
     }
 }
 
@@ -1126,18 +1224,26 @@ fn docker(prog: &str, args: &[String], s: &mut ChangeSummary) {
     match (group, sub) {
         ("image", "rm" | "remove") => sub = "rmi",
         ("system" | "volume" | "network" | "image" | "container", "prune") | ("volume" | "network", "rm" | "remove") => {
-            let what = match group {
-                "system" => "未用的容器 / 镜像 / 网络",
-                "image" => "未用的镜像",
-                "volume" => "数据卷",
-                "network" => "网络",
-                _ => "已停止的容器",
+            let what = match (group, en()) {
+                ("system", false) => "未用的容器 / 镜像 / 网络",
+                ("image", false) => "未用的镜像",
+                ("volume", false) => "数据卷",
+                ("network", false) => "网络",
+                (_, false) => "已停止的容器",
+                ("system", true) => "unused containers / images / networks",
+                ("image", true) => "unused images",
+                ("volume", true) => "volume",
+                ("network", true) => "network",
+                (_, true) => "stopped containers",
             };
             if sub == "prune" {
-                return push_removal(&mut s.removals, format!("清理{what}（{prog} {group} prune）"));
+                return push_removal(
+                    &mut s.removals,
+                    crate::tr!("清理{what}（{prog} {group} prune）", "Prune {what} ({prog} {group} prune)"),
+                );
             }
             for n in positionals(rest, &[]) {
-                push_removal(&mut s.removals, format!("删除{what} {n}（{prog}）"));
+                push_removal(&mut s.removals, crate::tr!("删除{what} {n}（{prog}）", "Delete {what} {n} ({prog})"));
             }
             return;
         }
@@ -1150,29 +1256,40 @@ fn docker(prog: &str, args: &[String], s: &mut ChangeSummary) {
             let p = positionals(rest, DOCKER_VALUE_OPTS);
             let Some(image) = p.first() else { return };
             let name = opt_value(rest, &["--name"]);
-            let verb = if sub == "run" { "运行" } else { "创建" };
+            let verb = match (sub == "run", en()) {
+                (true, false) => "运行",
+                (false, false) => "创建",
+                (true, true) => "Run",
+                (false, true) => "Create",
+            };
             let line = match name {
-                Some(n) => format!("{verb} {image}（名为 {n}）"),
+                Some(n) => crate::tr!("{verb} {image}（名为 {n}）", "{verb} {image} (named {n})"),
                 None => format!("{verb} {image}"),
             };
             push(&mut s.containers, line);
             for p in opt_values(rest, &["-p", "--publish"]) {
-                push(&mut s.ports, format!("{p}（{prog} 映射）"));
+                push(&mut s.ports, crate::tr!("{p}（{prog} 映射）", "{p} ({prog} mapping)"));
             }
         }
         "rm" => {
             for n in positionals(rest, &["-t", "--time", "-s", "--signal"]) {
-                push_removal(&mut s.removals, format!("删除容器 {n}（{prog}）"));
+                push_removal(&mut s.removals, crate::tr!("删除容器 {n}（{prog}）", "Delete container {n} ({prog})"));
             }
         }
         "stop" | "start" | "restart" | "kill" | "pause" | "unpause" => {
-            let verb = match sub {
-                "stop" => "停止",
-                "start" => "启动",
-                "restart" => "重启",
-                "kill" => "杀掉",
-                "pause" => "暂停",
-                _ => "恢复",
+            let verb = match (sub, en()) {
+                ("stop", false) => "停止",
+                ("start", false) => "启动",
+                ("restart", false) => "重启",
+                ("kill", false) => "杀掉",
+                ("pause", false) => "暂停",
+                (_, false) => "恢复",
+                ("stop", true) => "Stop",
+                ("start", true) => "Start",
+                ("restart", true) => "Restart",
+                ("kill", true) => "Kill",
+                ("pause", true) => "Pause",
+                (_, true) => "Unpause",
             };
             for n in positionals(rest, &["-t", "--time", "-s", "--signal"]) {
                 push(&mut s.containers, format!("{verb} {n}"));
@@ -1180,19 +1297,19 @@ fn docker(prog: &str, args: &[String], s: &mut ChangeSummary) {
         }
         "rmi" => {
             for n in positionals(rest, &[]) {
-                push_removal(&mut s.removals, format!("删除镜像 {n}（{prog}）"));
+                push_removal(&mut s.removals, crate::tr!("删除镜像 {n}（{prog}）", "Delete image {n} ({prog})"));
             }
         }
         "pull" => {
             for n in positionals(rest, &["--platform"]) {
-                push(&mut s.containers, format!("拉取镜像 {n}"));
+                push(&mut s.containers, crate::tr!("拉取镜像 {n}", "Pull image {n}"));
             }
         }
         "build" => {
             let tag = opt_value(rest, &["-t", "--tag"]);
             push(&mut s.containers, match tag {
-                Some(t) => format!("构建镜像 {t}"),
-                None => "构建镜像".to_string(),
+                Some(t) => crate::tr!("构建镜像 {t}", "Build image {t}"),
+                None => crate::tr!("构建镜像", "Build image"),
             });
         }
         _ => {}
@@ -1247,7 +1364,7 @@ fn compose(prog: &str, args: &[String], s: &mut ChangeSummary) {
         line.push_str(&services.join(" "));
     }
     if let Some(f) = file {
-        line.push_str(&format!("（{f}）"));
+        line.push_str(&crate::tr!("（{f}）", " ({f})"));
     }
     push(&mut s.containers, line);
 }

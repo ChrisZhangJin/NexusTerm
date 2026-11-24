@@ -39,8 +39,27 @@ pub const UNVERIFIABLE: &str = "未核验：";
 
 /// YOLO 判据遇到非只读命令时的说法。
 pub const YOLO_REFUSE: &str = "这条检查有风险，判据未经确认时不执行、也不为核验打扰用户（不阻塞完成）";
-const RULE_CONFIRMED: &str = "[已确认·经授权执行]";
-const RULE_YOLO: &str = "[未确认·只读规则]";
+fn rule_confirmed() -> String {
+    crate::tr!("[已确认·经授权执行]", "[Confirmed · run with authorization]")
+}
+fn rule_yolo() -> String {
+    crate::tr!("[未确认·只读规则]", "[Unconfirmed · read-only rule]")
+}
+fn yolo_refuse() -> String {
+    if crate::i18n::is_en() {
+        "This check is risky: unconfirmed checks are neither run nor bother you for verification (doesn't block completion)"
+            .to_string()
+    } else {
+        YOLO_REFUSE.to_string()
+    }
+}
+/// 给人看的「未核验」前缀：执行通道报来的错误固定以 [`UNVERIFIABLE`] 开头，显示时换成当前语言
+fn localize_unverifiable(e: &str) -> String {
+    match e.strip_prefix(UNVERIFIABLE) {
+        Some(rest) if crate::i18n::is_en() => format!("Not verified: {rest}"),
+        _ => e.to_string(),
+    }
+}
 
 /// 写入类命令（首词）：判据只允许只读检查。
 const WRITE_WORDS: &[&str] = &[
@@ -60,20 +79,30 @@ const READ_ONLY_FORMS: &[&str] = &[
 pub fn read_only_reason(cmd: &str) -> Result<(), String> {
     let c = cmd.trim();
     if c.is_empty() {
-        return Err("命令为空".into());
+        return Err(crate::tr!("命令为空", "Empty command"));
     }
     let risk = danger::assess(c);
     if risk.dangerous {
-        return Err(format!("危险命令不作为判据执行：{}", risk.reasons.join("；")));
+        return Err(crate::tr!(
+            "危险命令不作为判据执行：{}",
+            "Dangerous commands aren't run as checks: {}",
+            risk.reasons.join(if crate::i18n::is_en() { "; " } else { "；" })
+        ));
     }
     let stripped = c.replace("2>&1", "").replace(">/dev/null", "").replace("> /dev/null", "");
     if stripped.contains('>') {
-        return Err("判据命令里有输出重定向（会写文件），没有执行".into());
+        return Err(crate::tr!(
+            "判据命令里有输出重定向（会写文件），没有执行",
+            "The check command redirects output (would write a file), not run"
+        ));
     }
     for seg in c.split(|ch| ch == ';' || ch == '|' || ch == '&').map(str::trim).filter(|s| !s.is_empty()) {
         let first = seg.split_whitespace().next().unwrap_or("");
         if WRITE_WORDS.contains(&first) && !READ_ONLY_FORMS.iter().any(|f| seg.starts_with(f)) {
-            return Err(format!("「{first}」可能改动现场，判据只允许只读检查，没有执行"));
+            return Err(crate::tr!(
+                "「{first}」可能改动现场，判据只允许只读检查，没有执行",
+                "\"{first}\" may change the system; checks must be read-only, not run"
+            ));
         }
     }
     Ok(())
@@ -112,18 +141,25 @@ fn result(check: &Check, passed: bool, detail: impl Into<String>) -> CheckResult
 
 /// 执行通道报「此刻没法核验」：不算没过、不阻塞完成（报告里列为「·」）。
 fn unverifiable(check: &Check, why: &str) -> CheckResult {
-    CheckResult { check: check.clone(), passed: false, detail: why.to_string(), skipped: true }
+    CheckResult { check: check.clone(), passed: false, detail: localize_unverifiable(why), skipped: true }
 }
 
 async fn run_probe<P: Prober>(p: &mut P, cmd: &str, cap: Duration) -> Result<(bool, String), String> {
     let out = match tokio::time::timeout(cap, p.run(&format!("{cmd}; echo {RC_MARK}$?"))).await {
         Ok(r) => r?,
-        Err(_) => return Ok((false, "超时".to_string())),
+        Err(_) => return Ok((false, crate::tr!("超时", "Timed out"))),
     };
     let (rc, rest) = parse_rc(&out);
     match rc {
-        Some(code) => Ok((code == 0, format!("退出码 {code}；{}", clip(&rest)))),
-        None => Ok((false, format!("没拿到退出码（命令可能还没结束）；{}", clip(&rest)))),
+        Some(code) => Ok((code == 0, crate::tr!("退出码 {code}；{}", "Exit code {code}; {}", clip(&rest)))),
+        None => Ok((
+            false,
+            crate::tr!(
+                "没拿到退出码（命令可能还没结束）；{}",
+                "No exit code (the command may still be running); {}",
+                clip(&rest)
+            ),
+        )),
     }
 }
 
@@ -139,22 +175,32 @@ pub async fn verify<P: Prober>(
     let mut out = Vec::with_capacity(checks.len());
     for c in checks {
         let r = match c {
-            Check::Manual { .. } => result(c, false, "未自动核验（仅供参考，不阻塞完成）"),
+            Check::Manual { .. } => result(
+                c,
+                false,
+                crate::tr!("未自动核验（仅供参考，不阻塞完成）", "Not checked automatically (for reference, doesn't block completion)"),
+            ),
             Check::ScreenMatches { re } => match regex::Regex::new(re) {
-                Err(e) => result(c, false, format!("正则写错了：{e}")),
+                Err(e) => result(c, false, crate::tr!("正则写错了：{e}", "Invalid regex: {e}")),
                 Ok(rx) => {
                     let screen = p.screen();
                     match rx.find(&screen) {
-                        Some(m) => result(c, true, format!("屏幕上有「{}」", clip(m.as_str()))),
-                        None => result(c, false, format!("当前屏幕没有匹配；屏幕尾部：{}", clip(&screen))),
+                        Some(m) => result(c, true, crate::tr!("屏幕上有「{}」", "Screen shows \"{}\"", clip(m.as_str()))),
+                        None => result(
+                            c,
+                            false,
+                            crate::tr!("当前屏幕没有匹配；屏幕尾部：{}", "No match on the current screen; screen tail: {}", clip(&screen)),
+                        ),
                     }
                 }
             },
             Check::CommandOk { cmd } => command_check(c, cmd, policy, confirmed, cap, p).await,
             Check::FileExists { path } => match run_probe(p, &format!("test -e {}", shell_quote(path)), cap).await {
-                Ok((ok, ev)) => result(c, ok, if ok { "存在".to_string() } else { format!("不存在（{ev}）") }),
+                Ok((ok, ev)) => {
+                    result(c, ok, if ok { crate::tr!("存在", "Exists") } else { crate::tr!("不存在（{ev}）", "Not found ({ev})") })
+                }
                 Err(e) if e.starts_with(UNVERIFIABLE) => unverifiable(c, &e),
-                Err(e) => result(c, false, format!("执行失败：{e}")),
+                Err(e) => result(c, false, crate::tr!("执行失败：{e}", "Failed to run: {e}")),
             },
         };
         out.push(r);
@@ -171,17 +217,17 @@ async fn command_check<P: Prober>(
     cap: Duration,
     p: &mut P,
 ) -> CheckResult {
-    let rule = if confirmed { RULE_CONFIRMED } else { RULE_YOLO };
+    let rule = if confirmed { rule_confirmed() } else { rule_yolo() };
     let r = |ok: bool, d: String| result(c, ok, format!("{rule} {d}"));
     let gate = authorize(policy, &AgentAction::Exec { target: None, command: cmd.to_string() }, None);
     if let Gate::Deny(why) = &gate {
-        return r(false, format!("契约不允许执行：{why}"));
+        return r(false, crate::tr!("契约不允许执行：{why}", "The contract doesn't allow running it: {why}"));
     }
     if confirmed {
         // 用户点过头的判据：与普通托管写入同一套闸门；危险 / approve 档就挂起等批准
         if let Gate::Approve(reasons) = &gate {
             if !p.approve(cmd, reasons).await {
-                return r(false, "这条检查需要批准，用户没有批准，没有执行".to_string());
+                return r(false, crate::tr!("这条检查需要批准，用户没有批准，没有执行", "This check needed approval and wasn't approved, not run"));
             }
         }
     } else {
@@ -189,13 +235,14 @@ async fn command_check<P: Prober>(
         // 要批准的不为核验去打扰人，记成「未核验」，不阻塞完成（报告里照列）
         // 危险（哪怕可恢复）的检查也不在核验时顺手执行
         if matches!(gate, Gate::Approve(_)) || danger::assess(cmd).dangerous {
-            return unverifiable(c, &format!("{rule} {UNVERIFIABLE}{YOLO_REFUSE}"));
+            let head = localize_unverifiable(&format!("{UNVERIFIABLE}{}", yolo_refuse()));
+            return unverifiable(c, &format!("{rule} {head}"));
         }
     }
     match run_probe(p, cmd, cap).await {
         Ok((ok, ev)) => r(ok, ev),
-        Err(e) if e.starts_with(UNVERIFIABLE) => unverifiable(c, &format!("{rule} {e}")),
-        Err(e) => r(false, format!("执行失败：{e}")),
+        Err(e) if e.starts_with(UNVERIFIABLE) => unverifiable(c, &format!("{rule} {}", localize_unverifiable(&e))),
+        Err(e) => r(false, crate::tr!("执行失败：{e}", "Failed to run: {e}")),
     }
 }
 
@@ -374,7 +421,7 @@ pub(crate) mod tests {
         let checks = vec![Check::CommandOk { cmd: "cargo test".into() }];
         let r = verify(&checks, &policy(), true, CAP, &mut p).await;
         assert!(r[0].passed, "{:?}", r[0]);
-        assert!(r[0].detail.starts_with(RULE_CONFIRMED));
+        assert!(r[0].detail.starts_with(&rule_confirmed()));
         assert_eq!(p.ran.len(), 1);
         assert!(p.asked.is_empty(), "auto 档 + 不危险：Allow，直接跑");
         // notify 档同样直接跑
@@ -388,13 +435,13 @@ pub(crate) mod tests {
     async fn unconfirmed_checks_run_through_the_gate_but_never_ask() {
         let mut p = prober("", vec![("cargo test", "__NX_CHECK_RC=0")]);
         let r = verify(&[Check::CommandOk { cmd: "cargo test".into() }], &policy(), false, CAP, &mut p).await;
-        assert!(r[0].passed && r[0].detail.starts_with(RULE_YOLO), "{:?}", r[0]);
+        assert!(r[0].passed && r[0].detail.starts_with(&rule_yolo()), "{:?}", r[0]);
         // 要批准的（不可逆）：不跑、不问人，记「未核验」，不阻塞完成
         let mut p = prober("", vec![]);
         let r = verify(&[Check::CommandOk { cmd: "sudo reboot --dry-run".into() }], &policy(), false, CAP, &mut p).await;
         assert!(!r[0].passed && r[0].skipped, "{:?}", r[0]);
         assert_eq!(verdict(&r), Verdict::AllPassed);
-        assert!(r[0].detail.starts_with(RULE_YOLO) && r[0].detail.contains(YOLO_REFUSE), "{}", r[0].detail);
+        assert!(r[0].detail.starts_with(&rule_yolo()) && r[0].detail.contains(YOLO_REFUSE), "{}", r[0].detail);
         assert!(p.ran.is_empty() && p.asked.is_empty());
     }
 

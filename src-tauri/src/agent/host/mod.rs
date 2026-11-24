@@ -195,10 +195,10 @@ pub enum Check {
 impl Check {
     pub fn describe(&self) -> String {
         match self {
-            Self::ScreenMatches { re } => format!("屏幕匹配 /{re}/"),
-            Self::CommandOk { cmd } => format!("命令成功：`{cmd}`"),
-            Self::FileExists { path } => format!("文件存在：{path}"),
-            Self::Manual { text } => format!("人工确认：{text}"),
+            Self::ScreenMatches { re } => crate::tr!("屏幕匹配 /{re}/", "Screen matches /{re}/"),
+            Self::CommandOk { cmd } => crate::tr!("命令成功：`{cmd}`", "Command succeeds: `{cmd}`"),
+            Self::FileExists { path } => crate::tr!("文件存在：{path}", "File exists: {path}"),
+            Self::Manual { text } => crate::tr!("人工确认：{text}", "Manual check: {text}"),
         }
     }
 
@@ -361,7 +361,9 @@ impl HostSupervisor {
 
     /// 立即迁移一个契约的相位（命令层用，比如「停止」要马上生效）；非法事件不改状态。
     pub fn apply(&self, contract_id: &str, ev: HostEvent) -> Result<HostPhase, String> {
-        let h = self.get(contract_id).ok_or_else(|| format!("没有托管契约 {contract_id}"))?;
+        let h = self
+            .get(contract_id)
+            .ok_or_else(|| crate::tr!("没有托管契约 {contract_id}", "Autopilot contract {contract_id} not found"))?;
         h.apply(ev).map_err(|e| e.to_string())
     }
 }

@@ -65,7 +65,7 @@ pub fn skill_validate(input: SkillInput) -> Vec<String> {
 /// 导出为文本（带版本头的美化 JSON）。运行统计不导出。前端负责写文件。
 #[tauri::command]
 pub fn skill_export(id: String, state: State<'_, AppState>) -> Result<String, String> {
-    let s = state.store.skill_get(&id).ok_or_else(|| "skill 不存在".to_string())?;
+    let s = state.store.skill_get(&id).ok_or_else(|| crate::tr!("skill 不存在", "Skill not found"))?;
     Ok(skill::export_text(&s))
 }
 
@@ -132,7 +132,7 @@ pub async fn skill_run(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<skill_run::SkillRunReport, String> {
-    let skill = state.store.skill_get(&skill_id).ok_or_else(|| "技能不存在".to_string())?;
+    let skill = state.store.skill_get(&skill_id).ok_or_else(|| crate::tr!("技能不存在", "Skill not found"))?;
     let cfg = load_config(&state.store);
     let opts = skill_run::RunOpts::from_config(&cfg);
     let ctx = skill_run::SkillRunCtx { app: &app, state: &state, runtime: &state.act, cfg: &cfg };

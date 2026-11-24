@@ -77,7 +77,12 @@ pub fn coerce_params(v: Option<&serde_json::Value>) -> Result<BTreeMap<String, S
     let obj = match v {
         Value::Null => return Ok(out),
         Value::Object(m) => m,
-        _ => return Err("params 必须是对象，形如 {\"名字\":\"值\"}".into()),
+        _ => {
+            return Err(crate::tr!(
+                "params 必须是对象，形如 {{\"名字\":\"值\"}}",
+                "params must be an object, like {{\"name\":\"value\"}}"
+            ))
+        }
     };
     for (k, val) in obj {
         match val {
@@ -91,7 +96,12 @@ pub fn coerce_params(v: Option<&serde_json::Value>) -> Result<BTreeMap<String, S
             Value::Bool(b) => {
                 out.insert(k.clone(), b.to_string());
             }
-            _ => return Err(format!("参数「{k}」的值必须是字符串（不接受数组 / 对象）")),
+            _ => {
+                return Err(crate::tr!(
+                    "参数「{k}」的值必须是字符串（不接受数组 / 对象）",
+                    "The value of parameter \"{k}\" must be a string (arrays / objects aren't accepted)"
+                ))
+            }
         }
     }
     Ok(out)
@@ -203,7 +213,7 @@ pub fn search<'a>(skills: &'a [Skill], query: Option<&str>) -> Vec<&'a Skill> {
 pub fn find_skill<'a>(skills: &'a [Skill], key: &str) -> Result<&'a Skill, String> {
     let key = key.trim();
     if key.is_empty() {
-        return Err("缺少 id 或 name（先用 op=list 查看有哪些技能）".into());
+        return Err(missing_key());
     }
     if let Some(s) = skills.iter().find(|s| s.id == key) {
         return Ok(s);
@@ -225,18 +235,41 @@ pub fn find_skill<'a>(skills: &'a [Skill], key: &str) -> Result<&'a Skill, Strin
     }
     let near = search(skills, Some(key));
     if near.is_empty() {
-        Err(format!("找不到技能「{}」（先用 op=list 查看有哪些技能）", clip(key, 60)))
+        Err(crate::tr!(
+            "找不到技能「{}」（先用 op=list 查看有哪些技能）",
+            "Skill \"{}\" not found (use op=list to see the available skills)",
+            clip(key, 60)
+        ))
     } else {
-        Err(format!("找不到技能「{}」。相近的有：{}", clip(key, 60), brief_names(&near)))
+        Err(crate::tr!(
+            "找不到技能「{}」。相近的有：{}",
+            "Skill \"{}\" not found. Similar ones: {}",
+            clip(key, 60),
+            brief_names(&near)
+        ))
     }
 }
 
+/// 「缺少 id 或 name」（卡片上给人看，也喂回模型）
+fn missing_key() -> String {
+    crate::tr!("缺少 id 或 name（先用 op=list 查看有哪些技能）", "Missing id or name (use op=list to see the available skills)")
+}
+
 fn brief_names(v: &[&Skill]) -> String {
-    v.iter().take(5).map(|s| format!("[{}] {}", short_id(&s.id), clip(&s.name, 40))).collect::<Vec<_>>().join("；")
+    v.iter()
+        .take(5)
+        .map(|s| format!("[{}] {}", short_id(&s.id), clip(&s.name, 40)))
+        .collect::<Vec<_>>()
+        .join(if crate::i18n::is_en() { "; " } else { "；" })
 }
 
 fn ambiguous(key: &str, v: &[&Skill]) -> String {
-    format!("「{}」对应多个技能，请用 id 指明：{}", clip(key, 60), brief_names(v))
+    crate::tr!(
+        "「{}」对应多个技能，请用 id 指明：{}",
+        "\"{}\" matches several skills; specify one by id: {}",
+        clip(key, 60),
+        brief_names(v)
+    )
 }
 
 // ——————————————————————————————— 给模型的文本 ———————————————————————————————
@@ -368,7 +401,8 @@ fn result_code(r: &StepResult) -> &'static str {
 
 /// 这一步与密码有关吗？有关的步骤报告里只给结局，不给备注 / 屏幕尾部。
 fn is_secret_step(rec: &StepRecord) -> bool {
-    rec.kind == "secret" || rec.summary.contains("输入密码")
+    // summary 来自 skill_run::summarize（中 / 英）
+    rec.kind == "secret" || rec.summary.contains("输入密码") || rec.summary.to_lowercase().contains("password")
 }
 
 fn step_report_line(rec: &StepRecord) -> String {
@@ -464,8 +498,8 @@ pub fn run_read_call(skills: &[Skill], call: &SkillCall) -> ReadOutcome {
                 ok: true,
                 op: "list",
                 card: match call.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
-                    Some(q) => format!("检索技能「{}」：{} 个匹配", clip(q, 40), n),
-                    None => format!("列出技能：共 {} 个", skills.len()),
+                    Some(q) => crate::tr!("检索技能「{}」：{} 个匹配", "Search skills \"{}\": {} matches", clip(q, 40), n),
+                    None => crate::tr!("列出技能：共 {} 个", "List skills: {} total", skills.len()),
                 },
                 feedback: list_text(skills, call.query.as_deref()),
             }
@@ -474,19 +508,19 @@ pub fn run_read_call(skills: &[Skill], call: &SkillCall) -> ReadOutcome {
             Some(Ok(s)) => ReadOutcome {
                 ok: true,
                 op: "show",
-                card: format!("查看技能「{}」（{} 步）", clip(&s.name, 40), s.steps.len()),
+                card: crate::tr!("查看技能「{}」（{} 步）", "View skill \"{}\" ({} steps)", clip(&s.name, 40), s.steps.len()),
                 feedback: show_text(s),
             },
             Some(Err(e)) => ReadOutcome { ok: false, op: "show", card: e.clone(), feedback: format!("nx_skill show 失败：{e}") },
             None => {
-                let e = "缺少 id 或 name（先用 op=list 查看有哪些技能）".to_string();
+                let e = missing_key();
                 ReadOutcome { ok: false, op: "show", card: e.clone(), feedback: format!("nx_skill show 失败：{e}") }
             }
         },
         SkillOp::Run => ReadOutcome {
             ok: false,
             op: "run",
-            card: "run 不是只读操作".into(),
+            card: crate::tr!("run 不是只读操作", "run isn't a read-only operation"),
             feedback: "内部错误：run 应由主循环处理".into(),
         },
     }
@@ -499,9 +533,11 @@ pub fn precheck_run(s: &Skill, call: &SkillCall) -> Result<(), String> {
         return Err(e.clone());
     }
     if s.steps.is_empty() {
-        return Err("该技能没有步骤".into());
+        return Err(crate::tr!("该技能没有步骤", "This skill has no steps"));
     }
-    skill::resolve_params(&s.params, &call.params).map(|_| ()).map_err(|errs| errs.join("；"))
+    skill::resolve_params(&s.params, &call.params)
+        .map(|_| ())
+        .map_err(|errs| errs.join(if crate::i18n::is_en() { "; " } else { "；" }))
 }
 
 // ——————————————————————————————— 测试 ———————————————————————————————

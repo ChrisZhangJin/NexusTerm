@@ -347,7 +347,7 @@ async fn draft_criteria(cfg: &super::AgentConfig, goal: &str, cancel: &AtomicBoo
     let reply = match tokio::time::timeout(Duration::from_secs(60), call).await {
         Ok(Ok(r)) => Ok(r.text),
         Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err("起草超时".to_string()),
+        Err(_) => Err(crate::tr!("起草超时", "Drafting timed out")),
     };
     criteria::draft_or_fallback(reply)
 }
@@ -385,7 +385,10 @@ pub(crate) fn claim_all_then_sign<T>(
     sign: impl FnOnce() -> Result<T, String>,
 ) -> Result<(T, Vec<(String, ControlState)>), String> {
     let changed = control.try_acquire_all(console_ids, run_id).map_err(|busy| {
-        format!("终端「{busy}」正被另一轮运行驾驶着（对话 / 技能 / 另一份托管），先停掉它再开始托管")
+        crate::tr!(
+            "终端「{busy}」正被另一轮运行驾驶着（对话 / 技能 / 另一份托管），先停掉它再开始托管",
+            "Terminal \"{busy}\" is being driven by another run (chat / skill / another autopilot). Stop it before starting autopilot"
+        )
     })?;
     match sign() {
         Ok(v) => Ok((v, changed)),
@@ -444,7 +447,7 @@ pub async fn host_start(
 ) -> Result<String, String> {
     let goal = goal.trim().to_string();
     if goal.is_empty() {
-        return Err("托管目标不能为空".to_string());
+        return Err(crate::tr!("托管目标不能为空", "The autopilot goal can't be empty"));
     }
     // 多终端：主终端之外一并操作的终端（去重、去掉主终端本身）
     let mut extra_hints: Vec<ConsoleHint> = Vec::new();
@@ -463,15 +466,18 @@ pub async fn host_start(
             .iter()
             .find(|h| &h.console_id == id)
             .and_then(|h| nonempty(&h.label))
-            .unwrap_or_else(|| "这个终端".to_string());
+            .unwrap_or_else(|| crate::tr!("这个终端", "This terminal"));
         if !state.local.contains(id) && !state.sessions.contains(id) {
-            return Err(format!("没有 id 为「{id}」的终端"));
+            return Err(crate::tr!("没有 id 为「{id}」的终端", "Terminal with id \"{id}\" not found"));
         }
         if rt.host.live_on_console(id).is_some() {
-            return Err(format!("{name}已经在托管中"));
+            return Err(crate::tr!("{name}已经在托管中", "{name} is already on autopilot"));
         }
         if rt.is_running(id) {
-            return Err(format!("{name}上有一轮对话 / 技能正在运行，请先停止"));
+            return Err(crate::tr!(
+                "{name}上有一轮对话 / 技能正在运行，请先停止",
+                "A chat / skill is running on {name}, stop it first"
+            ));
         }
     }
     // 上一份 Agent 配置不可用就别签约：签了也起不来
@@ -584,7 +590,7 @@ fn finish_hosted(app: &AppHandle, h: &HostShared, res: Result<(), AgentError>) {
         let ev = match res {
             _ if h.cancel.load(Ordering::Relaxed) => HostEvent::Stop,
             Err(e) => HostEvent::Fatal(e.to_string()),
-            Ok(()) => HostEvent::Fatal("托管运行意外结束".to_string()),
+            Ok(()) => HostEvent::Fatal(crate::tr!("托管运行意外结束", "The autopilot run ended unexpectedly")),
         };
         let _ = h.apply(ev);
     }
@@ -603,7 +609,11 @@ fn finish_hosted(app: &AppHandle, h: &HostShared, res: Result<(), AgentError>) {
 }
 
 fn hosted(state: &AppState, contract_id: &str) -> Result<Arc<HostShared>, String> {
-    state.act.host.get(contract_id).ok_or_else(|| format!("没有托管任务 {contract_id}"))
+    state
+        .act
+        .host
+        .get(contract_id)
+        .ok_or_else(|| crate::tr!("没有托管任务 {contract_id}", "Autopilot task {contract_id} not found"))
 }
 
 /// 人在驾驶时点了卡片上的按钮 / 「加预算继续」：先替他交还，事件才合法。
@@ -661,10 +671,15 @@ pub async fn host_answer(
     match h.phase().base() {
         // 密码卡的值只走密码通道；判据草稿走 host_confirm_criteria
         HostPhase::WaitingHuman { card } if matches!(card.kind, CardKind::Secret | CardKind::CriteriaDraft { .. }) => {
-            return Err("这张卡片不能在这里答复".to_string())
+            return Err(crate::tr!("这张卡片不能在这里答复", "This card can't be answered here"))
         }
         HostPhase::WaitingHuman { card } if card.id == reply.card_id => {}
-        _ => return Err("这张卡片已经处理过了，或不是当前等你答复的那张".to_string()),
+        _ => {
+            return Err(crate::tr!(
+                "这张卡片已经处理过了，或不是当前等你答复的那张",
+                "This card was already handled, or isn't the one currently waiting for you"
+            ))
+        }
     }
     h.answer_card(reply, || release_user_control(&app, &state, &h));
     Ok(())
@@ -711,7 +726,7 @@ pub async fn host_resume(
 ) -> Result<(), String> {
     let h = hosted(&state, &contract_id)?;
     if !matches!(h.phase().base(), HostPhase::Paused { .. }) {
-        return Err("托管没有暂停，不需要继续".to_string());
+        return Err(crate::tr!("托管没有暂停，不需要继续", "Autopilot isn't paused, nothing to resume"));
     }
     handback_if_driving(&app, &state, &h);
     h.send(HostEvent::Resume { new_budget: budget });
@@ -731,7 +746,7 @@ pub async fn host_confirm_criteria(
     let h = hosted(&state, &contract_id)?;
     match h.phase().base() {
         HostPhase::WaitingHuman { card } if card.id == card_id && matches!(card.kind, CardKind::CriteriaDraft { .. }) => {}
-        _ => return Err("没有等你确认的判据草稿".to_string()),
+        _ => return Err(crate::tr!("没有等你确认的判据草稿", "No draft completion checks are waiting for you")),
     }
     let checks = if checks.is_empty() { criteria::fallback() } else { checks };
     registry.set_criteria(&contract_id, checks.clone(), false);
@@ -760,7 +775,7 @@ pub async fn host_amend(
 ) -> Result<(), String> {
     let h = hosted(&state, &contract_id)?;
     if h.is_terminal() {
-        return Err("托管已经结束，不能再改".to_string());
+        return Err(crate::tr!("托管已经结束，不能再改", "Autopilot has ended and can't be changed"));
     }
     let goal = goal.map(|g| g.trim().to_string()).filter(|g| !g.is_empty());
     let tier = authority_tier.filter(|t| !t.trim().is_empty());
@@ -779,7 +794,7 @@ pub async fn host_amend(
             bus,
             core.clone(),
         )
-        .ok_or_else(|| "契约不存在".to_string())?
+        .ok_or_else(|| crate::tr!("契约不存在", "Contract not found"))?
     } else {
         prev.contract.clone()
     };
@@ -876,7 +891,8 @@ pub async fn host_report_misread(
     let note = note.unwrap_or_default().trim().chars().take(500).collect::<String>();
     let report = misread::MisreadReport { version: 1, reported_at_ms: now_ms(), note: note.clone(), from_gate, evidence };
     let dir = crate::app_data_dir(&app).join("misreads");
-    let path = misread::write_report(&dir, &report).map_err(|e| format!("保存误判样本失败：{e}"))?;
+    let path = misread::write_report(&dir, &report)
+        .map_err(|e| crate::tr!("保存误判样本失败：{e}", "Failed to save the misread sample: {e}"))?;
     if !h.is_terminal() {
         let retry_ok = report.evidence.vouchable
             && h.vouch.set(&report.evidence.console_id, &report.evidence.screen_hash, std::time::Instant::now());
@@ -923,7 +939,7 @@ pub(crate) fn console_ref_from(host_key: String, console_id: &str, hint: &Consol
     ConsoleRef {
         host_key,
         session_record_id: nonempty(&hint.session_record_id),
-        label: nonempty(&hint.label).unwrap_or_else(|| "当前会话".to_string()),
+        label: nonempty(&hint.label).unwrap_or_else(|| crate::tr!("当前会话", "Current session")),
         cwd: nonempty(&hint.cwd),
         tmux: nonempty(&hint.tmux),
         console_id: console_id.to_string(),
@@ -932,7 +948,7 @@ pub(crate) fn console_ref_from(host_key: String, console_id: &str, hint: &Consol
 
 /// 主机键用 `hostmem::resolve_host`（ssh:user@host:port / local / tab:标签）：重启后 console id 会变，它不变。
 pub(crate) fn console_ref_of(state: &AppState, console_id: &str, hint: &ConsoleHint) -> ConsoleRef {
-    let label = nonempty(&hint.label).unwrap_or_else(|| "当前会话".to_string());
+    let label = nonempty(&hint.label).unwrap_or_else(|| crate::tr!("当前会话", "Current session"));
     let key = super::hostmem::resolve_host(state, console_id, &label).map(|h| h.key).unwrap_or_default();
     console_ref_from(key, console_id, hint)
 }
@@ -1048,9 +1064,9 @@ pub fn host_reattach_candidates(
     state: State<'_, AppState>,
 ) -> Result<Vec<ReattachCandidate>, String> {
     let h = hosted(&state, &contract_id)?;
-    let cp = h.checkpoint().ok_or_else(|| "没有可接驳的现场".to_string())?;
+    let cp = h.checkpoint().ok_or_else(no_checkpoint)?;
     let slot = pick_slot(&cp, slot, |id| act::session_alive(&state, id));
-    let saved = cp.slot(&slot).cloned().ok_or_else(|| format!("这份托管里没有终端「{slot}」"))?;
+    let saved = cp.slot(&slot).cloned().ok_or_else(|| no_slot(&slot))?;
     // 本次托管已经接上的其余终端不当候选
     let taken: Vec<String> = cp.consoles().map(|c| c.console_id.clone()).filter(|c| c != &slot).collect();
     let cands: Vec<ConsoleRef> = candidates
@@ -1108,7 +1124,7 @@ pub(crate) fn reattach_slot_plan(
     let mut next = cp.clone();
     if partial {
         if !matches!(next.phase, HostPhase::Suspended { .. }) {
-            return Err("这份托管没有在等重新接驳".to_string());
+            return Err(not_waiting_reattach());
         }
         match &verdict {
             ResumeVerdict::Expired { reason } => return Err(reason.clone()),
@@ -1116,7 +1132,7 @@ pub(crate) fn reattach_slot_plan(
             _ => {}
         }
         if !next.replace_slot(slot, console) {
-            return Err(format!("这份托管里没有终端「{slot}」"));
+            return Err(no_slot(slot));
         }
         next.contract.authority_tier = next.authority.tier.clone();
         return Ok((next, Vec::new(), drifted));
@@ -1151,7 +1167,7 @@ pub(crate) fn auto_resume_plan(
     let ev = match &cp.phase {
         HostPhase::Suspended { reason: SuspendReason::ConsoleGone, .. } => HostEvent::ConsoleBack,
         HostPhase::Suspended { .. } => HostEvent::Reattach(cp.console.clone()),
-        _ => return Err("这份托管没有在等重新接驳".to_string()),
+        _ => return Err(not_waiting_reattach()),
     };
     let (p, mut fx) = super::host::phase::step(&cp.phase, ev).map_err(|e| e.to_string())?;
     next.phase = p;
@@ -1160,14 +1176,33 @@ pub(crate) fn auto_resume_plan(
     Ok((next, fx))
 }
 
+fn no_checkpoint() -> String {
+    crate::tr!("没有可接驳的现场", "No saved state to reattach to")
+}
+
+fn no_slot(slot: &str) -> String {
+    crate::tr!("这份托管里没有终端「{slot}」", "Terminal \"{slot}\" not found in this autopilot run")
+}
+
+fn not_waiting_reattach() -> String {
+    crate::tr!("这份托管没有在等重新接驳", "This autopilot run isn't waiting to be reattached")
+}
+
 /// 部分接驳挂着的「还差 …」那一行的开头。
 const WAITING_MARK: &str = "已接上「";
+const WAITING_MARK_EN: &str = "Reattached \"";
 /// [`drift_notice`] 的开头。
 const DRIFT_MARK: &str = "接驳时的屏幕和重启前不一样";
+const DRIFT_MARK_EN: &str = "The screen at reattach differs from before the restart";
+
+/// 提示里的「还差 …」行（两种语言都认：切换语言前留下的也要认得）
+fn is_waiting_line(l: &str) -> bool {
+    l.starts_with(WAITING_MARK) || l.starts_with(WAITING_MARK_EN)
+}
 
 /// 多步接驳时往下一步带的提示：去掉上一步「还差 …」那一行，其余（例如降档提示）原样带上。
 pub(crate) fn carried_notice(n: Option<String>) -> Option<String> {
-    let kept: Vec<&str> = n.as_deref().unwrap_or("").lines().filter(|l| !l.starts_with(WAITING_MARK)).collect();
+    let kept: Vec<&str> = n.as_deref().unwrap_or("").lines().filter(|l| !is_waiting_line(l)).collect();
     let s = kept.join("\n");
     (!s.trim().is_empty()).then_some(s)
 }
@@ -1176,7 +1211,9 @@ pub(crate) fn carried_notice(n: Option<String>) -> Option<String> {
 /// 漂移：上一步已有降档提示就沿用（它说的才是**原来**的档位，这一步的 prev_tier 已经是确认档了）。
 pub(crate) fn reattach_notice(prior: Option<String>, from_partial: bool, partial: bool, drifted: bool, prev_tier: &str) -> Option<String> {
     if drifted {
-        return Some(prior.filter(|p| p.contains(DRIFT_MARK)).unwrap_or_else(|| drift_notice(prev_tier)));
+        return Some(
+            prior.filter(|p| p.contains(DRIFT_MARK) || p.contains(DRIFT_MARK_EN)).unwrap_or_else(|| drift_notice(prev_tier)),
+        );
     }
     if partial || from_partial {
         return prior;
@@ -1205,15 +1242,15 @@ pub async fn host_reattach(
         .act
         .host
         .begin_reattach(&contract_id)
-        .ok_or_else(|| "这份托管正在接驳中，请稍候".to_string())?;
+        .ok_or_else(|| crate::tr!("这份托管正在接驳中，请稍候", "This autopilot run is already being reattached, please wait"))?;
     let old = hosted(&state, &contract_id)?;
     if !matches!(old.phase(), HostPhase::Suspended { .. }) {
-        return Err("这份托管没有在等重新接驳".to_string());
+        return Err(not_waiting_reattach());
     }
-    let mut cp = old.checkpoint().ok_or_else(|| "没有可接驳的现场".to_string())?;
+    let mut cp = old.checkpoint().ok_or_else(no_checkpoint)?;
     // 多终端：一次接一格（保存时的 console id）；没指定就先接主终端，再按顺序接其余不在的
     let slot = pick_slot(&cp, slot, |id| act::session_alive(&state, id));
-    let saved = cp.slot(&slot).cloned().ok_or_else(|| format!("这份托管里没有终端「{slot}」"))?;
+    let saved = cp.slot(&slot).cloned().ok_or_else(|| no_slot(&slot))?;
     let is_primary = slot == cp.console.console_id;
     let mut restore_note = None;
     let console_id = if open_new.unwrap_or(false) {
@@ -1232,28 +1269,40 @@ pub async fn host_reattach(
         });
         out.session_id
     } else {
-        console_id.filter(|c| !c.trim().is_empty()).ok_or_else(|| "请选择要接驳的终端".to_string())?
+        console_id
+            .filter(|c| !c.trim().is_empty())
+            .ok_or_else(|| crate::tr!("请选择要接驳的终端", "Choose a terminal to reattach to"))?
     };
     if !act::session_alive(&state, &console_id) {
-        return Err(format!("没有 id 为「{console_id}」的终端"));
+        return Err(crate::tr!("没有 id 为「{console_id}」的终端", "Terminal with id \"{console_id}\" not found"));
     }
     // 打开新连接要等一阵：回来后再确认一遍还是那份挂起的任务（没被停掉 / 没被别处接走）。
     // 新开的标签页不替用户关（里面可能已经有他要的现场 / 正在登录），只在报错里说明
     if let Err(e) = still_reattachable(&state.act.host, &contract_id, &old) {
         return Err(if open_new.unwrap_or(false) {
-            format!("{e}。刚为接驳新开的标签页「{}」保留着，不需要的话可以手动关掉。", saved.label)
+            crate::tr!(
+                "{e}。刚为接驳新开的标签页「{}」保留着，不需要的话可以手动关掉。",
+                "{e}. The tab \"{}\" just opened for reattaching was left open; close it yourself if you don't need it.",
+                saved.label
+            )
         } else {
             e
         });
     }
     if state.act.host.live_on_console(&console_id).is_some_and(|h| h.contract_id() != contract_id) {
-        return Err("这个终端正被另一份托管占着".to_string());
+        return Err(crate::tr!("这个终端正被另一份托管占着", "This terminal is taken by another autopilot run"));
     }
     if console_id != slot && cp.slot(&console_id).is_some() {
-        return Err("这个终端已经是本次托管里的另一个终端了，请选别的".to_string());
+        return Err(crate::tr!(
+            "这个终端已经是本次托管里的另一个终端了，请选别的",
+            "This terminal is already another terminal in this autopilot run, pick a different one"
+        ));
     }
     if state.act.is_running(&console_id) {
-        return Err("这个终端上有一轮对话 / 技能正在运行，请先停止".to_string());
+        return Err(crate::tr!(
+            "这个终端上有一轮对话 / 技能正在运行，请先停止",
+            "A chat / skill is running on this terminal, stop it first"
+        ));
     }
     let hint = ConsoleHint {
         console_id: console_id.clone(),
@@ -1293,7 +1342,7 @@ pub async fn host_reattach(
         old.supersede();
     }
     // 上一步是部分接驳（仍挂着「还差 …」）：它的降档提示要带到这一步
-    let from_partial = old.notice().is_some_and(|n| n.lines().any(|l| l.starts_with(WAITING_MARK)));
+    let from_partial = old.notice().is_some_and(|n| n.lines().any(is_waiting_line));
     if partial {
         // 新开连接后要恢复现场的话：这一次不起任务，记进对话（最后一个接上后模型第一步就看得到）
         if let Some(n) = restore_note.take() {
@@ -1320,7 +1369,13 @@ pub async fn host_reattach(
     }
     h.set_notice(reattach_notice(carried_notice(old.notice()), from_partial, partial, drifted, &prev_tier));
     if partial {
-        let waiting = format!("{WAITING_MARK}{}」；还差 {}，全部接上后自动接着托管。", saved.label, still_missing.iter().map(|l| format!("「{l}」")).collect::<Vec<_>>().join("、"));
+        let waiting = if crate::i18n::is_en() {
+            let missing = still_missing.iter().map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(", ");
+            format!("{WAITING_MARK_EN}{}\"; still waiting for {missing}. Autopilot resumes once all are back.", saved.label)
+        } else {
+            let missing = still_missing.iter().map(|l| format!("「{l}」")).collect::<Vec<_>>().join("、");
+            format!("{WAITING_MARK}{}」；还差 {missing}，全部接上后自动接着托管。", saved.label)
+        };
         let n = h.notice().map_or(waiting.clone(), |n| format!("{n}\n{waiting}"));
         h.set_notice(Some(n));
     }
@@ -1405,7 +1460,7 @@ async fn complete_partial(app: &AppHandle, old: &Arc<HostShared>) -> Result<(), 
     if !old.all_alive() {
         return Err("还有终端不在".to_string());
     }
-    let mut cp = old.checkpoint().ok_or_else(|| "没有可接驳的现场".to_string())?;
+    let mut cp = old.checkpoint().ok_or_else(no_checkpoint)?;
     let live = old.ctx();
     cp.contract = live.contract.clone();
     cp.authority = live.authority.clone();
@@ -1437,6 +1492,22 @@ async fn complete_partial(app: &AppHandle, old: &Arc<HostShared>) -> Result<(), 
 
 /// 接驳时屏幕漂移、降到确认档的提示：说清原来是什么档、怎么改回去。
 pub(crate) fn drift_notice(prev_tier: &str) -> String {
+    if crate::i18n::is_en() {
+        let was = match prev_tier {
+            super::policy::TIER_YOLO => "\"YOLO\"",
+            super::policy::TIER_AUTO => "\"Auto\"",
+            super::policy::TIER_NOTIFY => "\"Notify\"",
+            _ => "",
+        };
+        let back = if was.is_empty() {
+            String::new()
+        } else {
+            format!(". Once you've checked things look right, you can switch \"Permission level\" below back to {was}")
+        };
+        return format!(
+            "{DRIFT_MARK_EN} (or it's a new connection), so it was lowered to \"Ask first\": every write will ask you first{back}."
+        );
+    }
     let was = match prev_tier {
         super::policy::TIER_YOLO => "「YOLO·完全放手」",
         super::policy::TIER_AUTO => "「自动执行」",
@@ -1465,7 +1536,10 @@ pub(crate) fn move_lease(
     new_console: &str,
 ) -> Result<Vec<(String, ControlState)>, String> {
     if control.holders_of(new_console).iter().any(|h| h != run_id) {
-        return Err("这个终端正被另一轮运行驾驶着（对话 / 技能 / 另一份托管），先停掉它再接驳".to_string());
+        return Err(crate::tr!(
+            "这个终端正被另一轮运行驾驶着（对话 / 技能 / 另一份托管），先停掉它再接驳",
+            "This terminal is being driven by another run (chat / skill / another autopilot). Stop it before reattaching"
+        ));
     }
     let mut changes = Vec::new();
     if let Some(st) = control.acquire(new_console, run_id) {
@@ -1487,7 +1561,10 @@ pub(crate) fn still_reattachable(
 ) -> Result<(), String> {
     match sup.get(contract_id) {
         Some(cur) if Arc::ptr_eq(&cur, old) && matches!(cur.phase(), HostPhase::Suspended { .. }) => Ok(()),
-        _ => Err("这份托管在接驳过程中已被停止或接到了别处".to_string()),
+        _ => Err(crate::tr!(
+            "这份托管在接驳过程中已被停止或接到了别处",
+            "This autopilot run was stopped or reattached elsewhere while reattaching"
+        )),
     }
 }
 

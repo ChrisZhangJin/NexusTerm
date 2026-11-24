@@ -109,11 +109,11 @@ fn sha256_hex(b: &[u8]) -> String {
 }
 
 /// 不值得备份的原因：超过单文件上限 / 像二进制 / 不是合法 UTF-8。值得备份返回 None
-pub fn skip_reason(bytes: &[u8]) -> Option<&'static str> {
+pub fn skip_reason(bytes: &[u8]) -> Option<String> {
     if bytes.len() > FILE_CAP {
-        Some("原文件超过 1 MB，没有备份")
+        Some(crate::tr!("原文件超过 1 MB，没有备份", "Original file is over 1 MB, not backed up"))
     } else if bytes[..bytes.len().min(8192)].contains(&0) || std::str::from_utf8(bytes).is_err() {
-        Some("原文件是二进制 / 不是 UTF-8 文本，没有备份")
+        Some(crate::tr!("原文件是二进制 / 不是 UTF-8 文本，没有备份", "Original file is binary / not UTF-8 text, not backed up"))
     } else {
         None
     }
@@ -195,13 +195,18 @@ pub fn record(
     };
     match touch {
         Touch::Created => entry.status = BackupStatus::Created,
-        Touch::Unread => entry.note = Some("原文件过大，没有读取，也就没有备份".into()),
+        Touch::Unread => {
+            entry.note = Some(crate::tr!("原文件过大，没有读取，也就没有备份", "Original file too large to read, so not backed up"))
+        }
         Touch::Original(original) => {
             let total: u64 = idx.entries.iter().filter(|e| e.status == BackupStatus::BackedUp).map(|e| e.size).sum();
             if let Some(why) = skip_reason(original) {
-                entry.note = Some(why.into());
+                entry.note = Some(why);
             } else if total + original.len() as u64 > RUN_CAP {
-                entry.note = Some("这次托管的备份已满 20 MB，没有再备份".into());
+                entry.note = Some(crate::tr!(
+                    "这次托管的备份已满 20 MB，没有再备份",
+                    "This autopilot run's backups hit the 20 MB limit, not backed up"
+                ));
             } else {
                 write_private(&dir.join(format!("{}.bak", entry.id)), original)?;
                 entry.status = BackupStatus::BackedUp;
@@ -241,22 +246,35 @@ fn entry_valid(e: &BackupEntry) -> bool {
 /// 取回一份原文，校验索引与 sha256。
 pub fn load(root: &Path, contract_id: &str, id: &str) -> Result<(BackupEntry, Vec<u8>), String> {
     let dir = dir_of(root, contract_id);
-    let idx = read_index(&dir).ok_or_else(|| "这次托管没有留下备份".to_string())?;
+    let idx = read_index(&dir).ok_or_else(|| crate::tr!("这次托管没有留下备份", "This autopilot run left no backups"))?;
     if idx.contract_id != contract_id {
-        return Err("备份索引和这次托管对不上，不还原".into());
+        return Err(crate::tr!("备份索引和这次托管对不上，不还原", "Backup index doesn't match this autopilot run, not restoring"));
     }
-    let e = idx.entries.into_iter().find(|e| e.id == id).ok_or_else(|| format!("找不到备份 {id}"))?;
+    let e = idx
+        .entries
+        .into_iter()
+        .find(|e| e.id == id)
+        .ok_or_else(|| crate::tr!("找不到备份 {id}", "Backup {id} not found"))?;
     if !entry_valid(&e) {
-        return Err("备份索引损坏，不还原".into());
+        return Err(crate::tr!("备份索引损坏，不还原", "Backup index is corrupted, not restoring"));
     }
     match e.status {
         BackupStatus::BackedUp => {}
-        BackupStatus::Created => return Err(format!("「{}」是托管新建的，没有原文可还原", e.path)),
-        BackupStatus::Skipped => return Err(format!("「{}」没有备份原文，无法还原", e.path)),
+        BackupStatus::Created => {
+            return Err(crate::tr!(
+                "「{}」是托管新建的，没有原文可还原",
+                "\"{}\" was created by autopilot, there's no original to restore",
+                e.path
+            ))
+        }
+        BackupStatus::Skipped => {
+            return Err(crate::tr!("「{}」没有备份原文，无法还原", "\"{}\" has no backup of the original, can't restore", e.path))
+        }
     }
-    let bytes = fs::read(dir.join(format!("{}.bak", e.id))).map_err(|err| format!("备份文件读不出来：{err}"))?;
+    let bytes = fs::read(dir.join(format!("{}.bak", e.id)))
+        .map_err(|err| crate::tr!("备份文件读不出来：{err}", "Can't read the backup file: {err}"))?;
     if sha256_hex(&bytes) != e.sha256 {
-        return Err("备份文件已损坏（校验和对不上），不还原".into());
+        return Err(crate::tr!("备份文件已损坏（校验和对不上），不还原", "Backup file is corrupted (checksum mismatch), not restoring"));
     }
     Ok((e, bytes))
 }
@@ -265,7 +283,7 @@ pub fn load(root: &Path, contract_id: &str, id: &str) -> Result<(BackupEntry, Ve
 pub fn mark_restored(root: &Path, contract_id: &str, id: &str, now_ms: i64) -> Result<(), String> {
     let _g = index_lock();
     let dir = dir_of(root, contract_id);
-    let mut idx = read_index(&dir).ok_or_else(|| "这次托管没有留下备份".to_string())?;
+    let mut idx = read_index(&dir).ok_or_else(|| crate::tr!("这次托管没有留下备份", "This autopilot run left no backups"))?;
     if let Some(e) = idx.entries.iter_mut().find(|e| e.id == id) {
         e.restored_at = Some(now_ms);
     }

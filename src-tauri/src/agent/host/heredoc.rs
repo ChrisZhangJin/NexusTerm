@@ -336,11 +336,13 @@ pub fn feedback(h: &Heredoc, file_write_denied: bool) -> String {
 /// 门禁卡上给人看的一句话（给模型的完整话术见 [`feedback`]）。
 pub fn card_reason(h: &Heredoc) -> String {
     match h {
-        Heredoc::File { path, .. } => format!(
-            "在终端里逐行敲 heredoc 写文件容易被读屏误判、卡住后面的步骤，没有执行；已请 AI 改用 nx_write 直接写「{path}」"
+        Heredoc::File { path, .. } => crate::tr!(
+            "在终端里逐行敲 heredoc 写文件容易被读屏误判、卡住后面的步骤，没有执行；已请 AI 改用 nx_write 直接写「{path}」",
+            "Typing a heredoc line by line in the terminal to write a file is easily misread and stalls later steps, so it wasn't run; asked the AI to write \"{path}\" directly with nx_write"
         ),
-        Heredoc::Other { head } => format!(
-            "在终端里逐行敲带 heredoc 的命令（{head} <<…）容易被读屏误判，没有执行；已请 AI 改用 nx_run 旁路执行"
+        Heredoc::Other { head } => crate::tr!(
+            "在终端里逐行敲带 heredoc 的命令（{head} <<…）容易被读屏误判，没有执行；已请 AI 改用 nx_run 旁路执行",
+            "Typing a heredoc command ({head} <<…) line by line in the terminal is easily misread, so it wasn't run; asked the AI to run it via the side channel with nx_run"
         ),
     }
 }

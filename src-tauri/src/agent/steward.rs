@@ -505,7 +505,10 @@ pub fn compile_intent_input(
         strength: None,
         scope: None,
         source: Some("user".to_string()),
-        evidence: Some("由托管目标确定性编译（P2 零 LLM，可在面板编辑）".to_string()),
+        evidence: Some(crate::tr!(
+            "由托管目标确定性编译（P2 零 LLM，可在面板编辑）",
+            "Compiled deterministically from the autopilot goal (no LLM; editable in the panel)"
+        )),
         extra: Some(json!({
             "successCriteria": [],
             "constraints": constraints,
@@ -612,14 +615,14 @@ pub(crate) fn sign_contract(
     let console_id = console_id.to_string();
     let goal = goal.trim().to_string();
     if goal.is_empty() {
-        return Err("托管目标不能为空".to_string());
+        return Err(crate::tr!("托管目标不能为空", "The autopilot goal can't be empty"));
     }
     let kind = if state.local.contains(&console_id) {
         "local"
     } else if state.sessions.contains(&console_id) {
         "ssh"
     } else {
-        return Err(format!("没有 id 为「{console_id}」的终端"));
+        return Err(crate::tr!("没有 id 为「{console_id}」的终端", "Terminal with id \"{console_id}\" not found"));
     };
     // 一个 console 只有一份契约。旧契约不能只被 registry 顶掉：它的意向栈与授权都得一起收尾。
     if let Some(old) = registry.for_console(&console_id) {

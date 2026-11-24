@@ -135,16 +135,25 @@ impl ExhaustReason {
     /// 给人看的一句话。
     pub fn describe(&self) -> String {
         match *self {
-            Self::Steps { used, max } => format!("已执行 {used} 步，达到步数上限（{max} 步）"),
-            Self::Time { used_secs, max_secs } => format!(
+            Self::Steps { used, max } => {
+                crate::tr!("已执行 {used} 步，达到步数上限（{max} 步）", "Ran {used} steps, hit the step limit ({max} steps)")
+            }
+            Self::Time { used_secs, max_secs } => crate::tr!(
                 "已运行 {} 分钟，达到时间上限（{} 分钟）",
+                "Ran for {} min, hit the time limit ({} min)",
                 used_secs.div_ceil(60),
                 max_secs / 60
             ),
-            Self::Output { used, max } => format!("累计输出 {used} 字符，达到输出上限（{max} 字符）"),
-            Self::Cost { used_micros, max_micros } => {
-                format!("已花费约 {}，达到花费上限（{}）", usd(used_micros), usd(max_micros))
-            }
+            Self::Output { used, max } => crate::tr!(
+                "累计输出 {used} 字符，达到输出上限（{max} 字符）",
+                "Produced {used} characters of output, hit the output limit ({max} characters)"
+            ),
+            Self::Cost { used_micros, max_micros } => crate::tr!(
+                "已花费约 {}，达到花费上限（{}）",
+                "Spent about {}, hit the max spend ({})",
+                usd(used_micros),
+                usd(max_micros)
+            ),
         }
     }
 
@@ -335,6 +344,9 @@ impl PhaseTable {
 /// 暂停卡片的正文：**做了什么**（`recent_actions`，来自脱敏后的流水账摘要行）、
 /// **还差什么**（尚无结论，由模型接着做）、**怎么继续**。
 pub fn paused_text(cause: &PauseCause, steps_done: u32, recent_actions: &[String]) -> String {
+    if crate::i18n::is_en() {
+        return paused_text_en(cause, steps_done, recent_actions);
+    }
     let mut s = match cause {
         PauseCause::Budget { reason } => format!("本轮预算已用尽：{}。先暂停在这里。", reason.describe()),
         PauseCause::User => "已按你的要求在步骤边界暂停。".to_string(),
@@ -356,6 +368,33 @@ pub fn paused_text(cause: &PauseCause, steps_done: u32, recent_actions: &[String
         s.push_str("\n稍后点「继续」会在同一段对话上下文里重新请求模型；点「停止」则结束本轮。");
     } else {
         s.push_str("\n点「继续」会在同一段对话上下文里换一份新预算接着跑；点「停止」则结束本轮。");
+    }
+    s
+}
+
+fn paused_text_en(cause: &PauseCause, steps_done: u32, recent_actions: &[String]) -> String {
+    let mut s = match cause {
+        PauseCause::Budget { reason } => format!("This run's budget is used up: {}. Pausing here.", reason.describe()),
+        PauseCause::User => "Paused at a step boundary as you asked.".to_string(),
+        PauseCause::LlmError => {
+            "Requests to the model service kept failing and retries didn't help, so it's paused here (the conversation is kept)."
+                .to_string()
+        }
+    };
+    if recent_actions.is_empty() {
+        s.push_str(&format!("\nDone: {steps_done} steps in this segment, no actions to list yet."));
+    } else {
+        s.push_str(&format!("\nDone ({steps_done} steps in this segment, last {}):", recent_actions.len()));
+        for a in recent_actions {
+            s.push_str("\n · ");
+            s.push_str(a);
+        }
+    }
+    s.push_str("\nRemaining: the task hasn't reached a conclusion yet; the assistant will carry on with the rest.");
+    if matches!(cause, PauseCause::LlmError) {
+        s.push_str("\nClick \"Resume\" later to ask the model again in the same conversation; click \"Stop\" to end this run.");
+    } else {
+        s.push_str("\nClick \"Resume\" to continue in the same conversation with a fresh budget; click \"Stop\" to end this run.");
     }
     s
 }

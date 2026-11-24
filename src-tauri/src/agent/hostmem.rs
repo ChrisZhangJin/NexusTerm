@@ -215,11 +215,11 @@ pub fn host_key(id: HostId<'_>, label: &str) -> Option<String> {
 /// 主机键 → 给人看的名字（界面标题用）。
 pub fn host_display(key: &str) -> String {
     if key == "local" {
-        "本机".to_string()
+        crate::tr!("本机", "This computer")
     } else if let Some(rest) = key.strip_prefix("ssh:") {
         rest.to_string()
     } else if let Some(rest) = key.strip_prefix("tab:") {
-        format!("标签「{rest}」")
+        crate::tr!("标签「{rest}」", "Tab \"{rest}\"")
     } else {
         key.to_string()
     }
@@ -292,7 +292,11 @@ pub fn secret_hint(text: &str) -> Option<&'static str> {
     }
     for cap in kv_secret_re().captures_iter(text) {
         if looks_like_secret_value(&cap[1]) {
-            return Some("口令 / 令牌类关键词后跟了形似口令的值");
+            return Some(if crate::i18n::is_en() {
+                "a password / token keyword followed by a password-like value"
+            } else {
+                "口令 / 令牌类关键词后跟了形似口令的值"
+            });
         }
     }
     // 长随机串：>=24 位、字符集是 base64 / 十六进制那一类、大小写数字齐全（或全是十六进制 >=32 位）。
@@ -310,7 +314,11 @@ pub fn secret_hint(text: &str) -> Option<&'static str> {
         let upper = tok.chars().any(|c| c.is_ascii_uppercase());
         let lower = tok.chars().any(|c| c.is_ascii_lowercase());
         if (digit && upper && lower) || (tok.len() >= 32 && tok.chars().all(|c| c.is_ascii_hexdigit())) {
-            return Some("长随机串（疑似密钥 / 令牌 / 哈希）");
+            return Some(if crate::i18n::is_en() {
+                "a long random string (looks like a key / token / hash)"
+            } else {
+                "长随机串（疑似密钥 / 令牌 / 哈希）"
+            });
         }
     }
     None
@@ -327,18 +335,22 @@ pub fn validate_note_text(text: &str) -> Result<String, String> {
         .collect::<Vec<_>>()
         .join(" ");
     if norm.is_empty() {
-        return Err("备忘内容为空".into());
+        return Err(crate::tr!("备忘内容为空", "The note is empty"));
     }
     let n = norm.chars().count();
     if n > MAX_NOTE_CHARS {
-        return Err(format!(
-            "备忘过长（{n} 字，上限 {MAX_NOTE_CHARS}）：请只记一条精炼的稳定事实"
+        return Err(crate::tr!(
+            "备忘过长（{n} 字，上限 {MAX_NOTE_CHARS}）：请只记一条精炼的稳定事实",
+            "The note is too long ({n} characters, limit {MAX_NOTE_CHARS}): keep it to one concise, stable fact"
         ));
     }
     if let Some(why) = secret_hint(&norm) {
-        return Err(format!(
+        return Err(crate::tr!(
             "备忘疑似含凭据（{why}），已拒绝保存。主机备忘不加密，也会发给模型：\
-             绝不要记录密码 / 令牌 / 密钥 / 验证码，只记「用法与习惯」本身（例如「sudo 需要输入密码」，而不是密码）"
+             绝不要记录密码 / 令牌 / 密钥 / 验证码，只记「用法与习惯」本身（例如「sudo 需要输入密码」，而不是密码）",
+            "The note looks like it contains a credential ({why}), so it wasn't saved. Host notes aren't encrypted and \
+             are sent to the model: never record passwords / tokens / keys / verification codes, only the usage itself \
+             (e.g. \"sudo asks for a password\", not the password)"
         ));
     }
     Ok(norm)
@@ -479,21 +491,21 @@ pub fn run_memory_call(store: &Store, host_key: &str, display: &str, call: &Memo
             MemoryOutcome {
                 ok: true,
                 op: "read",
-                card: format!("读取了 {} 条主机备忘", notes.len()),
+                card: crate::tr!("读取了 {} 条主机备忘", "Read {} host notes", notes.len()),
                 note_id: None,
                 feedback,
             }
         }
         MemoryOp::Add => {
             let Some(text) = call.text.as_deref().filter(|t| !t.trim().is_empty()) else {
-                return fail("add", "缺少 text".into());
+                return fail("add", crate::tr!("缺少 text", "Missing text"));
             };
             let kind = Kind::parse_lenient(call.kind.as_deref());
             match store.host_memory_add(host_key, text, kind, Source::Agent) {
                 Ok((note, created)) => MemoryOutcome {
                     ok: true,
                     op: "add",
-                    card: format!("记住：{}", note.text),
+                    card: crate::tr!("记住：{}", "Remembered: {}", note.text),
                     note_id: Some(note.id.clone()),
                     feedback: if created {
                         format!("已记住（id {}，{}）。用户可在「主机备忘」里查看与删除。", short_id(&note.id), note.kind.as_str())
@@ -506,13 +518,13 @@ pub fn run_memory_call(store: &Store, host_key: &str, display: &str, call: &Memo
         }
         MemoryOp::Forget => {
             let Some(id) = call.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
-                return fail("forget", "缺少 id（先用 op=read 查看备忘与它们的 id）".into());
+                return fail("forget", crate::tr!("缺少 id（先用 op=read 查看备忘与它们的 id）", "Missing id (use op=read first to see the notes and their ids)"));
             };
             match store.host_memory_delete(Some(host_key), id, Source::Agent) {
                 Ok(note) => MemoryOutcome {
                     ok: true,
                     op: "forget",
-                    card: format!("忘记：{}", note.text),
+                    card: crate::tr!("忘记：{}", "Forgot: {}", note.text),
                     note_id: Some(note.id.clone()),
                     feedback: format!("已删除备忘 {}。", short_id(&note.id)),
                 },

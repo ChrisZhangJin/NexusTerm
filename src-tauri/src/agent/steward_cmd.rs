@@ -61,7 +61,7 @@ pub fn steward_intent_push(
     bus: State<'_, StewardBus>,
 ) -> Result<CtxItem, String> {
     if contract_id.trim().is_empty() {
-        return Err("契约 id 不能为空".to_string());
+        return Err(crate::tr!("契约 id 不能为空", "Contract id can't be empty"));
     }
     let position = brain
         .intent_stack(&contract_id)
@@ -75,7 +75,7 @@ pub fn steward_intent_push(
         strength: None,
         scope: None,
         source: Some("user".to_string()),
-        evidence: Some("用户在托管面板压入".to_string()),
+        evidence: Some(crate::tr!("用户在托管面板压入", "Pushed by the user from the autopilot panel")),
         extra: Some(json!({
             "successCriteria": [],
             "constraints": constraints.unwrap_or_default(),

@@ -36,41 +36,55 @@ const RATIONALE_CAP: usize = 600;
 pub fn describe_write(a: &AgentAction) -> Option<(&'static str, String)> {
     Some(match a {
         AgentAction::Exec { command, .. } => ("exec", command.trim().to_string()),
-        AgentAction::Run { command, .. } => ("exec", format!("（旁路）{}", command.trim())),
-        AgentAction::Keys { keys, .. } => ("keys", format!("发送按键：{keys}")),
+        AgentAction::Run { command, .. } => ("exec", crate::tr!("（旁路）{}", "(side channel) {}", command.trim())),
+        AgentAction::Keys { keys, .. } => ("keys", crate::tr!("发送按键：{keys}", "Send keys: {keys}")),
         // 交付通道：只记标题 + 来源（路径 / 命令），内容永远不进决策记录
         AgentAction::Reveal { title, source, .. } if !matches!(source, super::super::reveal::RevealSource::Invalid(_)) => {
             ("reveal", super::super::reveal::decision_text(title, source))
         }
         AgentAction::Secret { reason, .. } => {
-            ("secret", format!("请用户输入密码（{}）", reason.as_deref().unwrap_or("未说明")))
+            let why = reason.clone().unwrap_or_else(|| crate::tr!("未说明", "no reason given"));
+            ("secret", crate::tr!("请用户输入密码（{why}）", "Ask the user for a password ({why})"))
         }
         AgentAction::Skill { call, .. } if call.op == super::super::skilltool::SkillOp::Run => {
-            ("skill", format!("运行技能：{}", call.key.as_deref().unwrap_or("?")))
+            ("skill", crate::tr!("运行技能：{}", "Run skill: {}", call.key.as_deref().unwrap_or("?")))
         }
         AgentAction::Open { kind, label, command } => {
+            let en = crate::i18n::is_en();
             let what = match kind {
+                OpenKind::Local if en => "local".to_string(),
                 OpenKind::Local => "本地".to_string(),
                 OpenKind::Ssh { session_record_id } => format!("SSH {session_record_id}"),
             };
-            let mut t = format!("打开{what}会话「{}」", label.as_deref().unwrap_or("新会话"));
+            let label = label.clone().unwrap_or_else(|| crate::tr!("新会话", "new session"));
+            let mut t = crate::tr!("打开{what}会话「{label}」", "Open {what} session \"{label}\"");
             if let Some(c) = command {
-                t.push_str(&format!("并执行：{}", c.trim()));
+                t.push_str(&crate::tr!("并执行：{}", " and run: {}", c.trim()));
             }
             ("open", t)
         }
         AgentAction::File(call) if call.is_write() => ("file_write", call.summary()),
         AgentAction::Tab { op: TabOp::Close, target, .. } => {
-            ("tab_close", format!("关闭标签页 {}", target.as_deref().unwrap_or("当前")))
+            let t = target.clone().unwrap_or_else(|| crate::tr!("当前", "current"));
+            ("tab_close", crate::tr!("关闭标签页 {t}", "Close tab {t}"))
         }
         AgentAction::Tab { op: TabOp::Reconnect, target, .. } => {
-            ("tab_reconnect", format!("重连标签页 {}", target.as_deref().unwrap_or("当前")))
+            let t = target.clone().unwrap_or_else(|| crate::tr!("当前", "current"));
+            ("tab_reconnect", crate::tr!("重连标签页 {t}", "Reconnect tab {t}"))
         }
         _ => return None,
     })
 }
 
 fn gate_word(g: &Gate) -> &'static str {
+    if crate::i18n::is_en() {
+        return match g {
+            Gate::Allow => "allowed",
+            Gate::Notify => "run, then notified",
+            Gate::Approve(_) => "approved by user",
+            Gate::Deny(_) => "refused",
+        };
+    }
     match g {
         Gate::Allow => "放行",
         Gate::Notify => "执行后通知",
@@ -91,10 +105,10 @@ pub fn hosted_decision(
     now_ms: i64,
 ) -> DecisionRecord {
     let why: String = rationale.trim().chars().take(RATIONALE_CAP).collect();
-    let why = if why.is_empty() { "（模型这一轮没有写说明）".to_string() } else { why };
+    let why = if why.is_empty() { crate::tr!("（模型这一轮没有写说明）", "(the model gave no explanation this turn)") } else { why };
     // 落库的按键 / 命令：脱敏；屏幕被认成密码提示时按键一个字都不留（那可能就是口令）
     let text = if kind == "keys" && sit.is_some_and(|s| s.kind == super::super::situation::SituationKind::Password) {
-        super::gate::KEYS_HIDDEN.to_string()
+        super::gate::keys_hidden()
     } else {
         super::super::redact::redact(text)
     };

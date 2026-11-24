@@ -60,6 +60,18 @@ impl Program {
 
     /// 给人看的名字（与前端 `steward.ts` 的 PROGRAM_LABELS 同口径）
     pub fn label(self) -> &'static str {
+        if crate::i18n::is_en() {
+            return match self {
+                Self::Shell => "Shell",
+                Self::ClaudeCode => "Claude Code",
+                Self::Vim => "Vim",
+                Self::Pager => "pager",
+                Self::Tui => "full-screen program",
+                Self::Script => "interactive script",
+                Self::Ssh => "SSH",
+                Self::Unknown => "unknown program",
+            };
+        }
         match self {
             Self::Shell => "Shell",
             Self::ClaudeCode => "Claude Code",
@@ -122,6 +134,22 @@ impl SituationKind {
 
     /// 给人看的名字：门禁卡上「屏幕被识别为：…」用
     pub fn label(self) -> &'static str {
+        if crate::i18n::is_en() {
+            return match self {
+                Self::Question => "asking a question",
+                Self::Permission => "permission prompt",
+                Self::Password => "password / passphrase prompt",
+                Self::Menu => "selection menu",
+                Self::Pager => "pager (less / more)",
+                Self::Progress => "task in progress",
+                Self::SubagentStatus => "subtask status",
+                Self::AwaitingInput => "waiting for input",
+                Self::Idle => "shell prompt (idle)",
+                Self::Error => "stopped on an error",
+                Self::AltScreen => "full-screen program (situation not recognized)",
+                Self::Unknown => "not recognized",
+            };
+        }
         match self {
             Self::Question => "在问一个问题",
             Self::Permission => "授权确认框",
@@ -1395,6 +1423,9 @@ pub fn classify(snap: &ScreenSnapshot, now_ms: i64, stale_limit_ms: i64) -> Situ
 /// P1 的「建议卡」文本：按 §3.3 四类干预给出**建议**，不执行、不调 LLM。
 /// P2 接 DecisionCompiler 后，这里会被真实 DecisionRecord 取代。
 pub fn observe_suggestion(kind: SituationKind, same_ticks: u32, no_progress_ticks: u32) -> String {
+    if crate::i18n::is_en() {
+        return observe_suggestion_en(kind, same_ticks, no_progress_ticks);
+    }
     let loop_risk = same_ticks >= no_progress_ticks.saturating_mul(2);
     if loop_risk && matches!(kind, SituationKind::Question | SituationKind::Permission) {
         return "同一提问反复出现，疑似回环：建议升级给用户并附上前几次局面记录，不要重复作答。".to_string();
@@ -1423,6 +1454,38 @@ pub fn observe_suggestion(kind: SituationKind, same_ticks: u32, no_progress_tick
         }
         SituationKind::Error => "命令报错停住：建议升级并附脱敏屏幕快照，不要盲目重试。".to_string(),
         _ => "局面长时间未变化：建议先对齐屏幕现场（强制全量帧），再决定是否需要人工介入。".to_string(),
+    }
+}
+
+fn observe_suggestion_en(kind: SituationKind, same_ticks: u32, no_progress_ticks: u32) -> String {
+    let loop_risk = same_ticks >= no_progress_ticks.saturating_mul(2);
+    if loop_risk && matches!(kind, SituationKind::Question | SituationKind::Permission) {
+        return "The same question keeps coming back, looks like a loop: escalate to the user with the previous situations attached; don't answer again.".to_string();
+    }
+    match kind {
+        SituationKind::Question | SituationKind::AwaitingInput => {
+            "The program is waiting for an answer: P2 generates a full reply from the intent and types it; P1 is read-only, answer it yourself.".to_string()
+        }
+        SituationKind::Permission => {
+            "Permission prompt detected: choose \"allow once\"; options mentioning \"always / don't ask again\" are never picked automatically.".to_string()
+        }
+        SituationKind::Password => {
+            "Passwords / passphrases must be typed by the user: Steward never fills them in or writes them to the event stream.".to_string()
+        }
+        SituationKind::Progress => {
+            "The task still prints output but isn't progressing: wait longer and give a status summary without interrupting it.".to_string()
+        }
+        SituationKind::SubagentStatus => {
+            "Subtasks are idle: nudge them / restart with a new prompt / declare them stuck and report, with history attached.".to_string()
+        }
+        SituationKind::Pager | SituationKind::Menu => {
+            "The program is at a pager or menu: P2 can send q / a number to move on; P1 is read-only, do it yourself.".to_string()
+        }
+        SituationKind::Idle => {
+            "Back at the shell with nothing changing: check success_criteria; if met, hand back with a summary.".to_string()
+        }
+        SituationKind::Error => "The command stopped on an error: escalate with a redacted screen snapshot; don't retry blindly.".to_string(),
+        _ => "The situation hasn't changed for a long time: resync the screen (force a full frame) first, then decide whether a person needs to step in.".to_string(),
     }
 }
 

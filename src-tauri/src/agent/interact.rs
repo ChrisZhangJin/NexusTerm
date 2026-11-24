@@ -52,7 +52,7 @@ pub fn parse_keys_mode(src: &str, app_cursor: bool) -> Result<Vec<u8>, String> {
         match c {
             '\\' => {
                 let Some(&n) = chars.get(i + 1) else {
-                    return Err("按键串以孤立的反斜杠结尾（要发字面反斜杠请写 \\\\）".into());
+                    return Err(crate::tr!("按键串以孤立的反斜杠结尾（要发字面反斜杠请写 \\\\）", "The key sequence ends with a lone backslash (write \\\\ for a literal backslash)"));
                 };
                 match n {
                     'r' => out.push(0x0d),
@@ -63,15 +63,16 @@ pub fn parse_keys_mode(src: &str, app_cursor: bool) -> Result<Vec<u8>, String> {
                     'x' | 'X' => {
                         let hex: String = chars.iter().skip(i + 2).take(2).collect();
                         if hex.chars().count() != 2 || !hex.chars().all(|h| h.is_ascii_hexdigit()) {
-                            return Err("`\\x` 后面必须是两位十六进制，如 \\x03".into());
+                            return Err(crate::tr!("`\\x` 后面必须是两位十六进制，如 \\x03", "`\\x` must be followed by two hex digits, e.g. \\x03"));
                         }
                         // 上面已确认两位都是十六进制，from_str_radix 不会失败
                         out.push(u8::from_str_radix(&hex, 16).map_err(|e| e.to_string())?);
                         i += 2;
                     }
                     other => {
-                        return Err(format!(
-                            "不认识的转义 `\\{other}`（支持 \\r \\n \\t \\e \\\\ \\xNN）"
+                        return Err(crate::tr!(
+                            "不认识的转义 `\\{other}`（支持 \\r \\n \\t \\e \\\\ \\xNN）",
+                            "Unknown escape `\\{other}` (supported: \\r \\n \\t \\e \\\\ \\xNN)"
                         ));
                     }
                 }
@@ -94,11 +95,11 @@ pub fn parse_keys_mode(src: &str, app_cursor: bool) -> Result<Vec<u8>, String> {
             }
         }
         if out.len() > MAX_KEYS_BYTES {
-            return Err(format!("按键串解码后超过 {MAX_KEYS_BYTES} 字节上限，请拆成几次发送"));
+            return Err(crate::tr!("按键串解码后超过 {MAX_KEYS_BYTES} 字节上限，请拆成几次发送", "The decoded key sequence exceeds the {MAX_KEYS_BYTES}-byte limit; split it into several sends"));
         }
     }
     if out.is_empty() {
-        return Err("按键串为空".into());
+        return Err(crate::tr!("按键串为空", "The key sequence is empty"));
     }
     Ok(out)
 }
@@ -130,14 +131,15 @@ fn named_key_at(chars: &[char], at: usize, app_cursor: bool) -> Result<Option<(V
     let (base, times) = match name.rsplit_once('*') {
         Some((b, n)) if !b.is_empty() => match n.parse::<usize>() {
             Ok(t) if (1..=MAX_KEY_REPEAT).contains(&t) => (b.to_string(), t),
-            _ => return Err(format!("`<{name}>` 的重复次数要在 1–{MAX_KEY_REPEAT} 之间")),
+            _ => return Err(crate::tr!("`<{name}>` 的重复次数要在 1–{MAX_KEY_REPEAT} 之间", "The repeat count of `<{name}>` must be between 1 and {MAX_KEY_REPEAT}")),
         },
         _ => (name.clone(), 1),
     };
     match key_bytes(&base, app_cursor) {
         Some(b) => Ok(Some((b.repeat(times), end - at + 1))),
-        None => Err(format!(
-            "不认识的按键 `<{name}>`（要发字面 `<` 请写 <lt>；支持的键见 nx_send_keys 的说明）"
+        None => Err(crate::tr!(
+            "不认识的按键 `<{name}>`（要发字面 `<` 请写 <lt>；支持的键见 nx_send_keys 的说明）",
+            "Unknown key `<{name}>` (write <lt> for a literal `<`; see nx_send_keys for supported keys)"
         )),
     }
 }

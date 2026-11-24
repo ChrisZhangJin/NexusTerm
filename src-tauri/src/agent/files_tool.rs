@@ -118,12 +118,25 @@ impl FileCall {
     /// 给人看的一句话（卡片标题 / 决策记录）
     pub fn summary(&self) -> String {
         match self {
-            Self::Read(a) => format!("读取 {}", a.path),
-            Self::Write(a) => format!("写入 {}（{} 字节）", a.path, a.content.len()),
-            Self::Edit(a) => format!("修改 {}{}", a.path, if a.replace_all { "（全部替换）" } else { "" }),
-            Self::Glob(a) => format!("查找文件 {}{}", a.pattern, a.path.as_deref().map(|p| format!("（在 {p}）")).unwrap_or_default()),
-            Self::Grep(a) => format!("搜索 /{}/{}", a.pattern, a.path.as_deref().map(|p| format!("（在 {p}）")).unwrap_or_default()),
+            Self::Read(a) => crate::tr!("读取 {}", "Read {}", a.path),
+            Self::Write(a) => crate::tr!("写入 {}（{} 字节）", "Write {} ({} bytes)", a.path, a.content.len()),
+            Self::Edit(a) => crate::tr!(
+                "修改 {}{}",
+                "Edit {}{}",
+                a.path,
+                if a.replace_all { crate::tr!("（全部替换）", " (replace all)") } else { String::new() }
+            ),
+            Self::Glob(a) => crate::tr!("查找文件 {}{}", "Find files {}{}", a.pattern, in_dir(a.path.as_deref())),
+            Self::Grep(a) => crate::tr!("搜索 /{}/{}", "Search /{}/{}", a.pattern, in_dir(a.path.as_deref())),
         }
+    }
+}
+
+/// summary 里的「（在 某目录）」
+fn in_dir(p: Option<&str>) -> String {
+    match p {
+        Some(p) => crate::tr!("（在 {p}）", " (in {p})"),
+        None => String::new(),
     }
 }
 
@@ -142,9 +155,11 @@ pub fn absolutize(path: &str, cwd: Option<&str>) -> Result<String, String> {
             let rel = p.strip_prefix("./").unwrap_or(p);
             Ok(format!("{}/{}", c.trim_end_matches('/'), rel))
         }
-        None => Err(format!(
+        None => Err(crate::tr!(
             "「{p}」是相对路径，但不知道终端的当前目录。请改用绝对路径或以 ~ 开头；\
-             不确定当前目录可以先 nx_exec 执行 pwd"
+             不确定当前目录可以先 nx_exec 执行 pwd",
+            "\"{p}\" is a relative path, but the terminal's current directory is unknown. Use an absolute path or one \
+             starting with ~; if unsure of the current directory, run pwd with nx_exec first"
         )),
     }
 }
@@ -184,14 +199,14 @@ impl WriteApproval {
         let base = if self.read {
             self.summary.clone()
         } else if self.sensitive_path {
-            format!("写入受保护路径 {}：{}", self.path, self.summary)
+            crate::tr!("写入受保护路径 {}：{}", "Write protected path {}: {}", self.path, self.summary)
         } else {
             self.summary.clone()
         };
         if self.preview_complete {
             base
         } else {
-            format!("{base}（⚠ 预览不完整：卡上看不到全部修改）")
+            crate::tr!("{base}（⚠ 预览不完整：卡上看不到全部修改）", "{base} (⚠ incomplete preview: not every change is shown on the card)")
         }
     }
 }
@@ -228,7 +243,10 @@ fn clip(s: &str, max: usize) -> String {
 fn fail(summary: String, e: impl std::fmt::Display) -> FileOutcome {
     FileOutcome {
         ok: false,
-        feedback: format!("{summary} 失败：{e}\n如果文件工具在这台机器上不可用，可以改用 nx_exec。\n"),
+        feedback: crate::tr!(
+            "{summary} 失败：{e}\n如果文件工具在这台机器上不可用，可以改用 nx_exec。\n",
+            "{summary} failed: {e}\nIf the file tools aren't available on this machine, use nx_exec instead.\n"
+        ),
         summary,
         ..Default::default()
     }
@@ -238,7 +256,10 @@ fn fail(summary: String, e: impl std::fmt::Display) -> FileOutcome {
 fn protected(summary: String, e: FileError) -> FileOutcome {
     FileOutcome {
         ok: false,
-        feedback: format!("{summary} 没有执行：{e}。用户没有批准；不要尝试用其它方式读取它，确有需要请在结论里说明。\n"),
+        feedback: crate::tr!(
+            "{summary} 没有执行：{e}。用户没有批准；不要尝试用其它方式读取它，确有需要请在结论里说明。\n",
+            "{summary} was not run: {e}. The user didn't approve; don't try to read it another way — if you really need it, say so in your conclusion.\n"
+        ),
         summary,
         ..Default::default()
     }
@@ -254,10 +275,11 @@ async fn read<A: Approver>(
         Err(FileError::ReadDenied { path, size }) => {
             let req = WriteApproval {
                 path: path.clone(),
-                summary: format!("读取受保护路径 {path}"),
+                summary: crate::tr!("读取受保护路径 {path}", "Read protected path {path}"),
                 diff: String::new(),
-                reasons: vec![format!(
-                    "「{path}」在受保护清单里（密钥 / 凭据，{size} 字节）：批准即允许读取这一次；内容仍会脱敏后才给模型"
+                reasons: vec![crate::tr!(
+                    "「{path}」在受保护清单里（密钥 / 凭据，{size} 字节）：批准即允许读取这一次；内容仍会脱敏后才给模型",
+                    "\"{path}\" is on the protected list (keys / credentials, {size} bytes): approving allows reading it this once; the content is still redacted before it reaches the model"
                 )],
                 sensitive_path: false,
                 read: true,
@@ -305,7 +327,13 @@ pub async fn run<A: Approver>(
                 FileOutcome {
                     ok: true,
                     feedback: format!("{head}{}", shown(&r.content, r.sensitive, redact_all)),
-                    summary: format!("读取 {}（{} 行{}）", r.path, r.lines_returned, if r.sensitive { "，已脱敏" } else { "" }),
+                    summary: crate::tr!(
+                        "读取 {}（{} 行{}）",
+                        "Read {} ({} lines{})",
+                        r.path,
+                        r.lines_returned,
+                        if r.sensitive { crate::tr!("，已脱敏", ", redacted") } else { String::new() }
+                    ),
                     ..Default::default()
                 }
             }
@@ -316,7 +344,7 @@ pub async fn run<A: Approver>(
             Ok(r) => FileOutcome {
                 ok: true,
                 feedback: format!("{}\n", r.to_model_text()),
-                summary: format!("{summary}：{} 个", r.files.len()),
+                summary: crate::tr!("{summary}：{} 个", "{summary}: {}", r.files.len()),
                 ..Default::default()
             },
             Err(e) => fail(summary, e),
@@ -328,7 +356,7 @@ pub async fn run<A: Approver>(
             Ok(r) => FileOutcome {
                 ok: true,
                 feedback: shown(&r.to_model_text(), r.sensitive, redact_all),
-                summary: format!("{summary}：{} 处", r.matches.len()),
+                summary: crate::tr!("{summary}：{} 处", "{summary}: {} matches", r.matches.len()),
                 ..Default::default()
             },
             Err(e @ FileError::ReadDenied { .. }) => protected(summary, e),
@@ -368,8 +396,9 @@ pub(crate) fn placeholder_wipe(call: &FileCall, pending: &PendingChange) -> Opti
         _ => false,
     };
     more.then(|| {
-        format!(
+        crate::tr!(
             "内容里有脱敏占位符 {}，写入会抹掉真实密钥；请用 nx_edit 只改需要改的行，不要整文件重写",
+            "The content contains the redaction placeholder {}; writing it would wipe the real secret. Use nx_edit to change only the lines you need instead of rewriting the whole file",
             redact::PLACEHOLDER
         )
     })
@@ -415,7 +444,7 @@ async fn write<A: Approver>(
     if let WriteGate::Deny(why) = &gate {
         return FileOutcome {
             ok: false,
-            feedback: format!("{summary} 没有执行：{why}\n"),
+            feedback: crate::tr!("{summary} 没有执行：{why}\n", "{summary} was not run: {why}\n"),
             summary,
             ..Default::default()
         };
@@ -434,7 +463,7 @@ async fn write<A: Approver>(
     if let Some(why) = placeholder_wipe(call, &pending) {
         return FileOutcome {
             ok: false,
-            feedback: format!("{summary} 没有执行：{why}\n"),
+            feedback: crate::tr!("{summary} 没有执行：{why}\n", "{summary} was not run: {why}\n"),
             summary,
             diff: Some(redact::redact(&ch.diff_preview)),
             ..Default::default()
@@ -449,12 +478,19 @@ async fn write<A: Approver>(
         _ => Vec::new(),
     };
     if sensitive_path {
-        reasons.push(format!("「{}」在受保护清单里（密钥 / 凭据 / 系统配置）：批准即允许这一次写入", ch.path));
+        reasons.push(crate::tr!(
+            "「{}」在受保护清单里（密钥 / 凭据 / 系统配置）：批准即允许这一次写入",
+            "\"{}\" is on the protected list (keys / credentials / system config): approving allows this one write",
+            ch.path
+        ));
     }
     // 预览不完整：人看不到全部将要写入的内容，自动档位也不能静默落盘
     let complete = pending.preview_complete;
     if !complete {
-        reasons.push("预览不完整：差异过长、原文件过大或是二进制，卡上看不到全部修改；批准即按完整内容写入".into());
+        reasons.push(crate::tr!(
+            "预览不完整：差异过长、原文件过大或是二进制，卡上看不到全部修改；批准即按完整内容写入",
+            "Incomplete preview: the diff is too long, or the original file is too large or binary, so not every change is shown on the card; approving writes the full content"
+        ));
     }
     if sensitive_path || !complete || matches!(gate, WriteGate::Approve(_)) {
         let req = WriteApproval {
@@ -469,7 +505,10 @@ async fn write<A: Approver>(
         if !approver.approve(&req).await {
             return FileOutcome {
                 ok: false,
-                feedback: format!("{summary} 没有执行：用户没有批准。换个做法，或在结论里说明需要他本人修改。\n"),
+                feedback: crate::tr!(
+                    "{summary} 没有执行：用户没有批准。换个做法，或在结论里说明需要他本人修改。\n",
+                    "{summary} was not run: the user didn't approve. Try another approach, or say in your conclusion that they need to make the change themselves.\n"
+                ),
                 summary,
                 diff: Some(diff),
                 ..Default::default()
@@ -495,8 +534,9 @@ async fn write<A: Approver>(
         }
         Err(FileError::Conflict(p)) => FileOutcome {
             ok: false,
-            feedback: format!(
-                "「{p}」在审批期间被改动过，这次修改没有写入（也不会自动重试）。请重新 nx_read 看清现状后再决定怎么改。\n"
+            feedback: crate::tr!(
+                "「{p}」在审批期间被改动过，这次修改没有写入（也不会自动重试）。请重新 nx_read 看清现状后再决定怎么改。\n",
+                "\"{p}\" changed while waiting for approval, so this change was not written (and won't be retried automatically). nx_read it again before deciding how to change it.\n"
             ),
             summary,
             diff: Some(diff),

@@ -192,7 +192,10 @@ pub fn build_draft(events: &[TimelineEvent], meta: &RecordMeta) -> RecordingDraf
     // 时间线是环形的：窗口里第一条不是 start_seq + 1，说明最早的被挤掉了
     if let Some(first) = events.first() {
         if first.seq > meta.start_seq + 1 {
-            b.warn("录制太长：时间线只保留最近一段，最早的操作已丢失，草稿不完整");
+            b.warn(crate::tr!(
+                "录制太长：时间线只保留最近一段，最早的操作已丢失，草稿不完整",
+                "Recording too long: the timeline only keeps the most recent part, so the earliest actions were lost and the draft is incomplete"
+            ));
         }
     }
 
@@ -204,43 +207,54 @@ pub fn build_draft(events: &[TimelineEvent], meta: &RecordMeta) -> RecordingDraf
     let mut steps = std::mem::take(&mut b.steps);
     if steps.len() > skill::MAX_STEPS {
         steps.truncate(skill::MAX_STEPS);
-        b.warn(format!("步骤超过 {} 步上限，后面的已被截掉", skill::MAX_STEPS));
+        b.warn(crate::tr!(
+            "步骤超过 {} 步上限，后面的已被截掉",
+            "More than the {}-step limit; the rest were cut off",
+            skill::MAX_STEPS
+        ));
     }
 
     // 汇总型告警
     if b.agent_events > 0 {
-        b.warn(format!(
+        b.warn(crate::tr!(
             "录制期间 Agent 也执行了 {} 个动作，它们不是用户操作，已忽略",
+            "The agent also performed {} actions during recording; they aren't yours and were ignored",
             b.agent_events
         ));
     }
     if b.leaked_dropped > 0 {
-        b.warn(format!(
+        b.warn(crate::tr!(
             "有 {} 条命令 / 应答疑似含明文口令，已从草稿丢弃（原文未保留）。请改用密码步骤，不要把口令写在命令里",
+            "{} commands / replies looked like they contained a plaintext password and were dropped from the draft (not kept). Use a password step instead of putting passwords in commands",
             b.leaked_dropped
         ));
     }
     if b.too_long_dropped > 0 {
-        b.warn(format!("有 {} 条命令过长，已丢弃", b.too_long_dropped));
+        b.warn(crate::tr!("有 {} 条命令过长，已丢弃", "{} commands were too long and were dropped", b.too_long_dropped));
     }
     if b.unknown_prompt_secret > 0 {
-        b.warn(format!(
+        b.warn(crate::tr!(
             "有 {} 处在密码提示后输入了文字，已按密码处理（内容未记录）",
+            "Text was typed after a password prompt {} times; treated as passwords (content not recorded)",
             b.unknown_prompt_secret
         ));
     }
     if b.orphan_outputs > 0 {
-        b.warn(
+        b.warn(crate::tr!(
             "录制期间可能有未捕获的操作：出现了没有对应命令的输出（可能来自录制前启动的命令，\
              或经由历史 / 片段 / 宏发出的命令）",
-        );
+            "Some actions may not have been captured: there was output with no matching command (perhaps from a command \
+             started before recording, or one sent via history / snippets / macros)"
+        ));
     }
     // 对账：终端实际收到的回车 vs 捕获到的提交。Agent 自己的动作也会写输入段，有它在就没法对账
     if let (Some(got), 0) = (meta.in_submits, b.agent_events) {
         if got > b.submitted {
-            b.warn(format!(
+            b.warn(crate::tr!(
                 "录制期间可能有未捕获的操作：终端收到 {got} 次回车提交，只捕获到 {} 次\
                  （片段 / 快速发送 / 宏回放 / 全屏程序里的回车不在录制范围内）",
+                "Some actions may not have been captured: the terminal received {got} Enter submissions but only {} were captured \
+                 (Enter from snippets / quick send / macro playback / full-screen programs isn't recorded)",
                 b.submitted
             ));
         }
@@ -254,17 +268,20 @@ pub fn build_draft(events: &[TimelineEvent], meta: &RecordMeta) -> RecordingDraf
             let why = r
                 .reasons
                 .first()
-                .and_then(|s| s.split_once('：'))
+                .and_then(|s| s.split_once('：').or_else(|| s.split_once(": ")))
                 .map(|(_, w)| w.to_string())
-                .unwrap_or_else(|| "含危险操作".into());
-            b.warn(format!("第 {} 步（{}）风险较高：{why}", i + 1, step.kind()));
+                .unwrap_or_else(|| crate::tr!("含危险操作", "contains a dangerous operation"));
+            b.warn(crate::tr!("第 {} 步（{}）风险较高：{why}", "Step {} ({}) is high risk: {why}", i + 1, step.kind()));
         }
     }
     if steps.iter().any(|s| matches!(s, SkillStep::Exec { command, .. } if is_exit_command(command))) {
-        b.warn("包含 exit / logout：回放到这一步会结束当前会话");
+        b.warn(crate::tr!(
+            "包含 exit / logout：回放到这一步会结束当前会话",
+            "Contains exit / logout: playback will end the current session at that step"
+        ));
     }
     if steps.is_empty() {
-        b.warn("录制期间没有捕获到可用的操作");
+        b.warn(crate::tr!("录制期间没有捕获到可用的操作", "No usable actions were captured during recording"));
     }
 
     // hints：只给 exec / expect_respond（有命令输出可言）；不超出步数
@@ -284,10 +301,18 @@ pub fn build_draft(events: &[TimelineEvent], meta: &RecordMeta) -> RecordingDraf
 
     let mut notes = Vec::new();
     if b.merged > 0 {
-        notes.push(format!("合并了 {} 处重复 / 续行 / 连续按键片段", b.merged));
+        notes.push(crate::tr!(
+            "合并了 {} 处重复 / 续行 / 连续按键片段",
+            "Merged {} repeated / continued-line / consecutive keystroke fragments",
+            b.merged
+        ));
     }
     if b.dropped_noise > 0 {
-        notes.push(format!("忽略了 {} 条噪声操作（空行 / clear / 注释等）", b.dropped_noise));
+        notes.push(crate::tr!(
+            "忽略了 {} 条噪声操作（空行 / clear / 注释等）",
+            "Ignored {} noise actions (empty lines / clear / comments, etc.)",
+            b.dropped_noise
+        ));
     }
     notes.truncate(MAX_NOTES);
 
@@ -566,8 +591,9 @@ impl Builder {
         }
         if keys.eq_ignore_ascii_case("<C-c>") {
             if let Some(SkillStep::Exec { command, .. }) = self.steps.last() {
-                let msg = format!(
+                let msg = crate::tr!(
                     "命令 `{}` 之后紧跟 Ctrl-C：它可能是长驻命令（回放时 exec 会一直等它结束），请考虑设置超时或改写",
+                    "Command `{}` is followed by Ctrl-C: it may be long-running (playback would wait for it to finish); consider a timeout or rewriting it",
                     clip_head(command, 60)
                 );
                 self.warn(msg);
@@ -654,8 +680,12 @@ fn expect_from_prompt(prompt: &str, answer: &str) -> Option<String> {
 /// secret 步骤的 `reason`：由提示行文字派生，没有提示就用通用说法。**永远不含任何输入内容。**
 fn secret_reason(ctx: Option<&PromptCtx>) -> String {
     match ctx.map(|c| c.text.trim()).filter(|t| !t.is_empty()) {
-        Some(t) => format!("提示「{}」要求输入密码 / 口令", clip_tail(&redact::redact(t), MAX_REASON_PROMPT_CHARS)),
-        None => "录制时输入了一次密码 / 口令".to_string(),
+        Some(t) => crate::tr!(
+            "提示「{}」要求输入密码 / 口令",
+            "The prompt \"{}\" asks for a password / passphrase",
+            clip_tail(&redact::redact(t), MAX_REASON_PROMPT_CHARS)
+        ),
+        None => crate::tr!("录制时输入了一次密码 / 口令", "A password / passphrase was entered while recording"),
     }
 }
 
@@ -766,10 +796,13 @@ impl AgentManager {
         host_label: &str,
     ) -> Result<(RecorderStatus, Vec<TimelineEvent>), String> {
         if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err("AI 助手总开关未启用：时间线不会记录，无法录制".into());
+            return Err(crate::tr!(
+                "AI 助手总开关未启用：时间线不会记录，无法录制",
+                "The AI assistant is turned off: the timeline isn't recorded, so recording isn't possible"
+            ));
         }
         if self.recorder_active(session_id) {
-            return Err("这个终端已经在录制中".into());
+            return Err(crate::tr!("这个终端已经在录制中", "This terminal is already recording"));
         }
         let evs = self.timeline_flush(session_id, None);
         let start_seq = self.timelines.lock().get(session_id).map(|t| t.last_seq()).unwrap_or(0);
@@ -794,7 +827,7 @@ impl AgentManager {
             .recordings
             .lock()
             .remove(session_id)
-            .ok_or_else(|| "这个终端没有在录制".to_string())?;
+            .ok_or_else(|| crate::tr!("这个终端没有在录制", "This terminal isn't recording"))?;
         let flushed = self.timeline_flush(session_id, None);
         let events = self.timeline_since(session_id, state.start_seq, MAX_EVENTS);
         let in_submits = self.sessions.lock().get(session_id).map(|b| b.in_enters_since(state.start_pushed));

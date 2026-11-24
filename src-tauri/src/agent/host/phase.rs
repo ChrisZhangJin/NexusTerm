@@ -158,7 +158,7 @@ pub struct Invalid {
 
 impl fmt::Display for Invalid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "托管状态 {} 不接受事件 {}", self.from, self.event)
+        write!(f, "{}", crate::tr!("托管状态 {} 不接受事件 {}", "Autopilot state {} doesn't accept event {}", self.from, self.event))
     }
 }
 
@@ -272,7 +272,12 @@ fn answer(card: &HumanCard, reply: &CardReply) -> Result<(HostPhase, Vec<Effect>
                 .iter()
                 .map(|c| {
                     if c.check.is_manual() {
-                        CheckResult { check: c.check.clone(), passed: true, detail: "用户确认".into(), skipped: false }
+                        CheckResult {
+                            check: c.check.clone(),
+                            passed: true,
+                            detail: crate::tr!("用户确认", "Confirmed by you"),
+                            skipped: false,
+                        }
                     } else {
                         c.clone()
                     }

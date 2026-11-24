@@ -219,7 +219,7 @@ impl HostCheckpoint {
         verdict: &ResumeVerdict,
     ) -> Result<Vec<Effect>, String> {
         if self.slot(slot).is_none() {
-            return Err(format!("这份托管里没有终端「{slot}」"));
+            return Err(crate::tr!("这份托管里没有终端「{slot}」", "Terminal \"{slot}\" not found in this autopilot run"));
         }
         match verdict {
             ResumeVerdict::Expired { reason } | ResumeVerdict::Suspended { reason } => return Err(reason.clone()),

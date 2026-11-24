@@ -306,8 +306,14 @@ impl StewardState {
                 self.stale = true;
                 out.push(self.event(
                     StewardEventKind::ScreenLost,
-                    "后端还没有这个 console 的屏幕帧：先对齐现场，不判断局面".to_string(),
-                    Some("让前端补一帧全量（面板上的「强制全量帧」），再恢复观察。".to_string()),
+                    crate::tr!(
+                        "后端还没有这个 console 的屏幕帧：先对齐现场，不判断局面",
+                        "No screen frame for this console yet: syncing first, not judging the situation"
+                    ),
+                    Some(crate::tr!(
+                        "让前端补一帧全量（面板上的「强制全量帧」），再恢复观察。",
+                        "Have the frontend send a full frame (\"Force full frame\" in the panel), then observation resumes."
+                    )),
                     None,
                     now,
                     0,
@@ -329,15 +335,19 @@ impl StewardState {
             let (kind, message) = if stale {
                 (
                     StewardEventKind::StaleFeed,
-                    format!(
+                    crate::tr!(
                         "前端帧断流 {}ms：局面置信度已降权，P1 只读、P3 将收敛到只读动作",
+                        "No frames from the frontend for {}ms: confidence lowered; P1 read-only, P3 limited to read-only actions",
                         sit.stale_ms
                     ),
                 )
             } else {
                 (
                     StewardEventKind::FeedRestored,
-                    "屏幕帧恢复：置信度回到正常，已重新对齐现场".to_string(),
+                    crate::tr!(
+                        "屏幕帧恢复：置信度回到正常，已重新对齐现场",
+                        "Screen frames are back: confidence back to normal, resynced"
+                    ),
                 )
             };
             out.push(self.event(
@@ -356,7 +366,7 @@ impl StewardState {
         if changed {
             let first = self.last_signature.is_empty();
             let prev = if first {
-                "（首次）".to_string()
+                crate::tr!("（首次）", "(first)")
             } else {
                 self.last_signature.clone()
             };
@@ -377,18 +387,25 @@ impl StewardState {
             };
             out.push(self.event(
                 StewardEventKind::SituationChanged,
-                format!(
-                    "局面{}：{}（{} / 置信度 {:.2}）{}",
-                    if first { "建立" } else { "变化" },
-                    label,
-                    sit.program.as_str(),
-                    sit.confidence,
-                    if first {
-                        String::new()
-                    } else {
-                        format!(" · 上一个签名 {prev}")
-                    }
-                ),
+                if crate::i18n::is_en() {
+                    format!(
+                        "Situation {}: {} ({} / confidence {:.2}){}",
+                        if first { "established" } else { "changed" },
+                        label,
+                        sit.program.as_str(),
+                        sit.confidence,
+                        if first { String::new() } else { format!(" · previous signature {prev}") }
+                    )
+                } else {
+                    format!(
+                        "局面{}：{}（{} / 置信度 {:.2}）{}",
+                        if first { "建立" } else { "变化" },
+                        label,
+                        sit.program.as_str(),
+                        sit.confidence,
+                        if first { String::new() } else { format!(" · 上一个签名 {prev}") }
+                    )
+                },
                 suggestion,
                 Some(sit.clone()),
                 now,
@@ -401,8 +418,9 @@ impl StewardState {
                 self.no_progress_raised = true;
                 out.push(self.event(
                     StewardEventKind::NoProgress,
-                    format!(
+                    crate::tr!(
                         "连续 {} 个心跳局面未推进：{}（签名稳定 {}ms）",
+                        "No progress for {} heartbeats in a row: {} (signature stable for {}ms)",
                         self.same_ticks,
                         kind_label(sit.kind),
                         now - self.last_change_ms
@@ -444,6 +462,22 @@ fn needs_attention(kind: SituationKind) -> bool {
 }
 
 fn kind_label(kind: SituationKind) -> &'static str {
+    if crate::i18n::is_en() {
+        return match kind {
+            SituationKind::Question => "waiting for an answer",
+            SituationKind::Permission => "permission prompt",
+            SituationKind::Password => "password prompt",
+            SituationKind::Menu => "numbered menu",
+            SituationKind::Pager => "pager",
+            SituationKind::Progress => "task in progress",
+            SituationKind::SubagentStatus => "subtask status",
+            SituationKind::AwaitingInput => "waiting for input",
+            SituationKind::Idle => "shell idle",
+            SituationKind::Error => "stopped on an error",
+            SituationKind::AltScreen => "full-screen program (unclassified)",
+            SituationKind::Unknown => "unknown",
+        };
+    }
     match kind {
         SituationKind::Question => "等待回答",
         SituationKind::Permission => "授权确认",
@@ -648,7 +682,10 @@ pub fn spawn_daemon(
                 if !active {
                     events.push(st.event(
                         StewardEventKind::ContractStopped,
-                        "托管已停止：Steward 退出该 console（现场帧保留）".to_string(),
+                        crate::tr!(
+                            "托管已停止：Steward 退出该 console（现场帧保留）",
+                            "Autopilot stopped: Steward left this console (screen frames kept)"
+                        ),
                         None,
                         None,
                         now,
@@ -663,7 +700,7 @@ pub fn spawn_daemon(
                     let st = StewardState::new(c.console_id.clone(), c.id.clone());
                     events.push(st.event(
                         StewardEventKind::ContractStarted,
-                        format!("开始观察：目标「{}」", c.goal),
+                        crate::tr!("开始观察：目标「{}」", "Observing: goal \"{}\"", c.goal),
                         None,
                         None,
                         now,
