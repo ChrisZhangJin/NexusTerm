@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import {
   createDebouncedSaver,
   fromPersisted,
-  INTERRUPTED_NOTE,
+  interruptedNote,
   MAX_PERSISTED_MESSAGES,
   mergeRestored,
   REVEAL_NOT_SAVED,
@@ -79,10 +79,10 @@ test("fromPersisted：进行中的步骤卡收尾，已完成的原样保留", (
     msg("keys-done", { step: { kind: "keys", step: 7, output: "" } }),
   ]);
   assert.equal(out[0].step?.kind, "result");
-  assert.equal(out[0].step?.output, INTERRUPTED_NOTE);
+  assert.equal(out[0].step?.output, interruptedNote());
   for (const i of [1, 2, 3]) {
     assert.equal(out[i].step?.output, "", `步骤 ${i} 应被补成已收尾`);
-    assert.equal(out[i].step?.text, INTERRUPTED_NOTE);
+    assert.equal(out[i].step?.text, interruptedNote());
   }
   assert.equal(out[4].step?.secretStatus, "cancelled");
   assert.equal(out[5].step?.output, "a\nb");

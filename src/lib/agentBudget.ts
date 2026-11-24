@@ -5,6 +5,7 @@
  * `paused` 卡 = 这一轮停在暂停上（带原因分类），`resumed` 卡 = 又跑起来了；
  * 其余步骤不改变它。一轮结束 / 出错 / 被停止时对话状态整体重建，暂停标记随之消失。
  */
+import { t } from "../i18n";
 
 /** 为什么暂停：预算四项之一（步数 / 时间 / 输出 / 花费）、用户手动暂停，或模型服务连续出错（`llm`）。与后端 `StepPayload.pauseKind` 一致。 */
 export type PauseKind = "steps" | "time" | "output" | "cost" | "user" | "llm";
@@ -78,17 +79,17 @@ export function nextPause(cur: PauseKind | undefined, step: PauseStepLike): Paus
 export function pauseBannerText(kind: PauseKind): string {
   switch (kind) {
     case "steps":
-      return "已达到步数上限，本轮暂停。点「继续」换一份新预算接着做，或点「停止」结束。";
+      return t("已达到步数上限，本轮暂停。点「继续」换一份新预算接着做，或点「停止」结束。", "Step limit reached; this round is paused. Click Resume to continue with a fresh budget, or Stop to end.");
     case "time":
-      return "已达到时间上限，本轮暂停。点「继续」换一份新预算接着做，或点「停止」结束。";
+      return t("已达到时间上限，本轮暂停。点「继续」换一份新预算接着做，或点「停止」结束。", "Time limit reached; this round is paused. Click Resume to continue with a fresh budget, or Stop to end.");
     case "output":
-      return "已达到输出量上限，本轮暂停。点「继续」换一份新预算接着做，或点「停止」结束。";
+      return t("已达到输出量上限，本轮暂停。点「继续」换一份新预算接着做，或点「停止」结束。", "Output limit reached; this round is paused. Click Resume to continue with a fresh budget, or Stop to end.");
     case "cost":
-      return "已达到花费上限，本轮暂停。点「继续」换一份新预算接着做，或点「停止」结束。";
+      return t("已达到花费上限，本轮暂停。点「继续」换一份新预算接着做，或点「停止」结束。", "Spending limit reached; this round is paused. Click Resume to continue with a fresh budget, or Stop to end.");
     case "llm":
-      return "模型服务连续请求失败，自动重试后仍未恢复，本轮暂停（进度都还在）。稍后点「继续」重新请求，或点「停止」结束。";
+      return t("模型服务连续请求失败，自动重试后仍未恢复，本轮暂停（进度都还在）。稍后点「继续」重新请求，或点「停止」结束。", "The model service kept failing and retries didn't help, so this round is paused (progress is kept). Click Resume later to retry, or Stop to end.");
     default:
-      return "本轮已暂停。点「继续」接着做，或点「停止」结束。";
+      return t("本轮已暂停。点「继续」接着做，或点「停止」结束。", "This round is paused. Click Resume to continue, or Stop to end.");
   }
 }
 
@@ -100,12 +101,18 @@ export interface StewardBudgetPref {
   maxCostUsd: number;
 }
 
-/** 「最长时长」下拉的可选项（分钟）。 */
-export const STEWARD_DURATION_OPTIONS: ReadonlyArray<{ minutes: number; label: string }> = [
-  { minutes: 120, label: "2 小时" },
-  { minutes: 360, label: "6 小时" },
-  { minutes: 720, label: "12 小时" },
-  { minutes: 1440, label: "24 小时" },
+/** 「最长时长」下拉的可选项（分钟）。label 是 getter：读的时候按当前语言取 */
+const durationOption = (minutes: number) => ({
+  minutes,
+  get label() {
+    return t("{h} 小时", "{h} hours", { h: minutes / 60 });
+  },
+});
+export const STEWARD_DURATION_OPTIONS: ReadonlyArray<{ readonly minutes: number; readonly label: string }> = [
+  durationOption(120),
+  durationOption(360),
+  durationOption(720),
+  durationOption(1440),
 ];
 
 export const DEFAULT_STEWARD_BUDGET_PREF: StewardBudgetPref = { maxMinutes: 360, maxSteps: 400, maxCostUsd: 0 };

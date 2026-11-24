@@ -6,6 +6,7 @@
  * 状态与订阅在 `lib/useRecorder.ts`。
  */
 
+import { t } from "../i18n";
 import type { SkillStep } from "../types";
 
 /** 后端 `RecorderStatus`（camelCase） */
@@ -82,13 +83,16 @@ export function describeStep(step: SkillStep): string {
     case "exec":
       return step.command;
     case "keys":
-      return `按键 ${step.keys}`;
+      return t("按键 {k}", "Keys {k}", { k: step.keys });
     case "expect_respond":
-      return `等「${step.expect}」→ 回答 ${step.secret ? "（密码）" : step.respond}`;
+      return t("等「{e}」→ 回答 {r}", "Wait for “{e}” → answer {r}", {
+        e: step.expect,
+        r: step.secret ? t("（密码）", "(password)") : step.respond,
+      });
     case "secret":
-      return `输入密码：${step.reason}`;
+      return t("输入密码：{r}", "Enter password: {r}", { r: step.reason });
     case "screen_check":
-      return `检查屏幕「${step.expect}」`;
+      return t("检查屏幕「{e}」", "Check screen for “{e}”", { e: step.expect });
   }
 }
 
@@ -99,9 +103,12 @@ export function hintFor(draft: RecordingDraft, stepIndex: number): StepHint | un
 
 /** 草稿一行摘要：「5 步 · 风险高 · 2 条提醒」 */
 export function summarizeDraft(d: RecordingDraft): string {
-  const risk = d.risk === "high" ? "风险高" : d.risk === "medium" ? "风险中" : "风险低";
-  const parts = [`${d.steps.length} 步`, risk];
-  if (d.warnings.length > 0) parts.push(`${d.warnings.length} 条提醒`);
+  const risk =
+    d.risk === "high" ? t("风险高", "High risk") : d.risk === "medium" ? t("风险中", "Medium risk") : t("风险低", "Low risk");
+  const n = d.steps.length;
+  const parts = [t("{n} 步", n === 1 ? "{n} step" : "{n} steps", { n }), risk];
+  const w = d.warnings.length;
+  if (w > 0) parts.push(t("{w} 条提醒", w === 1 ? "{w} warning" : "{w} warnings", { w }));
   return parts.join(" · ");
 }
 

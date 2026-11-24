@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { t, useLocale } from "../i18n";
 import type { MacroRecord, MacroStep } from "../types";
 import MacroMigrateDialog from "./MacroMigrateDialog";
 
@@ -57,6 +58,7 @@ export default function MacroDialog({
   onDelete,
   onClose,
 }: Props) {
+  useLocale();
   const [sel, setSel] = useState<string | null>(focusId ?? macros[0]?.id ?? null);
   const [name, setName] = useState("");
   const [steps, setSteps] = useState<MacroStep[]>([]);
@@ -187,7 +189,7 @@ export default function MacroDialog({
     setError(null);
     try {
       // 名字带序号，避免「新宏」重名到分不清
-      const m = await onCreate(`新宏 ${macros.length + 1}`, TEMPLATE);
+      const m = await onCreate(t("新宏 {n}", "New macro {n}", { n: macros.length + 1 }), TEMPLATE);
       justCreated.current = m.id;
       skipSave.current = true;
       setSel(m.id);
@@ -251,11 +253,11 @@ export default function MacroDialog({
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal macro-modal" onClick={(e) => e.stopPropagation()}>
-        <h2>宏</h2>
+        <h2>{t("宏", "Macros")}</h2>
 
         <div className="macro-body">
           <aside className="macro-list">
-            {macros.length === 0 && <p className="macro-empty">还没有宏</p>}
+            {macros.length === 0 && <p className="macro-empty">{t("还没有宏", "No macros yet")}</p>}
             {macros.map((m) => (
               <button
                 key={m.id}
@@ -264,20 +266,23 @@ export default function MacroDialog({
                 title={m.name}
               >
                 <span className="macro-item-name">{m.name}</span>
-                <span className="macro-item-count">{stepCount(m)} 步</span>
+                <span className="macro-item-count">{t("{n} 步", stepCount(m) === 1 ? "{n} step" : "{n} steps", { n: stepCount(m) })}</span>
               </button>
             ))}
             <button className="btn macro-new" disabled={busy} onClick={() => void createNew()}>
-              ＋ 新建宏
+              {t("＋ 新建宏", "＋ New macro")}
             </button>
           </aside>
 
           <section className="macro-editor">
             {!current ? (
               <div className="macro-placeholder">
-                <p>宏是一串「等什么、发什么」的操作。</p>
+                <p>{t("宏是一串「等什么、发什么」的操作。", "A macro is a sequence of “wait for this, send that” steps.")}</p>
                 <p className="hint" style={{ margin: 0 }}>
-                  点「新建宏」，或者直接点下面的「录制」，把你现在做的事录成一条宏。
+                  {t(
+                    "点「新建宏」，或者直接点下面的「录制」，把你现在做的事录成一条宏。",
+                    "Click New macro, or just click Record below to turn what you do now into a macro."
+                  )}
                 </p>
               </div>
             ) : (
@@ -287,17 +292,17 @@ export default function MacroDialog({
                     className="macro-name"
                     value={name}
                     spellCheck={false}
-                    placeholder="宏名称"
+                    placeholder={t("宏名称", "Macro name")}
                     onChange={(e) => setName(e.target.value)}
                   />
                   <span className={`macro-save${saved ? " on" : ""}`}>
-                    {name.trim() ? (saved ? "已保存" : "自动保存") : "名称不能为空"}
+                    {name.trim() ? (saved ? t("已保存", "Saved") : t("自动保存", "Autosave")) : t("名称不能为空", "Name can't be empty")}
                   </span>
                 </div>
 
                 <div className="macro-steps">
                   {steps.length === 0 && (
-                    <p className="macro-empty">还没有步骤，从下面添加一步。</p>
+                    <p className="macro-empty">{t("还没有步骤，从下面添加一步。", "No steps yet. Add one below.")}</p>
                   )}
                   {steps.map((s, i) => (
                     <div className="macro-step" key={i}>
@@ -309,7 +314,7 @@ export default function MacroDialog({
                             className="macro-param grow"
                             value={s.text}
                             spellCheck={false}
-                            placeholder="要发送的内容（支持 \r \n \t \e \xNN 转义）"
+                            placeholder={t("要发送的内容（支持 \\r \\n \\t \\e \\xNN 转义）", "Text to send (supports \\r \\n \\t \\e \\xNN escapes)")}
                             onChange={(e) =>
                               patchStep(i, { ...s, text: e.target.value })
                             }
@@ -322,7 +327,7 @@ export default function MacroDialog({
                                 patchStep(i, { ...s, enter: e.target.checked })
                               }
                             />
-                            回车
+                            {t("回车", "Enter")}
                           </label>
                         </>
                       )}
@@ -333,7 +338,7 @@ export default function MacroDialog({
                             className="macro-param grow"
                             value={s.pattern}
                             spellCheck={false}
-                            placeholder="等待出现的文本；留空 = 等输出停止"
+                            placeholder={t("等待出现的文本；留空 = 等输出停止", "Text to wait for; empty = wait for output to settle")}
                             onChange={(e) =>
                               patchStep(i, { ...s, pattern: e.target.value })
                             }
@@ -344,7 +349,7 @@ export default function MacroDialog({
                             min={0}
                             value={s.timeoutMs ? Math.round(s.timeoutMs / 1000) : ""}
                             placeholder="20"
-                            title="超时（秒）；留空 = 默认 20 秒"
+                            title={t("超时（秒）；留空 = 默认 20 秒", "Timeout (seconds); empty = default 20 s")}
                             onChange={(e) =>
                               patchStep(i, {
                                 ...s,
@@ -352,13 +357,13 @@ export default function MacroDialog({
                               })
                             }
                           />
-                          <span className="macro-unit">秒</span>
+                          <span className="macro-unit">{t("秒", "s")}</span>
                         </>
                       )}
 
                       {s.kind === "sleep" && (
                         <>
-                          <span className="macro-param-label">等待</span>
+                          <span className="macro-param-label">{t("等待", "Wait")}</span>
                           <input
                             className="macro-param num"
                             type="number"
@@ -373,14 +378,14 @@ export default function MacroDialog({
                               })
                             }
                           />
-                          <span className="macro-unit">秒</span>
+                          <span className="macro-unit">{t("秒", "s")}</span>
                         </>
                       )}
 
                       <span className="macro-step-ops">
                         <button
                           className="icon-btn"
-                          title="上移"
+                          title={t("上移", "Move up")}
                           disabled={i === 0}
                           onClick={() => move(i, -1)}
                         >
@@ -388,7 +393,7 @@ export default function MacroDialog({
                         </button>
                         <button
                           className="icon-btn"
-                          title="下移"
+                          title={t("下移", "Move down")}
                           disabled={i === steps.length - 1}
                           onClick={() => move(i, 1)}
                         >
@@ -396,7 +401,7 @@ export default function MacroDialog({
                         </button>
                         <button
                           className="icon-btn danger"
-                          title="删除这一步"
+                          title={t("删除这一步", "Delete this step")}
                           onClick={() => setSteps((prev) => prev.filter((_, k) => k !== i))}
                         >
                           ✕
@@ -408,20 +413,20 @@ export default function MacroDialog({
 
                 <div className="macro-add">
                   <button className="btn" onClick={() => add("send")}>
-                    ＋ 发送
+                    {t("＋ 发送", "＋ Send")}
                   </button>
                   <button className="btn" onClick={() => add("wait")}>
-                    ＋ 等待
+                    {t("＋ 等待", "＋ Wait")}
                   </button>
                   <button className="btn" onClick={() => add("sleep")}>
-                    ＋ 延时
+                    {t("＋ 延时", "＋ Delay")}
                   </button>
                   <button
                     className="btn danger-text macro-del"
                     disabled={busy}
                     onClick={() => void remove()}
                   >
-                    {confirmDel ? "再点一次，永久删除" : "删除这条宏"}
+                    {confirmDel ? t("再点一次，永久删除", "Click again to delete permanently") : t("删除这条宏", "Delete this macro")}
                   </button>
                 </div>
               </>
@@ -444,13 +449,13 @@ export default function MacroDialog({
               }}
             />
             <span>
-              连接后自动运行
+              {t("连接后自动运行", "Run after connecting")}
               <em>
                 {!sessionId
-                  ? "当前标签没有对应的连接配置，无法绑定"
+                  ? t("当前标签没有对应的连接配置，无法绑定", "This tab has no saved connection, so it can't be bound")
                   : bound === sel
-                    ? `「${sessionName}」每次连上都会先执行这条宏（重连也算）`
-                    : `勾选后，「${sessionName}」每次连上会先执行这条宏`}
+                    ? t("「{name}」每次连上都会先执行这条宏（重连也算）", "“{name}” runs this macro first every time it connects (reconnects too)", { name: sessionName ?? "" })
+                    : t("勾选后，「{name}」每次连上会先执行这条宏", "When checked, “{name}” runs this macro first every time it connects", { name: sessionName ?? "" })}
               </em>
             </span>
           </label>
@@ -460,33 +465,33 @@ export default function MacroDialog({
           <button
             className="btn"
             disabled={!tabReady || recording || !current}
-            title={tabReady ? "" : "先连接一个会话，宏才有地方执行"}
+            title={tabReady ? "" : t("先连接一个会话，宏才有地方执行", "Connect a session first so the macro has somewhere to run")}
             onClick={() => current && onRun(current)}
           >
-            运行{tabLabel ? `（${tabLabel}）` : ""}
+            {tabLabel ? t("运行（{tab}）", "Run ({tab})", { tab: tabLabel }) : t("运行", "Run")}
           </button>
           <button className={`btn${recording ? " primary" : ""}`} onClick={onRecord}>
-            {recording ? "停止录制" : "录制"}
+            {recording ? t("停止录制", "Stop recording") : t("录制", "Record")}
           </button>
           <button
             className="btn"
             disabled={!current}
-            title="把这条宏转成技能（原宏保留；录下的密码不会被复制）"
+            title={t("把这条宏转成技能（原宏保留；录下的密码不会被复制）", "Convert this macro into a skill (the macro is kept; recorded passwords aren't copied)")}
             onClick={() => current && setMig({ ids: [current.id] })}
           >
-            转为技能
+            {t("转为技能", "Convert to skill")}
           </button>
           <button
             className="btn"
             disabled={macros.length === 0}
-            title="把所有宏转成技能（已迁移过的会跳过；原宏保留）"
+            title={t("把所有宏转成技能（已迁移过的会跳过；原宏保留）", "Convert all macros into skills (already migrated ones are skipped; macros are kept)")}
             onClick={() => setMig({ ids: null })}
           >
-            全部迁移
+            {t("全部迁移", "Migrate all")}
           </button>
           <span className="macro-spacer" />
           <button className="btn primary" onClick={onClose}>
-            关闭
+            {t("关闭", "Close")}
           </button>
         </div>
       </div>

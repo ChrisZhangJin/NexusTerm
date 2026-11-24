@@ -1,3 +1,4 @@
+import { t } from "../i18n";
 import type { MacroStep } from "../types";
 import { api, stringToBytes } from "../api";
 import { getTerm, lastOutputAt, onInput } from "./termRegistry";
@@ -343,15 +344,17 @@ export async function runMacro(
 export function describeStep(step: MacroStep): string {
   switch (step.kind) {
     case "send": {
-      const text = step.text === "" ? "（空行回车）" : step.text;
-      return `发送 ${text}${step.enter ? " ⏎" : ""}`;
+      const text = step.text === "" ? t("（空行回车）", "(empty line, Enter)") : step.text;
+      return t("发送 {text}", "Send {text}", { text }) + (step.enter ? " ⏎" : "");
     }
     case "wait":
       return step.pattern.trim()
-        ? `等待出现 ${step.pattern}`
-        : `等待输出停止 ${((step.timeoutMs || QUIET_TIMEOUT) / 1000).toFixed(0)}s 内`;
+        ? t("等待出现 {p}", "Wait for {p}", { p: step.pattern })
+        : t("等待输出停止 {s}s 内", "Wait for output to settle (within {s}s)", {
+            s: ((step.timeoutMs || QUIET_TIMEOUT) / 1000).toFixed(0),
+          });
     case "sleep":
-      return `等待 ${(step.ms / 1000).toFixed(1)}s`;
+      return t("等待 {s}s", "Wait {s}s", { s: (step.ms / 1000).toFixed(1) });
   }
 }
 

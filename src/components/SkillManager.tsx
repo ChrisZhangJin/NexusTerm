@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { api } from "../api";
+import { t, useLocale } from "../i18n";
 import type { Skill, SkillInput, SkillTrustView } from "../types";
 import {
   describeHostScope,
@@ -62,6 +63,7 @@ const SkillRow = memo(function SkillRow({
   onExport: (s: Skill) => void;
   onDelete: (s: Skill) => void;
 }) {
+  useLocale();
   const badge = trustBadge(trust);
   const blocked = scopeBlock(trust);
   return (
@@ -93,7 +95,7 @@ const SkillRow = memo(function SkillRow({
         </span>
         {blocked && (
           <span className="sk-trust scope" title={blocked}>
-            超出范围
+            {t("超出范围", "Out of scope")}
           </span>
         )}
       </div>
@@ -101,7 +103,7 @@ const SkillRow = memo(function SkillRow({
         {describeHostScope(skill.hostScope)}
       </div>
       <div className="sk-c-src">{SOURCE_LABEL[skill.source]}</div>
-      <div className="sk-c-cnt" title="成功 / 失败次数">
+      <div className="sk-c-cnt" title={t("成功 / 失败次数", "Successes / failures")}>
         <span className="sk-ok">{skill.successCount}</span>
         {" / "}
         <span className={skill.failCount > 0 ? "sk-fail" : ""}>{skill.failCount}</span>
@@ -110,16 +112,22 @@ const SkillRow = memo(function SkillRow({
       <div className="sk-c-act" onClick={(e) => e.stopPropagation()}>
         <button
           className="sk-ibtn"
-          title={blocked ? `不能在当前会话运行：${blocked}` : onRun ? "在当前会话运行" : "没有可用的会话，或 Agent 正忙"}
+          title={
+            blocked
+              ? t("不能在当前会话运行：{why}", "Can't run in this session: {why}", { why: blocked })
+              : onRun
+                ? t("在当前会话运行", "Run in this session")
+                : t("没有可用的会话，或 Agent 正忙", "No session available, or the Agent is busy")
+          }
           disabled={!onRun || !!blocked}
           onClick={() => onRun?.(skill)}
         >
           ▶
         </button>
-        <button className="sk-ibtn" title="导出为文件" onClick={() => onExport(skill)}>
+        <button className="sk-ibtn" title={t("导出为文件", "Export to file")} onClick={() => onExport(skill)}>
           ⤒
         </button>
-        <button className="sk-ibtn danger" title="删除" onClick={() => onDelete(skill)}>
+        <button className="sk-ibtn danger" title={t("删除", "Delete")} onClick={() => onDelete(skill)}>
           ✕
         </button>
       </div>
@@ -152,6 +160,7 @@ function ImportDialog({
   onConfirm: () => void;
   onClose: () => void;
 }) {
+  useLocale();
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
@@ -169,18 +178,22 @@ function ImportDialog({
   return (
     <div className="modal-backdrop sk-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal sk-modal sk-import" onMouseDown={(e) => e.stopPropagation()}>
-        <h2>导入技能</h2>
+        <h2>{t("导入技能", "Import skill")}</h2>
         <div className="sk-body">
           <div className="sk-import-file">
-            <span className="sk-note">文件：{state.fileName}</span>
+            <span className="sk-note">{t("文件：{f}", "File: {f}", { f: state.fileName })}</span>
             <button className="btn sk-small" onClick={onPick} disabled={busy}>
-              换一个文件…
+              {t("换一个文件…", "Choose another file…")}
             </button>
           </div>
 
           {state.problems.length > 0 && (
             <div className="sk-errbox">
-              <div className="sk-errbox-title">无法导入（{state.problems.length} 个问题）</div>
+              <div className="sk-errbox-title">
+                {t("无法导入（{n} 个问题）", state.problems.length === 1 ? "Can't import (1 problem)" : "Can't import ({n} problems)", {
+                  n: state.problems.length,
+                })}
+              </div>
               {state.problems.map((t, i) => (
                 <div key={i}>{t}</div>
               ))}
@@ -190,23 +203,33 @@ function ImportDialog({
           {p && (
             <>
               <div className="sk-warn">
-                导入的技能不带信任：来源标记为「导入」，成功 / 失败计数从 0 开始，风险会重新评估。
-                先看一遍下面的步骤再确认。
+                {t(
+                  "导入的技能不带信任：来源标记为「导入」，成功 / 失败计数从 0 开始，风险会重新评估。 先看一遍下面的步骤再确认。",
+                  "Imported skills start untrusted: the source is marked Imported, success / failure counts start at 0, and the risk is reassessed. Review the steps below before confirming."
+                )}
               </div>
-              {existingNames.has(p.name) && <div className="sk-warn">已有同名技能「{p.name}」，导入后会多出一个同名的。</div>}
+              {existingNames.has(p.name) && (
+                <div className="sk-warn">
+                  {t(
+                    "已有同名技能「{name}」，导入后会多出一个同名的。",
+                    "A skill named “{name}” already exists; importing adds a second one with the same name.",
+                    { name: p.name }
+                  )}
+                </div>
+              )}
               <div className="sk-prev-head">
                 <strong>{p.name}</strong>
                 <RiskBadge risk={p.risk} />
-                <span className="sk-note">适用主机：{describeHostScope(p.hostScope)}</span>
+                <span className="sk-note">{t("适用主机：{h}", "Hosts: {h}", { h: describeHostScope(p.hostScope) })}</span>
               </div>
               {p.description && <div className="sk-note">{p.description}</div>}
               {p.params.length > 0 && (
                 <div className="sk-prev-params">
-                  参数：
+                  {t("参数：", "Parameters: ")}
                   {p.params.map((x) => (
                     <span className="sk-chip" key={x.name} title={x.description}>
                       {x.name}
-                      {x.secret ? "（secret）" : x.default !== undefined ? ` = ${x.default}` : ""}
+                      {x.secret ? t("（secret）", " (secret)") : x.default !== undefined ? ` = ${x.default}` : ""}
                       {x.required ? " *" : ""}
                     </span>
                   ))}
@@ -215,7 +238,7 @@ function ImportDialog({
               <StepPreview steps={p.steps} declared={declared} secretNames={secretNames} />
               {p.verify && (
                 <div className="sk-note">
-                  验证：屏幕应出现{" "}
+                  {t("验证：屏幕应出现", "Verify: screen should show")}{" "}
                   <code className="sk-code">
                     <Highlighted text={p.verify.expect} declared={declared} secretNames={secretNames} />
                   </code>
@@ -227,10 +250,10 @@ function ImportDialog({
         <div className="sk-foot">
           <div className="sk-foot-msg" />
           <button className="btn" onClick={onClose} disabled={busy}>
-            取消
+            {t("取消", "Cancel")}
           </button>
           <button className="btn primary" onClick={onConfirm} disabled={busy || !p}>
-            {busy ? "导入中…" : "导入"}
+            {busy ? t("导入中…", "Importing…") : t("导入", "Import")}
           </button>
         </div>
       </div>
@@ -250,6 +273,7 @@ function RunDialog({
   onRun: (params: Record<string, string>) => void;
   onClose: () => void;
 }) {
+  useLocale();
   const plain = skill.params.filter((p) => !p.secret);
   const secrets = skill.params.filter((p) => p.secret);
   const [vals, setVals] = useState<Record<string, string>>(() =>
@@ -276,10 +300,13 @@ function RunDialog({
   return (
     <div className="modal-backdrop sk-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal sk-modal sk-import" onMouseDown={(e) => e.stopPropagation()}>
-        <h2>运行「{skill.name}」</h2>
+        <h2>{t("运行「{name}」", "Run “{name}”", { name: skill.name })}</h2>
         <div className="sk-body">
           <div className="sk-warn">
-            将在当前会话里按步骤执行。每一步仍会经过危险命令检查与审批；审批模式下每个写入步骤都要你确认。
+            {t(
+              "将在当前会话里按步骤执行。每一步仍会经过危险命令检查与审批；审批模式下每个写入步骤都要你确认。",
+              "Runs step by step in the current session. Every step still goes through the dangerous-command check and approval; in approval mode you confirm each step that writes."
+            )}
           </div>
           {plain.map((p) => (
             <div className="sk-field" key={p.name}>
@@ -298,17 +325,25 @@ function RunDialog({
           ))}
           {secrets.length > 0 && (
             <div className="sk-note">
-              secret 参数（{secrets.map((p) => p.name).join("、")}）不在这里填：运行到需要时会弹出密码卡片，由你输入。
+              {t(
+                "secret 参数（{names}）不在这里填：运行到需要时会弹出密码卡片，由你输入。",
+                "Secret parameters ({names}) aren't filled in here: a password card pops up when they're needed.",
+                { names: secrets.map((p) => p.name).join(t("、", ", ")) }
+              )}
             </div>
           )}
         </div>
         <div className="sk-foot">
-          <div className="sk-foot-msg sk-note">{missing.length > 0 ? `请填写：${missing.map((p) => p.name).join("、")}` : ""}</div>
+          <div className="sk-foot-msg sk-note">
+            {missing.length > 0
+              ? t("请填写：{names}", "Please fill in: {names}", { names: missing.map((p) => p.name).join(t("、", ", ")) })
+              : ""}
+          </div>
           <button className="btn" onClick={onClose}>
-            取消
+            {t("取消", "Cancel")}
           </button>
           <button className="btn primary" onClick={go} disabled={missing.length > 0}>
-            运行
+            {t("运行", "Run")}
           </button>
         </div>
       </div>
@@ -319,6 +354,7 @@ function RunDialog({
 // ——————————————————————————————— 管理器 ———————————————————————————————
 
 export default function SkillManager({ onClose, initialDraft, onRunSkill, scopeTarget }: SkillManagerProps) {
+  useLocale();
   const [skills, setSkills] = useState<Skill[] | null>(null);
   // 4.4：id → 信任结论。失败 / 没加载到就是空表，徽标按最严的「需逐步确认」显示
   const [trust, setTrust] = useState<Record<string, SkillTrustView>>({});
@@ -405,15 +441,22 @@ export default function SkillManager({ onClose, initialDraft, onRunSkill, scopeT
       const text = await api.skillExport(s.id);
       const { save } = await import("@tauri-apps/plugin-dialog");
       const path = await save({
-        title: "导出技能",
+        title: t("导出技能", "Export skill"),
         defaultPath: exportFileName(s.name),
-        filters: [{ name: "技能文件", extensions: ["json"] }],
+        filters: [{ name: t("技能文件", "Skill file"), extensions: ["json"] }],
       });
       if (!path) return;
       await api.writeFile(path, Array.from(new TextEncoder().encode(text)));
-      setNotice({ text: `已导出「${s.name}」到 ${path}（不含运行统计，也不含任何密码）`, kind: "ok" });
+      setNotice({
+        text: t(
+          "已导出「{name}」到 {path}（不含运行统计，也不含任何密码）",
+          "Exported “{name}” to {path} (no run statistics, no passwords)",
+          { name: s.name, path }
+        ),
+        kind: "ok",
+      });
     } catch (e) {
-      setNotice({ text: `导出失败：${String(e)}`, kind: "err" });
+      setNotice({ text: t("导出失败：{e}", "Export failed: {e}", { e: String(e) }), kind: "err" });
     }
   }, []);
 
@@ -423,10 +466,10 @@ export default function SkillManager({ onClose, initialDraft, onRunSkill, scopeT
     if (!s) return;
     try {
       await api.skillDelete(s.id);
-      setNotice({ text: `已删除「${s.name}」`, kind: "ok" });
+      setNotice({ text: t("已删除「{name}」", "Deleted “{name}”", { name: s.name }), kind: "ok" });
       void load(query);
     } catch (e) {
-      setNotice({ text: `删除失败：${String(e)}`, kind: "err" });
+      setNotice({ text: t("删除失败：{e}", "Delete failed: {e}", { e: String(e) }), kind: "err" });
     }
   };
 
@@ -434,7 +477,10 @@ export default function SkillManager({ onClose, initialDraft, onRunSkill, scopeT
   const onFile = async (file: File | undefined) => {
     if (!file) return;
     if (file.size > MAX_IMPORT_BYTES) {
-      setImp({ fileName: file.name, text: "", preview: null, problems: [`文件超过 ${MAX_IMPORT_BYTES / 1024} KB，不像一份技能文件`] });
+      setImp({ fileName: file.name, text: "", preview: null, problems: [
+          t("文件超过 {kb} KB，不像一份技能文件", "The file is over {kb} KB, so it's unlikely to be a skill file", { kb: MAX_IMPORT_BYTES / 1024 }),
+        ],
+      });
       return;
     }
     try {
@@ -446,7 +492,7 @@ export default function SkillManager({ onClose, initialDraft, onRunSkill, scopeT
         setImp({ fileName: file.name, text, preview: null, problems: splitProblems(String(e)) });
       }
     } catch (e) {
-      setImp({ fileName: file.name, text: "", preview: null, problems: [`读取文件失败：${String(e)}`] });
+      setImp({ fileName: file.name, text: "", preview: null, problems: [t("读取文件失败：{e}", "Couldn't read the file: {e}", { e: String(e) })] });
     }
   };
 
@@ -463,7 +509,10 @@ export default function SkillManager({ onClose, initialDraft, onRunSkill, scopeT
       const saved = await api.skillImport(imp.text);
       setImp(null);
       setNotice({
-        text: `已导入「${saved.name}」（风险：${RISK_LABEL[saved.risk]}；计数从 0 开始）`,
+        text: t("已导入「{name}」（风险：{risk}；计数从 0 开始）", "Imported “{name}” (risk: {risk}; counts start at 0)", {
+          name: saved.name,
+          risk: RISK_LABEL[saved.risk],
+        }),
         kind: "ok",
       });
       void load(query);
@@ -481,16 +530,18 @@ export default function SkillManager({ onClose, initialDraft, onRunSkill, scopeT
       <div className="modal-backdrop sk-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
         <div className="modal sk-modal sk-manager" onMouseDown={(e) => e.stopPropagation()}>
           <div className="sk-title-row">
-            <h2>技能</h2>
-            <span className="sk-note sk-title-note">可回放的操作流程。步骤里永远没有密码值。</span>
+            <h2>{t("技能", "Skills")}</h2>
+            <span className="sk-note sk-title-note">
+              {t("可回放的操作流程。步骤里永远没有密码值。", "Replayable procedures. Steps never contain password values.")}
+            </span>
             <span className="sk-spacer" />
-            <button className="btn sk-small" onClick={pickFile} title="从文件导入技能">
-              导入…
+            <button className="btn sk-small" onClick={pickFile} title={t("从文件导入技能", "Import a skill from a file")}>
+              {t("导入…", "Import…")}
             </button>
             <button className="btn primary sk-small" onClick={() => setEditing(open({}))}>
-              ＋ 新建
+              {t("＋ 新建", "＋ New")}
             </button>
-            <button className="ap-x" onClick={onClose} title="关闭">
+            <button className="ap-x" onClick={onClose} title={t("关闭", "Close")}>
               ✕
             </button>
           </div>
@@ -498,28 +549,33 @@ export default function SkillManager({ onClose, initialDraft, onRunSkill, scopeT
           <input
             className="sk-input sk-search"
             value={query}
-            placeholder="搜索名称或描述…"
+            placeholder={t("搜索名称或描述…", "Search name or description…")}
             onChange={(e) => setQuery(e.target.value)}
           />
 
           {notice && <div className={notice.kind === "ok" ? "sk-notice" : "sk-errbox"}>{notice.text}</div>}
-          {loadErr && <div className="sk-errbox">加载失败：{loadErr}</div>}
+          {loadErr && <div className="sk-errbox">{t("加载失败：{e}", "Failed to load: {e}", { e: loadErr })}</div>}
 
           <div className="sk-list">
             <div className="sk-row sk-head">
-              <div className="sk-c-name">名称</div>
-              <div className="sk-c-risk">风险</div>
-              <div className="sk-c-trust">信任</div>
-              <div className="sk-c-host">适用主机</div>
-              <div className="sk-c-src">来源</div>
-              <div className="sk-c-cnt">成功 / 失败</div>
-              <div className="sk-c-last">上次运行</div>
+              <div className="sk-c-name">{t("名称", "Name")}</div>
+              <div className="sk-c-risk">{t("风险", "Risk")}</div>
+              <div className="sk-c-trust">{t("信任", "Trust")}</div>
+              <div className="sk-c-host">{t("适用主机", "Hosts")}</div>
+              <div className="sk-c-src">{t("来源", "Source")}</div>
+              <div className="sk-c-cnt">{t("成功 / 失败", "OK / Failed")}</div>
+              <div className="sk-c-last">{t("上次运行", "Last run")}</div>
               <div className="sk-c-act" />
             </div>
-            {skills === null && !loadErr && <div className="sk-empty">加载中…</div>}
+            {skills === null && !loadErr && <div className="sk-empty">{t("加载中…", "Loading…")}</div>}
             {skills !== null && skills.length === 0 && (
               <div className="sk-empty">
-                {query.trim() ? "没有匹配的技能" : "还没有技能。点「新建」手写一个，或「导入」别人导出的文件。"}
+                {query.trim()
+                  ? t("没有匹配的技能", "No matching skills")
+                  : t(
+                      "还没有技能。点「新建」手写一个，或「导入」别人导出的文件。",
+                      "No skills yet. Click New to write one, or Import a file someone exported."
+                    )}
               </div>
             )}
             {skills?.map((s) => (
@@ -547,8 +603,12 @@ export default function SkillManager({ onClose, initialDraft, onRunSkill, scopeT
             setEditing(null);
             setNotice({
               text: raised
-                ? `已保存「${saved.name}」。风险已被后端抬高为「${RISK_LABEL[saved.risk]}」（按步骤内容评估，不能手动降低）`
-                : `已保存「${saved.name}」（风险：${RISK_LABEL[saved.risk]}）`,
+                ? t(
+                    "已保存「{name}」。风险已被后端抬高为「{risk}」（按步骤内容评估，不能手动降低）",
+                    "Saved “{name}”. The backend raised the risk to {risk} (assessed from the steps; can't be lowered manually)",
+                    { name: saved.name, risk: RISK_LABEL[saved.risk] }
+                  )
+                : t("已保存「{name}」（风险：{risk}）", "Saved “{name}” (risk: {risk})", { name: saved.name, risk: RISK_LABEL[saved.risk] }),
               kind: "ok",
             });
             void load(query);
@@ -582,10 +642,13 @@ export default function SkillManager({ onClose, initialDraft, onRunSkill, scopeT
       {confirmDel && (
         <ConfirmDialog
           opts={{
-            title: "删除技能",
-            message: `确定删除技能「${confirmDel.name}」？`,
-            detail: "删除后无法恢复，运行统计一并丢失。想留底请先导出。",
-            okText: "删除",
+            title: t("删除技能", "Delete skill"),
+            message: t("确定删除技能「{name}」？", "Delete the skill “{name}”?", { name: confirmDel.name }),
+            detail: t(
+              "删除后无法恢复，运行统计一并丢失。想留底请先导出。",
+              "This can't be undone, and its run statistics are lost too. Export it first if you want a copy."
+            ),
+            okText: t("删除", "Delete"),
             danger: true,
           }}
           onResult={(ok) => (ok ? void doDelete() : setConfirmDel(null))}

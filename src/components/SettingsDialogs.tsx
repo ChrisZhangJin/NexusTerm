@@ -82,8 +82,8 @@ export function AppearanceDialog(p: AppearanceProps) {
     <div className="modal-backdrop" onMouseDown={p.onClose}>
       <div className="modal settings-modal" onMouseDown={(e) => e.stopPropagation()}>
         <div className="settings-head">
-          <h2>外观</h2>
-          <button className="settings-x" onClick={p.onClose} title="关闭（Esc）">
+          <h2>{t("外观", "Appearance")}</h2>
+          <button className="settings-x" onClick={p.onClose} title={t("关闭（Esc）", "Close (Esc)")}>
             ×
           </button>
         </div>
@@ -101,9 +101,9 @@ export function AppearanceDialog(p: AppearanceProps) {
           </select>
         </div>
 
-        <div className="settings-section">终端</div>
+        <div className="settings-section">{t("终端", "Terminal")}</div>
         <div className="row">
-          <label>配色</label>
+          <label>{t("配色", "Color scheme")}</label>
           <select value={p.themeName} onChange={(e) => p.onTheme(e.target.value)}>
             {p.themeNames.map((n) => (
               <option key={n} value={n}>
@@ -113,7 +113,7 @@ export function AppearanceDialog(p: AppearanceProps) {
           </select>
         </div>
         <div className="row">
-          <label>字体</label>
+          <label>{t("字体", "Font")}</label>
           <select value={p.fontFamily} onChange={(e) => p.onFontFamily(e.target.value)}>
             {p.fonts.map((f) => (
               <option key={f.value} value={f.value}>
@@ -123,7 +123,7 @@ export function AppearanceDialog(p: AppearanceProps) {
           </select>
         </div>
         <div className="row">
-          <label>字号</label>
+          <label>{t("字号", "Font size")}</label>
           <input
             type="range"
             min={10}
@@ -134,7 +134,7 @@ export function AppearanceDialog(p: AppearanceProps) {
           <span className="settings-val">{p.fontSize}px</span>
         </div>
         <div className="row">
-          <label>行高</label>
+          <label>{t("行高", "Line height")}</label>
           <input
             type="range"
             min={1}
@@ -157,7 +157,10 @@ export function AppearanceDialog(p: AppearanceProps) {
           <span className="wp-cmd">ssh prod-server</span>
           {"\n"}
           <span className="wp-dim">
-            {p.fontSize}px / 行高 {p.lineHeight.toFixed(2)} · 中文与 emoji 宽度已启用
+            {t("{size}px / 行高 {lh} · 中文与 emoji 宽度已启用", "{size}px / line height {lh} · CJK and emoji widths enabled", {
+              size: p.fontSize,
+              lh: p.lineHeight.toFixed(2),
+            })}
           </span>
         </div>
 
@@ -169,16 +172,22 @@ export function AppearanceDialog(p: AppearanceProps) {
             onChange={(e) => setPrefs({ gpuRender: e.target.checked })}
           />
           <span>
-            GPU 渲染
+            {t("GPU 渲染", "GPU rendering")}
             <em>
               {gpu.ok
-                ? `用显卡绘制终端文字（${gpu.renderer || "WebGL 2"}），大量输出与滚动更流畅、更省电；遇到显示异常可关掉`
-                : `不可用：${gpu.reason ?? "没有可用的 GPU"}，使用 CPU 渲染`}
+                ? t(
+                    "用显卡绘制终端文字（{r}），大量输出与滚动更流畅、更省电；遇到显示异常可关掉",
+                    "Draws terminal text on the GPU ({r}): smoother and more power-efficient with heavy output and scrolling. Turn it off if you see rendering glitches",
+                    { r: gpu.renderer || "WebGL 2" }
+                  )
+                : t("不可用：{reason}，使用 CPU 渲染", "Unavailable: {reason}. Using CPU rendering", {
+                    reason: gpu.reason ?? t("没有可用的 GPU", "no GPU available"),
+                  })}
             </em>
           </span>
         </label>
 
-        <div className="settings-section">底部栏</div>
+        <div className="settings-section">{t("底部栏", "Status bar")}</div>
         <label className="settings-check">
           <input
             type="checkbox"
@@ -186,8 +195,8 @@ export function AppearanceDialog(p: AppearanceProps) {
             onChange={(e) => setPrefs({ showResources: e.target.checked })}
           />
           <span>
-            显示 CPU / 内存 / 磁盘
-            <em>SSH 会话显示远端主机，本地终端显示本机</em>
+            {t("显示 CPU / 内存 / 磁盘", "Show CPU / memory / disk")}
+            <em>{t("SSH 会话显示远端主机，本地终端显示本机", "SSH sessions show the remote host; local terminals show this machine")}</em>
           </span>
         </label>
         <label className={`settings-check${prefs.showResources ? "" : " disabled"}`}>
@@ -198,14 +207,19 @@ export function AppearanceDialog(p: AppearanceProps) {
             onChange={(e) => setPrefs({ liveMonitor: e.target.checked })}
           />
           <span>
-            实时监控
-            <em>每 5 秒刷新并播放过渡动画；关闭后停止采集，所有动画不再展示（也可在资源区右键切换）</em>
+            {t("实时监控", "Live monitoring")}
+            <em>
+              {t(
+                "每 5 秒刷新并播放过渡动画；关闭后停止采集，所有动画不再展示（也可在资源区右键切换）",
+                "Refreshes every 5 seconds with transition animations. When off, sampling stops and no animations play (you can also toggle this by right-clicking the resource area)"
+              )}
+            </em>
           </span>
         </label>
 
         <div className="modal-actions">
           <button className="btn primary" onClick={p.onClose}>
-            完成
+            {t("完成", "Done")}
           </button>
         </div>
       </div>
@@ -221,19 +235,20 @@ interface BehaviorProps {
 }
 
 export function BehaviorDialog(p: BehaviorProps) {
+  useLocale();
   const prefs = usePrefs();
   useEsc(p.onClose);
   return (
     <div className="modal-backdrop" onMouseDown={p.onClose}>
       <div className="modal settings-modal" onMouseDown={(e) => e.stopPropagation()}>
         <div className="settings-head">
-          <h2>行为</h2>
-          <button className="settings-x" onClick={p.onClose} title="关闭（Esc）">
+          <h2>{t("行为", "Behavior")}</h2>
+          <button className="settings-x" onClick={p.onClose} title={t("关闭（Esc）", "Close (Esc)")}>
             ×
           </button>
         </div>
 
-        <div className="settings-section">终端行为</div>
+        <div className="settings-section">{t("终端行为", "Terminal behavior")}</div>
         <label className="settings-check">
           <input
             type="checkbox"
@@ -241,8 +256,8 @@ export function BehaviorDialog(p: BehaviorProps) {
             onChange={(e) => setPrefs({ copyOnSelect: e.target.checked })}
           />
           <span>
-            选中即复制
-            <em>鼠标选中文本后自动写入剪贴板</em>
+            {t("选中即复制", "Copy on select")}
+            <em>{t("鼠标选中文本后自动写入剪贴板", "Selected text is copied to the clipboard automatically")}</em>
           </span>
         </label>
         <label className="settings-check">
@@ -252,8 +267,8 @@ export function BehaviorDialog(p: BehaviorProps) {
             onChange={(e) => setPrefs({ confirmCloseTab: e.target.checked })}
           />
           <span>
-            关闭标签前确认
-            <em>会话仍在连接时，关闭标签先弹窗询问</em>
+            {t("关闭标签前确认", "Confirm before closing tabs")}
+            <em>{t("会话仍在连接时，关闭标签先弹窗询问", "Ask before closing a tab whose session is still connected")}</em>
           </span>
         </label>
         <label className="settings-check">
@@ -263,17 +278,19 @@ export function BehaviorDialog(p: BehaviorProps) {
             onChange={(e) => setPrefs({ shareSftpConnection: e.target.checked })}
           />
           <span>
-            文件面板复用已登录连接
+            {t("文件面板复用已登录连接", "Reuse logged-in connection for files")}
             <em>
-              同一主机开着终端标签时，文件面板直接在那条连接上开 SFTP，
-              不必再输一次密码和验证码。关掉则每次单独连一条。
+              {t(
+                "同一主机开着终端标签时，文件面板直接在那条连接上开 SFTP，不必再输一次密码和验证码。关掉则每次单独连一条。",
+                "When a terminal tab is open to the same host, the file panel opens SFTP on that connection, so you don't have to enter the password and verification code again. When off, it always opens a separate connection."
+              )}
             </em>
           </span>
         </label>
 
-        <div className="settings-section">宏</div>
+        <div className="settings-section">{t("宏", "Macros")}</div>
         <div className="row">
-          <label>录制与回放</label>
+          <label>{t("录制与回放", "Record & replay")}</label>
           <button
             className="btn"
             onClick={() => {
@@ -281,16 +298,19 @@ export function BehaviorDialog(p: BehaviorProps) {
               p.onOpenMacros();
             }}
           >
-            打开宏管理器…
+            {t("打开宏管理器…", "Open macro manager…")}
           </button>
         </div>
         <p className="ag-hint">
-          宏：录下一串操作（等什么、发什么），可一键重放，也能绑到某个会话上连接后自动执行。
+          {t(
+            "宏：录下一串操作（等什么、发什么），可一键重放，也能绑到某个会话上连接后自动执行。",
+            "Macros record a sequence of steps (what to wait for, what to send). Replay them in one click, or attach one to a session to run automatically after connecting."
+          )}
         </p>
 
         <div className="modal-actions">
           <button className="btn primary" onClick={p.onClose}>
-            完成
+            {t("完成", "Done")}
           </button>
         </div>
       </div>
@@ -301,6 +321,7 @@ export function BehaviorDialog(p: BehaviorProps) {
 // ——— 快捷键 ———
 
 export function ShortcutsDialog({ onClose }: { onClose: () => void }) {
+  useLocale();
   const saved = useShortcuts();
   const [draft, setDraft] = useState<Shortcuts>(saved);
   const [recording, setRecording] = useState<ShortcutAction | null>(null);
@@ -330,7 +351,7 @@ export function ShortcutsDialog({ onClose }: { onClose: () => void }) {
       if (!combo) return; // 只按了修饰键，继续等
       const bad = validateCombo(combo);
       if (bad) {
-        setErr({ action: recording, msg: `${formatCombo(combo)}：${bad}` });
+        setErr({ action: recording, msg: t("{combo}：{bad}", "{combo}: {bad}", { combo: formatCombo(combo), bad }) });
         return;
       }
       setDraft((d) => {
@@ -343,7 +364,13 @@ export function ShortcutsDialog({ onClose }: { onClose: () => void }) {
       const clash = SHORTCUT_ORDER.find((a) => a !== recording && draft[a] === combo);
       setErr(
         clash
-          ? { action: recording, msg: `已从「${SHORTCUT_LABELS[clash]}」移除 ${formatCombo(combo)}` }
+          ? {
+              action: recording,
+              msg: t("已从「{a}」移除 {combo}", "Removed {combo} from \"{a}\"", {
+                a: SHORTCUT_LABELS[clash],
+                combo: formatCombo(combo),
+              }),
+            }
           : null
       );
       setRecording(null);
@@ -368,14 +395,16 @@ export function ShortcutsDialog({ onClose }: { onClose: () => void }) {
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="settings-head">
-          <h2>快捷键</h2>
-          <button className="settings-x" onClick={onClose} title="关闭（Esc）">
+          <h2>{t("快捷键", "Keyboard shortcuts")}</h2>
+          <button className="settings-x" onClick={onClose} title={t("关闭（Esc）", "Close (Esc)")}>
             ×
           </button>
         </div>
         <p className="mark-hint">
-          点击右侧按键框后直接按下新的组合键；Backspace 清除绑定，Esc 取消录制。
-          终端右键菜单里显示的快捷键会同步更新。
+          {t(
+            "点击右侧按键框后直接按下新的组合键；Backspace 清除绑定，Esc 取消录制。终端右键菜单里显示的快捷键会同步更新。",
+            "Click a key box on the right, then press the new key combination. Backspace clears the binding; Esc cancels. Shortcuts shown in the terminal context menu update to match."
+          )}
         </p>
 
         <div className="sc-list">
@@ -385,7 +414,7 @@ export function ShortcutsDialog({ onClose }: { onClose: () => void }) {
               <div key={a} className={`sc-row${recording === a ? " recording" : ""}`}>
                 <span className="sc-label">
                   {SHORTCUT_LABELS[a]}
-                  {changed && <span className="sc-changed" title="已修改">●</span>}
+                  {changed && <span className="sc-changed" title={t("已修改", "Modified")}>●</span>}
                 </span>
                 <button
                   className={`sc-key${draft[a] ? "" : " empty"}`}
@@ -393,15 +422,21 @@ export function ShortcutsDialog({ onClose }: { onClose: () => void }) {
                     setErr(null);
                     setRecording(recording === a ? null : a);
                   }}
-                  title="点击后按下新的组合键"
+                  title={t("点击后按下新的组合键", "Click, then press a new key combination")}
                 >
-                  {recording === a ? "请按下组合键…" : draft[a] ? formatCombo(draft[a]) : "未设置"}
+                  {recording === a
+                    ? t("请按下组合键…", "Press a key combination…")
+                    : draft[a]
+                      ? formatCombo(draft[a])
+                      : t("未设置", "Not set")}
                 </button>
                 <button
                   className="sc-reset"
                   disabled={!changed}
                   onClick={() => setDraft((d) => ({ ...d, [a]: DEFAULT_SHORTCUTS[a] }))}
-                  title={`恢复默认：${DEFAULT_SHORTCUTS[a] ? formatCombo(DEFAULT_SHORTCUTS[a]) : "未设置"}`}
+                  title={t("恢复默认：{k}", "Reset to default: {k}", {
+                    k: DEFAULT_SHORTCUTS[a] ? formatCombo(DEFAULT_SHORTCUTS[a]) : t("未设置", "Not set"),
+                  })}
                 >
                   ↺
                 </button>
@@ -421,13 +456,13 @@ export function ShortcutsDialog({ onClose }: { onClose: () => void }) {
               setErr(null);
             }}
           >
-            全部恢复默认
+            {t("全部恢复默认", "Reset all to defaults")}
           </button>
           <button className="btn" onClick={onClose}>
-            取消
+            {t("取消", "Cancel")}
           </button>
           <button className="btn primary" disabled={!dirty} onClick={save}>
-            保存
+            {t("保存", "Save")}
           </button>
         </div>
       </div>
@@ -440,36 +475,39 @@ export function ShortcutsDialog({ onClose }: { onClose: () => void }) {
 const PROVIDER_ORDER: readonly AgentProvider[] = ["openai", "anthropic", "custom"];
 
 /** 地址默认值要和后端 endpoint() 的拼接对得上：OpenAI 系拼 /chat/completions、Anthropic 拼 /messages，故此处都填「根地址」。 */
-const PROVIDER_META: Record<
+const providerMeta = (): Record<
   AgentProvider,
   { label: string; url: string; urlHint: string; modelHint: string }
-> = {
+> => ({
   openai: {
     label: "OpenAI",
     url: "https://api.openai.com/v1",
     urlHint: "",
-    modelHint: "例如 gpt-4o-mini",
+    modelHint: t("例如 gpt-4o-mini", "e.g. gpt-4o-mini"),
   },
   anthropic: {
     label: "Anthropic",
     url: "https://api.anthropic.com",
     urlHint: "",
-    modelHint: "例如 claude-3-5-sonnet-latest",
+    modelHint: t("例如 claude-3-5-sonnet-latest", "e.g. claude-3-5-sonnet-latest"),
   },
   custom: {
-    label: "自定义",
+    label: t("自定义", "Custom"),
     url: "",
-    urlHint: "填 OpenAI 兼容接口地址（本地代理、网关、自建服务均可），结尾的 / 会自动去掉",
-    modelHint: "按服务商文档填写",
+    urlHint: t(
+      "填 OpenAI 兼容接口地址（本地代理、网关、自建服务均可），结尾的 / 会自动去掉",
+      "An OpenAI-compatible endpoint (local proxy, gateway or self-hosted service). A trailing / is removed automatically"
+    ),
+    modelHint: t("按服务商文档填写", "See your provider's docs"),
   },
-};
+});
 
 /** 只给四档而不是自由填数字：这个值直接决定单次请求的 token 量与花费，选档位比让用户猜 24576 和 32768 的差别安全。 */
-const CONTEXT_CHOICES: readonly { bytes: number; label: string }[] = [
-  { bytes: 16 * 1024, label: "16 KB · 约 5 千汉字 · 最省" },
-  { bytes: 32 * 1024, label: "32 KB · 约 1.1 万汉字 · 默认" },
-  { bytes: 64 * 1024, label: "64 KB · 约 2.2 万汉字" },
-  { bytes: 128 * 1024, label: "128 KB · 约 4.4 万汉字 · 最完整" },
+const contextChoices = (): readonly { bytes: number; label: string }[] => [
+  { bytes: 16 * 1024, label: t("16 KB · 约 5 千汉字 · 最省", "16 KB · ~16K characters · cheapest") },
+  { bytes: 32 * 1024, label: t("32 KB · 约 1.1 万汉字 · 默认", "32 KB · ~32K characters · default") },
+  { bytes: 64 * 1024, label: t("64 KB · 约 2.2 万汉字", "64 KB · ~64K characters") },
+  { bytes: 128 * 1024, label: t("128 KB · 约 4.4 万汉字 · 最完整", "128 KB · ~128K characters · most complete") },
 ];
 
 const DEFAULT_HOST_NOTIFY: HostNotifyConfig = { system: true, taskbar: true, webhook: "" };
@@ -488,12 +526,13 @@ function PriceRow({
 }) {
   const [inDraft, setInDraft] = useState<string | null>(null);
   const [outDraft, setOutDraft] = useState<string | null>(null);
+  useLocale();
   const num = (n: number) => (n > 0 ? String(n) : "");
   return (
     <div className="row ag-price-row">
       <input
         className="ag-price-pattern"
-        placeholder="模型名包含…（如 deepseek-chat）"
+        placeholder={t("模型名包含…（如 deepseek-chat）", "Model name contains… (e.g. deepseek-chat)")}
         value={price.pattern}
         disabled={disabled}
         onChange={(e) => onChange({ ...price, pattern: e.target.value })}
@@ -503,8 +542,8 @@ function PriceRow({
         type="number"
         min={0}
         step={0.01}
-        placeholder="输入"
-        title="美元 / 百万输入 token"
+        placeholder={t("输入", "Input")}
+        title={t("美元 / 百万输入 token", "USD per million input tokens")}
         value={inDraft ?? num(price.inputPerM)}
         disabled={disabled}
         onChange={(e) => setInDraft(e.target.value)}
@@ -518,8 +557,8 @@ function PriceRow({
         type="number"
         min={0}
         step={0.01}
-        placeholder="输出"
-        title="美元 / 百万输出 token"
+        placeholder={t("输出", "Output")}
+        title={t("美元 / 百万输出 token", "USD per million output tokens")}
         value={outDraft ?? num(price.outputPerM)}
         disabled={disabled}
         onChange={(e) => setOutDraft(e.target.value)}
@@ -528,14 +567,17 @@ function PriceRow({
           setOutDraft(null);
         }}
       />
-      <button className="ap-mini" disabled={disabled} onClick={onRemove} title="删除这一行">
-        删除
+      <button className="ap-mini" disabled={disabled} onClick={onRemove} title={t("删除这一行", "Remove this row")}>
+        {t("删除", "Remove")}
       </button>
     </div>
   );
 }
 
 export function AgentDialog({ onClose }: { onClose: () => void }) {
+  useLocale();
+  const PROVIDER_META = providerMeta();
+  const CONTEXT_CHOICES = contextChoices();
   const saved = useAgentConfig();
   const [draft, setDraft] = useState<AgentConfig>(saved);
   const [showKey, setShowKey] = useState(false);
@@ -588,7 +630,7 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
 
   const addAccount = () => {
     const id = newAccountId();
-    const acct = defaultAccount(id, `账号 ${draft.accounts.length + 1}`);
+    const acct = defaultAccount(id, t("账号 {n}", "Account {n}", { n: draft.accounts.length + 1 }));
     patch({ accounts: [...draft.accounts, acct], activeId: id });
   };
 
@@ -604,8 +646,8 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
 
   // 与后端 validate 的后三项一致：地址 / 模型 / Key
   const missing = [
-    !current.baseUrl.trim() && "接口地址",
-    !current.model.trim() && "模型",
+    !current.baseUrl.trim() && t("接口地址", "Endpoint"),
+    !current.model.trim() && t("模型", "Model"),
     !current.apiKey.trim() && "API Key",
   ].filter((x): x is string => typeof x === "string");
   const canTest = missing.length === 0;
@@ -626,7 +668,7 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
       setTestMsg({ ok: true, text });
     } catch (e) {
       // 后端已把错误翻译成中文，直接展示即可
-      setTestMsg({ ok: false, text: String(e ?? "测试失败") });
+      setTestMsg({ ok: false, text: String(e ?? t("测试失败", "Test failed")) });
     } finally {
       setTesting(false);
     }
@@ -645,7 +687,7 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
       await saveAgentConfig({ ...draft, autoAttach: true, budget: normalizeBudget(draft.budget) });
       onClose();
     } catch (e) {
-      setSaveErr(String(e ?? "保存失败"));
+      setSaveErr(String(e ?? t("保存失败", "Save failed")));
     }
   };
 
@@ -653,7 +695,7 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
   const contextOptions = CONTEXT_CHOICES.some((c) => c.bytes === current.maxContextBytes)
     ? CONTEXT_CHOICES
     : [
-        { bytes: current.maxContextBytes, label: `${formatBytes(current.maxContextBytes)}（自定义）` },
+        { bytes: current.maxContextBytes, label: t("{size}（自定义）", "{size} (custom)", { size: formatBytes(current.maxContextBytes) }) },
         ...CONTEXT_CHOICES,
       ];
 
@@ -662,40 +704,48 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
       <div className="modal settings-modal ag-modal" onMouseDown={(e) => e.stopPropagation()}>
         <div className="settings-head">
           <h2>Nexus AI Agent</h2>
-          <button className="settings-x" onClick={onClose} title="关闭（Esc）">
+          <button className="settings-x" onClick={onClose} title={t("关闭（Esc）", "Close (Esc)")}>
             ×
           </button>
         </div>
         <p className="mark-hint">
-          会话的输出旁路给模型，AI 因此能带着上下文回答「刚才那条命令为什么报错」。
-          本页改动在点击「保存」后才生效。
+          {t(
+            "会话的输出旁路给模型，AI 因此能带着上下文回答「刚才那条命令为什么报错」。本页改动在点击「保存」后才生效。",
+            "Session output is mirrored to the model, so the AI can answer questions like \"why did that last command fail?\" with context. Changes on this page take effect after you click Save."
+          )}
         </p>
 
         {/* 安全提示刻意放在最上面：这是「把终端内容发给第三方」的开关，必须先看风险再填 Key */}
         <div className="ag-notice">
           <div className="ag-notice-title">
             <span className="ag-notice-icon">!</span>
-            启用前请读一遍
+            {t("启用前请读一遍", "Read this before enabling")}
           </div>
           <ul>
             <li>
-              <strong>API Key 明文保存在本机 nexus.db</strong>
-              —— 与已保存的主机密码同一套策略，不是系统钥匙串；备份或迁移数据库文件时它就包含在里面。
+              <strong>{t("API Key 明文保存在本机 nexus.db", "The API key is stored in plain text in the local nexus.db")}</strong>
+              {t(
+                "—— 与已保存的主机密码同一套策略，不是系统钥匙串；备份或迁移数据库文件时它就包含在里面。",
+                " — same policy as saved host passwords, not the system keychain. It's included whenever you back up or move the database file."
+              )}
             </li>
             <li>
-              <strong>开启后，该会话的终端输出会发往第三方模型服务</strong>
-              —— 屏幕上出现过的内容都可能出网。脱敏能降低风险，但无法保证不泄露。
+              <strong>{t("开启后，该会话的终端输出会发往第三方模型服务", "When on, the session's terminal output is sent to a third-party model service")}</strong>
+              {t(
+                "—— 屏幕上出现过的内容都可能出网。脱敏能降低风险，但无法保证不泄露。",
+                " — anything that appeared on screen may leave your machine. Redaction lowers the risk but can't guarantee nothing leaks."
+              )}
             </li>
             <li>
-              <strong>AI 给出的命令不会自动执行</strong>
-              —— 只进建议区，由你确认后才会写入终端。
+              <strong>{t("AI 给出的命令不会自动执行", "Commands suggested by the AI never run automatically")}</strong>
+              {t("—— 只进建议区，由你确认后才会写入终端。", " — they go to the suggestion area and are written to the terminal only after you confirm.")}
             </li>
           </ul>
         </div>
 
-        <div className="settings-section">账号</div>
+        <div className="settings-section">{t("账号", "Accounts")}</div>
         <div className="row">
-          <label>当前账号</label>
+          <label>{t("当前账号", "Current account")}</label>
           <select
             value={draft.activeId}
             onChange={(e) => patch({ activeId: e.target.value })}
@@ -706,34 +756,41 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
               </option>
             ))}
           </select>
-          <button className="ag-eye" onClick={addAccount} title="新增一个账号">
-            新增
+          <button className="ag-eye" onClick={addAccount} title={t("新增一个账号", "Add an account")}>
+            {t("新增", "Add")}
           </button>
           <button
             className="ag-eye"
             onClick={removeAccount}
             disabled={draft.accounts.length <= 1}
-            title={draft.accounts.length <= 1 ? "至少保留一个账号" : "删除当前账号"}
+            title={
+              draft.accounts.length <= 1
+                ? t("至少保留一个账号", "At least one account is required")
+                : t("删除当前账号", "Delete the current account")
+            }
           >
-            删除
+            {t("删除", "Delete")}
           </button>
         </div>
         <div className="row">
-          <label>账号名称</label>
+          <label>{t("账号名称", "Account name")}</label>
           <input
             value={current.name}
             onChange={(e) => patchAccount({ name: e.target.value })}
-            placeholder="例如：OpenAI 正式、本地 vLLM"
+            placeholder={t("例如：OpenAI 正式、本地 vLLM", "e.g. OpenAI prod, local vLLM")}
             spellCheck={false}
           />
         </div>
         <p className="ag-hint">
-          可配置多个账号（不同服务商 / 模型 / Key），在此下拉切换；Nexus AI Agent 使用当前选中的账号。
+          {t(
+            "可配置多个账号（不同服务商 / 模型 / Key），在此下拉切换；Nexus AI Agent 使用当前选中的账号。",
+            "You can set up several accounts (different providers / models / keys) and switch between them here. Nexus AI Agent uses the selected account."
+          )}
         </p>
 
-        <div className="settings-section">连接</div>
+        <div className="settings-section">{t("连接", "Connection")}</div>
         <div className="row">
-          <label>服务商</label>
+          <label>{t("服务商", "Provider")}</label>
           <select
             value={current.provider}
             onChange={(e) => {
@@ -750,7 +807,7 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
           </select>
         </div>
         <div className="row">
-          <label>接口地址</label>
+          <label>{t("接口地址", "Endpoint")}</label>
           <input
             value={current.baseUrl}
             onChange={(e) => patchAccount({ baseUrl: e.target.value })}
@@ -762,7 +819,7 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
           <p className="ag-hint">{PROVIDER_META[current.provider].urlHint}</p>
         )}
         <div className="row">
-          <label>模型</label>
+          <label>{t("模型", "Model")}</label>
           <input
             value={current.model}
             onChange={(e) => patchAccount({ model: e.target.value })}
@@ -783,38 +840,40 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
           <button
             className="ag-eye"
             onClick={() => setShowKey((v) => !v)}
-            title={showKey ? "隐藏 API Key" : "显示 API Key"}
+            title={showKey ? t("隐藏 API Key", "Hide API key") : t("显示 API Key", "Show API key")}
           >
-            {showKey ? "隐藏" : "显示"}
+            {showKey ? t("隐藏", "Hide") : t("显示", "Show")}
           </button>
         </div>
         <div className="ag-test-row">
           <button className="btn" disabled={!canTest || testing} onClick={runTest}>
-            {testing ? "测试中…" : "测试连接"}
+            {testing ? t("测试中…", "Testing…") : t("测试连接", "Test connection")}
           </button>
           {testing && <span className="spinner sm" />}
           {testMsg ? (
             <span className={`ag-test-msg ${testMsg.ok ? "ok" : "err"}`}>{testMsg.text}</span>
           ) : (
             <span className="ag-hint ag-test-tip">
-              {canTest ? "用当前账号发一条极短消息验证" : `还需填写：${missing.join("、")}`}
+              {canTest
+                ? t("用当前账号发一条极短消息验证", "Sends a very short message with the current account")
+                : t("还需填写：{fields}", "Still required: {fields}", { fields: missing.join(t("、", ", ")) })}
             </span>
           )}
         </div>
 
-        <div className="settings-section">行为（当前账号）</div>
+        <div className="settings-section">{t("行为（当前账号）", "Behavior (current account)")}</div>
         <div className="ag-block">
-          <span className="ag-block-label">系统提示词（留空则使用内置默认提示词）</span>
+          <span className="ag-block-label">{t("系统提示词（留空则使用内置默认提示词）", "System prompt (leave empty to use the built-in default)")}</span>
           <textarea
             className="ag-ta"
             value={current.systemPrompt}
             onChange={(e) => patchAccount({ systemPrompt: e.target.value })}
-            placeholder="例如：你是资深 SRE，回答请给出可执行命令，并说明风险"
+            placeholder={t("例如：你是资深 SRE，回答请给出可执行命令，并说明风险", "e.g. You are a senior SRE. Give runnable commands and explain the risks")}
             spellCheck={false}
           />
         </div>
         <div className="row">
-          <label>上下文上限</label>
+          <label>{t("上下文上限", "Context limit")}</label>
           <select
             value={String(current.maxContextBytes)}
             onChange={(e) => patchAccount({ maxContextBytes: Number(e.target.value) })}
@@ -827,7 +886,11 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
           </select>
         </div>
         <p className="ag-hint">
-          单次提问最多回看最近 {formatBytes(current.maxContextBytes)} 的终端输出，更早的部分会被丢弃。
+          {t(
+            "单次提问最多回看最近 {size} 的终端输出，更早的部分会被丢弃。",
+            "Each question looks back at most at the last {size} of terminal output; anything older is dropped.",
+            { size: formatBytes(current.maxContextBytes) }
+          )}
         </p>
         <label className="settings-check">
           <input
@@ -836,14 +899,17 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
             onChange={(e) => patchAccount({ redact: e.target.checked })}
           />
           <span>
-            出网前脱敏
+            {t("出网前脱敏", "Redact before sending")}
             <em>
-              会话输出发往模型前，抹掉密钥、token、私钥、邮箱、IP 等；关掉则发送原始输出
+              {t(
+                "会话输出发往模型前，抹掉密钥、token、私钥、邮箱、IP 等；关掉则发送原始输出",
+                "Strips keys, tokens, private keys, emails, IPs, etc. from session output before it goes to the model. When off, raw output is sent"
+              )}
             </em>
           </span>
         </label>
 
-        <div className="settings-section">总开关</div>
+        <div className="settings-section">{t("总开关", "Master switch")}</div>
         <label className="settings-check">
           <input
             type="checkbox"
@@ -851,45 +917,54 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
             onChange={(e) => patch({ enabled: e.target.checked })}
           />
           <span>
-            启用 Nexus AI Agent
-            <em>关闭时后端完全不采集旁路，零开销；不启用则本页其余设置都不生效</em>
+            {t("启用 Nexus AI Agent", "Enable Nexus AI Agent")}
+            <em>
+              {t(
+                "关闭时后端完全不采集旁路，零开销；不启用则本页其余设置都不生效",
+                "When off, the backend captures nothing — zero overhead — and the other settings on this page have no effect"
+              )}
+            </em>
           </span>
         </label>
         {/* 执行权限放在总开关区而不是某个账号下面：换模型不该悄悄换掉 Agent 在终端里的授权级别。 */}
-        <div className="settings-section">执行权限</div>
+        <div className="settings-section">{t("执行权限", "Execution permissions")}</div>
         <div className="row">
-          <label>执行模式</label>
+          <label>{t("执行模式", "Execution mode")}</label>
           <select
             value={draft.execMode}
             disabled={!draft.enabled}
             onChange={(e) => patch({ execMode: e.target.value as AgentExecMode })}
           >
-            <option value="approval">人在回路（推荐）</option>
-            <option value="agentic">全自动</option>
+            <option value="approval">{t("人在回路（推荐）", "Human in the loop (recommended)")}</option>
+            <option value="agentic">{t("全自动", "Fully automatic")}</option>
           </select>
         </div>
         <p className="ag-hint">
           {draft.execMode === "agentic" ? (
             <>
-              <strong>全自动</strong>
-              ：Agent 会直接在终端会话里执行它认为必要的命令，不再逐条询问。
-              只在你完全信任这台机器上的操作对象时选它。
+              <strong>{t("全自动", "Fully automatic")}</strong>
+              {t(
+                "：Agent 会直接在终端会话里执行它认为必要的命令，不再逐条询问。只在你完全信任这台机器上的操作对象时选它。",
+                ": the Agent runs whatever commands it deems necessary directly in the terminal session without asking each time. Choose this only if you fully trust what it's working on."
+              )}
             </>
           ) : (
             <>
-              <strong>人在回路</strong>
-              ：被判定为危险的命令（删除、覆写、改权限、把未知脚本管道给 shell 等）
-              会先弹出卡片等你点头；只读命令照常执行。
+              <strong>{t("人在回路", "Human in the loop")}</strong>
+              {t(
+                "：被判定为危险的命令（删除、覆写、改权限、把未知脚本管道给 shell 等）会先弹出卡片等你点头；只读命令照常执行。",
+                ": commands judged dangerous (deleting, overwriting, changing permissions, piping unknown scripts into a shell, etc.) show a card and wait for your approval; read-only commands run normally."
+              )}
             </>
           )}
         </p>
 
-        <div className="settings-section">运行预算</div>
+        <div className="settings-section">{t("运行预算", "Run budget")}</div>
         {(
           [
-            ["maxSteps", "最多步数", "步", 1],
-            ["maxMinutes", "最长时间（分钟，0 = 不限）", "分钟", 0],
-            ["maxOutputChars", "输出字符上限（0 = 不限）", "字符", 0],
+            ["maxSteps", t("最多步数", "Max steps"), t("步", "steps"), 1],
+            ["maxMinutes", t("最长时间（分钟，0 = 不限）", "Max time (minutes, 0 = unlimited)"), t("分钟", "minutes"), 0],
+            ["maxOutputChars", t("输出字符上限（0 = 不限）", "Max output characters (0 = unlimited)"), t("字符", "characters"), 0],
           ] as [keyof RunBudget, string, string, number][]
         ).map(([key, label, unit, min]) => (
           <div className="row" key={key}>
@@ -909,12 +984,20 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
           </div>
         ))}
         <p className="ag-hint">
-          一轮 Agent 运行最多做这么多步（一次 <code>nx_skill</code> 运行算 1 步）、最多跑这么久、最多读写这么多字符；
-          任何一项用完都不会直接失败，而是<strong>暂停</strong>并说明已做了什么，由你点「继续」（换一份新预算接着做）或「停止」。
-          运行中也可以随时手动「暂停」。
+          {t("一轮 Agent 运行最多做这么多步（一次 ", "Limits for one Agent run: at most this many steps (one ")}
+          <code>nx_skill</code>
+          {t(
+            " 运行算 1 步）、最多跑这么久、最多读写这么多字符；任何一项用完都不会直接失败，而是",
+            " run counts as 1 step), this much time, and this many characters read or written. Running out of any of them doesn't fail the run — it "
+          )}
+          <strong>{t("暂停", "pauses")}</strong>
+          {t(
+            "并说明已做了什么，由你点「继续」（换一份新预算接着做）或「停止」。运行中也可以随时手动「暂停」。",
+            " and explains what's been done, so you can click Resume (continue with a fresh budget) or Stop. You can also pause manually at any time."
+          )}
         </p>
 
-        <div className="settings-section">模型单价</div>
+        <div className="settings-section">{t("模型单价", "Model pricing")}</div>
         {draft.prices.map((p, i) => (
           <PriceRow
             key={i}
@@ -930,21 +1013,29 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
             disabled={!draft.enabled}
             onClick={() => patch({ prices: [...draft.prices, { pattern: current.model.trim(), inputPerM: 0, outputPerM: 0 }] })}
           >
-            + 添加一行
+            {t("+ 添加一行", "+ Add row")}
           </button>
           <span className="ag-hint">
             {priceFor(draft.prices, current.model)
-              ? `当前模型「${current.model}」按「${priceFor(draft.prices, current.model)?.pattern}」计价`
-              : `当前模型「${current.model || "未填"}」没有单价：只显示 token，不显示花费`}
+              ? t("当前模型「{m}」按「{p}」计价", "Current model \"{m}\" is priced as \"{p}\"", {
+                  m: current.model,
+                  p: priceFor(draft.prices, current.model)?.pattern ?? "",
+                })
+              : t(
+                  "当前模型「{m}」没有单价：只显示 token，不显示花费",
+                  "Current model \"{m}\" has no price: tokens are shown, cost isn't",
+                  { m: current.model || t("未填", "not set") }
+                )}
           </span>
         </div>
         <p className="ag-hint">
-          美元 / 百万 token（输入、输出）。模型名包含左栏的文字（不分大小写）就用这一行，多行命中取最长的那行。
-          用来在托管卡和对话框底部显示「≈$」、以及托管的「最多花费」。只预置了几款价格确定的模型，别的请按服务商的价目自己填；
-          不含缓存折扣，结果只是估算。
+          {t(
+            "美元 / 百万 token（输入、输出）。模型名包含左栏的文字（不分大小写）就用这一行，多行命中取最长的那行。用来在托管卡和对话框底部显示「≈$」、以及托管的「最多花费」。只预置了几款价格确定的模型，别的请按服务商的价目自己填；不含缓存折扣，结果只是估算。",
+            "USD per million tokens (input, output). A row applies when the model name contains the text on the left (case-insensitive); if several match, the longest wins. Used for the \"≈$\" shown on autopilot cards and at the bottom of the chat, and for the autopilot Max spend. Only a few models with known prices are preset — fill in others from your provider's price list. Cache discounts aren't included; results are estimates."
+          )}
         </p>
 
-        <div className="settings-section">托管需要我时</div>
+        <div className="settings-section">{t("托管需要我时", "When autopilot needs me")}</div>
         <label className="settings-check">
           <input
             type="checkbox"
@@ -952,8 +1043,13 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
             onChange={(e) => setNotify((n) => ({ ...n, system: e.target.checked }))}
           />
           <span>
-            系统通知
-            <em>托管在等你回答 / 批准、暂停、挂起或结束时弹一条通知；窗口在前台时不弹（标签上的琥珀色圆点照常亮）</em>
+            {t("系统通知", "System notification")}
+            <em>
+              {t(
+                "托管在等你回答 / 批准、暂停、挂起或结束时弹一条通知；窗口在前台时不弹（标签上的琥珀色圆点照常亮）",
+                "Shows a notification when autopilot is waiting for your answer / approval, pauses, is suspended or finishes. Not shown while the window is in front (the amber dot on the tab still lights up)"
+              )}
+            </em>
           </span>
         </label>
         <label className="settings-check">
@@ -963,25 +1059,29 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
             onChange={(e) => setNotify((n) => ({ ...n, taskbar: e.target.checked }))}
           />
           <span>
-            任务栏闪烁
-            <em>窗口不在前台时让任务栏 / Dock 图标闪一下</em>
+            {t("任务栏闪烁", "Flash taskbar")}
+            <em>{t("窗口不在前台时让任务栏 / Dock 图标闪一下", "Flashes the taskbar / Dock icon when the window isn't in front")}</em>
           </span>
         </label>
         <div className="row">
-          <label>Webhook（可选）</label>
+          <label>{t("Webhook（可选）", "Webhook (optional)")}</label>
           <input
             type="url"
-            placeholder="https://… 留空不推送"
+            placeholder={t("https://… 留空不推送", "https://… leave empty to disable")}
             value={notify.webhook}
             onChange={(e) => setNotify((n) => ({ ...n, webhook: e.target.value }))}
           />
         </div>
         <p className="ag-hint">
-          填了就在同样的时机 POST 一段 JSON <code>{"{title, body, host, state, ts}"}</code>
-          ，可接企业微信 / 飞书 / Telegram 的转发桥推到手机。只带一行原因（已脱敏），不含终端内容。
+          {t("填了就在同样的时机 POST 一段 JSON ", "If set, a JSON payload ")}
+          <code>{"{title, body, host, state, ts}"}</code>
+          {t(
+            "，可接企业微信 / 飞书 / Telegram 的转发桥推到手机。只带一行原因（已脱敏），不含终端内容。",
+            " is POSTed at the same moments — hook it up to a WeCom / Feishu / Telegram bridge to get it on your phone. It carries only a one-line reason (redacted), never terminal content."
+          )}
         </p>
 
-        <div className="settings-section">排查</div>
+        <div className="settings-section">{t("排查", "Troubleshooting")}</div>
         <label className="settings-check">
           <input
             type="checkbox"
@@ -990,22 +1090,24 @@ export function AgentDialog({ onClose }: { onClose: () => void }) {
             onChange={(e) => patch({ trace: e.target.checked })}
           />
           <span>
-            记录推理过程与请求/回复
+            {t("记录推理过程与请求/回复", "Log reasoning, requests and replies")}
             <em>
-              把模型的推理（服务方返回时）、每轮请求与回复写入应用数据目录下 logs/agent.log。
-              内容可能含敏感信息（写入前会脱敏，但不保证万无一失），默认关闭，排查完请关掉
+              {t(
+                "把模型的推理（服务方返回时）、每轮请求与回复写入应用数据目录下 logs/agent.log。内容可能含敏感信息（写入前会脱敏，但不保证万无一失），默认关闭，排查完请关掉",
+                "Writes the model's reasoning (when the provider returns it) and every request and reply to logs/agent.log in the app data folder. It may contain sensitive data (redacted before writing, but not guaranteed). Off by default — turn it off again when you're done"
+              )}
             </em>
           </span>
         </label>
 
-        {saveErr && <div className="ag-err">保存失败：{saveErr}</div>}
+        {saveErr && <div className="ag-err">{t("保存失败：{e}", "Save failed: {e}", { e: saveErr })}</div>}
 
         <div className="modal-actions">
           <button className="btn" onClick={onClose}>
-            取消
+            {t("取消", "Cancel")}
           </button>
           <button className="btn primary" disabled={!dirty} onClick={save}>
-            保存
+            {t("保存", "Save")}
           </button>
         </div>
       </div>
@@ -1024,12 +1126,12 @@ interface VaultReport {
 /** 「12 条凭据、2 个 API Key、3 个 TOTP 种子」——为 0 的项不列，免得报告里全是「0 个」。 */
 function sweepParts(r: SweepReport): string {
   const xs = [
-    `${r.credentials} 条凭据`,
-    r.apiKeys > 0 ? `${r.apiKeys} 个 API Key` : null,
-    r.seedsConverted > 0 ? `${r.seedsConverted} 个 TOTP 种子` : null,
+    t("{n} 条凭据", "{n} credentials", { n: r.credentials }),
+    r.apiKeys > 0 ? t("{n} 个 API Key", "{n} API keys", { n: r.apiKeys }) : null,
+    r.seedsConverted > 0 ? t("{n} 个 TOTP 种子", "{n} TOTP seeds", { n: r.seedsConverted }) : null,
   ].filter((x): x is string => x !== null);
   // 一条都没动过也要说话：静默成功会让用户怀疑按钮根本没生效
-  return xs.length > 0 ? xs.join("、") : "0 条凭据";
+  return xs.length > 0 ? xs.join(t("、", ", ")) : t("0 条凭据", "0 credentials");
 }
 
 /**
@@ -1039,20 +1141,40 @@ function describeDone(mode: MasterPasswordMode, r: SweepReport | null): VaultRep
   if (r) {
     if (mode === "disable") {
       return {
-        text: `已关闭主密码保护，${sweepParts(r)}还原成明文存回 nexus.db。`,
+        text: t(
+          "已关闭主密码保护，{parts}还原成明文存回 nexus.db。",
+          "Master password protection is off. {parts} restored to plain text in nexus.db.",
+          { parts: sweepParts(r) }
+        ),
         warn: false,
       };
     }
     // seedsUnreadable 是唯一需要用户动手的结果：那几个种子是别的机器写的，本机解不开
     const tail =
       r.seedsUnreadable > 0
-        ? ` ${r.seedsUnreadable} 个 TOTP 种子来自其它机器、解不开，需要重新填写。`
+        ? t(
+            " {n} 个 TOTP 种子来自其它机器、解不开，需要重新填写。",
+            " {n} TOTP seeds come from another machine and can't be decrypted; please re-enter them.",
+            { n: r.seedsUnreadable }
+          )
         : "";
-    return { text: `已加密 ${sweepParts(r)}。${tail}`, warn: r.seedsUnreadable > 0 };
+    return {
+      text: t("已加密 {parts}。{tail}", "Encrypted {parts}.{tail}", { parts: sweepParts(r), tail }),
+      warn: r.seedsUnreadable > 0,
+    };
   }
   return mode === "change"
-    ? { text: "主密码已修改。旧密码立即失效，请记牢新密码。", warn: false }
-    : { text: "已解锁，本次运行期间凭据可正常读写。", warn: false };
+    ? {
+        text: t(
+          "主密码已修改。旧密码立即失效，请记牢新密码。",
+          "Master password changed. The old one no longer works — make sure you remember the new one."
+        ),
+        warn: false,
+      }
+    : {
+        text: t("已解锁，本次运行期间凭据可正常读写。", "Unlocked. Credentials can be read and written for the rest of this run."),
+        warn: false,
+      };
 }
 
 export function SecurityDialog({
@@ -1063,6 +1185,7 @@ export function SecurityDialog({
   /** 连接迁移导入成功后调用：调用方要重新拉连接列表与会话附加设置 */
   onImported?: () => void;
 }) {
+  useLocale();
   const [status, setStatus] = useState<VaultStatus | null>(null);
   /** null = 还在问系统凭据服务。不是 false —— 「没记住」和「还不知道」要分开显示 */
   const [remembered, setRemembered] = useState<boolean | null>(null);
@@ -1121,7 +1244,13 @@ export function SecurityDialog({
 
   const lockNow = async () => {
     await api.vaultLock();
-    setReport({ text: "已锁定。再次读写已保存的凭据需要重新输入主密码。", warn: false });
+    setReport({
+      text: t(
+        "已锁定。再次读写已保存的凭据需要重新输入主密码。",
+        "Locked. You'll need the master password to read or write saved credentials again."
+      ),
+      warn: false,
+    });
     setTick((t) => t + 1);
   };
 
@@ -1137,7 +1266,10 @@ export function SecurityDialog({
     }
     setRemembered(false);
     setReport({
-      text: "已忘掉本机记住的钥匙。当前不会锁定，下次启动时需要输入主密码。",
+      text: t(
+        "已忘掉本机记住的钥匙。当前不会锁定，下次启动时需要输入主密码。",
+        "Forgot the key remembered on this machine. The vault stays unlocked for now; you'll need the master password next launch."
+      ),
       warn: false,
     });
     void api.vaultForget();
@@ -1151,12 +1283,12 @@ export function SecurityDialog({
       const picked = await openDialog({
         multiple: false,
         directory: false,
-        title: "导入连接",
-        filters: [{ name: "NexusTerm 连接迁移文件", extensions: [CONN_FILE_EXT] }],
+        title: t("导入连接", "Import connections"),
+        filters: [{ name: t("NexusTerm 连接迁移文件", "NexusTerm connection export"), extensions: [CONN_FILE_EXT] }],
       });
       if (typeof picked === "string") setMig({ kind: "import", path: picked });
     } catch (e) {
-      setMigReport({ text: `无法打开文件选择框：${String(e)}`, warn: true, details: [] });
+      setMigReport({ text: t("无法打开文件选择框：{e}", "Couldn't open the file picker: {e}", { e: String(e) }), warn: true, details: [] });
     }
   };
 
@@ -1176,73 +1308,80 @@ export function SecurityDialog({
     >
       <div className="modal settings-modal" onMouseDown={(e) => e.stopPropagation()}>
         <div className="settings-head">
-          <h2>安全</h2>
-          <button className="settings-x" onClick={onClose} title="关闭（Esc）">
+          <h2>{t("安全", "Security")}</h2>
+          <button className="settings-x" onClick={onClose} title={t("关闭（Esc）", "Close (Esc)")}>
             ×
           </button>
         </div>
         <p className="mark-hint">
-          主密码保护已保存的密码、私钥口令、API Key 和 TOTP 种子。密钥由主密码派生，
-          nexus.db 可以原样拷到另一台机器，输同一个主密码就全部打开。
+          {t(
+            "主密码保护已保存的密码、私钥口令、API Key 和 TOTP 种子。密钥由主密码派生，nexus.db 可以原样拷到另一台机器，输同一个主密码就全部打开。",
+            "The master password protects saved passwords, private key passphrases, API keys and TOTP seeds. The key is derived from the master password, so nexus.db can be copied as-is to another machine and opened with the same master password."
+          )}
         </p>
 
         {/* 状态行 */}
         {status === null ? (
           <div className="sec-state">
-            读取保险库状态…
+            {t("读取保险库状态…", "Reading vault status…")}
           </div>
         ) : !enabled ? (
           <div className="sec-state off">
-            未启用主密码保护
-            <em>密码、私钥口令、API Key 以明文存在 nexus.db 里</em>
+            {t("未启用主密码保护", "Master password protection is off")}
+            <em>{t("密码、私钥口令、API Key 以明文存在 nexus.db 里", "Passwords, private key passphrases and API keys are stored in plain text in nexus.db")}</em>
           </div>
         ) : unlocked ? (
           <div className="sec-state unlocked">
-            已解锁
-            <em>本次运行期间凭据可正常读写</em>
+            {t("已解锁", "Unlocked")}
+            <em>{t("本次运行期间凭据可正常读写", "Credentials can be read and written for the rest of this run")}</em>
           </div>
         ) : (
           <div className="sec-state locked">
-            已锁定
-            <em>需要主密码才能读写已保存的凭据</em>
+            {t("已锁定", "Locked")}
+            <em>{t("需要主密码才能读写已保存的凭据", "The master password is needed to read or write saved credentials")}</em>
           </div>
         )}
 
         {/* 操作区：按状态给按钮，不给的那些是此刻根本做不了的 */}
-        <div className="settings-section">主密码</div>
+        <div className="settings-section">{t("主密码", "Master password")}</div>
         {status === null ? (
           <p className="ag-hint">…</p>
         ) : !enabled ? (
           <>
             <div className="row">
-              <label>保险库</label>
+              <label>{t("保险库", "Vault")}</label>
               <button className="btn primary" onClick={() => open("enable")}>
-                启用主密码保护…
+                {t("启用主密码保护…", "Enable master password…")}
               </button>
             </div>
             <p className="ag-hint">
-              启用后会把库里已有的凭据一次性改写成密文。
-              <strong>忘记主密码将无法恢复任何凭据，也没有找回手段。</strong>
+              {t("启用后会把库里已有的凭据一次性改写成密文。", "Enabling encrypts all existing credentials at once. ")}
+              <strong>
+                {t(
+                  "忘记主密码将无法恢复任何凭据，也没有找回手段。",
+                  "If you forget the master password, no credentials can be recovered — there is no reset."
+                )}
+              </strong>
             </p>
           </>
         ) : unlocked ? (
           <div className="row">
-            <label>保险库</label>
+            <label>{t("保险库", "Vault")}</label>
             <button className="btn" onClick={() => open("change")}>
-              修改主密码…
+              {t("修改主密码…", "Change master password…")}
             </button>
             <button className="btn" onClick={() => void lockNow()}>
-              立即锁定
+              {t("立即锁定", "Lock now")}
             </button>
             <button className="btn" onClick={() => open("disable")}>
-              关闭主密码保护…
+              {t("关闭主密码保护…", "Disable master password…")}
             </button>
           </div>
         ) : (
           <div className="row">
-            <label>保险库</label>
+            <label>{t("保险库", "Vault")}</label>
             <button className="btn primary" onClick={() => open("unlock")}>
-              输入主密码解锁…
+              {t("输入主密码解锁…", "Unlock with master password…")}
             </button>
           </div>
         )}
@@ -1250,7 +1389,7 @@ export function SecurityDialog({
         {/* 「在本机记住」：保险库没启用时这个开关没有意义，整块不渲染 */}
         {enabled &&
           (remembered === null ? (
-            <p className="ag-hint">正在检查这把钥匙有没有记在本机…</p>
+            <p className="ag-hint">{t("正在检查这把钥匙有没有记在本机…", "Checking whether the key is remembered on this machine…")}</p>
           ) : (
             <label className="settings-check">
               <input
@@ -1259,11 +1398,12 @@ export function SecurityDialog({
                 onChange={(e) => toggleRemember(e.target.checked)}
               />
               <span>
-                在本机记住这把钥匙
+                {t("在本机记住这把钥匙", "Remember the key on this machine")}
                 <em>
-                  仅本机有效，换到其它机器仍需输入主密码。
-                  打开需要重新验证主密码（把钥匙写进系统凭据服务没有免密的路径）；
-                  关掉立即生效，当前不会锁定。
+                  {t(
+                    "仅本机有效，换到其它机器仍需输入主密码。打开需要重新验证主密码（把钥匙写进系统凭据服务没有免密的路径）；关掉立即生效，当前不会锁定。",
+                    "Applies to this machine only; other machines still need the master password. Turning it on requires the master password again (the key can't be written to the system credential store without it). Turning it off takes effect immediately and doesn't lock the vault."
+                  )}
                 </em>
               </span>
             </label>
@@ -1276,50 +1416,67 @@ export function SecurityDialog({
         )}
 
         {/* 两栏对照：用户会默认「开了主密码 = 整个库都安全了」，而事实不是。 */}
-        <div className="settings-section">加密范围</div>
+        <div className="settings-section">{t("加密范围", "What gets encrypted")}</div>
         <div className="sec-cols">
           <div className={`sec-col${enabled ? " on" : " off"}`}>
-            <h4>{enabled ? "已加密" : "已加密 —— 当前未加密"}</h4>
+            <h4>{enabled ? t("已加密", "Encrypted") : t("已加密 —— 当前未加密", "Encrypted — currently not encrypted")}</h4>
             <ul>
-              <li>SSH 登录密码</li>
-              <li>私钥口令</li>
-              <li>LLM API Key</li>
-              <li>TOTP 种子</li>
+              <li>{t("SSH 登录密码", "SSH login passwords")}</li>
+              <li>{t("私钥口令", "Private key passphrases")}</li>
+              <li>{t("LLM API Key", "LLM API keys")}</li>
+              <li>{t("TOTP 种子", "TOTP seeds")}</li>
             </ul>
             {enabled ? (
               <em>
-                密钥由主密码派生，整个 nexus.db 可以拷到别的机器，输同一个主密码就能打开。
-                忘记主密码 = 以上四项全部永久无法恢复。
+                {t(
+                  "密钥由主密码派生，整个 nexus.db 可以拷到别的机器，输同一个主密码就能打开。忘记主密码 = 以上四项全部永久无法恢复。",
+                  "The key is derived from the master password, so the whole nexus.db can be copied to another machine and opened with the same master password. Forget the master password and all four items above are lost for good."
+                )}
               </em>
             ) : (
               <em>
-                保险库未启用，前三项以明文存在 nexus.db 里。
-                TOTP 种子是例外：它现在挂在本机密钥上，是加密的，但<strong>不可移植</strong>
-                —— 把 nexus.db 拷到另一台机器就解不开，必须重新填写。
+                {t(
+                  "保险库未启用，前三项以明文存在 nexus.db 里。TOTP 种子是例外：它现在挂在本机密钥上，是加密的，但",
+                  "The vault is off, so the first three are stored in plain text in nexus.db. TOTP seeds are the exception: they're encrypted with a key tied to this machine, but "
+                )}
+                <strong>{t("不可移植", "not portable")}</strong>
+                {t(
+                  "—— 把 nexus.db 拷到另一台机器就解不开，必须重新填写。",
+                  " — copy nexus.db to another machine and they can't be decrypted; you'll have to re-enter them."
+                )}
               </em>
             )}
           </div>
           <div className="sec-col off">
-            <h4>未加密（启用主密码也不会加密）</h4>
+            <h4>{t("未加密（启用主密码也不会加密）", "Not encrypted (even with a master password)")}</h4>
             <ul>
-              <li>连接备注</li>
-              <li>登录脚本与会话附加设置</li>
-              <li>宏的内容与步骤</li>
-              <li>主机 / 端口 / 用户名 / 分组</li>
+              <li>{t("连接备注", "Connection notes")}</li>
+              <li>{t("登录脚本与会话附加设置", "Login scripts and extra session settings")}</li>
+              <li>{t("宏的内容与步骤", "Macro contents and steps")}</li>
+              <li>{t("主机 / 端口 / 用户名 / 分组", "Host / port / username / group")}</li>
             </ul>
           </div>
         </div>
 
-        <div className="settings-section">连接迁移</div>
+        <div className="settings-section">{t("连接迁移", "Connection migration")}</div>
         <p className="ag-hint">
-          把全部已保存的连接（含密码、私钥口令、TOTP 种子，可选私钥文件）打成一个文件，
-          换电脑时导入。文件用你设的导出密码加密，和主密码无关。
-          <strong>拿到文件并且知道导出密码的人就能读到这些凭据</strong>
-          —— 导出密码请和文件分开保管，迁移完成后记得删除文件。
-          导入时与已有连接（主机、端口、用户名、名称都相同）重复的会跳过，不会覆盖。
+          {t(
+            "把全部已保存的连接（含密码、私钥口令、TOTP 种子，可选私钥文件）打成一个文件，换电脑时导入。文件用你设的导出密码加密，和主密码无关。",
+            "Packs all saved connections (including passwords, private key passphrases, TOTP seeds and, optionally, private key files) into one file to import on a new computer. The file is encrypted with an export password you choose, independent of the master password. "
+          )}
+          <strong>
+            {t(
+              "拿到文件并且知道导出密码的人就能读到这些凭据",
+              "Anyone with the file and the export password can read these credentials"
+            )}
+          </strong>
+          {t(
+            "—— 导出密码请和文件分开保管，迁移完成后记得删除文件。导入时与已有连接（主机、端口、用户名、名称都相同）重复的会跳过，不会覆盖。",
+            " — keep the export password separate from the file and delete the file once you're done. On import, duplicates of existing connections (same host, port, username and name) are skipped, not overwritten."
+          )}
         </p>
         <div className="row">
-          <label>连接</label>
+          <label>{t("连接", "Connections")}</label>
           <button
             className="btn"
             onClick={() => {
@@ -1327,10 +1484,10 @@ export function SecurityDialog({
               setMig({ kind: "export" });
             }}
           >
-            导出全部连接…
+            {t("导出全部连接…", "Export all connections…")}
           </button>
           <button className="btn" onClick={() => void pickImport()}>
-            导入连接…
+            {t("导入连接…", "Import connections…")}
           </button>
         </div>
         {migReport && (
@@ -1348,7 +1505,7 @@ export function SecurityDialog({
 
         <div className="modal-actions">
           <button className="btn primary" onClick={onClose}>
-            完成
+            {t("完成", "Done")}
           </button>
         </div>
       </div>

@@ -6,6 +6,7 @@
  * 同一组件树分支上，层层传 props 会把 App.tsx 撑爆。玩法与 prefs.ts 一致。
  */
 
+import { t } from "../i18n";
 import { useSyncExternalStore } from "react";
 import { api } from "../api";
 import type { AgentAccount, AgentConfig, AgentProvider } from "../types";
@@ -18,7 +19,7 @@ export function newAccountId(): string {
 }
 
 /** 与后端 `AgentAccount::default()` 对齐。systemPrompt 留空 = 用后端内置提示词。 */
-export function defaultAccount(id = "default", name = "默认"): AgentAccount {
+export function defaultAccount(id = "default", name = t("默认", "Default")): AgentAccount {
   return {
     id,
     name,
@@ -78,7 +79,7 @@ function normalize(raw: Partial<AgentConfig> | null | undefined): AgentConfig {
   // 兼容后端万一回了旧扁平结构：把顶层连接字段包成一个账号
   if (accounts.length === 0) {
     if (c.baseUrl !== undefined || c.model !== undefined || c.apiKey !== undefined) {
-      accounts = [normalizeAccount({ id: "default", name: "默认", ...c }, 0)];
+      accounts = [normalizeAccount({ id: "default", name: t("默认", "Default"), ...c }, 0)];
     } else {
       accounts = [defaultAccount()];
     }
@@ -194,11 +195,11 @@ export function useAgentConfig(): AgentConfig {
  * 弹出两句不同的话。不校验 apiKey 格式：各家形状差别太大，真校验交给 `agent_test`。
  */
 export function isAgentReady(cfg: AgentConfig): { ok: boolean; reason?: string } {
-  if (!cfg.enabled) return { ok: false, reason: "Nexus AI Agent 未启用：请先在设置里打开总开关" };
+  if (!cfg.enabled) return { ok: false, reason: t("Nexus AI Agent 未启用：请先在设置里打开总开关", "Nexus AI Agent is off. Turn it on in Settings first.") };
   const a = activeAccount(cfg);
-  if (!a.apiKey.trim()) return { ok: false, reason: "当前账号尚未填写 API Key：请到设置里填写后再提问" };
-  if (!a.model.trim()) return { ok: false, reason: "当前账号尚未填写模型名称：请到设置里填写后再提问" };
-  if (!a.baseUrl.trim()) return { ok: false, reason: "当前账号尚未填写接口地址（Base URL）" };
+  if (!a.apiKey.trim()) return { ok: false, reason: t("当前账号尚未填写 API Key：请到设置里填写后再提问", "This account has no API key yet. Add one in Settings, then ask again.") };
+  if (!a.model.trim()) return { ok: false, reason: t("当前账号尚未填写模型名称：请到设置里填写后再提问", "This account has no model name yet. Add one in Settings, then ask again.") };
+  if (!a.baseUrl.trim()) return { ok: false, reason: t("当前账号尚未填写接口地址（Base URL）", "This account has no API endpoint (Base URL) yet.") };
   return { ok: true };
 }
 

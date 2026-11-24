@@ -1,13 +1,18 @@
 import { memo, useMemo } from "react";
 import type { SkillRisk, SkillStep } from "../types";
+import { t, useLocale } from "../i18n";
 import { describeSkillStep, RISK_LABEL, STEP_KIND_LABEL } from "../lib/skill";
 import { placeholderRefs, placeholderSegments } from "../lib/skillForm";
 import "./SkillManager.css";
 
 /** 风险徽标。风险只读：由后端评估、只会被抬高，界面不提供修改入口。 */
 export function RiskBadge({ risk, title }: { risk: SkillRisk; title?: string }) {
+  useLocale();
   return (
-    <span className={`sk-risk ${risk}`} title={title ?? "风险等级由后端评估，只会被抬高、不能手动降低"}>
+    <span
+      className={`sk-risk ${risk}`}
+      title={title ?? t("风险等级由后端评估，只会被抬高、不能手动降低", "Risk is assessed by the backend; it can only be raised, never lowered by hand")}
+    >
       {RISK_LABEL[risk]}
     </span>
   );
@@ -23,6 +28,7 @@ export const Highlighted = memo(function Highlighted({
   declared: ReadonlySet<string>;
   secretNames?: ReadonlySet<string>;
 }) {
+  useLocale();
   const segs = useMemo(() => placeholderSegments(text, declared, secretNames), [text, declared, secretNames]);
   return (
     <>
@@ -33,7 +39,13 @@ export const Highlighted = memo(function Highlighted({
           <span
             key={i}
             className={`sk-ph ${s.kind === "param" ? "ok" : "bad"}${s.secret ? " secret" : ""}`}
-            title={s.kind === "param" ? (s.secret ? "secret 参数：运行时走密码通道" : "已声明的参数") : "未声明的参数"}
+            title={
+              s.kind === "param"
+                ? s.secret
+                  ? t("secret 参数：运行时走密码通道", "Secret parameter: supplied through the password channel at run time")
+                  : t("已声明的参数", "Declared parameter")
+                : t("未声明的参数", "Undeclared parameter")
+            }
           >
             {s.text}
           </span>
@@ -59,6 +71,7 @@ export const PlaceholderChips = memo(function PlaceholderChips({
   secretNames: ReadonlySet<string>;
   allowSecret?: boolean;
 }) {
+  useLocale();
   const refs = useMemo(() => placeholderRefs(text, declared, secretNames), [text, declared, secretNames]);
   if (refs.length === 0) return null;
   return (
@@ -72,17 +85,20 @@ export const PlaceholderChips = memo(function PlaceholderChips({
             className={`sk-ph ${bad || misuse ? "bad" : "ok"}${r.secret ? " secret" : ""}`}
             title={
               bad
-                ? "未声明的参数：请在「参数」里添加"
+                ? t("未声明的参数：请在「参数」里添加", "Undeclared parameter: add it under Parameters")
                 : misuse
-                  ? "secret 参数只能用于密码通道（secret 步骤 / secret 应答），不能代入命令、按键或 pattern"
+                  ? t(
+                      "secret 参数只能用于密码通道（secret 步骤 / secret 应答），不能代入命令、按键或 pattern",
+                      "Secret parameters only work in the password channel (secret steps / secret responses), not in commands, keys or patterns"
+                    )
                   : r.secret
-                    ? "secret 参数：运行时走密码通道"
-                    : "已声明的参数"
+                    ? t("secret 参数：运行时走密码通道", "Secret parameter: supplied through the password channel at run time")
+                    : t("已声明的参数", "Declared parameter")
             }
           >
             {`{{${r.name}}}`}
-            {bad && " 未声明"}
-            {misuse && " 不可用于此处"}
+            {bad && t(" 未声明", " undeclared")}
+            {misuse && t(" 不可用于此处", " not allowed here")}
           </span>
         );
       })}
@@ -100,6 +116,7 @@ export function StepPreview({
   declared: ReadonlySet<string>;
   secretNames: ReadonlySet<string>;
 }) {
+  useLocale();
   return (
     <ol className="sk-steplist">
       {steps.map((s, i) => (

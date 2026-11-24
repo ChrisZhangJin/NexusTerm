@@ -3,6 +3,7 @@
  * （校验、风险评估、渲染都以后端为准；这里只做编辑器要用的轻量辅助，不重复校验）。
  */
 
+import { t } from "../i18n";
 import type { SkillInput, SkillRisk, SkillStep, SkillTrustView } from "../types";
 
 /**
@@ -56,18 +57,36 @@ export function undeclaredParams(input: Pick<SkillInput, "params" | "steps" | "v
   return [...seen];
 }
 
-export const STEP_KIND_LABEL: Record<SkillStep["kind"], string> = {
-  exec: "执行命令",
-  keys: "发送按键",
-  expect_respond: "等待并应答",
-  secret: "输入密码",
-  screen_check: "检查屏幕",
+/** 步骤类型的显示名。各项是 getter：读的时候按当前语言取 */
+export const STEP_KIND_LABEL: Readonly<Record<SkillStep["kind"], string>> = {
+  get exec() {
+    return t("执行命令", "Run command");
+  },
+  get keys() {
+    return t("发送按键", "Send keys");
+  },
+  get expect_respond() {
+    return t("等待并应答", "Wait & respond");
+  },
+  get secret() {
+    return t("输入密码", "Enter password");
+  },
+  get screen_check() {
+    return t("检查屏幕", "Check screen");
+  },
 };
 
-export const RISK_LABEL: Record<SkillRisk, string> = {
-  low: "低风险",
-  medium: "中风险",
-  high: "高风险",
+/** 风险的显示名（getter，跟随当前语言） */
+export const RISK_LABEL: Readonly<Record<SkillRisk, string>> = {
+  get low() {
+    return t("低风险", "Low risk");
+  },
+  get medium() {
+    return t("中风险", "Medium risk");
+  },
+  get high() {
+    return t("高风险", "High risk");
+  },
 };
 
 /** 步骤的一行摘要（列表 / 预览用）。secret 步骤只显示理由，永远没有值可显示。 */
@@ -78,11 +97,13 @@ export function describeSkillStep(step: SkillStep): string {
     case "keys":
       return step.keys;
     case "expect_respond":
-      return step.secret ? `等到「${step.expect}」→ 输入密码` : `等到「${step.expect}」→ ${step.respond}`;
+      return step.secret
+        ? t("等到「{e}」→ 输入密码", "Wait for “{e}” → enter password", { e: step.expect })
+        : t("等到「{e}」→ {r}", "Wait for “{e}” → {r}", { e: step.expect, r: step.respond });
     case "secret":
-      return `输入密码：${step.reason}`;
+      return t("输入密码：{r}", "Enter password: {r}", { r: step.reason });
     case "screen_check":
-      return `屏幕应出现「${step.expect}」`;
+      return t("屏幕应出现「{e}」", "Screen should show “{e}”", { e: step.expect });
   }
 }
 
@@ -115,15 +136,16 @@ export interface TrustBadge {
  * 没拿到结论（还在加载 / 失败）时按最严的「需逐步确认」展示，不会误导成已信任。
  */
 export function trustBadge(v: SkillTrustView | undefined): TrustBadge {
-  if (!v) return { label: "需逐步确认", tone: "confirm", title: "每个写步骤都会先询问你" };
+  const confirm = t("需逐步确认", "Confirm each step");
+  if (!v) return { label: confirm, tone: "confirm", title: t("每个写步骤都会先询问你", "You'll be asked before every step that changes things") };
   switch (v.level) {
     case "trusted":
-      return { label: "已信任（只读）", tone: "trusted", title: v.reason };
+      return { label: t("已信任（只读）", "Trusted (read-only)"), tone: "trusted", title: v.reason };
     case "guarded":
-      return { label: "始终逐步确认", tone: "guarded", title: v.reason };
+      return { label: t("始终逐步确认", "Always confirm each step"), tone: "guarded", title: v.reason };
     default:
       return {
-        label: v.streak > 0 ? `需逐步确认 ${v.streak}/${v.needed}` : "需逐步确认",
+        label: v.streak > 0 ? `${confirm} ${v.streak}/${v.needed}` : confirm,
         tone: "confirm",
         title: v.reason,
       };
@@ -136,5 +158,5 @@ export function trustBadge(v: SkillTrustView | undefined): TrustBadge {
  */
 export function scopeBlock(v: SkillTrustView | undefined): string | null {
   if (!v || v.scopeOk !== false) return null;
-  return v.scopeReason?.trim() || "超出技能的适用主机范围";
+  return v.scopeReason?.trim() || t("超出技能的适用主机范围", "This host is outside the skill's host scope");
 }
