@@ -1,6 +1,10 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { initPlatform } from "./lib/platform";
+import { initLocale } from "./i18n";
+
+// 所有窗口（主窗口、浏览窗口、浮动 Agent 窗口）都先定好界面语言并告诉后端
+initLocale();
 
 declare global {
   interface Window {

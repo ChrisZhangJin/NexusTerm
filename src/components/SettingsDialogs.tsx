@@ -20,6 +20,7 @@ import type {
 import { normalizeBudget, parseBudgetInput, type RunBudget } from "../lib/agentBudget";
 import { normalizePrice, priceFor } from "../lib/usage";
 import { detectGpu } from "../lib/gpuRender";
+import { localePref, setLocalePref, t, useLocale, type LocalePref } from "../i18n";
 import type { ModelPrice } from "../types";
 import MasterPasswordDialog, { type MasterPasswordMode } from "./MasterPasswordDialog";
 import ConnMigrateDialog, { type ConnMigrateMode } from "./ConnMigrateDialog";
@@ -72,6 +73,8 @@ interface AppearanceProps {
 }
 
 export function AppearanceDialog(p: AppearanceProps) {
+  useLocale();
+  const langPref = localePref();
   const gpu = detectGpu();
   const prefs = usePrefs();
   useEsc(p.onClose);
@@ -83,6 +86,19 @@ export function AppearanceDialog(p: AppearanceProps) {
           <button className="settings-x" onClick={p.onClose} title="关闭（Esc）">
             ×
           </button>
+        </div>
+
+        <div className="settings-section">语言 / Language</div>
+        <div className="row">
+          <select
+            value={langPref}
+            onChange={(e) => setLocalePref(e.target.value as LocalePref)}
+            aria-label="语言 / Language"
+          >
+            <option value="system">{t("跟随系统", "Follow system")}</option>
+            <option value="zh">中文</option>
+            <option value="en">English</option>
+          </select>
         </div>
 
         <div className="settings-section">终端</div>

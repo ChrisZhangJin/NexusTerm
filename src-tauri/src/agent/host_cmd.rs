@@ -341,7 +341,9 @@ pub(crate) fn terminals_section(ctx: &HostCtx) -> String {
 async fn draft_criteria(cfg: &super::AgentConfig, goal: &str, cancel: &AtomicBool) -> Vec<Check> {
     let acct = cfg.active_account();
     let msgs = vec![ChatMessage::user(criteria::draft_prompt(goal))];
-    let call = super::llm::complete_reply(acct, criteria::DRAFT_SYSTEM, &msgs, &[], Some(cancel));
+    // 判据会显示在托管卡上给人看：界面是英文就让模型用英文写
+    let system = format!("{}{}", criteria::DRAFT_SYSTEM, crate::i18n::reply_language_note());
+    let call = super::llm::complete_reply(acct, &system, &msgs, &[], Some(cancel));
     let reply = match tokio::time::timeout(Duration::from_secs(60), call).await {
         Ok(Ok(r)) => Ok(r.text),
         Ok(Err(e)) => Err(e.to_string()),

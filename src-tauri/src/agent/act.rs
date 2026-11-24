@@ -3745,6 +3745,8 @@ pub async fn run(
     if host.is_some() {
         system.push_str(HOSTED_ADDENDUM);
     }
+    // 界面是英文：让 AI 用英文写给人看的一切（回答、提问、完成报告）
+    system.push_str(crate::i18n::reply_language_note());
     // 托管：契约（授权 / 偏好 / 意向 / 主机备忘 / KB）接在后面；`host_amend` 时按版本号重建
     let base_system = system.clone();
     let mut ctx_ver = 0u64;

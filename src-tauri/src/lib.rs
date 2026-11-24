@@ -23,6 +23,8 @@ mod store;
 mod sysstat;
 mod totp;
 mod vault;
+#[macro_use]
+pub mod i18n;
 mod xsh;
 mod connection_import;
 
@@ -252,6 +254,7 @@ pub fn run() {
             cmd::load_password,
             cmd::reorder_sessions,
             cmd::import_xsh,
+            cmd::set_locale,
             cmd::preview_connection_import,
             cmd::export_xsh,
             cmd::export_sessions_xsh,

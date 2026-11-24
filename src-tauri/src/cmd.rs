@@ -1242,3 +1242,9 @@ pub async fn preview_connection_import(path: String, format: String) -> Result<c
         .await
         .map_err(|_| "连接配置解析任务失败".to_string())?
 }
+
+/// 前端选定的界面语言（"zh" / "en"）：后端直接显示给用户的提示、AI 回答的语言跟着走。
+#[tauri::command]
+pub fn set_locale(locale: String) {
+    crate::i18n::set_locale(&locale);
+}
