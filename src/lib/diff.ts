@@ -16,6 +16,10 @@ export interface DiffLine {
 
 /** 与后端 `files::DIFF_INCOMPLETE_MARK` 一致 */
 export const INCOMPLETE_MARK = "⚠ 预览不完整";
+/** 后端英文界面下的同一标记（两种语言都认：标记是后端按当时的语言写进 diff 的） */
+export const INCOMPLETE_MARK_EN = "⚠ Preview incomplete";
+
+const isIncompleteMark = (line: string) => line.startsWith(INCOMPLETE_MARK) || line.startsWith(INCOMPLETE_MARK_EN);
 
 export function parseDiff(diff: string): DiffLine[] {
   const out: DiffLine[] = [];
@@ -28,7 +32,7 @@ export function parseDiff(diff: string): DiffLine[] {
       kind = "hunk";
       inHunk = true;
     } else if (!inHunk && (line.startsWith("+++") || line.startsWith("---"))) kind = "meta";
-    else if (line.startsWith(INCOMPLETE_MARK) || line.startsWith("…（")) kind = "note";
+    else if (isIncompleteMark(line) || line.startsWith("…（") || line.startsWith("…(")) kind = "note";
     else if (line.startsWith("+")) kind = "add";
     else if (line.startsWith("-")) kind = "del";
     else kind = "ctx";
@@ -49,7 +53,7 @@ export function needsIncompleteBanner(previewComplete: boolean | null | undefine
 /** 预览是否不完整；是则返回那条说明（去掉标记前缀前的整行），否则 null */
 export function incompleteNote(diff: string): string | null {
   const first = diff.replace(/^\s+/, "").split("\n", 1)[0] ?? "";
-  return first.startsWith(INCOMPLETE_MARK) ? first : null;
+  return isIncompleteMark(first) ? first : null;
 }
 
 /** 增 / 删行数与区块数（卡片标题用） */

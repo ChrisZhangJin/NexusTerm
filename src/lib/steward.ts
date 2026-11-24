@@ -18,6 +18,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ScreenDelta, ScreenDeltaAck } from "./termRegistry";
+import { localized } from "./localized";
 
 export type StewardTier = "auto" | "notify" | "approve" | "yolo";
 
@@ -309,92 +310,92 @@ export interface StewardRuntimeInfo {
   consoles: StewardStateInfo[];
 }
 
-const SITUATION_LABELS: Record<SituationKind, string> = {
-  question: "等待回答",
-  permission: "授权确认",
-  password: "密码输入",
-  menu: "编号菜单",
-  pager: "分页器",
-  progress: "任务进行中",
-  subagent_status: "子任务状态",
-  awaiting_input: "等待输入",
-  idle: "shell 空闲",
-  error: "报错停住",
-  alt_screen: "全屏程序（未细分）",
-  unknown: "未知",
-};
+const SITUATION_LABELS: Record<SituationKind, string> = localized({
+  question: ["等待回答", "Waiting for an answer"],
+  permission: ["授权确认", "Permission prompt"],
+  password: ["密码输入", "Password prompt"],
+  menu: ["编号菜单", "Numbered menu"],
+  pager: ["分页器", "Pager"],
+  progress: ["任务进行中", "Task in progress"],
+  subagent_status: ["子任务状态", "Subtask status"],
+  awaiting_input: ["等待输入", "Waiting for input"],
+  idle: ["shell 空闲", "Shell idle"],
+  error: ["报错停住", "Stopped on error"],
+  alt_screen: ["全屏程序（未细分）", "Full-screen program (unclassified)"],
+  unknown: ["未知", "Unknown"],
+});
 
-export const EVENT_LABELS: Record<StewardEventKind, string> = {
-  situation_changed: "局面变化",
-  no_progress: "空转",
-  stale_feed: "帧断流",
-  feed_restored: "帧恢复",
-  screen_lost: "无屏幕帧",
-  contract_started: "开始托管",
-  contract_stopped: "停止托管",
-};
+export const EVENT_LABELS: Record<StewardEventKind, string> = localized({
+  situation_changed: ["局面变化", "Situation changed"],
+  no_progress: ["空转", "No progress"],
+  stale_feed: ["帧断流", "Screen feed stalled"],
+  feed_restored: ["帧恢复", "Screen feed restored"],
+  screen_lost: ["无屏幕帧", "No screen frames"],
+  contract_started: ["开始托管", "Autopilot started"],
+  contract_stopped: ["停止托管", "Autopilot stopped"],
+});
 
-const PROGRAM_LABELS: Record<Program, string> = {
-  shell: "Shell",
-  claude_code: "Claude Code",
-  vim: "Vim",
-  pager: "分页器",
-  tui: "全屏 TUI",
-  script: "交互脚本",
-  ssh: "SSH",
-  unknown: "未知程序",
-};
+const PROGRAM_LABELS: Record<Program, string> = localized({
+  shell: ["Shell", "Shell"],
+  claude_code: ["Claude Code", "Claude Code"],
+  vim: ["Vim", "Vim"],
+  pager: ["分页器", "Pager"],
+  tui: ["全屏 TUI", "Full-screen TUI"],
+  script: ["交互脚本", "Interactive script"],
+  ssh: ["SSH", "SSH"],
+  unknown: ["未知程序", "Unknown program"],
+});
 
 export const situationLabel = (k: SituationKind): string => SITUATION_LABELS[k];
 export const eventLabel = (k: StewardEventKind): string => EVENT_LABELS[k];
 export const programLabel = (p: Program): string => PROGRAM_LABELS[p];
 
 /** 决策记录的人话标签。放这里而不是组件里，方便单测与以后复用。 */
-export const ACTION_LABELS: Record<string, string> = {
-  answer: "替你回答",
-  secret: "密码（本人输入）",
-  wait: "继续等待",
-  observe: "只观察",
-  advance: "推进步骤",
-  handoff: "交还",
-};
+export const ACTION_LABELS: Record<string, string> = localized({
+  answer: ["替你回答", "Answer for you"],
+  secret: ["密码（本人输入）", "Password (you type it)"],
+  wait: ["继续等待", "Keep waiting"],
+  observe: ["只观察", "Observe only"],
+  advance: ["推进步骤", "Advance step"],
+  handoff: ["交还", "Hand back"],
+});
 
-export const REF_LABELS: Record<string, string> = {
-  profile: "偏好",
-  intent: "意向",
-  knowledge: "知识",
-  playbook: "剧本",
-  authority: "授权",
-  policy: "安全策略",
-  history: "历史决策",
-};
+export const REF_LABELS: Record<string, string> = localized({
+  profile: ["偏好", "Preferences"],
+  intent: ["意向", "Intent"],
+  knowledge: ["知识", "Knowledge"],
+  playbook: ["剧本", "Playbook"],
+  authority: ["授权", "Permissions"],
+  policy: ["安全策略", "Safety policy"],
+  history: ["历史决策", "Past decisions"],
+});
 
-export const OUTCOME_LABELS: Record<string, string> = {
-  proposed: "已提议",
-  applied: "已生效",
-  escalated: "待确认",
-  observed: "只观察",
-  rejected: "用户接管",
-  no_receipt: "回执超时",
-  rolled_back: "已纠正",
-};
+export const OUTCOME_LABELS: Record<string, string> = localized({
+  proposed: ["已提议", "Proposed"],
+  applied: ["已生效", "Applied"],
+  escalated: ["待确认", "Awaiting confirmation"],
+  observed: ["只观察", "Observed"],
+  rejected: ["用户接管", "Taken over by you"],
+  no_receipt: ["回执超时", "Receipt timed out"],
+  rolled_back: ["已纠正", "Corrected"],
+});
 
 /** 档位的人话标签（值不变，只换显示）。面板、依据编辑、决策卡共用。 */
-export const TIER_LABELS: Record<StewardTier, string> = {
-  auto: "自动执行",
-  notify: "通知后执行",
-  approve: "需确认后执行",
-  yolo: "YOLO·完全放手",
-};
+export const TIER_LABELS: Record<StewardTier, string> = localized({
+  auto: ["自动执行", "Auto"],
+  notify: ["通知后执行", "Notify"],
+  approve: ["需确认后执行", "Ask first"],
+  yolo: ["YOLO·完全放手", "YOLO"],
+});
 
 export const tierLabel = (t: string): string => TIER_LABELS[t as StewardTier] ?? t;
 
 /** 契约 / 现场状态的人话标签；未知值原样显示 */
-const CONTRACT_STATUS_LABELS: Record<string, string> = {
-  observing: "观察中",
-  hosted: "托管中",
-  none: "未托管",
-};
+const CONTRACT_STATUS_LABELS: Record<string, string> = localized({
+  observing: ["观察中", "Observing"],
+  hosted: ["托管中", "On autopilot"],
+  none: ["未托管", "Not on autopilot"],
+});
 
 export const contractStatusLabel = (s: string): string => CONTRACT_STATUS_LABELS[s] ?? s;
 

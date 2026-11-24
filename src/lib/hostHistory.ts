@@ -3,6 +3,7 @@
  */
 
 import type { HostBackupEntry, HostChangeSummary } from "../types";
+import { t } from "../i18n";
 
 export interface ChangeGroup {
   label: string;
@@ -12,12 +13,12 @@ export interface ChangeGroup {
 /** 除文件外的分组（文件单独渲染，带「还原」按钮）。空组不出现 */
 export function changeGroups(c: HostChangeSummary): ChangeGroup[] {
   const groups: ChangeGroup[] = [
-    { label: "软件包", items: c.packages },
-    { label: "服务", items: c.services },
-    { label: "端口 / 防火墙", items: c.ports },
-    { label: "容器", items: c.containers },
-    { label: "下载", items: c.downloads },
-    { label: "删除", items: c.removals ?? [] },
+    { label: t("软件包", "Packages"), items: c.packages },
+    { label: t("服务", "Services"), items: c.services },
+    { label: t("端口 / 防火墙", "Ports / firewall"), items: c.ports },
+    { label: t("容器", "Containers"), items: c.containers },
+    { label: t("下载", "Downloads"), items: c.downloads },
+    { label: t("删除", "Deletions"), items: c.removals ?? [] },
   ];
   return groups.filter((g) => g.items.length > 0);
 }
@@ -59,22 +60,22 @@ export function fileRows(files: string[], backups: HostBackupEntry[]): FileRow[]
 export function backupInfo(b: HostBackupEntry): { restorable: boolean; note: string } {
   switch (b.status ?? "backedUp") {
     case "created":
-      return { restorable: false, note: "这个文件是托管新建的" };
+      return { restorable: false, note: t("这个文件是托管新建的", "This file was created by autopilot") };
     case "skipped":
-      return { restorable: false, note: `没有备份原文：${b.note || "原因不明"}` };
+      return { restorable: false, note: t("没有备份原文：{why}", "Original not backed up: {why}", { why: b.note || t("原因不明", "unknown reason") }) };
     default:
-      return { restorable: true, note: `原文已备份 ${fmtSize(b.size)}` };
+      return { restorable: true, note: t("原文已备份 {size}", "Original backed up ({size})", { size: fmtSize(b.size) }) };
   }
 }
 
 /** 72_000 → 「1 分 12 秒」 */
 export function fmtDuration(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
-  if (s < 60) return `${s} 秒`;
+  if (s < 60) return t("{s} 秒", "{s}s", { s });
   const m = Math.floor(s / 60);
-  if (m < 60) return s % 60 ? `${m} 分 ${s % 60} 秒` : `${m} 分`;
+  if (m < 60) return s % 60 ? t("{m} 分 {s} 秒", "{m}m {s}s", { m, s: s % 60 }) : t("{m} 分", "{m}m", { m });
   const h = Math.floor(m / 60);
-  return m % 60 ? `${h} 小时 ${m % 60} 分` : `${h} 小时`;
+  return m % 60 ? t("{h} 小时 {m} 分", "{h}h {m}m", { h, m: m % 60 }) : t("{h} 小时", "{h}h", { h });
 }
 
 /** 「11-20 14:05」；跨年带年份 */
@@ -88,11 +89,11 @@ export function fmtWhen(ts: number, now: number = Date.now()): string {
 export function historyStateLabel(state: string): { label: string; tone: string } {
   switch (state) {
     case "completed":
-      return { label: "完成", tone: "done" };
+      return { label: t("完成", "Done"), tone: "done" };
     case "failed":
-      return { label: "失败", tone: "bad" };
+      return { label: t("失败", "Failed"), tone: "bad" };
     case "stopped":
-      return { label: "已停止", tone: "idle" };
+      return { label: t("已停止", "Stopped"), tone: "idle" };
     default:
       return { label: state, tone: "idle" };
   }

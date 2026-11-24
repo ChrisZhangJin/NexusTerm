@@ -5,6 +5,7 @@
  * 还能加自定义关键字（命中即拒绝）。改动立即回调，由调用方决定落到哪（本地偏好 / host_amend）。
  */
 import { useState } from "react";
+import { t, useLocale } from "../i18n";
 import { addDeny, denyHint, denyLabel, isLockedDeny, removeDeny } from "../lib/host";
 
 interface DenyEditorProps {
@@ -16,6 +17,7 @@ interface DenyEditorProps {
 }
 
 export default function DenyEditor({ value, onChange, disabled, highlight }: DenyEditorProps) {
+  useLocale();
   const [draft, setDraft] = useState("");
   const add = () => {
     const next = addDeny(value, draft);
@@ -24,8 +26,14 @@ export default function DenyEditor({ value, onChange, disabled, highlight }: Den
   };
   return (
     <div className="deny-editor">
-      <span className="deny-title" title="命中禁止项的操作一律不执行（任何授权档位都一样）。点 ✕ 放开这一类。">
-        禁止项
+      <span
+        className="deny-title"
+        title={t(
+          "命中禁止项的操作一律不执行（任何授权档位都一样）。点 ✕ 放开这一类。",
+          "Actions that hit a blocked item are never run, at any permission level. Click ✕ to allow that kind."
+        )}
+      >
+        {t("禁止项", "Blocked actions")}
       </span>
       {value.map((tag) => {
         const locked = isLockedDeny(tag);
@@ -41,7 +49,7 @@ export default function DenyEditor({ value, onChange, disabled, highlight }: Den
               <button
                 className="deny-x"
                 disabled={disabled}
-                aria-label={`放开：${denyLabel(tag)}`}
+                aria-label={t("放开：{label}", "Allow: {label}", { label: denyLabel(tag) })}
                 onClick={() => onChange(removeDeny(value, tag))}
               >
                 ✕
@@ -54,7 +62,7 @@ export default function DenyEditor({ value, onChange, disabled, highlight }: Den
         className="deny-add"
         value={draft}
         disabled={disabled}
-        placeholder="+ 关键字（如 systemctl）"
+        placeholder={t("+ 关键字（如 systemctl）", "+ keyword (e.g. systemctl)")}
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === "Enter") {

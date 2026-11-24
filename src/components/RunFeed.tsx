@@ -15,6 +15,8 @@ import { GateCard, type GateHost } from "./GateCard";
 import { isHandEyeKind, maskReveal } from "../lib/agentRun";
 import { REVEAL_NOT_SAVED } from "../lib/agentHistory";
 import { api } from "../api";
+import { t, useLocale } from "../i18n";
+import { localized } from "../lib/localized";
 import type {
   AgentApproveRequest,
   AgentMessage,
@@ -84,6 +86,7 @@ export function RunFeed({
   /** 被托管的契约（门禁卡按钮用） */
   host?: GateHost | null;
 }) {
+  useLocale();
   const ref = useRef<HTMLDivElement>(null);
   // 贴底时才跟随：用户往上翻看历史就别把他拽回去
   const stick = useRef(true);
@@ -100,7 +103,7 @@ export function RunFeed({
         if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
       }}
     >
-      {messages.length === 0 && !busy && <div className="st-empty">还没有运行记录。</div>}
+      {messages.length === 0 && !busy && <div className="st-empty">{t("还没有运行记录。", "No runs yet.")}</div>}
       {messages.map((m) => {
         if (isRunCard(m)) {
           return (
@@ -123,7 +126,7 @@ export function RunFeed({
             <i />
             <i />
           </span>
-          托管执行中…
+          {t("托管执行中…", "Autopilot running…")}
         </div>
       )}
       {busy && paused && pauseText && <div className="ap-note ap-paused">{pauseText}</div>}
@@ -157,38 +160,40 @@ function prettyToolArgs(raw: string): string {
 }
 
 /** 终端停在交互提示上时（密码 / 确认 / 分页 / 菜单 / REPL）给步骤卡片挂的小标签；shell_prompt / unknown 不显示 */
-const PROMPT_LABELS: Record<string, string> = {
-  password: "等待密码",
-  yes_no: "等待确认",
-  pager: "分页器",
-  menu: "菜单",
-  repl: "REPL",
-};
+const PROMPT_LABELS: Record<string, string> = localized({
+  password: ["等待密码", "Awaiting password"],
+  yes_no: ["等待确认", "Awaiting confirmation"],
+  pager: ["分页器", "Pager"],
+  menu: ["菜单", "Menu"],
+  repl: ["REPL", "REPL"],
+});
 
 function PromptBadge({ kind }: { kind?: string }) {
+  useLocale();
   const label = kind ? PROMPT_LABELS[kind] : undefined;
   if (!label) return null;
   return (
-    <span className="ap-prompt-badge" title={`终端当前停在：${kind}`}>
+    <span className="ap-prompt-badge" title={t("终端当前停在：{kind}", "Terminal is waiting at: {kind}", { kind: kind ?? "" })}>
       {label}
     </span>
   );
 }
 
 /** 密码通道结局 → 卡片上的中文短语 */
-const SECRET_STATUS_LABELS: Record<string, string> = {
-  provided: "已输入",
-  declined: "已跳过",
-  timeout: "已超时",
-  cancelled: "已取消",
-  failed: "写入失败",
-};
+const SECRET_STATUS_LABELS: Record<string, string> = localized({
+  provided: ["已输入", "Entered"],
+  declined: ["已跳过", "Skipped"],
+  timeout: ["已超时", "Timed out"],
+  cancelled: ["已取消", "Cancelled"],
+  failed: ["写入失败", "Failed to write"],
+});
 
 /**
  * 一次执行的卡片：命令 + 结果。「在哪台机器上跑的」必须写清楚 —— Agent 是全局的，
  * 可以同时在好几个会话上下令，只显示命令的话分不清输出来自哪台机器。
  */
 function StepCard({ step }: { step: AgentStep }) {
+  useLocale();
   if (step.kind === "note" || step.kind === "resumed") {
     return <div className="ap-note">{step.text ?? ""}</div>;
   }
@@ -203,11 +208,12 @@ function StepCard({ step }: { step: AgentStep }) {
   if (step.kind === "todo") return <TodoList items={step.todo ?? []} />;
   // 文件工具：读 / 查找 / 搜索一行带过；写 / 改带差异预览
   if (step.kind === "file") {
-    const failed = step.text !== undefined && step.text !== "完成";
+    // 成功时后端给的是「完成」（英文界面可能是 Done）：两种都算成功
+    const failed = step.text !== undefined && step.text !== "完成" && step.text !== "Done";
     return (
       <div className={`ap-step file${failed ? " danger" : ""}`}>
         <div className="ap-step-head">
-          <span className="ap-step-tag">文件</span>
+          <span className="ap-step-tag">{t("文件", "File")}</span>
           {step.targetLabel ? (
             <span className="ap-step-where" title={step.target}>
               {step.targetLabel}
@@ -227,15 +233,15 @@ function StepCard({ step }: { step: AgentStep }) {
     return (
       <div className="ap-step tool">
         <div className="ap-step-head">
-          <span className="ap-step-tag">工具调用</span>
-          <span className="ap-step-tool">{step.toolLabel ?? "工具"}</span>
+          <span className="ap-step-tag">{t("工具调用", "Tool call")}</span>
+          <span className="ap-step-tool">{step.toolLabel ?? t("工具", "Tool")}</span>
         </div>
         <div className="ap-step-why">
           <code>{step.tool ?? ""}</code>
           {step.toolArgs && step.toolArgs.trim() !== "{}" ? (
             <span className="ap-tool-args">{prettyToolArgs(step.toolArgs)}</span>
           ) : (
-            <span className="ap-tool-args dim">（无参数）</span>
+            <span className="ap-tool-args dim">{t("（无参数）", "(no arguments)")}</span>
           )}
         </div>
       </div>
@@ -250,7 +256,7 @@ function StepCard({ step }: { step: AgentStep }) {
       <div className="ap-step">
         <div className="ap-step-head">
           <span className="ap-step-tag">
-            {isTab ? "标签页" : isOpen ? "新会话" : "导记录"}
+            {isTab ? t("标签页", "Tab") : isOpen ? t("新会话", "New session") : t("导记录", "Export log")}
           </span>
           {step.targetLabel ? (
             <span className="ap-step-where" title={step.target}>
@@ -271,7 +277,7 @@ function StepCard({ step }: { step: AgentStep }) {
     return (
       <div className={`ap-step${finished ? "" : " pending"}${bad ? " danger" : ""}`}>
         <div className="ap-step-head">
-          <span className="ap-step-tag">密码</span>
+          <span className="ap-step-tag">{t("密码", "Password")}</span>
           {step.targetLabel ? (
             <span className="ap-step-where" title={step.target}>
               {step.targetLabel}
@@ -279,10 +285,10 @@ function StepCard({ step }: { step: AgentStep }) {
           ) : null}
           <PromptBadge kind={step.promptKind} />
         </div>
-        {step.command ? <div className="ap-step-why">原因：{step.command}</div> : null}
+        {step.command ? <div className="ap-step-why">{t("原因：", "Reason: ")}{step.command}</div> : null}
         <div className="ap-step-why">
-          {finished ? (SECRET_STATUS_LABELS[step.secretStatus!] ?? step.secretStatus) : "等待用户输入……"}
-          {step.text && finished ? `（${step.text}）` : ""}
+          {finished ? (SECRET_STATUS_LABELS[step.secretStatus!] ?? step.secretStatus) : t("等待用户输入……", "Waiting for user input…")}
+          {step.text && finished ? t("（{text}）", " ({text})", { text: step.text }) : ""}
         </div>
         {finished && out.trim() ? <pre className="ap-code ap-out-plain">{out}</pre> : null}
       </div>
@@ -292,17 +298,17 @@ function StepCard({ step }: { step: AgentStep }) {
   if (step.kind === "skill") {
     const st = step.skillStatus ?? "running";
     const label: Record<string, string> = {
-      running: "进行中",
-      ok: "完成",
-      deviated: "偏离",
-      failed: "失败",
-      skipped: "跳过",
-      declined: "未获批",
+      running: t("进行中", "Running"),
+      ok: t("完成", "Done"),
+      deviated: t("偏离", "Deviated"),
+      failed: t("失败", "Failed"),
+      skipped: t("跳过", "Skipped"),
+      declined: t("未获批", "Not approved"),
     };
     return (
       <div className={`ap-step${st === "running" ? " pending" : ""}`}>
         <div className="ap-step-head">
-          <span className="ap-step-tag">技能</span>
+          <span className="ap-step-tag">{t("技能", "Skill")}</span>
           {step.targetLabel ? (
             <span className="ap-step-where" title={step.target}>
               {step.targetLabel}
@@ -312,14 +318,20 @@ function StepCard({ step }: { step: AgentStep }) {
         </div>
         {step.command ? <pre className="ap-code">{step.command}</pre> : null}
         {step.text && st !== "running" ? <div className="ap-step-why">{step.text}</div> : null}
-        {st === "running" ? <div className="ap-running">{step.text ?? "执行中……"}</div> : null}
+        {st === "running" ? <div className="ap-running">{step.text ?? t("执行中……", "Running…")}</div> : null}
       </div>
     );
   }
   // 手和眼：发按键 / 等输出 / 读屏幕 / 盯屏等待（托管）。output 为空 = 进行中，有值（含空串）= 已收尾。
   if (isHandEyeKind(step.kind)) {
     const tag =
-      step.kind === "keys" ? "按键" : step.kind === "wait" ? "等待" : step.kind === "watch" ? "盯屏等待" : "读屏";
+      step.kind === "keys"
+        ? t("按键", "Keys")
+        : step.kind === "wait"
+          ? t("等待", "Wait")
+          : step.kind === "watch"
+            ? t("盯屏等待", "Watch screen")
+            : t("读屏", "Read screen");
     const finished = step.output !== undefined;
     const out = step.output ?? "";
     const lines = out.split("\n").length;
@@ -339,7 +351,11 @@ function StepCard({ step }: { step: AgentStep }) {
         {finished && out.trim() ? (
           lines > 10 ? (
             <details className="ap-out">
-              <summary>{step.kind === "screen" || step.kind === "watch" ? "屏幕" : "输出"} {lines} 行</summary>
+              <summary>
+                {step.kind === "screen" || step.kind === "watch"
+                  ? t("屏幕 {n} 行", "Screen: {n} lines", { n: lines })
+                  : t("输出 {n} 行", "Output: {n} lines", { n: lines })}
+              </summary>
               <pre className="ap-code">{out}</pre>
             </details>
           ) : (
@@ -353,7 +369,7 @@ function StepCard({ step }: { step: AgentStep }) {
               <i />
               <i />
             </span>
-            {step.kind === "watch" ? "盯屏中…" : "进行中…"}
+            {step.kind === "watch" ? t("盯屏中…", "Watching…") : t("进行中…", "Running…")}
           </div>
         ) : null}
       </div>
@@ -363,7 +379,7 @@ function StepCard({ step }: { step: AgentStep }) {
     return (
       <div className="ap-step danger">
         <div className="ap-step-head">
-          <span className="ap-step-tag">未执行</span>
+          <span className="ap-step-tag">{t("未执行", "Not run")}</span>
           {/* 被拦下的伪命令（new-tab 之类）没有目标会话：写"未知会话"会让人以
               为它跑去了某台机器上，而实情是它一步都没出去。没有目标就别编一个。 */}
           {step.targetLabel ? (
@@ -374,7 +390,7 @@ function StepCard({ step }: { step: AgentStep }) {
         </div>
         <pre className="ap-code">{step.command ?? ""}</pre>
         {step.reasons?.length ? (
-          <div className="ap-step-why">原因：{step.reasons.join("；")}</div>
+          <div className="ap-step-why">{t("原因：", "Reason: ")}{step.reasons.join(t("；", "; "))}</div>
         ) : null}
       </div>
     );
@@ -402,14 +418,14 @@ function StepCard({ step }: { step: AgentStep }) {
   // 没有退出码这回事了：命令是否成功，由模型读下面这段真实输出自己判断，
   // 跟真人盯着终端看一样。这里只中性地标「执行中 / 已完成」，不再染色判对错。
   const done = step.kind === "result";
-  const tag = done ? "已完成" : "执行中";
+  const tag = done ? t("已完成", "Done") : t("执行中", "Running");
   const lines = (step.output ?? "").split("\n").length;
   return (
     <div className={`ap-step${done ? "" : " pending"}`}>
       <div className="ap-step-head">
         <span className="ap-step-tag">{tag}</span>
         <span className="ap-step-where" title={step.target}>
-          {step.targetLabel ?? "未知会话"}
+          {step.targetLabel ?? t("未知会话", "Unknown session")}
         </span>
         {done ? <PromptBadge kind={step.promptKind} /> : null}
       </div>
@@ -419,14 +435,14 @@ function StepCard({ step }: { step: AgentStep }) {
           // 长输出折叠：一屏七八行的核对性输出最常见，全展开会把对话挤没
           lines > 10 ? (
             <details className="ap-out">
-              <summary>输出 {lines} 行</summary>
+              <summary>{t("输出 {n} 行", "Output: {n} lines", { n: lines })}</summary>
               <pre className="ap-code">{step.output}</pre>
             </details>
           ) : (
             <pre className="ap-code ap-out-plain">{step.output}</pre>
           )
         ) : (
-          <div className="ap-step-why">（该命令没有输出）</div>
+          <div className="ap-step-why">{t("（该命令没有输出）", "(no output)")}</div>
         )
       ) : (
         <div className="ap-running">
@@ -435,7 +451,8 @@ function StepCard({ step }: { step: AgentStep }) {
             <i />
             <i />
           </span>
-          等待输出…{step.elapsedSecs ? `（已等待 ${step.elapsedSecs} 秒）` : ""}
+          {t("等待输出…", "Waiting for output…")}
+          {step.elapsedSecs ? t("（已等待 {n} 秒）", " ({n}s elapsed)", { n: step.elapsedSecs }) : ""}
         </div>
       )}
     </div>
@@ -457,6 +474,7 @@ function ApproveCard({
   busy: boolean;
   onDecide: (approved: boolean) => void;
 }) {
+  useLocale();
   const settled = result !== undefined;
   // 越界批准与危险命令批准含义不同：前者批的是「动这台不在范围里的会话」，
   // 标题与文案必须直说，别让人以为只是又一次命令风险提示。
@@ -470,44 +488,54 @@ function ApproveCard({
       <div className="ap-step-head">
         <span className="ap-step-tag">
           {scope
-            ? "超出作用范围 · 需要批准"
+            ? t("超出作用范围 · 需要批准", "Out of scope · Approval needed")
             : skill
-              ? "技能 · 需要确认"
+              ? t("技能 · 需要确认", "Skill · Confirmation needed")
               : req.kind === "file_sensitive"
-                ? "写受保护路径 · 需要批准"
+                ? t("写受保护路径 · 需要批准", "Write to protected path · Approval needed")
                 : req.kind === "file_read_sensitive"
-                  ? "读受保护路径 · 需要批准"
+                  ? t("读受保护路径 · 需要批准", "Read protected path · Approval needed")
                   : file
-                  ? "写文件 · 需要批准"
-                  : "需要批准"}
+                  ? t("写文件 · 需要批准", "Write file · Approval needed")
+                  : t("需要批准", "Approval needed")}
         </span>
         <span className="ap-step-where" title={req.target}>
-          {req.targetLabel || "未知会话"}
+          {req.targetLabel || t("未知会话", "Unknown session")}
         </span>
       </div>
       <pre className="ap-code">{req.command}</pre>
       {needsIncompleteBanner(req.previewComplete, req.diff) ? (
         <div className="ap-diff-incomplete" role="alert">
-          ⚠ 预览不完整：卡上看不到全部修改，批准写入的是完整内容
+          {t(
+            "⚠ 预览不完整：卡上看不到全部修改，批准写入的是完整内容",
+            "⚠ Incomplete preview: not every change is shown here; approving writes the full content"
+          )}
         </div>
       ) : null}
       {req.diff ? <DiffView diff={req.diff} open /> : null}
       {req.reasons.length > 0 && (
         <div className="ap-step-why">
-          {scope ? "越界原因" : skill || file ? "说明" : "风险提示"}：{req.reasons.join("；")}
+          {scope ? t("越界原因：", "Out-of-scope reason: ") : skill || file ? t("说明：", "Note: ") : t("风险提示：", "Risk: ")}
+          {req.reasons.join(t("；", "; "))}
         </div>
       )}
       {settled ? (
         <div className="ap-approve-done">
-          {result ? (scope ? "已允许，该会话已并入本轮作用范围" : skill ? "已确认" : "已允许执行") : "已拒绝 / 已超时"}
+          {result
+            ? scope
+              ? t("已允许，该会话已并入本轮作用范围", "Allowed — this session is now in scope for this run")
+              : skill
+                ? t("已确认", "Confirmed")
+                : t("已允许执行", "Allowed")
+            : t("已拒绝 / 已超时", "Denied / timed out")}
         </div>
       ) : (
         <div className="ap-approve-row">
           <button className="btn primary" disabled={!busy} onClick={() => onDecide(true)}>
-            {scope ? "允许越界操作" : skill ? "确认" : file ? "允许写入" : "允许执行"}
+            {scope ? t("允许越界操作", "Allow out of scope") : skill ? t("确认", "Confirm") : file ? t("允许写入", "Allow write") : t("允许执行", "Allow")}
           </button>
           <button className="btn" disabled={!busy} onClick={() => onDecide(false)}>
-            拒绝
+            {t("拒绝", "Deny")}
           </button>
         </div>
       )}
@@ -535,6 +563,7 @@ function SecretCard({
   /** `value` 为 undefined = 跳过。返回内联错误文案，或 null 表示已处理 */
   onAnswer: (value?: string) => Promise<string | null>;
 }) {
+  useLocale();
   const [value, setValue] = useState("");
   const [inlineErr, setInlineErr] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
@@ -544,8 +573,8 @@ function SecretCard({
   // 倒计时只是提示：真正的超时在后端，到点后端会放弃等待并告诉模型「超时」
   useEffect(() => {
     if (settled) return;
-    const t = window.setInterval(() => setLeft((n) => (n > 0 ? n - 1 : 0)), 1000);
-    return () => window.clearInterval(t);
+    const timer = window.setInterval(() => setLeft((n) => (n > 0 ? n - 1 : 0)), 1000);
+    return () => window.clearInterval(timer);
   }, [settled]);
 
   const submit = async (v?: string) => {
@@ -569,19 +598,19 @@ function SecretCard({
   return (
     <div className={`ap-approve ap-secret${settled ? (result === "submitted" ? " ok" : " no") : ""}`}>
       <div className="ap-step-head">
-        <span className="ap-step-tag">请求输入密码</span>
+        <span className="ap-step-tag">{t("请求输入密码", "Password requested")}</span>
         <span className="ap-step-where" title={req.target}>
-          {req.targetLabel || "未知会话"}
+          {req.targetLabel || t("未知会话", "Unknown session")}
         </span>
       </div>
-      <div className="ap-step-why">原因：{req.reason}</div>
+      <div className="ap-step-why">{t("原因：", "Reason: ")}{req.reason}</div>
       {settled ? (
         <div className="ap-approve-done">
           {result === "submitted"
-            ? "已提交（密码只写入了终端，助手看不到它）"
+            ? t("已提交（密码只写入了终端，助手看不到它）", "Submitted (sent to the terminal only; the assistant can't see it)")
             : result === "skipped"
-              ? "已跳过"
-              : "已失效（超时或这一轮已结束）"}
+              ? t("已跳过", "Skipped")
+              : t("已失效（超时或这一轮已结束）", "Expired (timed out or the run has ended)")}
         </div>
       ) : (
         <form
@@ -593,7 +622,10 @@ function SecretCard({
         >
           {unexpected && (
             <div className="ap-secret-warn">
-              终端看起来并没有停在密码提示上，输入可能会被回显到屏幕。
+              {t(
+                "终端看起来并没有停在密码提示上，输入可能会被回显到屏幕。",
+                "The terminal doesn't seem to be at a password prompt — your input may be echoed on screen."
+              )}
             </div>
           )}
           <input
@@ -603,7 +635,7 @@ function SecretCard({
             autoCorrect="off"
             autoCapitalize="off"
             spellCheck={false}
-            placeholder="在此输入，回车提交"
+            placeholder={t("在此输入，回车提交", "Type here, press Enter to submit")}
             value={value}
             disabled={dead || sending}
             onChange={(e) => setValue(e.target.value)}
@@ -611,12 +643,12 @@ function SecretCard({
           {inlineErr && <div className="ap-secret-err">{inlineErr}</div>}
           <div className="ap-approve-row">
             <button className="btn primary" type="submit" disabled={dead || sending || !value}>
-              提交
+              {t("提交", "Submit")}
             </button>
             <button className="btn" type="button" disabled={dead || sending} onClick={() => void submit(undefined)}>
-              跳过
+              {t("跳过", "Skip")}
             </button>
-            <span className="ap-secret-left">{dead ? "已失效" : unlimited ? "不限时" : `${left} 秒后超时`}</span>
+            <span className="ap-secret-left">{dead ? t("已失效", "Expired") : unlimited ? t("不限时", "No time limit") : t("{n} 秒后超时", "Times out in {n}s", { n: left })}</span>
           </div>
         </form>
       )}
@@ -629,6 +661,7 @@ function SecretCard({
  * 默认打码，点「显示」/「复制」才用到原文；原文只在内存里，重载后卡上只剩占位。
  */
 function RevealCard({ step }: { step: AgentStep }) {
+  useLocale();
   const [shown, setShown] = useState(false);
   const [note, setNote] = useState<string | null>(null);
   const content = step.revealContent;
@@ -636,16 +669,16 @@ function RevealCard({ step }: { step: AgentStep }) {
     if (content === undefined) return;
     try {
       await api.clipboardWrite(content);
-      setNote("已复制到剪贴板");
+      setNote(t("已复制到剪贴板", "Copied to clipboard"));
     } catch (e) {
-      setNote(`复制失败：${String(e)}`);
+      setNote(t("复制失败：{e}", "Copy failed: {e}", { e: String(e) }));
     }
   };
   return (
     <div className="ap-step ap-reveal">
       <div className="ap-step-head">
-        <span className="ap-step-tag">交付给你</span>
-        <span className="ap-reveal-title">{step.text || "交付内容"}</span>
+        <span className="ap-step-tag">{t("交付给你", "Delivered to you")}</span>
+        <span className="ap-reveal-title">{step.text || t("交付内容", "Delivered content")}</span>
         {step.targetLabel ? (
           <span className="ap-step-where" title={step.target}>
             {step.targetLabel}
@@ -654,8 +687,9 @@ function RevealCard({ step }: { step: AgentStep }) {
       </div>
       {step.command ? (
         <div className="ap-step-why">
-          来源：{step.command}
-          {step.output ? `（${step.output}）` : ""}
+          {t("来源：", "Source: ")}
+          {step.command}
+          {step.output ? t("（{v}）", " ({v})", { v: step.output }) : ""}
         </div>
       ) : null}
       {content === undefined ? (
@@ -668,19 +702,24 @@ function RevealCard({ step }: { step: AgentStep }) {
           <div className="ap-approve-row">
             {shown ? (
               <button className="btn" type="button" onClick={() => setShown(false)}>
-                隐藏
+                {t("隐藏", "Hide")}
               </button>
             ) : (
               <button className="btn primary" type="button" onClick={() => setShown(true)}>
-                显示
+                {t("显示", "Show")}
               </button>
             )}
             <button className="btn" type="button" onClick={() => void copy()}>
-              复制
+              {t("复制", "Copy")}
             </button>
             {note ? <span className="ap-reveal-note">{note}</span> : null}
           </div>
-          <div className="ap-step-why">内容只给你，没有经过助手；不会写进聊天记录，重启后就看不到了，请及时妥善保存。</div>
+          <div className="ap-step-why">
+            {t(
+              "内容只给你，没有经过助手；不会写进聊天记录，重启后就看不到了，请及时妥善保存。",
+              "This is for you only and never passed through the assistant. It isn't saved to the chat history and will be gone after a restart, so store it somewhere safe now."
+            )}
+          </div>
         </>
       )}
     </div>

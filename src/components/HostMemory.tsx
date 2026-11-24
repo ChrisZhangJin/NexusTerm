@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { api } from "../api";
+import { t, useLocale } from "../i18n";
 import type { AgentStep, HostMemoryView, HostNote, HostNoteKind } from "../types";
 import {
   agentMayDelete,
@@ -30,6 +31,7 @@ export function HostMemoryDialog({
   label: string;
   onClose: () => void;
 }) {
+  useLocale();
   const [data, setData] = useState<HostMemoryView | null>(null);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -135,23 +137,29 @@ export function HostMemoryDialog({
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="modal hm-modal" role="dialog" aria-label="主机备忘">
+      <div className="modal hm-modal" role="dialog" aria-label={t("主机备忘", "Host notes")}>
         <h2>
-          主机备忘
+          {t("主机备忘", "Host notes")}
           {host && <span className="hm-host" title={host.key}>{host.display}</span>}
         </h2>
 
         {data && !host && (
-          <p className="hm-warn">认不出这个标签属于哪台主机，无法记忆。</p>
+          <p className="hm-warn">{t("认不出这个标签属于哪台主机，无法记忆。", "Can't tell which host this tab belongs to, so nothing can be remembered.")}</p>
         )}
         {host?.origin === "label" && (
           <p className="hm-hint">
-            这个标签没有登记连接信息，备忘按标签名「{host.display}」归档，换了标签名就看不到了。
+            {t(
+              "这个标签没有登记连接信息，备忘按标签名「{name}」归档，换了标签名就看不到了。",
+              "This tab has no saved connection, so notes are filed under the tab name \"{name}\" and won't show up if the tab is renamed.",
+              { name: host.display }
+            )}
           </p>
         )}
         <p className="hm-hint">
-          助手会在每次运行开始时读到这些备忘，也会自己记一些（提示符样式、sudo 习惯、常用路径、这台机器的怪脾气）。
-          助手只能删它自己记的；你编辑过的归你，它删不掉。不要在这里写密码或密钥。
+          {t(
+            "助手会在每次运行开始时读到这些备忘，也会自己记一些（提示符样式、sudo 习惯、常用路径、这台机器的怪脾气）。助手只能删它自己记的；你编辑过的归你，它删不掉。不要在这里写密码或密钥。",
+            "The assistant reads these notes at the start of every run and also writes some itself (prompt style, sudo habits, common paths, this machine's quirks). It can only delete the ones it wrote; anything you've edited is yours and it can't delete it. Don't put passwords or keys here."
+          )}
         </p>
 
         {data && host && (
@@ -159,21 +167,21 @@ export function HostMemoryDialog({
         )}
 
         <div className="hm-list">
-          {data && host && notes.length === 0 && <div className="hm-empty">还没有备忘。</div>}
+          {data && host && notes.length === 0 && <div className="hm-empty">{t("还没有备忘。", "No notes yet.")}</div>}
           {groupNotes(notes).map((g) => (
             <div key={g.kind} className="hm-group">
               <div className="hm-group-title">{KIND_LABEL[g.kind]}</div>
               {g.notes.map((n) => (
                 <div key={n.id} className={`hm-note${editId === n.id ? " editing" : ""}`}>
-                  <span className={`hm-src ${n.source}`} title={agentMayDelete(n) ? "助手可以删除" : "助手不能删除"}>
+                  <span className={`hm-src ${n.source}`} title={agentMayDelete(n) ? t("助手可以删除", "The assistant can delete this") : t("助手不能删除", "The assistant can't delete this")}>
                     {SOURCE_LABEL[n.source]}
                   </span>
                   <span className="hm-text">{n.text}</span>
                   <button className="ap-mini" disabled={busy} onClick={() => startEdit(n)}>
-                    编辑
+                    {t("编辑", "Edit")}
                   </button>
                   <button className="ap-mini" disabled={busy} onClick={() => void remove(n)}>
-                    删除
+                    {t("删除", "Delete")}
                   </button>
                 </div>
               ))}
@@ -186,7 +194,11 @@ export function HostMemoryDialog({
             <textarea
               value={draft}
               maxLength={(data?.maxChars ?? 500) * 2}
-              placeholder={editId ? "修改这条备忘" : "新增一条，例如：sudo 需要密码，不要用 sudo -n"}
+              placeholder={
+                editId
+                  ? t("修改这条备忘", "Edit this note")
+                  : t("新增一条，例如：sudo 需要密码，不要用 sudo -n", "Add a note, e.g. sudo needs a password, don't use sudo -n")
+              }
               onChange={(e) => setDraft(e.target.value)}
               rows={2}
             />
@@ -203,11 +215,11 @@ export function HostMemoryDialog({
               </span>
               {editId && (
                 <button className="btn" disabled={busy} onClick={resetForm}>
-                  取消编辑
+                  {t("取消编辑", "Cancel edit")}
                 </button>
               )}
               <button className="btn primary" disabled={busy || !draft.trim()} onClick={() => void submit()}>
-                {editId ? "保存" : "添加"}
+                {editId ? t("保存", "Save") : t("添加", "Add")}
               </button>
             </div>
           </div>
@@ -219,21 +231,21 @@ export function HostMemoryDialog({
           {host && notes.length > 0 &&
             (confirmClear ? (
               <>
-                <span className="hm-hint">清空这台主机的全部 {notes.length} 条？</span>
+                <span className="hm-hint">{t("清空这台主机的全部 {n} 条？", "Clear all {n} notes for this host?", { n: notes.length })}</span>
                 <button className="btn" disabled={busy} onClick={() => setConfirmClear(false)}>
-                  不了
+                  {t("不了", "Cancel")}
                 </button>
                 <button className="btn primary" disabled={busy} onClick={() => void clearAll()}>
-                  确认清空
+                  {t("确认清空", "Clear all")}
                 </button>
               </>
             ) : (
               <button className="btn" disabled={busy} onClick={() => setConfirmClear(true)}>
-                清空
+                {t("清空", "Clear")}
               </button>
             ))}
           <button className="btn" onClick={onClose}>
-            关闭
+            {t("关闭", "Close")}
           </button>
         </div>
       </div>
@@ -247,6 +259,7 @@ export function HostMemoryDialog({
  * 新增卡上带「删除」：用户觉得记错了可以当场撤销（走 `host_memory_delete`，不受作者限制）。
  */
 export function MemoryStepCard({ step }: { step: AgentStep }) {
+  useLocale();
   const info = memoryStepInfo(step);
   const [state, setState] = useState<"idle" | "busy" | "gone">("idle");
   const [err, setErr] = useState("");
@@ -279,7 +292,7 @@ export function MemoryStepCard({ step }: { step: AgentStep }) {
         ) : null}
         {info.deletableId && (
           <button className="ap-mini" disabled={state !== "idle"} onClick={() => void del()}>
-            {state === "gone" ? "已删除" : "删除"}
+            {state === "gone" ? t("已删除", "Deleted") : t("删除", "Delete")}
           </button>
         )}
       </div>

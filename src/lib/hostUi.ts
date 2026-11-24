@@ -8,6 +8,8 @@
 import type { HostPhase } from "../types";
 import { basePhase, isLockedDeny, isTerminal } from "./host";
 import { TIER_LABELS, type StewardTier } from "./steward";
+import { t } from "../i18n";
+import { localized } from "./localized";
 
 // ———————————— 卡头动作 ————————————
 
@@ -36,41 +38,54 @@ export function hostHeadActions(p: HostPhase): HostHeadAction[] {
     const budget = b.cause.kind === "budget" || b.cause.kind === "deadline";
     out.push({
       kind: "resume",
-      label: budget ? "加预算继续" : "继续",
+      label: budget ? t("加预算继续", "Add budget & continue") : t("继续", "Resume"),
       tone: "primary",
-      title: "同一段上下文、换一份新预算接着做",
+      title: t("同一段上下文、换一份新预算接着做", "Continue in the same context with a fresh budget"),
     });
     if (p.kind === "userDriving") {
-      out.push({ kind: "handback", label: "交还", tone: "plain", title: "把终端交还给 AI（回到暂停状态）" });
+      out.push({ kind: "handback", label: t("交还", "Hand back"), tone: "plain", title: t("把终端交还给 AI（回到暂停状态）", "Hand the terminal back to the AI (stays paused)") });
     }
   } else if (p.kind === "userDriving") {
-    out.push({ kind: "handback", label: "交还", tone: "primary", title: "把终端交还给 AI，它从你接手前的状态继续" });
+    out.push({
+      kind: "handback",
+      label: t("交还", "Hand back"),
+      tone: "primary",
+      title: t("把终端交还给 AI，它从你接手前的状态继续", "Hand the terminal back to the AI; it picks up where it was before you took over"),
+    });
   } else {
     if (p.kind === "running") {
-      out.push({ kind: "pause", label: "暂停", tone: "plain", title: "当前这一步做完后暂停，终端还给你；之后可以「继续」" });
+      out.push({
+        kind: "pause",
+        label: t("暂停", "Pause"),
+        tone: "plain",
+        title: t("当前这一步做完后暂停，终端还给你；之后可以「继续」", "Pause after the current step and give you the terminal; you can Resume later"),
+      });
     }
     out.push({
       kind: "takeover",
-      label: "接管",
+      label: t("接管", "Take over"),
       tone: "plain",
-      title: "让 AI 立刻让路（你在终端里敲键也会自动触发），直到你点「交还」",
+      title: t(
+        "让 AI 立刻让路（你在终端里敲键也会自动触发），直到你点「交还」",
+        "Make the AI step aside right away (typing in the terminal does this too) until you click Hand back"
+      ),
     });
   }
-  out.push({ kind: "stop", label: "停止", tone: "danger", title: "结束这个托管（契约一并结束）" });
+  out.push({ kind: "stop", label: t("停止", "Stop"), tone: "danger", title: t("结束这个托管（契约一并结束）", "End this autopilot (and its contract)") });
   return out;
 }
 
 // ———————————— 契约 / 设置摘要 ————————————
 
 /** 摘要里用的短名（chip 上是长名）；底线项总在，不进摘要 */
-const DENY_SHORT: Record<string, string> = {
-  delete: "删除",
-  force_push: "强推",
-  file_write: "写文件",
-};
+const DENY_SHORT: Record<string, string> = localized({
+  delete: ["删除", "delete"],
+  force_push: ["强推", "force push"],
+  file_write: ["写文件", "file writes"],
+});
 
 export function denyShort(tag: string): string {
-  return DENY_SHORT[tag] ?? `「${tag}」`;
+  return DENY_SHORT[tag] ?? t("「{tag}」", "\"{tag}\"", { tag });
 }
 
 /** 「契约 / 设置」收起时的一行：`自动执行 · 禁止：删除、强推`；yolo 档调用方标红 */
@@ -78,11 +93,14 @@ export function hostSettingsSummary(
   tier: string | null | undefined,
   deny: readonly string[] | null | undefined
 ): { tier: string; deny: string; yolo: boolean } {
-  const t = tier && tier in TIER_LABELS ? TIER_LABELS[tier as StewardTier] : (tier ?? "");
+  const tierText = tier && tier in TIER_LABELS ? TIER_LABELS[tier as StewardTier] : (tier ?? "");
   const extra = (deny ?? []).filter((d) => !isLockedDeny(d)).map(denyShort);
   return {
-    tier: t,
-    deny: extra.length > 0 ? `禁止：${extra.join("、")}` : "禁止：仅底线项",
+    tier: tierText,
+    deny:
+      extra.length > 0
+        ? t("禁止：{list}", "Blocked: {list}", { list: extra.join(t("、", ", ")) })
+        : t("禁止：仅底线项", "Blocked: hard limits only"),
     yolo: tier === "yolo",
   };
 }
@@ -96,19 +114,43 @@ export interface HostPreset {
 }
 
 /** 每个授权档位一句话（预设按钮 / 档位下拉的提示） */
-export const TIER_HINTS: Record<StewardTier, string> = {
-  approve: "每次写入都先等你批准，AI 的问题也都交给你答",
-  notify: "同「自动」，另外每次写入都发通知卡，可接管并纠正",
-  auto: "范围内自主执行、自主作答，只有不可逆的操作才停下来问你；事后可查",
-  yolo: "一切自主执行，包括不可逆的操作（格式化、重启、删库……）；只有越过禁止项才停下来问你。替你输密码、选「永久允许」仍然不会做",
-};
+export const TIER_HINTS: Record<StewardTier, string> = localized({
+  approve: [
+    "每次写入都先等你批准，AI 的问题也都交给你答",
+    "Every write waits for your approval, and the AI's questions all go to you",
+  ],
+  notify: [
+    "同「自动」，另外每次写入都发通知卡，可接管并纠正",
+    "Like Auto, but every write also posts a notification card so you can take over and correct it",
+  ],
+  auto: [
+    "范围内自主执行、自主作答，只有不可逆的操作才停下来问你；事后可查",
+    "Acts and answers on its own within scope, stopping to ask only before irreversible actions; everything can be reviewed afterwards",
+  ],
+  yolo: [
+    "一切自主执行，包括不可逆的操作（格式化、重启、删库……）；只有越过禁止项才停下来问你。替你输密码、选「永久允许」仍然不会做",
+    "Does everything on its own, including irreversible actions (formatting, reboots, dropping databases…); stops to ask only when a blocked action comes up. It still never types your passwords or picks \"always allow\"",
+  ],
+});
 
-/** 开始表单上的主选择（「通知后执行」档留在「更多设置」里的完整档位下拉） */
-export const HOST_PRESETS: readonly HostPreset[] = [
-  { tier: "approve", label: "稳妥", hint: TIER_HINTS.approve },
-  { tier: "auto", label: "自动", hint: TIER_HINTS.auto },
-  { tier: "yolo", label: "YOLO·完全放手", hint: TIER_HINTS.yolo },
-];
+const PRESET_LABELS: Record<"approve" | "auto" | "yolo", string> = localized({
+  approve: ["稳妥", "Careful"],
+  auto: ["自动", "Auto"],
+  yolo: ["YOLO·完全放手", "YOLO"],
+});
+
+const preset = (tier: "approve" | "auto" | "yolo"): HostPreset => ({
+  tier,
+  get label() {
+    return PRESET_LABELS[tier];
+  },
+  get hint() {
+    return TIER_HINTS[tier];
+  },
+});
+
+/** 开始表单上的主选择（「通知后执行」档留在「更多设置」里的完整档位下拉）；文案按当前语言现取 */
+export const HOST_PRESETS: readonly HostPreset[] = [preset("approve"), preset("auto"), preset("yolo")];
 
 /** 完整档位（「更多设置」里的下拉、托管卡上的改档） */
 export const HOST_TIERS: readonly StewardTier[] = ["approve", "notify", "auto", "yolo"];

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { t, useLocale } from "../i18n";
 
 /**
  * 图片查看：Blob URL + <img>。SVG 同样走 <img>，其中的脚本 / 外部资源都不会执行或加载。
@@ -17,6 +18,7 @@ export default function ImageView({
   mime: string;
   onInfo: (info: string) => void;
 }) {
+  useLocale();
   const [url, setUrl] = useState<string | null>(null);
   const [err, setErr] = useState(false);
   const [nat, setNat] = useState<{ w: number; h: number } | null>(null);
@@ -142,8 +144,8 @@ export default function ImageView({
     <div className="rd-img-root">
       <div className="rd-img-tools">
         <div className="rd-seg">
-          <button className={fit ? "on" : ""} onClick={() => setFit(true)} title="适应窗口 (F)">
-            适应
+          <button className={fit ? "on" : ""} onClick={() => setFit(true)} title={t("适应窗口 (F)", "Fit to window (F)")}>
+            {t("适应", "Fit")}
           </button>
           <button
             className={!fit && pct === 100 ? "on" : ""}
@@ -151,28 +153,30 @@ export default function ImageView({
               setFit(false);
               place(1);
             }}
-            title="原始大小 (1)"
+            title={t("原始大小 (1)", "Actual size (1)")}
           >
             1:1
           </button>
         </div>
         <div className="rd-zoom">
-          <button onClick={() => zoomAt(view.s / 1.25)} title="缩小 (-)">
+          <button onClick={() => zoomAt(view.s / 1.25)} title={t("缩小 (-)", "Zoom out (-)")}>
             −
           </button>
           <span className="rd-zoom-val rd-zoom-ro">{pct}%</span>
-          <button onClick={() => zoomAt(view.s * 1.25)} title="放大 (+)">
+          <button onClick={() => zoomAt(view.s * 1.25)} title={t("放大 (+)", "Zoom in (+)")}>
             +
           </button>
         </div>
-        <div className="rd-seg" title="背景">
+        <div className="rd-seg" title={t("背景", "Background")}>
           {(["checker", "dark", "light"] as Bg[]).map((b) => (
             <button key={b} className={bg === b ? "on" : ""} onClick={() => setBg(b)}>
               {b === "checker" ? "▦" : b === "dark" ? "■" : "□"}
             </button>
           ))}
         </div>
-        <span className="rd-img-hint">滚轮缩放 · 拖拽平移 · 双击切换适应/1:1</span>
+        <span className="rd-img-hint">
+          {t("滚轮缩放 · 拖拽平移 · 双击切换适应/1:1", "Scroll to zoom · Drag to pan · Double-click toggles fit/1:1")}
+        </span>
       </div>
       <div
         ref={boxRef}
@@ -184,7 +188,9 @@ export default function ImageView({
         onDoubleClick={onDouble}
       >
         {err ? (
-          <div className="rd-error">图片无法解码（文件损坏，或格式不受支持）</div>
+          <div className="rd-error">
+            {t("图片无法解码（文件损坏，或格式不受支持）", "Can't decode the image (file is corrupt or the format isn't supported)")}
+          </div>
         ) : (
           url && (
             <img

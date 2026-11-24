@@ -13,12 +13,15 @@ import type {
   HostStatus,
   TerminalTab,
 } from "../types";
+import { t } from "../i18n";
 
 export type HostPillTone = "active" | "warn" | "idle" | "done" | "bad";
 
 export interface HostPill {
   label: string;
   tone: HostPillTone;
+  /** 文案里已经说了「在等你」（标签徽标不再加前缀） */
+  waiting?: boolean;
 }
 
 /** 剥掉（可能嵌套的）userDriving，得到人交还后会回到的那个状态 */
@@ -34,42 +37,42 @@ export function isTerminal(p: HostPhase): boolean {
 export function hostPill(p: HostPhase): HostPill {
   switch (p.kind) {
     case "running":
-      return { label: "运行中", tone: "active" };
+      return { label: t("运行中", "Running"), tone: "active" };
     case "waitingHuman":
       switch (p.card.kind.kind) {
         case "approve":
-          return { label: "等你批准", tone: "warn" };
+          return { label: t("等你批准", "Waiting for your approval"), tone: "warn", waiting: true };
         case "secret":
-          return { label: "等你输入密码", tone: "warn" };
+          return { label: t("等你输入密码", "Waiting for your password"), tone: "warn", waiting: true };
         case "criteriaDraft":
-          return { label: "等你确认判据", tone: "warn" };
+          return { label: t("等你确认判据", "Confirm the completion checks"), tone: "warn", waiting: true };
         case "manualCheck":
-          return { label: "等你确认完成", tone: "warn" };
+          return { label: t("等你确认完成", "Confirm it's done"), tone: "warn", waiting: true };
         case "watchdog":
-          return { label: "看门狗·等你看看", tone: "warn" };
+          return { label: t("看门狗·等你看看", "Watchdog · please take a look"), tone: "warn", waiting: true };
         default:
-          return { label: "等你回答", tone: "warn" };
+          return { label: t("等你回答", "Waiting for your answer"), tone: "warn", waiting: true };
       }
     case "userDriving":
-      return { label: "你在驾驶", tone: "warn" };
+      return { label: t("你在驾驶", "You're driving"), tone: "warn" };
     case "paused":
       switch (p.cause.kind) {
         case "budget":
         case "deadline":
-          return { label: "预算暂停", tone: "warn" };
+          return { label: t("预算暂停", "Paused · budget"), tone: "warn" };
         case "llmDown":
-          return { label: "暂停（模型不可用）", tone: "warn" };
+          return { label: t("暂停（模型不可用）", "Paused (model unavailable)"), tone: "warn" };
         default:
-          return { label: "已暂停", tone: "warn" };
+          return { label: t("已暂停", "Paused"), tone: "warn" };
       }
     case "suspended":
-      return { label: p.reason === "consoleGone" ? "终端断开·等重连" : "待重新接驳", tone: "warn" };
+      return { label: p.reason === "consoleGone" ? t("终端断开·等重连", "Terminal lost · waiting to reconnect") : t("待重新接驳", "Needs reattaching"), tone: "warn" };
     case "completed":
-      return { label: "完成", tone: "done" };
+      return { label: t("完成", "Done"), tone: "done" };
     case "failed":
-      return { label: "失败", tone: "bad" };
+      return { label: t("失败", "Failed"), tone: "bad" };
     case "stopped":
-      return { label: "已停止", tone: "idle" };
+      return { label: t("已停止", "Stopped"), tone: "idle" };
   }
 }
 
@@ -83,19 +86,19 @@ const TAB_BADGE_MAX = 60;
 export function hostTabBadge(p: HostPhase): string | null {
   if (p.kind === "userDriving") return null;
   // 胶囊文案里已经带「等你」的（等你批准 / 看门狗·等你看看）不再重复前缀
-  const head = (label: string) => (label.includes("等你") ? label : `等你：${label}`);
+  const head = (pill: HostPill) => (pill.waiting ? pill.label : t("等你：{label}", "Waiting for you: {label}", { label: pill.label }));
   switch (p.kind) {
     case "waitingHuman": {
       const q = clip(p.card.question.replace(/\s+/g, " ").trim());
       const k = p.card.kind.kind;
-      if (k === "ask") return q ? `等你：${q}` : "等你回答";
-      const label = head(hostPill(p).label);
-      return q && k !== "criteriaDraft" ? `${label}：${q}` : label;
+      if (k === "ask") return q ? t("等你：{q}", "Waiting for you: {q}", { q }) : t("等你回答", "Waiting for your answer");
+      const label = head(hostPill(p));
+      return q && k !== "criteriaDraft" ? t("{label}：{q}", "{label}: {q}", { label, q }) : label;
     }
     case "paused":
-      return p.cause.kind === "user" ? null : head(hostPill(p).label);
+      return p.cause.kind === "user" ? null : head(hostPill(p));
     case "suspended":
-      return head(hostPill(p).label);
+      return head(hostPill(p));
     default:
       return null;
   }
@@ -125,20 +128,20 @@ export function hostDetail(p: HostPhase): string | null {
   const b = basePhase(p);
   if (p.kind === "userDriving") {
     return b.kind === "running"
-      ? "你在操作终端，AI 已让路；点「交还」它就接着做"
-      : `你在操作终端；交还后回到「${hostPill(b).label}」`;
+      ? t("你在操作终端，AI 已让路；点「交还」它就接着做", "You're using the terminal and the AI has stepped aside; click Hand back to let it continue")
+      : t("你在操作终端；交还后回到「{label}」", "You're using the terminal; Hand back returns to \"{label}\"", { label: hostPill(b).label });
   }
   switch (b.kind) {
     case "paused":
       switch (b.cause.kind) {
         case "budget":
-          return `${b.cause.reason}。点「加预算继续」恢复，或「停止」结束。`;
+          return t("{reason}。点「加预算继续」恢复，或「停止」结束。", "{reason}. Click Add budget & continue to resume, or Stop to end.", { reason: b.cause.reason });
         case "deadline":
-          return "到了约定的期限。点「加预算继续」恢复，或「停止」结束。";
+          return t("到了约定的期限。点「加预算继续」恢复，或「停止」结束。", "The agreed deadline has passed. Click Add budget & continue to resume, or Stop to end.");
         case "llmDown":
-          return `模型服务暂不可用（${b.cause.error}）。恢复后点「继续」。`;
+          return t("模型服务暂不可用（{error}）。恢复后点「继续」。", "The model service is unavailable ({error}). Click Resume once it's back.", { error: b.cause.error });
         default:
-          return "已暂停，点「继续」接着做。";
+          return t("已暂停，点「继续」接着做。", "Paused. Click Resume to continue.");
       }
     case "completed":
       return b.summary;
@@ -206,24 +209,30 @@ export function hostForConsole(
 
 // ——— 完成判据：草稿卡里按「一行一条」编辑 ———
 
-const CHECK_PREFIX: Array<[HostCheck["kind"], string]> = [
-  ["commandOk", "命令"],
-  ["fileExists", "文件"],
-  ["screenMatches", "屏幕"],
-  ["manual", "人工"],
-];
+const CHECK_KINDS: HostCheck["kind"][] = ["commandOk", "fileExists", "screenMatches", "manual"];
+
+/** 每类判据的行前缀：中文 / 英文两套，编辑框里两种都认（切了语言之后旧文本照样能解析） */
+const CHECK_PREFIXES: Record<HostCheck["kind"], [string, string]> = {
+  commandOk: ["命令", "Command"],
+  fileExists: ["文件", "File"],
+  screenMatches: ["屏幕", "Screen"],
+  manual: ["人工", "Manual"],
+};
+
+const checkPrefix = (kind: HostCheck["kind"]): string => t(...CHECK_PREFIXES[kind]);
 
 /** 一条判据 → 一行「前缀: 内容」 */
 export function checkToLine(c: HostCheck): string {
+  const p = checkPrefix(c.kind);
   switch (c.kind) {
     case "commandOk":
-      return `命令: ${c.cmd}`;
+      return `${p}: ${c.cmd}`;
     case "fileExists":
-      return `文件: ${c.path}`;
+      return `${p}: ${c.path}`;
     case "screenMatches":
-      return `屏幕: ${c.re}`;
+      return `${p}: ${c.re}`;
     case "manual":
-      return `人工: ${c.text}`;
+      return `${p}: ${c.text}`;
   }
 }
 
@@ -235,8 +244,9 @@ export function textToChecks(text: string): HostCheck[] {
   for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (!line) continue;
-    const m = /^(命令|文件|屏幕|人工)\s*[:：]\s*(.*)$/.exec(line);
-    const kind = m ? CHECK_PREFIX.find(([, p]) => p === m[1])?.[0] : undefined;
+    const m = /^(命令|文件|屏幕|人工|command|file|screen|manual)\s*[:：]\s*(.*)$/i.exec(line);
+    const head = m?.[1].toLowerCase();
+    const kind = head ? CHECK_KINDS.find((k) => CHECK_PREFIXES[k].some((p) => p.toLowerCase() === head)) : undefined;
     const body = (m ? m[2] : line).trim();
     if (!body) continue;
     switch (kind) {
@@ -260,13 +270,13 @@ export function textToChecks(text: string): HostCheck[] {
 export function describeCheck(c: HostCheck): string {
   switch (c.kind) {
     case "screenMatches":
-      return `屏幕匹配 /${c.re}/`;
+      return t("屏幕匹配 /{re}/", "Screen matches /{re}/", { re: c.re });
     case "commandOk":
-      return `命令成功：\`${c.cmd}\``;
+      return t("命令成功：`{cmd}`", "Command succeeds: `{cmd}`", { cmd: c.cmd });
     case "fileExists":
-      return `文件存在：${c.path}`;
+      return t("文件存在：{path}", "File exists: {path}", { path: c.path });
     case "manual":
-      return `人工确认：${c.text}`;
+      return t("人工确认：{text}", "Manual check: {text}", { text: c.text });
   }
 }
 
@@ -288,7 +298,7 @@ export function formatReport(summary: string): string {
 export function checkLines(results: HostCheckResult[]): string[] {
   return results.map((r) => {
     const mark = r.check.kind === "manual" || r.skipped ? "·" : r.passed ? "✓" : "✗";
-    return `${mark} ${describeCheck(r.check)}：${r.detail}`;
+    return t("{mark} {check}：{detail}", "{mark} {check}: {detail}", { mark, check: describeCheck(r.check), detail: r.detail });
   });
 }
 
@@ -300,12 +310,12 @@ export const LOCKED_DENY = ["secret", "permanent_grant"] as const;
 /** 开始托管时默认的禁止项（与后端 Authority::default 一致） */
 export const DEFAULT_DENY = ["secret", "permanent_grant", "force_push", "delete"];
 
-const DENY_LABELS: Record<string, string> = {
-  delete: "删除类操作（rm / prune / drop …）",
-  force_push: "强制推送（git push -f）",
-  secret: "替你输密码",
-  permanent_grant: "选「不再询问 / 永久允许」",
-};
+const denyLabels = (): Record<string, string> => ({
+  delete: t("删除类操作（rm / prune / drop …）", "Deletions (rm / prune / drop …)"),
+  force_push: t("强制推送（git push -f）", "Force push (git push -f)"),
+  secret: t("替你输密码", "Typing your passwords"),
+  permanent_grant: t("选「不再询问 / 永久允许」", "Choosing \"don't ask again / always allow\""),
+});
 
 export function isLockedDeny(tag: string): boolean {
   return (LOCKED_DENY as readonly string[]).includes(tag);
@@ -313,20 +323,26 @@ export function isLockedDeny(tag: string): boolean {
 
 /** 面板上显示的名字；自定义关键字原样显示 */
 export function denyLabel(tag: string): string {
-  return DENY_LABELS[tag] ?? `含「${tag}」`;
+  return denyLabels()[tag] ?? t("含「{tag}」", "Contains \"{tag}\"", { tag });
 }
 
 /** 禁止项的说明（chip 悬停提示）：内置项具体管什么，别让人以为「生成密钥 / 写配置」也被禁了 */
-const DENY_HINTS: Record<string, string> = {
-  secret: "底线，不能放开（契约里叫 secret）：只指屏幕停在密码提示上时，AI 不替你输入密码（要你本人输入）。生成密钥、写带密码的配置文件都不受它限制",
-  permanent_grant: "底线，不能放开（契约里叫 permanent_grant）：AI 不会在授权框里选「不再询问 / 永久允许」",
-  force_push: "git push --force 一类改写远端历史的推送。点 ✕ 放开",
-  delete: "删除类操作：rm / prune / drop / kubectl delete 等。点 ✕ 放开",
-  file_write: "AI 用文件工具写 / 改文件。点 ✕ 放开",
-};
+const denyHints = (): Record<string, string> => ({
+  secret: t(
+    "底线，不能放开（契约里叫 secret）：只指屏幕停在密码提示上时，AI 不替你输入密码（要你本人输入）。生成密钥、写带密码的配置文件都不受它限制",
+    "Hard limit, can't be lifted (\"secret\" in the contract): when the screen stops at a password prompt, the AI won't type the password for you — you enter it yourself. Generating keys or writing config files that contain passwords is not affected"
+  ),
+  permanent_grant: t(
+    "底线，不能放开（契约里叫 permanent_grant）：AI 不会在授权框里选「不再询问 / 永久允许」",
+    "Hard limit, can't be lifted (\"permanent_grant\" in the contract): the AI never picks \"don't ask again / always allow\" in permission dialogs"
+  ),
+  force_push: t("git push --force 一类改写远端历史的推送。点 ✕ 放开", "Pushes that rewrite remote history, like git push --force. Click ✕ to allow"),
+  delete: t("删除类操作：rm / prune / drop / kubectl delete 等。点 ✕ 放开", "Deletions: rm / prune / drop / kubectl delete, etc. Click ✕ to allow"),
+  file_write: t("AI 用文件工具写 / 改文件。点 ✕ 放开", "The AI writing or editing files with its file tools. Click ✕ to allow"),
+});
 
 export function denyHint(tag: string): string {
-  return DENY_HINTS[tag] ?? `命令或写入的内容里出现「${tag}」就拒绝。点 ✕ 放开`;
+  return denyHints()[tag] ?? t("命令或写入的内容里出现「{tag}」就拒绝。点 ✕ 放开", "Refuse any command or write containing \"{tag}\". Click ✕ to allow", { tag });
 }
 
 /** 门禁卡（kind:"gate"）上能做什么 */
@@ -368,8 +384,8 @@ export function addDeny(list: readonly string[], raw: string): string[] {
 /** 判据文本的分类计数（确认卡上的「命令 2 · 屏幕 1 · 人工 1」），只列出现过的类，按固定顺序。 */
 export function criteriaSummary(text: string): Array<{ label: string; n: number; blocking: boolean }> {
   const cs = textToChecks(text);
-  return CHECK_PREFIX.map(([kind, label]) => ({
-    label,
+  return CHECK_KINDS.map((kind) => ({
+    label: checkPrefix(kind),
     n: cs.filter((c) => c.kind === kind).length,
     blocking: kind !== "manual",
   })).filter((x) => x.n > 0);

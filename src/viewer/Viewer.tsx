@@ -19,6 +19,7 @@ import ImageView from "./ImageView";
 import AudioView from "./AudioView";
 import VideoView from "./VideoView";
 import CodeView from "./CodeView";
+import { t, useLocale } from "../i18n";
 import "./viewer.css";
 
 /**
@@ -32,14 +33,14 @@ import "./viewer.css";
 type Doc = { name: string; source: string; kind: ViewableKind; bytes: Uint8Array };
 
 /** UTF-8 优先；非法时回退 GBK（国内老文档常见） */
-function decode(bytes: Uint8Array): { text: string; enc: string } {
+function decode(bytes: Uint8Array): { text: string; enc: string; lossy?: boolean } {
   try {
     return { text: new TextDecoder("utf-8", { fatal: true }).decode(bytes), enc: "UTF-8" };
   } catch {
     try {
       return { text: new TextDecoder("gbk").decode(bytes), enc: "GBK" };
     } catch {
-      return { text: new TextDecoder("utf-8").decode(bytes), enc: "UTF-8(容错)" };
+      return { text: new TextDecoder("utf-8").decode(bytes), enc: "UTF-8", lossy: true };
     }
   }
 }
@@ -61,6 +62,7 @@ async function openExternal(href: string) {
 }
 
 export default function Viewer({ id }: { id: string }) {
+  const lang = useLocale();
   const [doc, setDoc] = useState<Doc | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [mode, setMode] = useState<"render" | "source">("render");
@@ -89,10 +91,15 @@ export default function Viewer({ id }: { id: string }) {
       .viewerDoc(id)
       .then((d) => {
         setDoc({ ...d, bytes: base64ToBytes(d.data) });
-        document.title = `浏览 · ${d.name}`;
       })
       .catch((e) => setErr(String(e)));
   }, [id]);
+
+  // 窗口标题跟随语言切换
+  const docName = doc?.name;
+  useEffect(() => {
+    if (docName !== undefined) document.title = t("浏览 · {name}", "View · {name}", { name: docName });
+  }, [docName, lang]);
 
   useEffect(() => {
     localStorage.setItem("nx.viewer.zoom", String(zoom));
@@ -202,14 +209,14 @@ export default function Viewer({ id }: { id: string }) {
   if (err) {
     return (
       <div className="rd-root">
-        <div className="rd-error">无法打开：{err}</div>
+        <div className="rd-error">{t("无法打开：", "Can't open: ")}{err}</div>
       </div>
     );
   }
   if (!doc || !decoded) {
     return (
       <div className="rd-root">
-        <div className="rd-loading">加载中…</div>
+        <div className="rd-loading">{t("加载中…", "Loading…")}</div>
       </div>
     );
   }
@@ -235,37 +242,40 @@ export default function Viewer({ id }: { id: string }) {
         </span>
         <span className="rd-meta">
           {size}
-          {isImage ? (imgInfo ? ` · ${imgInfo}` : "") : isAudio || isVideo ? "" : ` · ${decoded.enc}`}
+          {isImage ? (imgInfo ? ` · ${imgInfo}` : "") : isAudio || isVideo ? "" : ` · ${decoded.lossy ? t("UTF-8(容错)", "UTF-8 (lossy)") : decoded.enc}`}
         </span>
         <span className="rd-spacer" />
         {isHtml && viewMode === "render" && (
           <label
             className="rd-js"
-            title="页面在隔离沙箱中运行，无法访问本应用；只在信任该文件时开启"
+            title={t(
+              "页面在隔离沙箱中运行，无法访问本应用；只在信任该文件时开启",
+              "The page runs in an isolated sandbox and can't access this app. Only enable if you trust this file."
+            )}
           >
             <input type="checkbox" checked={allowJs} onChange={(e) => setAllowJs(e.target.checked)} />
-            允许脚本
+            {t("允许脚本", "Allow scripts")}
           </label>
         )}
         {hasSource && (
           <div className="rd-seg">
             <button className={mode === "render" ? "on" : ""} onClick={() => setMode("render")}>
-              {isImage ? "图像" : "渲染"}
+              {isImage ? t("图像", "Image") : t("渲染", "Rendered")}
             </button>
             <button className={mode === "source" ? "on" : ""} onClick={() => setMode("source")}>
-              源码
+              {t("源码", "Source")}
             </button>
           </div>
         )}
         {!((isImage || isAudio || isVideo) && viewMode === "render") && (
         <div className="rd-zoom">
-          <button onClick={() => setZoom((z) => Math.max(50, z - 10))} title="缩小 (Ctrl -)">
+          <button onClick={() => setZoom((z) => Math.max(50, z - 10))} title={t("缩小 (Ctrl -)", "Zoom out (Ctrl -)")}>
             −
           </button>
-          <button className="rd-zoom-val" onClick={() => setZoom(100)} title="还原 (Ctrl 0)">
+          <button className="rd-zoom-val" onClick={() => setZoom(100)} title={t("还原 (Ctrl 0)", "Reset zoom (Ctrl 0)")}>
             {zoom}%
           </button>
-          <button onClick={() => setZoom((z) => Math.min(250, z + 10))} title="放大 (Ctrl +)">
+          <button onClick={() => setZoom((z) => Math.min(250, z + 10))} title={t("放大 (Ctrl +)", "Zoom in (Ctrl +)")}>
             +
           </button>
         </div>
@@ -273,9 +283,13 @@ export default function Viewer({ id }: { id: string }) {
         <button
           className={`rd-full${fullscreen ? " on" : ""}`}
           onClick={() => toggleFullscreen()}
-          title={fullscreen ? "退出全屏 (Esc / F11)" : "全屏 (F11)：宽表格可完整显示"}
+          title={
+            fullscreen
+              ? t("退出全屏 (Esc / F11)", "Exit full screen (Esc / F11)")
+              : t("全屏 (F11)：宽表格可完整显示", "Full screen (F11): shows wide tables in full")
+          }
         >
-          {fullscreen ? "退出全屏" : "全屏"}
+          {fullscreen ? t("退出全屏", "Exit full screen") : t("全屏", "Full screen")}
         </button>
       </div>
 
