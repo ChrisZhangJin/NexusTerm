@@ -181,6 +181,62 @@ pub fn has_blind_pick(reasons: &[String]) -> bool {
     reasons.iter().any(|r| r.strip_prefix(CRITICAL_MARK).map_or(false, |x| x.starts_with(BLIND_PICK_MARK)))
 }
 
+/// 本文件生成的审批原因（中文原文 → 英文），见 [`localize_reason`]
+const REASON_EN: &[(&str, &str)] = &[
+    (
+        "屏幕上有菜单，但没认出它的选项，按编号选择需要你确认选中的是哪一项",
+        "There's a menu on screen but its options weren't recognized; picking by number needs you to confirm which item gets selected",
+    ),
+    (
+        "没有新鲜的屏幕帧，看不到菜单 / 授权对话框的选项（可能含「永久授权」），需要人确认这次选择",
+        "No fresh screen frame, so the options of the menu / permission dialog can't be seen (may include \"always allow\"); a person needs to confirm this choice",
+    ),
+    (
+        "局面认不出是什么，按键里又有 Tab 补全 / Ctrl-R / 方向键翻历史，最终提交的那一行看不到",
+        "The situation isn't recognized and the keys include Tab completion / Ctrl-R / arrow-key history, so the line finally submitted can't be seen",
+    ),
+    (
+        "按键里有 Tab 补全 / Ctrl-R / 方向键翻历史，最终提交的那一行看不到",
+        "The keys include Tab completion / Ctrl-R / arrow-key history, so the line finally submitted can't be seen",
+    ),
+    ("读不出屏幕上已经敲着的内容，提交的那一行看不到", "Can't read what's already typed on screen, so the submitted line can't be seen"),
+];
+
+/// 审批原因给人看的版本：英文界面把标记与正文都翻成英文。原因本身按中文生成（[`has_critical`] /
+/// [`has_blind_pick`] 按中文标记认），只在展示时翻译；翻好的不要再拿去判断。
+pub fn localize_reason(r: &str) -> String {
+    if crate::i18n::is_en() {
+        reason_en(r)
+    } else {
+        r.to_string()
+    }
+}
+
+pub(crate) fn reason_en(r: &str) -> String {
+    let mut out = String::new();
+    let mut rest = r;
+    if let Some(x) = rest.strip_prefix(CRITICAL_MARK) {
+        out.push_str("⚠ Irreversible: ");
+        rest = x;
+    }
+    if let Some(x) = rest.strip_prefix(BLIND_PICK_MARK) {
+        out.push_str("[options not visible] ");
+        rest = x;
+    }
+    if let Some(x) = rest.strip_prefix("批准对话框里的命令 ") {
+        out.push_str("Command in the approval dialog ");
+        rest = x;
+    }
+    if let Some((_, en)) = REASON_EN.iter().find(|(z, _)| *z == rest) {
+        out.push_str(en);
+    } else if let Some((line, why)) = rest.strip_prefix('`').and_then(|x| x.split_once("`：")) {
+        out.push_str(&format!("`{line}`: {}", super::danger::reason_en(why)));
+    } else {
+        out.push_str(&super::danger::reason_en(rest));
+    }
+    out
+}
+
 fn danger_reasons(lines: &[String]) -> Vec<String> {
     let mut reasons = Vec::new();
     for line in lines {
@@ -224,11 +280,13 @@ pub fn assess_keys(bytes: &[u8], sit: Option<&Situation>) -> KeysVerdict {
     if let Some(s) = sit {
         // 口令：不许往里敲可见字符（控制键如 <C-c> / <Esc> 取消仍可）
         if s.kind == SituationKind::Password && has_text {
-            return KeysVerdict::Refuse(
+            return KeysVerdict::Refuse(crate::tr!(
                 "屏幕停在密码 / 口令提示上，不能用 nx_send_keys 输入（密码不经过模型，也不会回显）。\
-                 请调用 nx_secret 让用户本人输入；不想输入就发 <C-c> 取消。"
-                    .into(),
-            );
+                 请调用 nx_secret 让用户本人输入；不想输入就发 <C-c> 取消。",
+                "The screen is at a password / passphrase prompt; you can't type into it with nx_send_keys (passwords \
+                 never go through the model and aren't echoed). Call nx_secret so the user types it themselves; send \
+                 <C-c> to cancel instead."
+            ));
         }
         // 授权对话框：选中「永久授权」类选项 → 拒绝
         if matches!(s.kind, SituationKind::Permission | SituationKind::Menu)
@@ -265,9 +323,11 @@ pub fn assess_keys(bytes: &[u8], sit: Option<&Situation>) -> KeysVerdict {
         // 没有新鲜屏幕帧时单按一个数字：除非确定停在 shell 提示符上，否则可能正在给一个看不见的
         // 授权卡 / 菜单选项（含「永久允许」）。回车不在此列：「按回车继续」很常见，要照常能用
         if s.frame_id == 0 && digit && !confident_shell(s) {
-            return KeysVerdict::Refuse(
-                "没有新鲜的屏幕画面，看不出这个数字会选中什么（可能是授权卡上的「永久允许」）。先 nx_screen 看清选项再选。".into(),
-            );
+            return KeysVerdict::Refuse(crate::tr!(
+                "没有新鲜的屏幕画面，看不出这个数字会选中什么（可能是授权卡上的「永久允许」）。先 nx_screen 看清选项再选。",
+                "No fresh screen, so it's unclear what this number would select (it might be \"always allow\" on a \
+                 permission prompt). Read the options with nx_screen first, then choose."
+            ));
         }
         // 看不到选项（没有新鲜屏幕帧 / 没认出选项）时对授权卡、菜单直接按数字或回车：不知道选中的是什么
         // （可能正是「永久允许」），让模型先读屏。例外：有新鲜帧的菜单只是没认出选项，按编号交给人批准
@@ -288,9 +348,11 @@ pub fn assess_keys(bytes: &[u8], sit: Option<&Situation>) -> KeysVerdict {
                     "{mark}屏幕上有菜单，但没认出它的选项，按编号选择需要你确认选中的是哪一项"
                 )]);
             }
-            return KeysVerdict::Refuse(
-                "看不到这个授权卡 / 菜单的选项，直接按数字或回车可能选中「永久允许」一类的项。先 nx_screen 看清选项再选。".into(),
-            );
+            return KeysVerdict::Refuse(crate::tr!(
+                "看不到这个授权卡 / 菜单的选项，直接按数字或回车可能选中「永久允许」一类的项。先 nx_screen 看清选项再选。",
+                "The options of this permission prompt / menu can't be seen; pressing a number or Enter might select \
+                 something like \"always allow\". Read the options with nx_screen first, then choose."
+            ));
         }
         // 没有新鲜屏幕帧：看不到选项，选择动作（数字 / 方向键 / 回车）交给人
         if s.frame_id == 0
@@ -440,11 +502,13 @@ pub(crate) fn permanent_pick(bytes: &[u8], visible: &str, s: &Situation) -> Opti
     }
     // 方向键 / Shift-Tab：不知道光标会落到哪个选项（Claude Code 的 Shift-Tab 本身就是「本会话一律允许」）
     if has_navigation(bytes) {
-        return Some(
+        return Some(crate::tr!(
             "授权对话框里有「永久授权」类选项，而方向键 / Shift-Tab 会让光标落点不可知。\
-             请直接按选项的序号（如 1）选「仅本次允许」，不要用方向键或 Shift-Tab。"
-                .into(),
-        );
+             请直接按选项的序号（如 1）选「仅本次允许」，不要用方向键或 Shift-Tab。",
+            "The permission dialog has \"always allow\"-type options, and arrow keys / Shift-Tab make it unknowable \
+             where the cursor lands. Press the option's number (e.g. 1) to choose \"allow once\"; don't use arrow keys \
+             or Shift-Tab."
+        ));
     }
     None
 }
@@ -466,9 +530,12 @@ fn declines(bytes: &[u8], visible: &str, s: &Situation) -> bool {
 }
 
 fn refuse_permanent(text: &str) -> String {
-    format!(
+    crate::tr!(
         "选项「{text}」会永久扩大授权（don't ask again / always allow 一类），托管模式下不能替用户选。\
-         请改选「仅本次允许」的选项；没有这样的选项就选拒绝，并在结论里告诉用户需要他本人决定。"
+         请改选「仅本次允许」的选项；没有这样的选项就选拒绝，并在结论里告诉用户需要他本人决定。",
+        "Option \"{text}\" permanently widens permissions (don't ask again / always allow), which autopilot can't \
+         choose for the user. Pick the \"allow once\" option instead; if there's none, decline and tell the user in \
+         your conclusion that they need to decide."
     )
 }
 

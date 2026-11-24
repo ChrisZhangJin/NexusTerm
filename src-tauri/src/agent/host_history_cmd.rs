@@ -154,7 +154,7 @@ pub async fn host_history(limit: Option<usize>, app: AppHandle) -> Result<Vec<Ho
             .collect()
     })
     .await
-    .map_err(|e| format!("读取历史托管失败：{e}"))
+    .map_err(|e| crate::tr!("读取历史托管失败：{e}", "Failed to load autopilot history: {e}"))
 }
 
 /// 一次托管的实际改动（没定格就按决策记录现算）+ 备份清单：同上，放到阻塞线程池里。
@@ -168,7 +168,7 @@ pub async fn host_changes(contract_id: String, app: AppHandle) -> Result<HostCha
         }
     })
     .await
-    .map_err(|e| format!("读取托管改动失败：{e}"))
+    .map_err(|e| crate::tr!("读取托管改动失败：{e}", "Failed to load autopilot changes: {e}"))
 }
 
 /// 把备份的原文写回去。走原来那个终端的文件通道；终端已经关了就报错。
@@ -183,20 +183,25 @@ pub async fn host_restore_backup(
     let (entry, bytes) = backup::load(&root, &contract_id, &backup_id)?;
     let st = &*state;
     if !st.local.contains(&entry.console_id) && !st.sessions.contains(&entry.console_id) {
-        return Err(format!(
+        return Err(crate::tr!(
             "当初改「{}」的那个终端已经关闭，没法经它写回。请重新连上那台机器后手动恢复（原文保存在应用数据目录的 host-backups 里）",
+            "The terminal that changed \"{}\" has been closed, so it can't be written back through it. Reconnect to that machine and restore it manually (the original is saved under host-backups in the app data directory)",
             entry.path
         ));
     }
-    let text = String::from_utf8(bytes).map_err(|_| "备份不是文本，不还原".to_string())?;
-    let transport = super::files::transport_for(st, &entry.console_id).await.map_err(|e| format!("打不开文件通道：{e}"))?;
+    let text = String::from_utf8(bytes).map_err(|_| crate::tr!("备份不是文本，不还原", "The backup isn't text, not restoring"))?;
+    let transport = super::files::transport_for(st, &entry.console_id)
+        .await
+        .map_err(|e| crate::tr!("打不开文件通道：{e}", "Couldn't open the file channel: {e}"))?;
     let ops = super::files::FileOps::new(&*transport, super::files::FileOpsConfig::default());
     // 用户在确认框里点了「还原」：受保护路径（当初也是批准过才写的）照样允许写回
     let opts = super::files::WriteOptions { create_dirs: true, allow_sensitive: true };
-    ops.write(&entry.path, &text, &opts).await.map_err(|e| format!("还原「{}」失败：{e}", entry.path))?;
+    ops.write(&entry.path, &text, &opts)
+        .await
+        .map_err(|e| crate::tr!("还原「{}」失败：{e}", "Failed to restore \"{}\": {e}", entry.path))?;
     drop(ops);
     backup::mark_restored(&root, &contract_id, &backup_id, now_ms()).ok();
-    Ok(format!("已把「{}」还原成托管改动之前的内容", entry.path))
+    Ok(crate::tr!("已把「{}」还原成托管改动之前的内容", "Restored \"{}\" to its content before autopilot changed it", entry.path))
 }
 
 #[cfg(test)]

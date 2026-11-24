@@ -282,7 +282,10 @@ pub fn agent_run_pause(session_id: String, state: State<'_, AppState>, app: AppH
             &app,
             &session_id,
             act::StepPayload {
-                text: Some("已请求暂停：当前这一步做完后会停下。".into()),
+                text: Some(crate::tr!(
+                    "已请求暂停：当前这一步做完后会停下。",
+                    "Pause requested: it will stop after the current step."
+                )),
                 ..act::StepPayload::new("note", 0)
             },
         );
@@ -429,7 +432,7 @@ pub async fn agent_exec(
         &session_id,
         &command,
         0,
-        "当前会话",
+        &crate::tr!("当前会话", "Current session"),
         &session_id,
         None,
         false,
@@ -484,7 +487,7 @@ pub async fn agent_open_session(
         "ssh" => {
             let id = session_record_id
                 .filter(|s| !s.trim().is_empty())
-                .ok_or_else(|| "kind=ssh 必须提供 session_record_id".to_string())?;
+                .ok_or_else(|| crate::tr!("kind=ssh 必须提供 session_record_id", "kind=ssh requires session_record_id"))?;
             OpenKind::Ssh { session_record_id: id }
         }
         _ => OpenKind::Local,
@@ -540,7 +543,7 @@ pub async fn agent_open_window(session_id: String, app: AppHandle) -> Result<(),
                 }
             });
         })
-        .map_err(|e| format!("无法打开 Nexus AI Agent 窗口：{e}"))
+        .map_err(|e| crate::tr!("无法打开 Nexus AI Agent 窗口：{e}", "Couldn't open the Nexus AI Agent window: {e}"))
 }
 
 /// 关闭浮动 Agent 窗口（若存在）。幂等。

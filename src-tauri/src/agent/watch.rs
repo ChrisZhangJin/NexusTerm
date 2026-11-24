@@ -59,6 +59,17 @@ pub enum Reason {
 
 impl Reason {
     pub fn label(self) -> String {
+        if crate::i18n::is_en() {
+            return match self {
+                Self::NeedsAttention(k) => format!("Needs attention: situation is {}", k.as_str()),
+                Self::ShellPrompt => "Back at the shell prompt (the task has probably finished)".into(),
+                Self::Matched => "until matched".into(),
+                Self::Stalled => "The screen hasn't changed for a long time (may be stuck)".into(),
+                Self::Timeout => "Reached the maximum wait; the task may still be running".into(),
+                Self::Cancelled => "Cancelled by the user".into(),
+                Self::Paused => "The user asked to pause, stopping here".into(),
+            };
+        }
         match self {
             Self::NeedsAttention(k) => format!("需要处理：局面为 {}", k.as_str()),
             Self::ShellPrompt => "已回到 shell 提示符（任务多半已结束）".into(),

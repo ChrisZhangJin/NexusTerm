@@ -558,23 +558,24 @@ fn has_control(s: &str, allow_tab: bool) -> bool {
 
 /// 疑似写死的口令。返回命中的说明。宁可少报：只抓形状很确定的。
 pub(crate) fn literal_secret_hint(text: &str) -> Option<&'static str> {
-    static RES: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
+    // (正则, 中文说明, 英文说明)：说明会进校验报错给人看，跟界面语言走
+    static RES: OnceLock<Vec<(Regex, &'static str, &'static str)>> = OnceLock::new();
     let res = RES.get_or_init(|| {
         [
-            (r#"(?i)bearer\s+[A-Za-z0-9._~+/=\-]{8,}"#, "Bearer token"),
-            (r#"sk-[A-Za-z0-9_\-]{8,}"#, "sk- 开头的 API key"),
-            (r#"AKIA[0-9A-Z]{16}"#, "AWS access key"),
-            (r#"-----BEGIN [A-Z ]*PRIVATE KEY-----"#, "私钥"),
-            (r#"(?i)\bsshpass\s+-p"#, "sshpass -p 口令"),
-            (r#"(?i)\bmysql(?:dump|admin)?\b[^\n]*\s-p\S"#, "mysql -p口令"),
+            (r#"(?i)bearer\s+[A-Za-z0-9._~+/=\-]{8,}"#, "Bearer token", "Bearer token"),
+            (r#"sk-[A-Za-z0-9_\-]{8,}"#, "sk- 开头的 API key", "API key starting with sk-"),
+            (r#"AKIA[0-9A-Z]{16}"#, "AWS access key", "AWS access key"),
+            (r#"-----BEGIN [A-Z ]*PRIVATE KEY-----"#, "私钥", "private key"),
+            (r#"(?i)\bsshpass\s+-p"#, "sshpass -p 口令", "sshpass -p password"),
+            (r#"(?i)\bmysql(?:dump|admin)?\b[^\n]*\s-p\S"#, "mysql -p口令", "mysql -p<password>"),
         ]
         .iter()
-        .map(|(p, why)| (Regex::new(p).unwrap_or_else(|e| panic!("skill 口令正则编译失败 {p}：{e}")), *why))
+        .map(|(p, zh, en)| (Regex::new(p).unwrap_or_else(|e| panic!("skill 口令正则编译失败 {p}：{e}")), *zh, *en))
         .collect()
     });
-    for (re, why) in res {
+    for (re, zh, en) in res {
         if re.is_match(text) {
-            return Some(why);
+            return Some(if crate::i18n::is_en() { en } else { zh });
         }
     }
     // password=xxx / --password xxx：值是 `{{…}}` 或 `$VAR` 引用则放过
@@ -588,7 +589,11 @@ pub(crate) fn literal_secret_hint(text: &str) -> Option<&'static str> {
     for cap in kv.captures_iter(text) {
         let v = cap[1].trim_matches(|c| c == '"' || c == '\'');
         if !(v.is_empty() || v.starts_with("{{") || v.starts_with('$') || v.starts_with('-')) {
-            return Some("password= / --password 后跟字面值");
+            return Some(if crate::i18n::is_en() {
+                "literal value after password= / --password"
+            } else {
+                "password= / --password 后跟字面值"
+            });
         }
     }
     None
@@ -614,9 +619,13 @@ impl<'a> Ctx<'a> {
     fn placeholders(&mut self, label: &str, text: &str) {
         for name in placeholder_names(text) {
             match self.declared.get(name.as_str()) {
-                None => self.errs.push(format!("{label}：占位符 {{{{{name}}}}} 没有对应的参数声明")),
-                Some(p) if p.secret => self.errs.push(format!(
-                    "{label}：secret 参数 {{{{{name}}}}} 不能出现在这里（只能用在 secret 步骤 / secret 应答里，由密码通道在运行时提供）"
+                None => self.errs.push(crate::tr!(
+                    "{label}：占位符 {{{{{name}}}}} 没有对应的参数声明",
+                    "{label}: placeholder {{{{{name}}}}} has no matching parameter declaration"
+                )),
+                Some(p) if p.secret => self.errs.push(crate::tr!(
+                    "{label}：secret 参数 {{{{{name}}}}} 不能出现在这里（只能用在 secret 步骤 / secret 应答里，由密码通道在运行时提供）",
+                    "{label}: secret parameter {{{{{name}}}}} can't be used here (only in secret steps / secret responses, supplied at run time through the password channel)"
                 )),
                 Some(_) => {}
             }
@@ -625,24 +634,28 @@ impl<'a> Ctx<'a> {
 
     fn pattern(&mut self, label: &str, template: &str) {
         if template.trim().is_empty() {
-            self.errs.push(format!("{label}：pattern 为空"));
+            self.errs.push(crate::tr!("{label}：pattern 为空", "{label}: pattern is empty"));
             return;
         }
         if template.chars().count() > MAX_PATTERN_CHARS {
-            self.errs.push(format!("{label}：pattern 超过 {MAX_PATTERN_CHARS} 字符"));
+            self.errs.push(crate::tr!(
+                "{label}：pattern 超过 {MAX_PATTERN_CHARS} 字符",
+                "{label}: pattern is longer than {MAX_PATTERN_CHARS} characters"
+            ));
             return;
         }
         self.placeholders(label, template);
         if let Err(e) = pattern_is_regex(template) {
-            self.errs.push(format!("{label}：{e}"));
+            self.errs.push(crate::tr!("{label}：{e}", "{label}: {e}"));
         }
     }
 
     fn timeout(&mut self, label: &str, t: Option<u64>) {
         if let Some(t) = t {
             if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&t) {
-                self.errs.push(format!(
-                    "{label}：timeoutMs 必须在 {MIN_TIMEOUT_MS}..={MAX_TIMEOUT_MS} 之间"
+                self.errs.push(crate::tr!(
+                    "{label}：timeoutMs 必须在 {MIN_TIMEOUT_MS}..={MAX_TIMEOUT_MS} 之间",
+                    "{label}: timeoutMs must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS}"
                 ));
             }
         }
@@ -650,8 +663,10 @@ impl<'a> Ctx<'a> {
 
     fn literal_secret(&mut self, label: &str, text: &str) {
         if let Some(why) = literal_secret_hint(text) {
-            self.errs.push(format!(
-                "{label}：疑似写死了口令 / 密钥（{why}）。skill 里不能存密码值，请改用 secret 步骤或 secret 参数"
+            // 英文须含 `password`：macro_migrate::finalize 据此认出凭据类问题
+            self.errs.push(crate::tr!(
+                "{label}：疑似写死了口令 / 密钥（{why}）。skill 里不能存密码值，请改用 secret 步骤或 secret 参数",
+                "{label}: looks like a hard-coded password / key ({why}). Skills can't store password values; use a secret step or secret parameter instead"
             ));
         }
     }
@@ -659,16 +674,19 @@ impl<'a> Ctx<'a> {
     /// 校验按键串（占位符换成 `x` 后能被 `parse_keys` 解码）。
     fn keys(&mut self, label: &str, text: &str) {
         if text.is_empty() {
-            self.errs.push(format!("{label}：按键串为空"));
+            self.errs.push(crate::tr!("{label}：按键串为空", "{label}: key sequence is empty"));
             return;
         }
         if text.chars().count() > MAX_KEYS_CHARS {
-            self.errs.push(format!("{label}：按键串超过 {MAX_KEYS_CHARS} 字符"));
+            self.errs.push(crate::tr!(
+                "{label}：按键串超过 {MAX_KEYS_CHARS} 字符",
+                "{label}: key sequence is longer than {MAX_KEYS_CHARS} characters"
+            ));
             return;
         }
         self.placeholders(label, text);
         if let Err(e) = parse_keys(&dummy(text)) {
-            self.errs.push(format!("{label}：按键串无效：{e}"));
+            self.errs.push(crate::tr!("{label}：按键串无效：{e}", "{label}: invalid key sequence: {e}"));
         }
         self.literal_secret(label, text);
     }
@@ -681,46 +699,57 @@ pub fn validate(skill: &Skill) -> Result<(), Vec<String>> {
     // —— 基本信息 ——
     let name = skill.name.trim();
     if name.is_empty() {
-        cx.errs.push("名称不能为空".into());
+        cx.errs.push(crate::tr!("名称不能为空", "Name can't be empty"));
     } else if name.chars().count() > MAX_NAME_CHARS {
-        cx.errs.push(format!("名称超过 {MAX_NAME_CHARS} 字符"));
+        cx.errs.push(crate::tr!("名称超过 {MAX_NAME_CHARS} 字符", "Name is longer than {MAX_NAME_CHARS} characters"));
     } else if has_control(name, false) {
-        cx.errs.push("名称不能含控制字符".into());
+        cx.errs.push(crate::tr!("名称不能含控制字符", "Name can't contain control characters"));
     }
     if skill.description.chars().count() > MAX_DESC_CHARS {
-        cx.errs.push(format!("描述超过 {MAX_DESC_CHARS} 字符"));
+        cx.errs.push(crate::tr!("描述超过 {MAX_DESC_CHARS} 字符", "Description is longer than {MAX_DESC_CHARS} characters"));
     }
     if skill.schema_version == 0 || skill.schema_version > SCHEMA_VERSION {
-        cx.errs.push(format!(
+        cx.errs.push(crate::tr!(
             "schemaVersion {} 不受支持（本版本最高 {SCHEMA_VERSION}）",
+            "schemaVersion {} isn't supported (this version supports up to {SCHEMA_VERSION})",
             skill.schema_version
         ));
     }
 
     // —— 参数 ——
+    // 英文前缀 `Parameter "x"` / `Parameter name "x"` / `secret parameter "x"`：前端 groupProblems 按它归到参数下
     if skill.params.len() > MAX_PARAMS {
-        cx.errs.push(format!("参数最多 {MAX_PARAMS} 个"));
+        cx.errs.push(crate::tr!("参数最多 {MAX_PARAMS} 个", "At most {MAX_PARAMS} parameters"));
     }
     let mut seen = HashSet::new();
     for p in &skill.params {
         if !is_ident(&p.name) {
-            cx.errs.push(format!("参数名「{}」无效（只能是字母 / 数字 / 下划线，不以数字开头，≤64 字符）", p.name));
+            cx.errs.push(crate::tr!(
+                "参数名「{}」无效（只能是字母 / 数字 / 下划线，不以数字开头，≤64 字符）",
+                "Parameter name \"{}\" is invalid (letters / digits / underscores only, not starting with a digit, ≤64 characters)",
+                p.name
+            ));
             continue;
         }
         if !seen.insert(p.name.as_str()) {
-            cx.errs.push(format!("参数名「{}」重复", p.name));
+            cx.errs.push(crate::tr!("参数名「{}」重复", "Parameter name \"{}\" is duplicated", p.name));
             continue;
         }
         if p.description.chars().count() > MAX_PARAM_DESC_CHARS {
-            cx.errs.push(format!("参数「{}」的描述超过 {MAX_PARAM_DESC_CHARS} 字符", p.name));
+            cx.errs.push(crate::tr!(
+                "参数「{}」的描述超过 {MAX_PARAM_DESC_CHARS} 字符",
+                "Parameter \"{}\" description is longer than {MAX_PARAM_DESC_CHARS} characters",
+                p.name
+            ));
         }
         if let Some(d) = &p.default_value {
             if p.secret {
-                cx.errs.push(format!("secret 参数「{}」不能有默认值", p.name));
+                cx.errs.push(crate::tr!("secret 参数「{}」不能有默认值", "secret parameter \"{}\" can't have a default value", p.name));
             }
             if d.chars().count() > MAX_PARAM_VALUE_CHARS || has_control(d, false) {
-                cx.errs.push(format!(
+                cx.errs.push(crate::tr!(
                     "参数「{}」的默认值无效（≤{MAX_PARAM_VALUE_CHARS} 字符，不含控制字符 / 换行）",
+                    "Parameter \"{}\" has an invalid default value (≤{MAX_PARAM_VALUE_CHARS} characters, no control characters / line breaks)",
                     p.name
                 ));
             }
@@ -729,18 +758,19 @@ pub fn validate(skill: &Skill) -> Result<(), Vec<String>> {
     }
 
     // —— 步骤 ——
+    // 英文前缀 `Step N (kind)`：前端 groupProblems、macro_migrate::error_step_index 都按它认步骤号
     if skill.steps.is_empty() {
-        cx.errs.push("至少需要一个步骤".into());
+        cx.errs.push(crate::tr!("至少需要一个步骤", "At least one step is required"));
     }
     if skill.steps.len() > MAX_STEPS {
-        cx.errs.push(format!("步骤最多 {MAX_STEPS} 个"));
+        cx.errs.push(crate::tr!("步骤最多 {MAX_STEPS} 个", "At most {MAX_STEPS} steps"));
     }
     for (i, step) in skill.steps.iter().enumerate().take(MAX_STEPS) {
-        let label = format!("第 {} 步（{}）", i + 1, step.kind());
+        let label = crate::tr!("第 {} 步（{}）", "Step {} ({})", i + 1, step.kind());
         validate_step(&mut cx, &label, step);
         cx.timeout(&label, step.timeout_ms());
         if let Some(p) = step.expect_after() {
-            cx.pattern(&format!("{label} 的 expectAfter"), p);
+            cx.pattern(&crate::tr!("{label} 的 expectAfter", "{label} expectAfter"), p);
         }
     }
 
@@ -751,17 +781,23 @@ pub fn validate(skill: &Skill) -> Result<(), Vec<String>> {
     }
     if let HostScope::List { hosts } = &skill.host_scope {
         if hosts.is_empty() {
-            cx.errs.push("hostScope 为 list 时至少要有一项（要不限主机请用 any）".into());
+            cx.errs.push(crate::tr!(
+                "hostScope 为 list 时至少要有一项（要不限主机请用 any）",
+                "hostScope needs at least one entry when it's a list (use any for no host restriction)"
+            ));
         }
         if hosts.len() > MAX_HOST_ENTRIES {
-            cx.errs.push(format!("hostScope 最多 {MAX_HOST_ENTRIES} 项"));
+            cx.errs.push(crate::tr!("hostScope 最多 {MAX_HOST_ENTRIES} 项", "hostScope allows at most {MAX_HOST_ENTRIES} entries"));
         }
         for h in hosts.iter().take(MAX_HOST_ENTRIES) {
             if h.trim().is_empty()
                 || h.chars().count() > MAX_HOST_ENTRY_CHARS
                 || h.chars().any(|c| c.is_whitespace() || c.is_control())
             {
-                cx.errs.push(format!("hostScope 的条目「{h}」无效（非空、无空白、≤{MAX_HOST_ENTRY_CHARS} 字符）"));
+                cx.errs.push(crate::tr!(
+                    "hostScope 的条目「{h}」无效（非空、无空白、≤{MAX_HOST_ENTRY_CHARS} 字符）",
+                    "hostScope entry \"{h}\" is invalid (non-empty, no whitespace, ≤{MAX_HOST_ENTRY_CHARS} characters)"
+                ));
             }
         }
     }
@@ -769,20 +805,22 @@ pub fn validate(skill: &Skill) -> Result<(), Vec<String>> {
     // —— 风险：不得低于自动评估 ——
     let report = assess_risk(&skill.steps);
     if skill.risk < report.risk {
-        cx.errs.push(format!(
+        // 英文前缀 `Risk level`：前端 groupProblems 按它归到风险下
+        cx.errs.push(crate::tr!(
             "风险等级 {:?} 低于自动评估的 {:?}：{}",
+            "Risk level {:?} is lower than the assessed {:?}: {}",
             skill.risk,
             report.risk,
-            report.reasons.join("；")
+            report.reasons.join(if crate::i18n::is_en() { "; " } else { "；" })
         ));
     }
 
     // —— 总大小 ——
     match serde_json::to_string(skill) {
         Ok(j) if j.len() > MAX_SKILL_JSON_BYTES => {
-            cx.errs.push(format!("skill 序列化后超过 {} KB", MAX_SKILL_JSON_BYTES / 1024));
+            cx.errs.push(crate::tr!("skill 序列化后超过 {} KB", "The serialized skill is larger than {} KB", MAX_SKILL_JSON_BYTES / 1024));
         }
-        Err(e) => cx.errs.push(format!("无法序列化：{e}")),
+        Err(e) => cx.errs.push(crate::tr!("无法序列化：{e}", "Couldn't serialize: {e}")),
         _ => {}
     }
 
@@ -793,56 +831,66 @@ fn validate_step(cx: &mut Ctx<'_>, label: &str, step: &SkillStep) {
     match step {
         SkillStep::Exec { command, .. } => {
             if command.trim().is_empty() {
-                cx.errs.push(format!("{label}：命令为空"));
+                cx.errs.push(crate::tr!("{label}：命令为空", "{label}: command is empty"));
                 return;
             }
             if command.chars().count() > MAX_COMMAND_CHARS {
-                cx.errs.push(format!("{label}：命令超过 {MAX_COMMAND_CHARS} 字符"));
+                cx.errs.push(crate::tr!(
+                    "{label}：命令超过 {MAX_COMMAND_CHARS} 字符",
+                    "{label}: command is longer than {MAX_COMMAND_CHARS} characters"
+                ));
                 return;
             }
             if has_control(command, true) {
-                cx.errs.push(format!("{label}：命令必须是单行、不含控制字符（要发按键请用 keys 步骤）"));
+                cx.errs.push(crate::tr!(
+                    "{label}：命令必须是单行、不含控制字符（要发按键请用 keys 步骤）",
+                    "{label}: the command must be a single line without control characters (use a keys step to send keystrokes)"
+                ));
             }
             cx.placeholders(label, command);
             cx.literal_secret(label, command);
         }
         SkillStep::Keys { keys, .. } => cx.keys(label, keys),
         SkillStep::ExpectRespond { expect, respond, secret, .. } => {
-            cx.pattern(&format!("{label} 的 expect"), expect);
+            cx.pattern(&crate::tr!("{label} 的 expect", "{label} expect"), expect);
             if *secret {
                 check_secret_respond(cx, label, respond);
             } else {
                 if respond.is_empty() {
-                    cx.errs.push(format!("{label}：respond 为空"));
+                    cx.errs.push(crate::tr!("{label}：respond 为空", "{label}: respond is empty"));
                 } else {
-                    cx.keys(&format!("{label} 的 respond"), respond);
+                    cx.keys(&crate::tr!("{label} 的 respond", "{label} respond"), respond);
                 }
                 if looks_like_password_prompt(expect) {
-                    cx.errs.push(format!(
-                        "{label}：expect 像是口令提示，应答必须设 secret=true（skill 里不能存密码值）"
+                    cx.errs.push(crate::tr!(
+                        "{label}：expect 像是口令提示，应答必须设 secret=true（skill 里不能存密码值）",
+                        "{label}: expect looks like a password prompt, so the response must set secret=true (skills can't store password values)"
                     ));
                 }
             }
         }
         SkillStep::Secret { reason, param, .. } => {
             if reason.trim().is_empty() {
-                cx.errs.push(format!("{label}：reason 不能为空（给用户看的输入理由）"));
+                cx.errs.push(crate::tr!(
+                    "{label}：reason 不能为空（给用户看的输入理由）",
+                    "{label}: reason can't be empty (it tells the user what to enter)"
+                ));
             } else if reason.chars().count() > MAX_REASON_CHARS {
-                cx.errs.push(format!("{label}：reason 超过 {MAX_REASON_CHARS} 字符"));
+                cx.errs.push(crate::tr!("{label}：reason 超过 {MAX_REASON_CHARS} 字符", "{label}: reason is longer than {MAX_REASON_CHARS} characters"));
             }
             if let Some(p) = param {
                 require_secret_param(cx, label, p);
             }
         }
-        SkillStep::ScreenCheck { expect, .. } => cx.pattern(&format!("{label} 的 expect"), expect),
+        SkillStep::ScreenCheck { expect, .. } => cx.pattern(&crate::tr!("{label} 的 expect", "{label} expect"), expect),
     }
 }
 
 fn require_secret_param(cx: &mut Ctx<'_>, label: &str, name: &str) {
     match cx.declared.get(name) {
         Some(p) if p.secret => {}
-        Some(_) => cx.errs.push(format!("{label}：参数「{name}」不是 secret 参数")),
-        None => cx.errs.push(format!("{label}：参数「{name}」没有声明")),
+        Some(_) => cx.errs.push(crate::tr!("{label}：参数「{name}」不是 secret 参数", "{label}: parameter \"{name}\" isn't a secret parameter")),
+        None => cx.errs.push(crate::tr!("{label}：参数「{name}」没有声明", "{label}: parameter \"{name}\" isn't declared")),
     }
 }
 
@@ -854,8 +902,9 @@ fn check_secret_respond(cx: &mut Ctx<'_>, label: &str, respond: &str) {
     let segs = scan(respond.trim());
     match segs.as_slice() {
         [Seg::Param { name, .. }] => require_secret_param(cx, label, name),
-        _ => cx.errs.push(format!(
-            "{label}：secret 应答只能是空（运行时现问）或唯一一个 {{{{secret 参数}}}} 引用，不能写字面值"
+        _ => cx.errs.push(crate::tr!(
+            "{label}：secret 应答只能是空（运行时现问）或唯一一个 {{{{secret 参数}}}} 引用，不能写字面值",
+            "{label}: a secret response must be empty (asked at run time) or a single {{{{secret parameter}}}} reference, not a literal value"
         )),
     }
 }
@@ -945,7 +994,7 @@ pub fn assess_risk(steps: &[SkillStep]) -> RiskReport {
     for (i, step) in steps.iter().enumerate() {
         let (r, why) = assess_step(step);
         if r > Risk::Low {
-            reasons.push(format!("第 {} 步（{}）：{why}", i + 1, step.kind()));
+            reasons.push(crate::tr!("第 {} 步（{}）：{why}", "Step {} ({}): {why}", i + 1, step.kind()));
         }
         risk = risk.max(r);
     }
@@ -964,33 +1013,33 @@ fn assess_step(step: &SkillStep) -> (Risk, String) {
                 return (Risk::High, why);
             }
             if matches!(scan(command.trim_start()).first(), Some(Seg::Param { .. })) {
-                return (Risk::High, "命令的程序名来自参数，无法评估".into());
+                return (Risk::High, crate::tr!("命令的程序名来自参数，无法评估", "the program name comes from a parameter, so it can't be assessed"));
             }
             if !placeholder_names(command).is_empty() {
-                return (Risk::Medium, "命令含参数占位符".into());
+                return (Risk::Medium, crate::tr!("命令含参数占位符", "the command contains parameter placeholders"));
             }
             if is_readonly_command(command) {
                 (Risk::Low, String::new())
             } else {
-                (Risk::Medium, "命令可能修改系统状态".into())
+                (Risk::Medium, crate::tr!("命令可能修改系统状态", "the command may change system state"))
             }
         }
-        SkillStep::Keys { keys, .. } => assess_keys(keys, "按键含回车，会提交一行"),
+        SkillStep::Keys { keys, .. } => assess_keys(keys, &crate::tr!("按键含回车，会提交一行", "the keys include Enter and submit a line")),
         SkillStep::ExpectRespond { respond, secret, .. } => {
             if *secret {
-                (Risk::Medium, "需要输入密码".into())
+                (Risk::Medium, crate::tr!("需要输入密码", "needs a password"))
             } else {
-                assess_keys(respond, "应答含回车，会提交一行")
+                assess_keys(respond, &crate::tr!("应答含回车，会提交一行", "the response includes Enter and submits a line"))
             }
         }
-        SkillStep::Secret { .. } => (Risk::Medium, "需要输入密码".into()),
+        SkillStep::Secret { .. } => (Risk::Medium, crate::tr!("需要输入密码", "needs a password")),
         SkillStep::ScreenCheck { .. } => (Risk::Low, String::new()),
     }
 }
 
 fn assess_keys(keys: &str, enter_why: &str) -> (Risk, String) {
     let Ok(bytes) = parse_keys(&dummy(keys)) else {
-        return (Risk::Medium, "按键串无法解析".into());
+        return (Risk::Medium, crate::tr!("按键串无法解析", "the key sequence can't be parsed"));
     };
     // 先解码再评估：`<Enter>` 之类具名键里的 `>` 不能被当成重定向。
     // 控制字节换成空格，剩下的就是会被敲进终端的可见文本。
@@ -1030,10 +1079,11 @@ pub fn resolve_params(
     let mut out = ResolvedParams::default();
     for name in supplied.keys() {
         match decls.iter().find(|p| &p.name == name) {
-            None => errs.push(format!("未声明的参数「{name}」")),
-            Some(p) if p.secret => {
-                errs.push(format!("secret 参数「{name}」不能随调用传入，运行时由密码通道提供"))
-            }
+            None => errs.push(crate::tr!("未声明的参数「{name}」", "Undeclared parameter \"{name}\"")),
+            Some(p) if p.secret => errs.push(crate::tr!(
+                "secret 参数「{name}」不能随调用传入，运行时由密码通道提供",
+                "secret parameter \"{name}\" can't be passed in the call; it's supplied at run time through the password channel"
+            )),
             Some(_) => {}
         }
     }
@@ -1047,14 +1097,15 @@ pub fn resolve_params(
             (Some(v), _) => v.clone(),
             (None, Some(d)) => d.clone(),
             (None, None) if p.required => {
-                errs.push(format!("缺少必填参数「{}」", p.name));
+                errs.push(crate::tr!("缺少必填参数「{}」", "Missing required parameter \"{}\"", p.name));
                 continue;
             }
             (None, None) => String::new(),
         };
         if value.chars().count() > MAX_PARAM_VALUE_CHARS || has_control(&value, false) {
-            errs.push(format!(
+            errs.push(crate::tr!(
                 "参数「{}」的值无效（≤{MAX_PARAM_VALUE_CHARS} 字符，不含控制字符 / 换行）",
+                "Parameter \"{}\" has an invalid value (≤{MAX_PARAM_VALUE_CHARS} characters, no control characters / line breaks)",
                 p.name
             ));
             continue;
@@ -1198,25 +1249,29 @@ pub fn export_text(skill: &Skill) -> String {
 /// 时间戳取当前、风险重新评估（只抬不降）、重新校验。**不会**入库，也**不会**被信任。
 pub fn import_text(text: &str, new_id: String, now: i64) -> Result<Skill, Vec<String>> {
     if text.len() > MAX_IMPORT_BYTES {
-        return Err(vec![format!("文件过大（超过 {} KB）", MAX_IMPORT_BYTES / 1024)]);
+        return Err(vec![crate::tr!("文件过大（超过 {} KB）", "File too large (over {} KB)", MAX_IMPORT_BYTES / 1024)]);
     }
     let root: Value =
-        serde_json::from_str(text).map_err(|e| vec![format!("不是有效的 JSON：{e}")])?;
+        serde_json::from_str(text).map_err(|e| vec![crate::tr!("不是有效的 JSON：{e}", "Not valid JSON: {e}")])?;
     if root.get("format").and_then(Value::as_str) != Some(EXPORT_FORMAT) {
-        return Err(vec![format!("不是 Nexus skill 文件（缺少 format = \"{EXPORT_FORMAT}\"）")]);
+        return Err(vec![crate::tr!(
+            "不是 Nexus skill 文件（缺少 format = \"{EXPORT_FORMAT}\"）",
+            "Not a Nexus skill file (missing format = \"{EXPORT_FORMAT}\")"
+        )]);
     }
     match root.get("version").and_then(Value::as_u64) {
         Some(v) if v >= 1 && v <= SCHEMA_VERSION as u64 => {}
         Some(v) => {
-            return Err(vec![format!(
-                "文件版本 {v} 不受支持（本版本最高 {SCHEMA_VERSION}），请升级 Nexus"
+            return Err(vec![crate::tr!(
+                "文件版本 {v} 不受支持（本版本最高 {SCHEMA_VERSION}），请升级 Nexus",
+                "File version {v} isn't supported (this version supports up to {SCHEMA_VERSION}); please update Nexus"
             )])
         }
-        None => return Err(vec!["缺少 version".into()]),
+        None => return Err(vec![crate::tr!("缺少 version", "Missing version")]),
     }
-    let body = root.get("skill").cloned().ok_or_else(|| vec!["缺少 skill 字段".to_string()])?;
+    let body = root.get("skill").cloned().ok_or_else(|| vec![crate::tr!("缺少 skill 字段", "Missing skill field")])?;
     let mut skill: Skill =
-        serde_json::from_value(body).map_err(|e| vec![format!("skill 内容无效：{e}")])?;
+        serde_json::from_value(body).map_err(|e| vec![crate::tr!("skill 内容无效：{e}", "Invalid skill content: {e}")])?;
 
     skill.id = new_id;
     skill.source = SkillSource::Imported;
@@ -1284,11 +1339,11 @@ pub fn trust_fingerprint(skill: &Skill) -> String {
     Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn risk_zh(r: Risk) -> &'static str {
+fn risk_zh(r: Risk) -> String {
     match r {
-        Risk::Low => "低（只读）",
-        Risk::Medium => "中",
-        Risk::High => "高",
+        Risk::Low => crate::tr!("低（只读）", "low (read-only)"),
+        Risk::Medium => crate::tr!("中", "medium"),
+        Risk::High => crate::tr!("高", "high"),
     }
 }
 
@@ -1304,26 +1359,57 @@ pub fn trust_info(skill: &Skill) -> TrustInfo {
     let (level, reason) = if risk > Risk::Low {
         (
             TrustLevel::Guarded,
-            format!("风险等级为{}：每个写步骤都需要确认（危险步骤任何时候都会询问）", risk_zh(risk)),
+            crate::tr!(
+                "风险等级为{}：每个写步骤都需要确认（危险步骤任何时候都会询问）",
+                "Risk level is {}: every write step needs confirmation (dangerous steps always ask)",
+                risk_zh(risk)
+            ),
         )
     } else if streak >= needed {
         (
             TrustLevel::Trusted,
-            format!("只读技能，已连续成功运行 {streak} 次：自动模式下免逐步确认（危险步骤与审批模式仍会询问）"),
+            crate::tr!(
+                "只读技能，已连续成功运行 {streak} 次：自动模式下免逐步确认（危险步骤与审批模式仍会询问）",
+                "Read-only skill with {streak} successful runs in a row: no step-by-step confirmation in Auto mode (dangerous steps and approval mode still ask)"
+            ),
         )
     } else if skill.trust_streak >= needed {
-        (TrustLevel::Confirm, format!("技能内容在获得信任后被修改，需重新连续成功运行 {needed} 次"))
+        (
+            TrustLevel::Confirm,
+            crate::tr!(
+                "技能内容在获得信任后被修改，需重新连续成功运行 {needed} 次",
+                "The skill was changed after it became trusted; it needs {needed} successful runs in a row again"
+            ),
+        )
     } else if skill.fail_count > 0 && streak == 0 {
-        (TrustLevel::Confirm, format!("最近一次运行失败或出现偏离，信任已清零：需重新连续成功运行 {needed} 次"))
+        (
+            TrustLevel::Confirm,
+            crate::tr!(
+                "最近一次运行失败或出现偏离，信任已清零：需重新连续成功运行 {needed} 次",
+                "The last run failed or went off track, so trust was reset: it needs {needed} successful runs in a row again"
+            ),
+        )
     } else if skill.success_count == 0 && skill.fail_count == 0 {
         let why = if skill.source == SkillSource::Imported {
-            "导入的技能（来源不受信）"
+            crate::tr!("导入的技能（来源不受信）", "Imported skill (untrusted source)")
         } else {
-            "还没有运行过"
+            crate::tr!("还没有运行过", "Not run yet")
         };
-        (TrustLevel::Confirm, format!("{why}：每个写步骤都需要确认（连续成功运行 {needed} 次后只读技能可免确认）"))
+        (
+            TrustLevel::Confirm,
+            crate::tr!(
+                "{why}：每个写步骤都需要确认（连续成功运行 {needed} 次后只读技能可免确认）",
+                "{why}: every write step needs confirmation (read-only skills skip it after {needed} successful runs in a row)"
+            ),
+        )
     } else {
-        (TrustLevel::Confirm, format!("已连续成功 {streak}/{needed} 次：达到后只读技能可免逐步确认"))
+        (
+            TrustLevel::Confirm,
+            crate::tr!(
+                "已连续成功 {streak}/{needed} 次：达到后只读技能可免逐步确认",
+                "{streak}/{needed} successful runs in a row: once reached, read-only skills skip step-by-step confirmation"
+            ),
+        )
     };
     TrustInfo { level, streak, needed, reason }
 }

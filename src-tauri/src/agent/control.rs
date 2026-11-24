@@ -267,6 +267,14 @@ pub enum PauseWait {
 /// 非托管运行（对话 / 技能）想写一个正被托管的终端时给模型 / 面板的话。
 pub const HOSTED_BUSY: &str = "这个终端正在被托管，先停掉托管或接管";
 
+/// [`HOSTED_BUSY`] 的当前语言版本（给人看）
+pub fn hosted_busy() -> String {
+    crate::tr!(
+        "这个终端正在被托管，先停掉托管或接管",
+        "This terminal is on autopilot; stop autopilot or take over first"
+    )
+}
+
 /// Agent 写 pty 之前的闸：`Paused` 就轮询等待，直到交还 / 取消 / 超过 `max`。
 ///
 /// 取消优先于一切 —— 用户点了停止，就不该再多等一个轮询周期。

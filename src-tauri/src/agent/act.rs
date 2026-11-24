@@ -48,6 +48,20 @@
 //!    让它自己决定重试、换命令还是收手；命令的真实输出原样喂回去 ——
 //!    没有退出码这种参考信息，模型得照着输出文本自己判断成败，这与人操作时一致。
 
+/// 中英一对里取当前界面语言那条（静态文案，签名要 `&'static str` 的地方用）。
+fn zh_en(zh: &'static str, en: &'static str) -> &'static str {
+    if crate::i18n::is_en() {
+        en
+    } else {
+        zh
+    }
+}
+
+/// 危险 / 按键原因给人看的版本（原因按中文生成、按中文判断；只在上卡时翻译，翻好的不再拿去判断）。
+fn shown_reasons(rs: &[String]) -> Vec<String> {
+    rs.iter().map(|r| super::steward_mode::localize_reason(r)).collect()
+}
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -313,11 +327,11 @@ impl TabOp {
     /// 给人看的中文说法，出现在步骤卡与喂回模型的反馈里。
     fn label(self) -> &'static str {
         match self {
-            Self::List => "列出标签页",
-            Self::Focus => "切换标签页",
-            Self::Close => "关闭标签页",
-            Self::Rename => "重命名标签页",
-            Self::Reconnect => "重连标签页",
+            Self::List => zh_en("列出标签页", "List tabs"),
+            Self::Focus => zh_en("切换标签页", "Switch tab"),
+            Self::Close => zh_en("关闭标签页", "Close tab"),
+            Self::Rename => zh_en("重命名标签页", "Rename tab"),
+            Self::Reconnect => zh_en("重连标签页", "Reconnect tab"),
         }
     }
 }
@@ -1026,47 +1040,47 @@ fn reveal_action(args: &serde_json::Value) -> AgentAction {
 /// 工具名（+ 参数）在界面上给人看的说法。
 pub fn tool_label(name: &str, args: &str) -> &'static str {
     match name.trim() {
-        TOOL_EXEC => "执行命令",
-        TOOL_RUN => "旁路执行",
-        TOOL_EXPORT => "导出记录",
-        TOOL_OPEN => "新建标签页",
-        TOOL_KEYS => "发送按键",
-        TOOL_WAIT => "等待输出",
-        TOOL_WATCH => "盯住任务",
-        TOOL_SCREEN => "读取屏幕",
-        TOOL_SECRET => "请求输入密码",
-        super::reveal::TOOL_REVEAL => "交付给你",
-        TOOL_MEMORY => "主机备忘",
-        TOOL_ASK_USER => "向你提问",
-        TOOL_COMPLETE => "宣告完成",
-        super::files::TOOL_READ => "读文件",
-        super::files::TOOL_WRITE => "写文件",
-        super::files::TOOL_EDIT => "改文件",
-        super::files::TOOL_GLOB => "查找文件",
-        super::files::TOOL_GREP => "搜索文件内容",
-        super::todo::TOOL_TODO => "更新计划",
+        TOOL_EXEC => zh_en("执行命令", "Run command"),
+        TOOL_RUN => zh_en("旁路执行", "Run via side channel"),
+        TOOL_EXPORT => zh_en("导出记录", "Export log"),
+        TOOL_OPEN => zh_en("新建标签页", "New tab"),
+        TOOL_KEYS => zh_en("发送按键", "Send keys"),
+        TOOL_WAIT => zh_en("等待输出", "Wait for output"),
+        TOOL_WATCH => zh_en("盯住任务", "Watch task"),
+        TOOL_SCREEN => zh_en("读取屏幕", "Read screen"),
+        TOOL_SECRET => zh_en("请求输入密码", "Request password"),
+        super::reveal::TOOL_REVEAL => zh_en("交付给你", "Delivered to you"),
+        TOOL_MEMORY => zh_en("主机备忘", "Host notes"),
+        TOOL_ASK_USER => zh_en("向你提问", "Ask you"),
+        TOOL_COMPLETE => zh_en("宣告完成", "Declare done"),
+        super::files::TOOL_READ => zh_en("读文件", "Read file"),
+        super::files::TOOL_WRITE => zh_en("写文件", "Write file"),
+        super::files::TOOL_EDIT => zh_en("改文件", "Edit file"),
+        super::files::TOOL_GLOB => zh_en("查找文件", "Find files"),
+        super::files::TOOL_GREP => zh_en("搜索文件内容", "Search file contents"),
+        super::todo::TOOL_TODO => zh_en("更新计划", "Update plan"),
         TOOL_SKILL => match serde_json::from_str::<serde_json::Value>(args)
             .ok()
             .and_then(|v| v.get("op").and_then(|o| o.as_str()).map(|s| s.to_string()))
             .as_deref()
         {
-            Some("run") => "运行技能",
-            Some("show") => "查看技能",
-            _ => "检索技能",
+            Some("run") => zh_en("运行技能", "Run skill"),
+            Some("show") => zh_en("查看技能", "View skill"),
+            _ => zh_en("检索技能", "Search skills"),
         },
         TOOL_TAB => match serde_json::from_str::<serde_json::Value>(args)
             .ok()
             .and_then(|v| v.get("op").and_then(|o| o.as_str()).map(|s| s.to_string()))
             .as_deref()
         {
-            Some("list") => "列出标签页",
-            Some("focus" | "switch" | "switchTo") => "切换标签页",
-            Some("close") => "关闭标签页",
-            Some("rename") => "重命名标签页",
-            Some("reconnect" | "reopen") => "重连标签页",
-            _ => "操作标签页",
+            Some("list") => zh_en("列出标签页", "List tabs"),
+            Some("focus" | "switch" | "switchTo") => zh_en("切换标签页", "Switch tab"),
+            Some("close") => zh_en("关闭标签页", "Close tab"),
+            Some("rename") => zh_en("重命名标签页", "Rename tab"),
+            Some("reconnect" | "reopen") => zh_en("重连标签页", "Reconnect tab"),
+            _ => zh_en("操作标签页", "Tab action"),
         },
-        _ => "工具调用",
+        _ => zh_en("工具调用", "Tool call"),
     }
 }
 
@@ -1648,25 +1662,43 @@ fn pseudo_command_hint(cmd: &str) -> Option<&'static str> {
             | "tab-new" | "tabnew" | "create-tab" | "add-tab" | "tab-create" | "newtabpage"
         ) =>
         {
-            Some("「新建标签页」是界面动作，终端里没有这条命令。请改用 nx_open_tab 工具")
+            Some(zh_en(
+                "「新建标签页」是界面动作，终端里没有这条命令。请改用 nx_open_tab 工具",
+                "\"New tab\" is a UI action; there's no such terminal command. Use the nx_open_tab tool instead",
+            ))
         }
         h if matches!(
             h,
             "reconnect" | "reconnect-tab" | "reconnecttab" | "reconnect_tab" | "re-tab"
             | "tab-reconnect"
-        ) => Some("「重连标签页」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=reconnect）"),
+        ) => Some(zh_en(
+            "「重连标签页」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=reconnect）",
+            "\"Reconnect tab\" is a UI action; there's no such terminal command. Use the nx_tab tool (op=reconnect) instead",
+        )),
         h if matches!(h, "close-tab" | "closetab" | "close_tab" | "tab-close" | "kill-tab") => {
-            Some("「关闭标签页」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=close）")
+            Some(zh_en(
+                "「关闭标签页」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=close）",
+                "\"Close tab\" is a UI action; there's no such terminal command. Use the nx_tab tool (op=close) instead",
+            ))
         }
         h if matches!(
             h,
             "switch-tab" | "switchtab" | "switch_tab" | "tab-switch" | "focus-tab" | "tab-focus"
-        ) => Some("「切换标签页」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=focus）"),
+        ) => Some(zh_en(
+            "「切换标签页」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=focus）",
+            "\"Switch tab\" is a UI action; there's no such terminal command. Use the nx_tab tool (op=focus) instead",
+        )),
         h if matches!(h, "list-tabs" | "listtab" | "tab-list" | "tabs") => {
-            Some("「查看标签页」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=list）")
+            Some(zh_en(
+                "「查看标签页」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=list）",
+                "\"List tabs\" is a UI action; there's no such terminal command. Use the nx_tab tool (op=list) instead",
+            ))
         }
         h if matches!(h, "rename-tab" | "renametab" | "rename_tab" | "tab-rename") => {
-            Some("「标签页改名」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=rename）")
+            Some(zh_en(
+                "「标签页改名」是界面动作，终端里没有这条命令。请改用 nx_tab 工具（op=rename）",
+                "\"Rename tab\" is a UI action; there's no such terminal command. Use the nx_tab tool (op=rename) instead",
+            ))
         }
         _ => None,
     }
@@ -1687,12 +1719,15 @@ fn action_for_command(target: Option<String>, command: &str) -> AgentAction {
 pub fn reject_command(cmd: &str) -> Option<&'static str> {
     // 只按空格与制表符判空：`\n` / `\r` 也要算「有东西」，否则会被当成空命令放过
     if cmd.trim_matches(|c: char| c == ' ' || c == '\t').is_empty() {
-        return Some("命令为空");
+        return Some(zh_en("命令为空", "Empty command"));
     }
     // ESC / BEL / NUL 同样要挡：它们能改写命令在屏幕上的显示，
     // 让人看到 `ls` 而实际跑的是别的。
     if cmd.chars().any(|c| c.is_control() && c != '\t') {
-        return Some("命令含换行或控制字符，必须拆成单条执行");
+        return Some(zh_en(
+            "命令含换行或控制字符，必须拆成单条执行",
+            "The command contains newlines or control characters; split it into single commands",
+        ));
     }
     None
 }
@@ -2222,7 +2257,12 @@ pub(super) fn situation_now(
 /// 写入超时的提示文案。独立于 `is_channel_closed`：只是一次写超时，
 /// 命令可能根本没发出去也可能发出去了但没收到确认，不等于连接已经报废，
 /// 不升级成「别再重试」那套更严厉的措辞。
-const WRITE_TIMEOUT_MSG: &str = "写入超时（15 秒内未发出）：连接可能暂时不稳定";
+fn write_timeout_msg() -> String {
+    crate::tr!(
+        "写入超时（15 秒内未发出）：连接可能暂时不稳定",
+        "Write timed out (not sent within 15 s): the connection may be unstable"
+    )
+}
 
 /// 也有可能执行本身就没跑起来（会话关了、拒绝-ID 不存在）。
 fn failure_feedback(command: &str, label: &str, why: &str) -> String {
@@ -2252,12 +2292,17 @@ fn failure_feedback(command: &str, label: &str, why: &str) -> String {
 
 /// 这条失败是不是「会话通道已关闭」。
 fn is_channel_closed(why: &str) -> bool {
-    why.contains("通道") && (why.contains("关闭") || why.contains("失效") || why.contains("断开"))
+    if why.contains("通道") && (why.contains("关闭") || why.contains("失效") || why.contains("断开")) {
+        return true;
+    }
+    // 界面是英文时下层报错也是英文
+    let w = why.to_ascii_lowercase();
+    w.contains("channel") && (w.contains("closed") || w.contains("gone") || w.contains("disconnected"))
 }
 
 /// 这条失败是不是「写入超时」（见 `WRITE_TIMEOUT_MSG`）。
 fn is_write_timeout(why: &str) -> bool {
-    why.contains("写入超时")
+    why.contains("写入超时") || why.contains("Write timed out")
 }
 
 /// 超长时保留的头部比例（百分比），其余留给尾部。尾部更值钱：最终结果、报错、提示符都在那儿。
@@ -2316,9 +2361,9 @@ pub(super) async fn write_to(state: &AppState, id: &str, data: &[u8]) -> Result<
             state.sessions.write(id, data.to_vec()),
         )
         .await
-        .map_err(|_| WRITE_TIMEOUT_MSG.to_string())?
+        .map_err(|_| write_timeout_msg())?
         .map_err(|e| e.to_string()),
-        None => Err(format!("会话不存在或已关闭：{id}")),
+        None => Err(crate::tr!("会话不存在或已关闭：{id}", "Session not found or closed: {id}")),
     }
 }
 
@@ -2497,7 +2542,10 @@ pub fn keys_risk(bytes: &[u8]) -> Option<Vec<String>> {
         return None;
     }
     let mut reasons = vec![
-        "按键序列含回车，会提交终端当前行（那一行也可能是之前输入或历史里翻出来的）".to_string(),
+        crate::tr!(
+            "按键序列含回车，会提交终端当前行（那一行也可能是之前输入或历史里翻出来的）",
+            "The keys include Enter, which submits the terminal's current line (that line may hold earlier input or a recalled history entry)"
+        ),
     ];
     let text = String::from_utf8_lossy(bytes);
     for line in text.split(['\r', '\n']).map(str::trim).filter(|l| !l.is_empty()) {
@@ -2506,7 +2554,7 @@ pub fn keys_risk(bytes: &[u8]) -> Option<Vec<String>> {
         let risk = assess(&visible);
         if risk.dangerous {
             for r in risk.reasons {
-                reasons.push(format!("`{visible}`：{r}"));
+                reasons.push(crate::tr!("`{visible}`：{}", "`{visible}`: {}", super::danger::localize_reason(&r)));
             }
         }
     }
@@ -2642,7 +2690,7 @@ pub(super) async fn gate_target(
                     StepPayload {
                         target: Some(id.clone()),
                         command: Some(skip_cmd.to_string()),
-                        reasons: Some(vec!["会话不存在，且不在作用范围内".into()]),
+                        reasons: Some(vec![crate::tr!("会话不存在，且不在作用范围内", "Session not found and not in scope")]),
                         ..StepPayload::new("skip", step)
                     },
                 );
@@ -2707,19 +2755,19 @@ fn resolve_auth(state: &AppState, record: &store::SessionRecord) -> Result<AuthM
             // 不区分的话，用户会得到一句与事实相反的「未保存密码」，然后去重填
             // 一个其实已经存在的密码 —— 而那一步同样会失败。
             if state.store.vault_locked() {
-                return Err("保险库已锁定，请先输入主密码".into());
+                return Err(crate::tr!("保险库已锁定，请先输入主密码", "The vault is locked. Enter your master password first"));
             }
             let password = state
                 .store
                 .get_password(&record.id)
-                .ok_or_else(|| "未保存密码，请先在该会话里补填密码".to_string())?;
+                .ok_or_else(|| crate::tr!("未保存密码，请先在该会话里补填密码", "No saved password. Add the password to this session first"))?;
             Ok(AuthMethod::Password { password })
         }
         "key" => {
             let path = record
                 .key_path
                 .clone()
-                .ok_or_else(|| "该会话未配置私钥路径".to_string())?;
+                .ok_or_else(|| crate::tr!("该会话未配置私钥路径", "This session has no private key path configured"))?;
             // 口令是「有则用，没有就试试看」：很多私钥本就没加口令，
             // 真要口令而又没有的话，连接会在握手阶段报出明确的认证错误。
             let passphrase = state.store.get_passphrase(&record.id);
@@ -2756,7 +2804,12 @@ pub async fn open_session(
             let record = state
                 .store
                 .get(session_record_id)
-                .map_err(|_| AgentError::BadRequest(format!("未找到会话配置：{session_record_id}")))?;
+                .map_err(|_| {
+                    AgentError::BadRequest(crate::tr!(
+                        "未找到会话配置：{session_record_id}",
+                        "Session profile not found: {session_record_id}"
+                    ))
+                })?;
             let auth = resolve_auth(state, &record).map_err(AgentError::BadRequest)?;
             let req = ConnectRequest {
                 host: record.host.clone(),
@@ -3246,7 +3299,10 @@ async fn hold_paused(
         emit_step(
             app,
             run,
-            StepPayload { text: Some("继续运行，已换上一份新预算。".into()), ..StepPayload::new("resumed", step) },
+            StepPayload {
+                text: Some(crate::tr!("继续运行，已换上一份新预算。", "Resumed with a fresh budget.")),
+                ..StepPayload::new("resumed", step)
+            },
         );
     }
     waited
@@ -3348,7 +3404,7 @@ pub(super) async fn request_approval(
     if let Some(h) = runtime.host.live(session_id) {
         let mut card = super::host::HumanCard::ask(
             &payload.request_id,
-            &format!("批准在「{}」上执行：{}", payload.target_label, payload.command),
+            &crate::tr!("批准在「{}」上执行：{}", "Approve running on \"{}\": {}", payload.target_label, payload.command),
             super::steward::now_ms(),
         );
         card.reasons = payload.reasons.clone();
@@ -3449,7 +3505,7 @@ fn resolve_targets(req: &AgentRunRequest) -> Vec<AgentTarget> {
     if req.targets.is_empty() {
         vec![AgentTarget {
             id: req.session_id.clone(),
-            label: "当前会话".into(),
+            label: crate::tr!("当前会话", "Current session"),
             cwd: None,
         }]
     } else {
@@ -3458,7 +3514,9 @@ fn resolve_targets(req: &AgentRunRequest) -> Vec<AgentTarget> {
 }
 
 /// 范围外会话在卡片里的占位展示名：后端只认 uuid，范围外的会话前端没有交过名字。
-const OUT_OF_SCOPE_LABEL: &str = "范围外会话";
+fn out_of_scope_name() -> &'static str {
+    zh_en("范围外会话", "Out-of-scope session")
+}
 
 /// `id` 是否在本轮作用范围内。
 ///
@@ -3495,7 +3553,7 @@ fn admit(targets: &mut Vec<AgentTarget>, id: &str, label: &str) {
 /// 范围外会话的展示名：带上 id 前 8 位，让人在弹窗里至少能和标签页对上号。
 fn out_of_scope_label(id: &str) -> String {
     let short: String = id.chars().take(8).collect();
-    format!("{OUT_OF_SCOPE_LABEL}（{short}）")
+    crate::tr!("{}（{short}）", "{} ({short})", out_of_scope_name())
 }
 
 /// 只留范围内的标签页，返回 `(范围内清单, 被藏起来的个数)`。
@@ -3517,14 +3575,14 @@ fn describe_open(
     ssh_desc: Option<&str>,
 ) -> String {
     let what = match kind {
-        OpenKind::Local => "本地终端".to_string(),
+        OpenKind::Local => crate::tr!("本地终端", "Local terminal"),
         OpenKind::Ssh { session_record_id } => ssh_desc
             .map(str::to_string)
-            .unwrap_or_else(|| format!("SSH 配置 {session_record_id}")),
+            .unwrap_or_else(|| crate::tr!("SSH 配置 {session_record_id}", "SSH profile {session_record_id}")),
     };
     match command.map(str::trim).filter(|c| !c.is_empty()) {
-        Some(c) => format!("打开新会话「{label}」（{what}）并执行：{c}"),
-        None => format!("打开新会话「{label}」（{what}）"),
+        Some(c) => crate::tr!("打开新会话「{label}」（{what}）并执行：{c}", "Open new session \"{label}\" ({what}) and run: {c}"),
+        None => crate::tr!("打开新会话「{label}」（{what}）", "Open new session \"{label}\" ({what})"),
     }
 }
 
@@ -3567,8 +3625,11 @@ async fn ask_beyond_scope(
     mut reasons: Vec<String>,
     feedback: &mut String,
 ) -> bool {
-    reasons.insert(0, "超出作用范围：用户没有把它加入本轮作用范围".into());
-    let (target_id, target_label) = target.unwrap_or(("", "新会话"));
+    reasons.insert(
+        0,
+        crate::tr!("超出作用范围：用户没有把它加入本轮作用范围", "Out of scope: you haven't added it to this run's scope"),
+    );
+    let (target_id, target_label) = target.unwrap_or(("", zh_en("新会话", "New session")));
     let payload = ApprovePayload {
         request_id: uuid::Uuid::new_v4().simple().to_string(),
         kind: "scope",
@@ -3851,7 +3912,7 @@ pub async fn run(
                     break;
                 }
                 control::PauseWait::Refused => {
-                    emit_step(app, &session, StepPayload { text: Some(control::HOSTED_BUSY.into()), ..StepPayload::new("note", step) });
+                    emit_step(app, &session, StepPayload { text: Some(control::hosted_busy()), ..StepPayload::new("note", step) });
                     feedback.push_str(&format!("{}：这一步没有往终端写入任何内容，别再对它下发终端动作。\n", control::HOSTED_BUSY));
                     break;
                 }
@@ -3861,7 +3922,7 @@ pub async fn run(
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            emit_step(app, &session, StepPayload { text: Some("已取消。".into()), ..StepPayload::new("note", step) });
+            emit_step(app, &session, StepPayload { text: Some(crate::tr!("已取消。", "Cancelled.")), ..StepPayload::new("note", step) });
             break;
         }
         // 托管：先处理收件箱（运行期间用户按的键 / 点的「暂停」），不在 Running 就挂起到回来
@@ -3911,7 +3972,10 @@ pub async fn run(
                     app,
                     &session,
                     StepPayload {
-                        text: Some("被托管的终端已经关闭，托管挂起；重新接驳前不会再写入。".into()),
+                        text: Some(crate::tr!(
+                            "被托管的终端已经关闭，托管挂起；重新接驳前不会再写入。",
+                            "The terminal on autopilot was closed, so autopilot is suspended. Nothing will be written until it's reattached."
+                        )),
                         ..StepPayload::new("note", step)
                     },
                 );
@@ -3927,7 +3991,10 @@ pub async fn run(
                     app,
                     &session,
                     StepPayload {
-                        text: Some("到了约定的期限，托管已暂停；要接着做请点「加预算继续」。".into()),
+                        text: Some(crate::tr!(
+                            "到了约定的期限，托管已暂停；要接着做请点「加预算继续」。",
+                            "Deadline reached, autopilot paused. Click \"Add budget & continue\" to keep going."
+                        )),
                         ..StepPayload::new("note", step)
                     },
                 );
@@ -3950,7 +4017,10 @@ pub async fn run(
                 app,
                 &session,
                 StepPayload {
-                    text: Some("用户一直在接管终端，本轮先停下；交还后可以再让我继续。".into()),
+                    text: Some(crate::tr!(
+                        "用户一直在接管终端，本轮先停下；交还后可以再让我继续。",
+                        "You've kept control of the terminal, so this run stops here. Hand it back and ask me to continue."
+                    )),
                     ..StepPayload::new("note", step)
                 },
             );
@@ -3971,7 +4041,7 @@ pub async fn run(
             };
             if let Some(ev) = ev {
                 let why = match &ev {
-                    HostEvent::LlmDown(e) => format!("模型服务暂不可用（{e}）"),
+                    HostEvent::LlmDown(e) => crate::tr!("模型服务暂不可用（{e}）", "Model service temporarily unavailable ({e})"),
                     HostEvent::BudgetExhausted(r) => r.clone(),
                     _ => String::new(),
                 };
@@ -3981,7 +4051,10 @@ pub async fn run(
                     app,
                     &session,
                     StepPayload {
-                        text: Some(format!("托管已暂停：{why}。点「加预算继续」恢复，或「停止」结束。")),
+                        text: Some(crate::tr!(
+                            "托管已暂停：{why}。点「加预算继续」恢复，或「停止」结束。",
+                            "Autopilot paused: {why}. Click \"Add budget & continue\" to resume, or \"Stop\" to end."
+                        )),
                         ..StepPayload::new("note", step)
                     },
                 );
@@ -3993,7 +4066,7 @@ pub async fn run(
                         emit_step(
                             app,
                             &session,
-                            StepPayload { text: Some("继续托管。".into()), ..StepPayload::new("resumed", step) },
+                            StepPayload { text: Some(crate::tr!("继续托管。", "Autopilot resumed.")), ..StepPayload::new("resumed", step) },
                         );
                     }
                     _ => break,
@@ -4024,7 +4097,7 @@ pub async fn run(
                     feedback.push_str(budget::RESUME_FEEDBACK);
                 }
                 control::PauseWait::Cancelled => {
-                    emit_step(app, &session, StepPayload { text: Some("已取消。".into()), ..StepPayload::new("note", step) });
+                    emit_step(app, &session, StepPayload { text: Some(crate::tr!("已取消。", "Cancelled.")), ..StepPayload::new("note", step) });
                     break;
                 }
                 control::PauseWait::TookOver | control::PauseWait::Refused => {
@@ -4032,7 +4105,10 @@ pub async fn run(
                         app,
                         &session,
                         StepPayload {
-                            text: Some("暂停太久没有继续，本轮已结束；需要的话重新提问即可。".into()),
+                            text: Some(crate::tr!(
+                                "暂停太久没有继续，本轮已结束；需要的话重新提问即可。",
+                                "Paused too long without resuming, so this run has ended. Ask again if needed."
+                            )),
                             ..StepPayload::new("note", step)
                         },
                     );
@@ -4076,8 +4152,9 @@ pub async fn run(
                     app,
                     &session,
                     StepPayload {
-                        text: Some(format!(
+                        text: Some(crate::tr!(
                             "模型请求失败：{}\n{:.0} 秒后自动重试（第 {}/{} 次）。",
+                            "Model request failed: {}\nRetrying automatically in {:.0} s (attempt {}/{}).",
                             error_headline(&n.error),
                             n.delay.as_secs_f64().ceil(),
                             n.attempt,
@@ -4095,7 +4172,7 @@ pub async fn run(
             }
             Err(f) if f.kind == llm::FailureKind::Cancelled => {
                 // 与循环顶的取消同一出口：正常收尾，不当成出错
-                emit_step(app, &session, StepPayload { text: Some("已取消。".into()), ..StepPayload::new("note", step) });
+                emit_step(app, &session, StepPayload { text: Some(crate::tr!("已取消。", "Cancelled.")), ..StepPayload::new("note", step) });
                 break;
             }
             Err(f) if f.kind == llm::FailureKind::Transient => {
@@ -4106,8 +4183,9 @@ pub async fn run(
                     app,
                     &session,
                     StepPayload {
-                        text: Some(format!(
+                        text: Some(crate::tr!(
                             "模型服务重试 {} 次仍失败：{}",
+                            "Model service still failing after {} retries: {}",
                             llm::AGENT_RETRY.max_attempts,
                             error_headline(&f.error.to_string())
                         )),
@@ -4133,7 +4211,10 @@ pub async fn run(
                         app,
                         &session,
                         StepPayload {
-                            text: Some("模型说上下文太长：已把较早的步骤压缩成笔记，重试一次。".into()),
+                            text: Some(crate::tr!(
+                                "模型说上下文太长：已把较早的步骤压缩成笔记，重试一次。",
+                                "The model says the context is too long: earlier steps were condensed into notes. Retrying once."
+                            )),
                             ..StepPayload::new("note", step)
                         },
                     );
@@ -4146,7 +4227,11 @@ pub async fn run(
                         app,
                         &session,
                         StepPayload {
-                            text: Some(format!("模型请求失败：{}。托管已暂停，修好后点「加预算继续」。", error_headline(&msg))),
+                            text: Some(crate::tr!(
+                                "模型请求失败：{}。托管已暂停，修好后点「加预算继续」。",
+                                "Model request failed: {}. Autopilot paused; fix it, then click \"Add budget & continue\".",
+                                error_headline(&msg)
+                            )),
                             ..StepPayload::new("note", step)
                         },
                     );
@@ -4228,7 +4313,11 @@ pub async fn run(
                 app,
                 &session,
                 StepPayload {
-                    text: Some(format!("模型调用了不存在的工具：{}，已告知它可用的工具。", unknown.join("、"))),
+                    text: Some(crate::tr!(
+                        "模型调用了不存在的工具：{}，已告知它可用的工具。",
+                        "The model called tools that don't exist: {}. It has been told which tools are available.",
+                        unknown.join(zh_en("、", ", "))
+                    )),
                     ..StepPayload::new("note", step)
                 },
             );
@@ -4248,7 +4337,10 @@ pub async fn run(
                     app,
                     &session,
                     StepPayload {
-                        text: Some("模型的回复因长度上限被截断，已请它接着写。".into()),
+                        text: Some(crate::tr!(
+                            "模型的回复因长度上限被截断，已请它接着写。",
+                            "The model's reply was cut off at the length limit; asked it to continue."
+                        )),
                         ..StepPayload::new("note", step)
                     },
                 );
@@ -4275,9 +4367,10 @@ pub async fn run(
                     app,
                     &session,
                     StepPayload {
-                        text: Some(
-                            "工具调用缺少必要参数，未产生任何动作，已请模型重发。".into(),
-                        ),
+                        text: Some(crate::tr!(
+                            "工具调用缺少必要参数，未产生任何动作，已请模型重发。",
+                            "The tool call was missing required arguments and did nothing; asked the model to resend."
+                        )),
                         ..StepPayload::new("note", step)
                     },
                 );
@@ -4298,9 +4391,10 @@ pub async fn run(
                     app,
                     &session,
                     StepPayload {
-                        text: Some(
-                            "这一轮的动作块没能解析成可执行指令（围栏里不是约定的 JSON），已请模型重发。".into(),
-                        ),
+                        text: Some(crate::tr!(
+                            "这一轮的动作块没能解析成可执行指令（围栏里不是约定的 JSON），已请模型重发。",
+                            "This round's action block couldn't be parsed into a command (not the agreed JSON); asked the model to resend."
+                        )),
                         ..StepPayload::new("note", step)
                     },
                 );
@@ -4551,7 +4645,7 @@ pub async fn run(
                         step,
                         &mut targets,
                         call.target(),
-                        |l| format!("在「{l}」上{summary}"),
+                        |l| crate::tr!("在「{l}」上{summary}", "{summary} on \"{l}\""),
                         call.tool(),
                         Vec::new(),
                         &mut feedback,
@@ -4619,7 +4713,10 @@ pub async fn run(
                             _ => super::files_tool::WriteGate::Auto,
                         }
                     } else if cfg.exec_mode.is_approval() {
-                        super::files_tool::WriteGate::Approve(vec!["审批模式：写文件前要你确认".into()])
+                        super::files_tool::WriteGate::Approve(vec![crate::tr!(
+                            "审批模式：写文件前要你确认",
+                            "Approval mode: writing files needs your confirmation"
+                        )])
                     } else {
                         super::files_tool::WriteGate::Auto
                     };
@@ -4659,7 +4756,7 @@ pub async fn run(
                             target: Some(target_id.clone()),
                             target_label: Some(label.clone()),
                             command: Some(out.summary.clone()),
-                            text: Some(if out.ok { "完成".into() } else { out.feedback.trim().to_string() }),
+                            text: Some(if out.ok { crate::tr!("完成", "Done") } else { out.feedback.trim().to_string() }),
                             output: out.diff.clone(),
                             ..StepPayload::new("file", step)
                         },
@@ -4686,8 +4783,9 @@ pub async fn run(
                             app,
                             &session,
                             StepPayload {
-                                text: Some(format!(
+                                text: Some(crate::tr!(
                                     "替你决定（托管自主）：按推荐「{}」继续。不可逆的操作仍会停下来问你。",
+                                    "Decided for you (autopilot): continuing with the recommended \"{}\". Irreversible actions will still stop and ask you.",
                                     recommendation.as_deref().unwrap_or("").trim()
                                 )),
                                 ..StepPayload::new("note", step)
@@ -4706,7 +4804,7 @@ pub async fn run(
                 AgentAction::Complete { summary, evidence } => {
                     let mut text = summary.clone();
                     if !evidence.is_empty() {
-                        text.push_str("\n\n证据：\n");
+                        text.push_str(zh_en("\n\n证据：\n", "\n\nEvidence:\n"));
                         for e in &evidence {
                             text.push_str(&format!("- {e}\n"));
                         }
@@ -4749,7 +4847,10 @@ pub async fn run(
                     emit_step(
                         app,
                         &session,
-                        StepPayload { text: Some(format!("完成判据核验：\n{evidence}")), ..StepPayload::new("note", step) },
+                        StepPayload {
+                            text: Some(crate::tr!("完成判据核验：\n{evidence}", "Completion checks:\n{evidence}")),
+                            ..StepPayload::new("note", step)
+                        },
                     );
                     match super::host::verify::verdict(&results) {
                         super::host::verify::Verdict::AllPassed => {
@@ -4779,7 +4880,7 @@ pub async fn run(
                         &session,
                         StepPayload {
                             command: Some(command.clone()),
-                            reasons: Some(vec!["不是 shell 命令，已拦下".into(), hint.clone()]),
+                            reasons: Some(vec![crate::tr!("不是 shell 命令，已拦下", "Not a shell command, blocked"), hint.clone()]),
                             ..StepPayload::new("skip", step)
                         },
                     );
@@ -4803,7 +4904,7 @@ pub async fn run(
                         RevealSource::Command(c) => Some(assess(c)),
                         _ => None,
                     };
-                    let scope_reasons = risk.as_ref().filter(|r| r.dangerous).map(|r| r.reasons.clone()).unwrap_or_default();
+                    let scope_reasons = risk.as_ref().filter(|r| r.dangerous).map(|r| shown_reasons(&r.reasons)).unwrap_or_default();
                     let Some((target_id, label, crossed)) = gate_target(
                         app,
                         state,
@@ -4812,7 +4913,7 @@ pub async fn run(
                         step,
                         &mut targets,
                         target.as_deref(),
-                        |l| format!("在「{l}」上{shown}"),
+                        |l| crate::tr!("在「{l}」上{shown}", "{shown} on \"{l}\""),
                         &shown,
                         scope_reasons,
                         &mut feedback,
@@ -4830,12 +4931,12 @@ pub async fn run(
                                 command: shown.clone(),
                                 target: target_id.clone(),
                                 target_label: label.clone(),
-                                reasons: with_cwd_note(r.reasons.clone()),
+                                reasons: with_cwd_note(shown_reasons(&r.reasons)),
                                 diff: None,
                                 preview_complete: None,
                             };
                             if !request_approval(app, runtime, &session, &req_payload).await {
-                                emit_step(app, &session, StepPayload { command: Some(shown.clone()), reasons: Some(r.reasons.clone()), ..StepPayload::new("skip", step) });
+                                emit_step(app, &session, StepPayload { command: Some(shown.clone()), reasons: Some(shown_reasons(&r.reasons)), ..StepPayload::new("skip", step) });
                                 feedback.push_str(&format!("「{title}」没有交付：命令未获批准（人没批准 / 等待超时）。\n"));
                                 continue;
                             }
@@ -4850,7 +4951,10 @@ pub async fn run(
                         RevealSource::Path(p) => match super::files_tool::absolutize(p, cwd.as_deref()) {
                             Err(why) => Err(RevealErr::File(why)),
                             Ok(abs) => match super::files::transport_for(state, &target_id).await {
-                                Err(e) => Err(RevealErr::File(format!("文件通道在「{label}」上不可用：{e}"))),
+                                Err(e) => Err(RevealErr::File(crate::tr!(
+                                    "文件通道在「{label}」上不可用：{e}",
+                                    "File channel unavailable on \"{label}\": {e}"
+                                ))),
                                 Ok(transport) => {
                                     let ops = super::files::FileOps::new(&*transport, super::files::FileOpsConfig::default());
                                     let unattended = host.as_ref().is_some_and(|h| h.ctx().authority.tier == super::policy::TIER_YOLO);
@@ -4923,7 +5027,7 @@ pub async fn run(
                     // （托管的 deny / 硬偏好 / 范围 / danger 已在上面的 `gate::authorize` 里做过）
                     let shown = command.trim().to_string();
                     let risk = assess(&command);
-                    let scope_reasons = if risk.dangerous { risk.reasons.clone() } else { Vec::new() };
+                    let scope_reasons = if risk.dangerous { shown_reasons(&risk.reasons) } else { Vec::new() };
                     let Some((target_id, label, crossed)) = gate_target(
                         app,
                         state,
@@ -4932,7 +5036,7 @@ pub async fn run(
                         step,
                         &mut targets,
                         target.as_deref(),
-                        |l| format!("在「{l}」旁路执行：{shown}"),
+                        |l| crate::tr!("在「{l}」旁路执行：{shown}", "Run via side channel on \"{l}\": {shown}"),
                         &shown,
                         scope_reasons,
                         &mut feedback,
@@ -4949,7 +5053,7 @@ pub async fn run(
                             command: shown.clone(),
                             target: target_id.clone(),
                             target_label: label.clone(),
-                            reasons: with_cwd_note(risk.reasons.clone()),
+                            reasons: with_cwd_note(shown_reasons(&risk.reasons)),
                             diff: None,
                             preview_complete: None,
                         };
@@ -4965,7 +5069,7 @@ pub async fn run(
                                     target: Some(target_id.clone()),
                                     target_label: Some(label.clone()),
                                     command: Some(shown.clone()),
-                                    reasons: Some(risk.reasons.clone()),
+                                    reasons: Some(shown_reasons(&risk.reasons)),
                                     ..StepPayload::new("skip", step)
                                 },
                             );
@@ -4981,7 +5085,7 @@ pub async fn run(
                         .and_then(|t| t.cwd.clone())
                         .or_else(|| host.as_ref().and_then(|h| h.saved_console_of(&target_id)).and_then(|c| c.cwd));
                     let secs = run_timeout(timeout_secs);
-                    let card_label = format!("{label} · 旁路");
+                    let card_label = crate::tr!("{label} · 旁路", "{label} · side channel");
                     emit_step(
                         app,
                         &session,
@@ -4992,7 +5096,7 @@ pub async fn run(
                             ..StepPayload::new("exec", step)
                         },
                     );
-                    let tl_seq = timeline::begin(app, &state.agent, &target_id, TlKind::Command, &shown, Some("旁路"));
+                    let tl_seq = timeline::begin(app, &state.agent, &target_id, TlKind::Command, &shown, Some(zh_en("旁路", "side channel")));
                     let res = oob_run(app, state, &session, step, &target_id, &card_label, &shown, cwd.as_deref(), secs, &cancel).await;
                     let (out, text) = match &res {
                         Ok(raw) => {
@@ -5080,7 +5184,7 @@ pub async fn run(
                                 StepPayload {
                                     target: Some(target_id.clone()),
                                     command: Some(command.trim().into()),
-                                    reasons: Some(vec!["会话不存在，且不在作用范围内".into()]),
+                                    reasons: Some(vec![crate::tr!("会话不存在，且不在作用范围内", "Session not found and not in scope")]),
                                     ..StepPayload::new("skip", step)
                                 },
                             );
@@ -5091,8 +5195,8 @@ pub async fn run(
                             ));
                             continue;
                         }
-                        let what = format!("在「{target_label}」执行：{}", command.trim());
-                        let reasons = if risk.dangerous { risk.reasons.clone() } else { Vec::new() };
+                        let what = crate::tr!("在「{target_label}」执行：{}", "Run on \"{target_label}\": {}", command.trim());
+                        let reasons = if risk.dangerous { shown_reasons(&risk.reasons) } else { Vec::new() };
                         if !ask_beyond_scope(
                             app,
                             runtime,
@@ -5121,7 +5225,7 @@ pub async fn run(
                             command: command.trim().into(),
                             target: target_id.clone(),
                             target_label: target_label.into(),
-                            reasons: with_cwd_note(risk.reasons.clone()),
+                            reasons: with_cwd_note(shown_reasons(&risk.reasons)),
                             diff: None,
                             preview_complete: None,
                         };
@@ -5147,7 +5251,7 @@ pub async fn run(
                                     target: Some(target_id.clone()),
                                     target_label: Some(target_label.into()),
                                     command: Some(command.trim().into()),
-                                    reasons: Some(risk.reasons.clone()),
+                                    reasons: Some(shown_reasons(&risk.reasons)),
                                     ..StepPayload::new("skip", step)
                                 },
                             );
@@ -5171,7 +5275,7 @@ pub async fn run(
                                 target: Some(target_id.clone()),
                                 target_label: Some(target_label.into()),
                                 command: Some(command.trim().into()),
-                                reasons: Some(vec![format!("等待期间局面变了：{why}")]),
+                                reasons: Some(vec![crate::tr!("等待期间局面变了：{why}", "The situation changed while waiting: {why}")]),
                                 ..StepPayload::new("skip", step)
                             },
                         );
@@ -5227,8 +5331,8 @@ pub async fn run(
                         if !in_scope(id, &targets) {
                             let label = out_of_scope_label(id);
                             let what = match name.as_deref() {
-                                Some(n) => format!("{}「{label}」→「{n}」", op.label()),
-                                None => format!("{}「{label}」", op.label()),
+                                Some(n) => crate::tr!("{}「{label}」→「{n}」", "{} \"{label}\" → \"{n}\"", op.label()),
+                                None => crate::tr!("{}「{label}」", "{} \"{label}\"", op.label()),
                             };
                             if !ask_beyond_scope(
                                 app,
@@ -5258,7 +5362,7 @@ pub async fn run(
                                 .map(|t| t.label.clone())
                                 .unwrap_or_else(|| id.to_string())
                         })
-                        .unwrap_or_else(|| "范围内的标签页".into());
+                        .unwrap_or_else(|| crate::tr!("范围内的标签页", "Tabs in scope"));
 
                     emit_step(
                         app,
@@ -5266,7 +5370,7 @@ pub async fn run(
                         StepPayload {
                             target: target.clone(),
                             target_label: Some(where_.clone()),
-                            text: Some(format!("正在{}……", op.label())),
+                            text: Some(crate::tr!("正在{}……", "{}…", op.label())),
                             ..StepPayload::new("tab", step)
                         },
                     );
@@ -5294,17 +5398,21 @@ pub async fn run(
                                 (reply.tabs.clone(), 0)
                             };
                             let detail = if op == TabOp::List {
-                                format!(
+                                crate::tr!(
                                     "作用范围内共 {} 个标签页{}",
+                                    "{} tab(s) in scope{}",
                                     tabs.len(),
                                     if hidden > 0 {
-                                        format!("（另有 {hidden} 个在作用范围之外，不能操作，也不会列出）")
+                                        crate::tr!(
+                                            "（另有 {hidden} 个在作用范围之外，不能操作，也不会列出）",
+                                            " ({hidden} more out of scope: not listed and can't be operated)"
+                                        )
                                     } else {
                                         String::new()
                                     }
                                 )
                             } else if reply.detail.trim().is_empty() {
-                                format!("{}完成", op.label())
+                                crate::tr!("{}完成", "{}: done", op.label())
                             } else {
                                 reply.detail.clone()
                             };
@@ -5325,7 +5433,7 @@ pub async fn run(
                         }
                         Some(reply) => {
                             let why = if reply.detail.trim().is_empty() {
-                                "前端拒绝了这个操作".to_string()
+                                crate::tr!("前端拒绝了这个操作", "The app refused this action")
                             } else {
                                 reply.detail.clone()
                             };
@@ -5354,8 +5462,9 @@ pub async fn run(
                                 StepPayload {
                                     target: target.clone(),
                                     target_label: Some(where_.clone()),
-                                    text: Some(format!(
+                                    text: Some(crate::tr!(
                                         "「{}」没有收到界面回执（主窗口可能没开或正忙），未能确认结果。",
+                                        "\"{}\" got no reply from the UI (the main window may be closed or busy); result unknown.",
                                         op.label()
                                     )),
                                     ..StepPayload::new("note", step)
@@ -5378,7 +5487,7 @@ pub async fn run(
                                 &session,
                                 StepPayload {
                                     command: Some(keys.clone()),
-                                    reasons: Some(vec![format!("按键串无效：{why}")]),
+                                    reasons: Some(vec![crate::tr!("按键串无效：{why}", "Invalid key sequence: {why}")]),
                                     ..StepPayload::new("skip", step)
                                 },
                             );
@@ -5400,7 +5509,7 @@ pub async fn run(
                         step,
                         &mut targets,
                         target.as_deref(),
-                        |l| format!("向「{l}」发送按键：{shown}"),
+                        |l| crate::tr!("向「{l}」发送按键：{shown}", "Send keys to \"{l}\": {shown}"),
                         &shown,
                         risk.clone().unwrap_or_default(),
                         &mut feedback,
@@ -5434,7 +5543,7 @@ pub async fn run(
                                     StepPayload {
                                         target: Some(target_id.clone()),
                                         target_label: Some(label.clone()),
-                                        reasons: Some(vec![why.clone()]),
+                                        reasons: Some(vec![super::steward_mode::localize_reason(&why)]),
                                         ..StepPayload::new("skip", step)
                                     },
                                 );
@@ -5442,7 +5551,7 @@ pub async fn run(
                                 continue;
                             }
                             super::steward_mode::KeysVerdict::Approve(reasons) => {
-                                risk = Some(reasons);
+                                risk = Some(shown_reasons(&reasons));
                                 crossed = false;
                             }
                         }
@@ -5452,7 +5561,7 @@ pub async fn run(
                         let req_payload = ApprovePayload {
                             request_id: uuid::Uuid::new_v4().simple().to_string(),
                             kind: "danger",
-                            command: format!("发送按键：{shown}"),
+                            command: crate::tr!("发送按键：{shown}", "Send keys: {shown}"),
                             target: target_id.clone(),
                             target_label: label.clone(),
                             reasons: reasons.clone(),
@@ -5545,7 +5654,11 @@ pub async fn run(
                             timeline::finish(app, &state.agent, &target_id, tl_seq, &tail, Some(&guess), false);
                             emit_interact(
                                 app, &session, "keys", step, &target_id, &label, Some(&shown),
-                                Some(if receipt.answered { "已发送".into() } else { "已发送，但提示仍在".into() }),
+                                Some(if receipt.answered {
+                                    crate::tr!("已发送", "Sent")
+                                } else {
+                                    crate::tr!("已发送，但提示仍在", "Sent, but the prompt is still there")
+                                }),
                                 Some(tail.clone()), Some(&guess),
                             );
                             feedback.push_str(&keys_feedback(&label, &shown, &tail, Some(&guess)));
@@ -5591,7 +5704,7 @@ pub async fn run(
                                 &session,
                                 StepPayload {
                                     command: pattern.clone(),
-                                    reasons: Some(vec![format!("pattern 无效：{why}")]),
+                                    reasons: Some(vec![crate::tr!("pattern 无效：{why}", "Invalid pattern: {why}")]),
                                     ..StepPayload::new("skip", step)
                                 },
                             );
@@ -5601,7 +5714,7 @@ pub async fn run(
                             continue;
                         }
                     };
-                    let shown = pattern.clone().unwrap_or_else(|| "（等输出静止）".into());
+                    let shown = pattern.clone().unwrap_or_else(|| crate::tr!("（等输出静止）", "(until output goes quiet)"));
                     let Some((target_id, label, _)) = gate_target(
                         app,
                         state,
@@ -5610,7 +5723,7 @@ pub async fn run(
                         step,
                         &mut targets,
                         target.as_deref(),
-                        |l| format!("读取「{l}」的新输出（等待：{shown}）"),
+                        |l| crate::tr!("读取「{l}」的新输出（等待：{shown}）", "Read new output from \"{l}\" (waiting for: {shown})"),
                         &shown,
                         Vec::new(),
                         &mut feedback,
@@ -5633,7 +5746,7 @@ pub async fn run(
                         .unwrap_or_default();
                     emit_interact(
                         app, &session, "wait", step, &target_id, &label, Some(&shown),
-                        Some(format!("等待中（最长 {} 秒）……", spec.timeout_ms / 1000)), None, None,
+                        Some(crate::tr!("等待中（最长 {} 秒）……", "Waiting (up to {} s)…", spec.timeout_ms / 1000)), None, None,
                     );
                     let res = interact::wait_for_pattern(
                         &spec,
@@ -5649,10 +5762,10 @@ pub async fn run(
                         trace::record(&session, step, "wait", &format!("{label}（{target_id}）{:?} {shown}\n{}", res.end, res.output));
                     }
                     let verdict = match res.end {
-                        WaitEnd::Matched => "已命中",
-                        WaitEnd::Quiet => "输出已静止",
-                        WaitEnd::Timeout => "超时未命中",
-                        WaitEnd::Cancelled => "已取消",
+                        WaitEnd::Matched => zh_en("已命中", "Matched"),
+                        WaitEnd::Quiet => zh_en("输出已静止", "Output went quiet"),
+                        WaitEnd::Timeout => zh_en("超时未命中", "Timed out without a match"),
+                        WaitEnd::Cancelled => zh_en("已取消", "Cancelled"),
                     };
                     let tl_seq = timeline::begin(app, &state.agent, &target_id, TlKind::Wait, &shown, Some(verdict));
                     timeline::finish(app, &state.agent, &target_id, tl_seq, &res.output, Some(&guess), false);
@@ -5674,7 +5787,7 @@ pub async fn run(
                                 &session,
                                 StepPayload {
                                     command: until.clone(),
-                                    reasons: Some(vec![format!("until 无效：{why}")]),
+                                    reasons: Some(vec![crate::tr!("until 无效：{why}", "Invalid until: {why}")]),
                                     ..StepPayload::new("skip", step)
                                 },
                             );
@@ -5684,7 +5797,7 @@ pub async fn run(
                             continue;
                         }
                     };
-                    let shown = until.clone().unwrap_or_else(|| "（盯到需要处理 / 结束）".into());
+                    let shown = until.clone().unwrap_or_else(|| crate::tr!("（盯到需要处理 / 结束）", "(until it needs attention or ends)"));
                     let Some((target_id, label, _)) = gate_target(
                         app,
                         state,
@@ -5693,7 +5806,7 @@ pub async fn run(
                         step,
                         &mut targets,
                         target.as_deref(),
-                        |l| format!("盯住「{l}」的任务进度"),
+                        |l| crate::tr!("盯住「{l}」的任务进度", "Watch task progress on \"{l}\""),
                         &shown,
                         Vec::new(),
                         &mut feedback,
@@ -5719,9 +5832,9 @@ pub async fn run(
                         .unwrap_or_default();
                     emit_interact(
                         app, &session, "watch", step, &target_id, &label, Some(&shown),
-                        Some(format!("盯着中（最长 {} 分钟）……", (wcfg.timeout_ms / 60_000).max(1))), None, None,
+                        Some(crate::tr!("盯着中（最长 {} 分钟）……", "Watching (up to {} min)…", (wcfg.timeout_ms / 60_000).max(1))), None, None,
                     );
-                    let tl_seq = timeline::begin(app, &state.agent, &target_id, TlKind::Wait, &shown, Some("盯住"));
+                    let tl_seq = timeline::begin(app, &state.agent, &target_id, TlKind::Wait, &shown, Some(zh_en("盯住", "Watch")));
                     let started = std::time::Instant::now();
                     let mut paused_for = Duration::ZERO;
                     let mut last_change = std::time::Instant::now();
@@ -5825,7 +5938,7 @@ pub async fn run(
                             last_beat = std::time::Instant::now();
                             emit_interact(
                                 app, &session, "watch", step, &target_id, &label, Some(&shown),
-                                Some(format!("已盯 {} 分钟，局面：{}", elapsed_ms / 60_000, sit.kind.as_str())), None, None,
+                                Some(crate::tr!("已盯 {} 分钟，局面：{}", "Watched for {} min, state: {}", elapsed_ms / 60_000, sit.kind.as_str())), None, None,
                             );
                         }
                         tokio::time::sleep(Duration::from_millis(super::watch::POLL_MS)).await;
@@ -5844,7 +5957,7 @@ pub async fn run(
                         // 起止两张卡的 command 必须一致，前端才会把它们合并
                         emit_interact(
                             app, &session, "watch", step, &target_id, &label, Some(&shown),
-                            Some("用户接管，已停止盯梢".into()), Some(String::new()), Some(&guess),
+                            Some(crate::tr!("用户接管，已停止盯梢", "You took over; stopped watching")), Some(String::new()), Some(&guess),
                         );
                         continue;
                     };
@@ -5880,7 +5993,7 @@ pub async fn run(
                         step,
                         &mut targets,
                         target.as_deref(),
-                        |l| format!("读取「{l}」的当前屏幕"),
+                        |l| crate::tr!("读取「{l}」的当前屏幕", "Read the current screen of \"{l}\""),
                         "screen",
                         Vec::new(),
                         &mut feedback,
@@ -5889,7 +6002,7 @@ pub async fn run(
                     else {
                         continue;
                     };
-                    emit_interact(app, &session, "screen", step, &target_id, &label, None, Some("正在读取屏幕……".into()), None, None);
+                    emit_interact(app, &session, "screen", step, &target_id, &label, None, Some(crate::tr!("正在读取屏幕……", "Reading screen…")), None, None);
                     let payload = ScreenRequest {
                         request_id: uuid::Uuid::new_v4().simple().to_string(),
                         session_id: session.clone(),
@@ -5920,15 +6033,15 @@ pub async fn run(
                     let guess = prompt::classify(&text, alt);
                     let tl_seq = timeline::begin(
                         app, &state.agent, &target_id, TlKind::Screen, "",
-                        Some(if rendered { "xterm 屏幕" } else { "旁路缓冲" }),
+                        Some(if rendered { zh_en("xterm 屏幕", "xterm screen") } else { zh_en("旁路缓冲", "side-channel buffer") }),
                     );
                     timeline::finish(app, &state.agent, &target_id, tl_seq, &text, Some(&guess), false);
                     emit_interact(
                         app, &session, "screen", step, &target_id, &label, None,
                         Some(match (rendered, alt) {
-                            (true, true) => "已读取屏幕（全屏程序）".into(),
-                            (true, false) => "已读取屏幕".into(),
-                            (false, _) => "界面未回应，改读旁路缓冲".into(),
+                            (true, true) => crate::tr!("已读取屏幕（全屏程序）", "Screen read (full-screen program)"),
+                            (true, false) => crate::tr!("已读取屏幕", "Screen read"),
+                            (false, _) => crate::tr!("界面未回应，改读旁路缓冲", "UI didn't respond; read the side-channel buffer instead"),
                         }),
                         Some(tail_chars(text.trim_matches('\n'), SCREEN_MAX_BYTES)),
                         Some(&guess),
@@ -5953,7 +6066,7 @@ pub async fn run(
                         step,
                         &mut targets,
                         target.as_deref(),
-                        |l| format!("请你向「{l}」输入密码（原因：{reason}）"),
+                        |l| crate::tr!("请你向「{l}」输入密码（原因：{reason}）", "Enter a password into \"{l}\" (reason: {reason})"),
                         "nx_secret",
                         Vec::new(),
                         &mut feedback,
@@ -5983,7 +6096,7 @@ pub async fn run(
                         prompting = at_password();
                     }
                     if !prompting {
-                        let why = "终端当前没有停在密码 / 口令提示上".to_string();
+                        let why = crate::tr!("终端当前没有停在密码 / 口令提示上", "The terminal isn't at a password or passphrase prompt");
                         emit_step(
                             app,
                             &session,
@@ -6011,7 +6124,10 @@ pub async fn run(
                     let secret_card = host.as_ref().and_then(|h| {
                         let mut c = super::host::HumanCard::ask(
                             &request_id,
-                            &format!("请在面板的密码卡片里为「{label}」输入密码（{reason}）"),
+                            &crate::tr!(
+                                "请在面板的密码卡片里为「{label}」输入密码（{reason}）",
+                                "Enter the password for \"{label}\" in the password card on the panel ({reason})"
+                            ),
                             super::steward::now_ms(),
                         );
                         c.kind = super::host::CardKind::Secret;
@@ -6019,7 +6135,7 @@ pub async fn run(
                     });
                     emit_interact(
                         app, &session, "secret", step, &target_id, &label, Some(&reason),
-                        Some("等待用户输入密码……".into()), None, Some(&guess),
+                        Some(crate::tr!("等待用户输入密码……", "Waiting for you to enter the password…")), None, Some(&guess),
                     );
                     let _ = app.emit(
                         &format!("nx://agent/secret/{session}"),
@@ -6183,13 +6299,13 @@ pub async fn run(
                             continue;
                         }
                         None => {
-                            fail(&mut feedback, "缺少 id 或 name（先用 op=list 查看有哪些技能）");
+                            fail(&mut feedback, &crate::tr!("缺少 id 或 name（先用 op=list 查看有哪些技能）", "Missing id or name (use op=list to see the available skills)"));
                             continue;
                         }
                     };
                     // 目标必须在作用范围内：技能不是越界的捷径（模型借它碰范围外会话就等于绕过范围闸门）
                     let Ok((target_id, label)) = locate(target.as_deref(), &targets, &session) else {
-                        fail(&mut feedback, "target 不在作用范围内，没有运行；技能只能在作用范围内的会话上运行。");
+                        fail(&mut feedback, &crate::tr!("target 不在作用范围内，没有运行；技能只能在作用范围内的会话上运行。", "The target is out of scope, so the skill didn't run. Skills can only run on sessions in scope."));
                         continue;
                     };
                     if let Err(e) = skilltool::precheck_run(found, &call) {
@@ -6197,7 +6313,7 @@ pub async fn run(
                         continue;
                     }
                     if !session_alive(state, &target_id) {
-                        fail(&mut feedback, "目标会话不存在或已关闭");
+                        fail(&mut feedback, &crate::tr!("目标会话不存在或已关闭", "Target session not found or closed"));
                         continue;
                     }
                     if trace_on {
@@ -6259,7 +6375,7 @@ pub async fn run(
                                 StepPayload {
                                     target: Some(target_id.clone()),
                                     command: Some("export".into()),
-                                    reasons: Some(vec!["会话不存在，且不在作用范围内".into()]),
+                                    reasons: Some(vec![crate::tr!("会话不存在，且不在作用范围内", "Session not found and not in scope")]),
                                     ..StepPayload::new("skip", step)
                                 },
                             );
@@ -6269,7 +6385,7 @@ pub async fn run(
                             ));
                             continue;
                         }
-                        let what = format!("导出「{target_label}」的完整会话记录");
+                        let what = crate::tr!("导出「{target_label}」的完整会话记录", "Export the full session log of \"{target_label}\"");
                         if !ask_beyond_scope(
                             app,
                             runtime,
@@ -6315,7 +6431,7 @@ pub async fn run(
                 }
 
                 AgentAction::Open { kind, label, command } => {
-                    let label = label.unwrap_or_else(|| "新会话".to_string());
+                    let label = label.unwrap_or_else(|| crate::tr!("新会话", "New session"));
 
                     // 前端对 session-opened 只负责接标签页、不做任何确认，所以这里是 open 唯一的
                     // 人工关口：新会话不在任何人划的范围里，开它（尤其带命令）必须先点头。
@@ -6334,7 +6450,7 @@ pub async fn run(
                         .as_deref()
                         .map(assess)
                         .filter(|r| r.dangerous)
-                        .map(|r| r.reasons)
+                        .map(|r| shown_reasons(&r.reasons))
                         .unwrap_or_default();
                     if !ask_beyond_scope(
                         app,
@@ -6355,7 +6471,7 @@ pub async fn run(
                         app,
                         &session,
                         StepPayload {
-                            text: Some(format!("正在打开新会话「{label}」……")),
+                            text: Some(crate::tr!("正在打开新会话「{label}」……", "Opening new session \"{label}\"…")),
                             ..StepPayload::new("open", step)
                         },
                     );
@@ -6378,8 +6494,9 @@ pub async fn run(
                                 StepPayload {
                                     target: Some(outcome.session_id.clone()),
                                     target_label: Some(outcome.label.clone()),
-                                    text: Some(format!(
+                                    text: Some(crate::tr!(
                                         "已打开「{}」，标签页已就位（id：{}）",
+                                        "Opened \"{}\"; the tab is ready (id: {})",
                                         outcome.label, outcome.session_id
                                     )),
                                     ..StepPayload::new("open", step)
@@ -6396,7 +6513,7 @@ pub async fn run(
                                 app,
                                 &session,
                                 StepPayload {
-                                    text: Some(format!("打开新会话失败：{e}")),
+                                    text: Some(crate::tr!("打开新会话失败：{e}", "Failed to open new session: {e}")),
                                     ..StepPayload::new("note", step)
                                 },
                             );
@@ -6439,7 +6556,10 @@ pub async fn run(
                 app,
                 &session,
                 StepPayload {
-                    text: Some("你接管了终端，等待交还超时，这一步没有执行。".into()),
+                    text: Some(crate::tr!(
+                        "你接管了终端，等待交还超时，这一步没有执行。",
+                        "You took over the terminal and it wasn't handed back in time, so this step didn't run."
+                    )),
                     ..StepPayload::new("note", step)
                 },
             );
@@ -6514,7 +6634,9 @@ const HOSTED_NO_ACTION_NUDGE: &str = "（托管中没有人在看纯文本回复
     目标达成就调用 nx_complete；只有用户本人才能回答的问题才用 nx_ask_user。）";
 
 /// 模型回了一段空话（没有动作也没有文字）时卡片上的问题。
-const HOSTED_EMPTY_REPLY_QUESTION: &str = "（模型没有给出任何内容）要我怎么继续？";
+fn hosted_empty_reply_question() -> &'static str {
+    zh_en("（模型没有给出任何内容）要我怎么继续？", "(The model returned nothing.) How should I continue?")
+}
 
 /// 无动作回复被当成提问、拿到答复之后提醒模型的话。
 const HOSTED_NO_ACTION_FEEDBACK: &str = "（你上一条回复没有任何动作，已作为问题交给用户，上面是他的答复。\
@@ -6544,7 +6666,7 @@ async fn park_on_no_action(
     messages: &mut Vec<ChatMessage>,
     feedback: &mut String,
 ) -> bool {
-    let q = if text.trim().is_empty() { HOSTED_EMPTY_REPLY_QUESTION } else { text };
+    let q = if text.trim().is_empty() { hosted_empty_reply_question() } else { text };
     if !host_ask(h, hosted_card(q, Vec::new(), None), messages).await {
         return false;
     }
@@ -6619,6 +6741,10 @@ fn looks_failed(t: &str) -> bool {
     ["没有执行", "未获执行", "没有发送", "未发送", "没有写入", "失败", "被拦下", "不在作用范围", "不可用"]
         .iter()
         .any(|k| t.contains(k))
+        // 界面是英文时，部分回执（同时显示给人看的那些）是英文
+        || ["didn't run", "failed", "Failed", "not in scope", "unavailable", "was cancelled", "timed out"]
+            .iter()
+            .any(|k| t.contains(k))
 }
 
 /// 回执挂到对的地方：上一条 assistant 带调用 → 紧随其后的 user（问人的答复可能已经先建好了它）；
@@ -6742,7 +6868,7 @@ pub struct HostNotice {
 fn hosted_approval_card(text: &str, reasons: &[String]) -> super::host::HumanCard {
     let mut card = super::host::HumanCard::ask(
         &uuid::Uuid::new_v4().simple().to_string(),
-        &format!("批准执行：{text}"),
+        &crate::tr!("批准执行：{text}", "Approve: {text}"),
         super::steward::now_ms(),
     );
     card.kind = super::host::CardKind::Approve;
@@ -6771,21 +6897,23 @@ pub(super) fn exec_blocker(sit: &super::situation::Situation) -> Option<String> 
         return None;
     }
     let what = match sit.kind {
-        K::Question => Some("一个提问（如 [Y/n]）"),
-        K::Permission => Some("一张授权确认"),
-        K::Menu => Some("一个选择菜单"),
-        K::Password => Some("密码 / 口令提示"),
-        K::Pager => Some("分页器"),
-        K::AwaitingInput => Some("一个等输入的程序（REPL / 输入框）"),
+        K::Question => Some(zh_en("一个提问（如 [Y/n]）", "a question (like [Y/n])")),
+        K::Permission => Some(zh_en("一张授权确认", "a permission prompt")),
+        K::Menu => Some(zh_en("一个选择菜单", "a selection menu")),
+        K::Password => Some(zh_en("密码 / 口令提示", "a password / passphrase prompt")),
+        K::Pager => Some(zh_en("分页器", "a pager")),
+        K::AwaitingInput => Some(zh_en("一个等输入的程序（REPL / 输入框）", "a program waiting for input (REPL / input box)")),
         _ => None,
     };
     if let Some(w) = what {
-        return Some(format!("终端此刻停在{w}上，不是 shell 提示符"));
+        return Some(crate::tr!("终端此刻停在{w}上，不是 shell 提示符", "The terminal is at {w}, not a shell prompt"));
     }
     match sit.program {
-        Program::ClaudeCode | Program::Vim | Program::Pager | Program::Tui if sit.kind != K::Idle => {
-            Some(format!("终端前台是 {} 程序，不是 shell 提示符", sit.program.as_str()))
-        }
+        Program::ClaudeCode | Program::Vim | Program::Pager | Program::Tui if sit.kind != K::Idle => Some(crate::tr!(
+            "终端前台是 {} 程序，不是 shell 提示符",
+            "The terminal's foreground is a {} program, not a shell prompt",
+            sit.program.as_str()
+        )),
         _ => None,
     }
 }
@@ -6817,7 +6945,10 @@ fn not_at_prompt_feedback(command: &str, label: &str, why: &str) -> String {
 pub(super) const CWD_NOTE: &str = "命令会在批准之后、shell 当时所在的目录里执行（等待期间若有人切换了目录，以那时为准）";
 
 fn with_cwd_note(mut reasons: Vec<String>) -> Vec<String> {
-    reasons.push(CWD_NOTE.to_string());
+    reasons.push(crate::tr!(
+        "命令会在批准之后、shell 当时所在的目录里执行（等待期间若有人切换了目录，以那时为准）",
+        "The command runs after approval, in whatever directory the shell is in at that moment (if someone changes directory while waiting, that one is used)"
+    ));
     reasons
 }
 
@@ -6974,7 +7105,8 @@ fn with_path(call: super::files_tool::FileCall, path: &str) -> super::files_tool
 }
 
 fn keys_recheck(judged: &super::situation::Situation, now: &super::situation::Situation) -> Option<String> {
-    super::situation::materially_changed(judged, now).map(|why| format!("等待期间屏幕局面变了：{why}"))
+    super::situation::materially_changed(judged, now)
+        .map(|why| crate::tr!("等待期间屏幕局面变了：{why}", "The screen changed while waiting: {why}"))
 }
 
 /// 反射代答的结局。
@@ -7091,7 +7223,11 @@ async fn watchdog_react(
 /// 看门狗 L2 卡片：警报 + 最近的决策记录，等人决定怎么继续。
 fn watchdog_card(alarm: &super::host::watchdog::Alarm, records: Vec<String>) -> super::host::HumanCard {
     let mut card = hosted_card(
-        &format!("{}\n提示过一次仍未改善，先停下来等你看一眼：要它怎么继续？", alarm.hint()),
+        &crate::tr!(
+            "{}\n提示过一次仍未改善，先停下来等你看一眼：要它怎么继续？",
+            "{}\nNo improvement after one warning, so pausing for you to take a look: how should it continue?",
+            alarm.hint()
+        ),
         Vec::new(),
         None,
     );
@@ -7109,7 +7245,12 @@ fn recent_decisions(state: &AppState, contract_id: &str, n: usize) -> Vec<String
         .filter_map(|(seq, outcome, raw)| {
             let r: super::decision::DecisionRecord = serde_json::from_str(&raw).ok()?;
             (r.contract_id == contract_id).then(|| {
-                format!("#{seq} {} 「{}」→ {outcome}{}", r.chosen.kind, r.chosen.text, if r.llm_used { "" } else { "（反射）" })
+                format!(
+                    "#{seq} {} 「{}」→ {outcome}{}",
+                    r.chosen.kind,
+                    r.chosen.text,
+                    if r.llm_used { "" } else { zh_en("（反射）", " (reflex)") }
+                )
             })
         })
         .take(n)
@@ -7132,7 +7273,7 @@ struct ActProber<'a> {
 
 impl super::host::verify::Prober for ActProber<'_> {
     fn approve(&mut self, cmd: &str, reasons: &[String]) -> impl std::future::Future<Output = bool> + Send {
-        let card = hosted_approval_card(&format!("（完成判据）{cmd}"), reasons);
+        let card = hosted_approval_card(&crate::tr!("（完成判据）{cmd}", "(completion check) {cmd}"), reasons);
         async move { self.host.approve(card).await }
     }
 
@@ -7153,20 +7294,22 @@ impl super::host::verify::Prober for ActProber<'_> {
             // 2) 没有旁路（堡垒机兼容模式 / Windows 本地）：只有终端正停在空闲的 shell 提示符上才敢敲
             let sit = situation_now(self.app, self.state, self.console, false);
             if let Some(why) = exec_blocker(&sit) {
-                return Err(format!(
+                return Err(crate::tr!(
                     "{}终端前台是{why}，又没有旁路执行通道；没有往终端里敲这条检查",
+                    "{}{why}, and there's no side channel, so this check wasn't typed into the terminal",
                     super::host::verify::UNVERIFIABLE
                 ));
             }
             match gate_drive(self.app, self.runtime, self.run_key, self.console, self.cancel).await {
                 control::PauseWait::Ready => {}
-                _ => return Err("已取消".to_string()),
+                _ => return Err(crate::tr!("已取消", "Cancelled")),
             }
-            let o = run_one(self.state, self.app, self.console, &cmd, self.step, "判据核验", self.console, Some(self.cancel), true)
+            let label = crate::tr!("判据核验", "Completion check");
+            let o = run_one(self.state, self.app, self.console, &cmd, self.step, &label, self.console, Some(self.cancel), true)
                 .await?;
             // 执行通道自己的上限到了：命令还没结束，按超时判不通过
             if o.reason == ExecEnd::Timeout {
-                return Err(format!("超时（{}）", tail_chars(o.output.trim(), 300)));
+                return Err(crate::tr!("超时（{}）", "Timed out ({})", tail_chars(o.output.trim(), 300)));
             }
             Ok(o.output)
         }
@@ -7187,7 +7330,7 @@ fn sh_quote(s: &str) -> String {
 /// 不经终端执行一条只读检查命令，返回合并后的输出（命令里已带 `; echo __NX_CHECK_RC=$?`）。
 /// SSH：同一连接上的 exec 旁路通道；本地（Unix）：`sh -c` 子进程。工作目录 = 终端当前目录。
 async fn oob_exec(state: &AppState, console: &str, cmd: &str, cwd: Option<&str>) -> Result<String, OobErr> {
-    oob_exec_with(state, console, cmd, cwd, 125, "判据核验超时", false).await
+    oob_exec_with(state, console, cmd, cwd, 125, zh_en("判据核验超时", "Completion check timed out"), false).await
 }
 
 /// SSH 旁路通道上的 (exec 命令, 标准输入)：脚本 = 先 cd 到终端目录（或说明不知道目录），再跑 `cmd`。
@@ -7259,7 +7402,7 @@ async fn local_check_with(cmd: &str, cwd: Option<&str>, secs: u64, timeout_msg: 
         .output();
     match tokio::time::timeout(std::time::Duration::from_secs(secs), child).await {
         Err(_) => Err(OobErr::Failed(timeout_msg.to_string())),
-        Ok(Err(e)) => Err(OobErr::Failed(format!("起子进程失败：{e}"))),
+        Ok(Err(e)) => Err(OobErr::Failed(crate::tr!("起子进程失败：{e}", "Failed to start subprocess: {e}"))),
         Ok(Ok(o)) => {
             let mut out = String::from_utf8_lossy(&o.stdout).into_owned();
             out.push_str(&String::from_utf8_lossy(&o.stderr));
@@ -7383,16 +7526,24 @@ fn run_feedback(command: &str, label: &str, cwd: Option<&str>, out: &str, rc: Op
 fn run_failure_feedback(command: &str, label: &str, e: &RunErr, secs: u64) -> String {
     let cmd = head_tail_chars(command.trim(), 300);
     match e {
-        RunErr::Unavailable => format!(
+        RunErr::Unavailable => crate::tr!(
             "`{cmd}` 没有执行：会话「{label}」没有可用的旁路执行通道（SSH 兼容模式 / 堡垒机不允许并行通道 / 本平台不支持）。\
-             请改用 nx_exec 在终端里执行；多行内容先用 nx_write 写成脚本文件，再 nx_exec `sh 脚本路径`。\n"
+             请改用 nx_exec 在终端里执行；多行内容先用 nx_write 写成脚本文件，再 nx_exec `sh 脚本路径`。\n",
+            "`{cmd}` didn't run: session \"{label}\" has no side channel available (SSH compatibility mode / the bastion host \
+             doesn't allow parallel channels / not supported on this platform). Use nx_exec in the terminal instead; for \
+             multi-line content, write a script with nx_write first, then nx_exec `sh <script path>`.\n"
         ),
-        RunErr::Cancelled => format!("`{cmd}` 已被用户取消，不要重试。\n"),
-        RunErr::Timeout => format!(
+        RunErr::Cancelled => crate::tr!("`{cmd}` 已被用户取消，不要重试。\n", "`{cmd}` was cancelled by the user. Don't retry it.\n"),
+        RunErr::Timeout => crate::tr!(
             "`{cmd}` 旁路执行超时（{secs} 秒），没有拿到结果；命令可能仍在运行。\
-             要跑很久的任务请用 nx_exec 在终端里启动、再 nx_watch 盯住，或给更大的 timeoutSecs（上限 {RUN_MAX_SECS}）。\n"
+             要跑很久的任务请用 nx_exec 在终端里启动、再 nx_watch 盯住，或给更大的 timeoutSecs（上限 {RUN_MAX_SECS}）。\n",
+            "`{cmd}` timed out on the side channel ({secs} s) with no result; it may still be running. \
+             For long tasks, start them with nx_exec in the terminal and nx_watch them, or pass a larger timeoutSecs (max {RUN_MAX_SECS}).\n"
         ),
-        RunErr::Failed(why) => format!("`{cmd}` 旁路执行失败：{why}。可以重试一次；连续失败就改用 nx_exec。\n"),
+        RunErr::Failed(why) => crate::tr!(
+            "`{cmd}` 旁路执行失败：{why}。可以重试一次；连续失败就改用 nx_exec。\n",
+            "`{cmd}` failed on the side channel: {why}. You can retry once; if it keeps failing, use nx_exec.\n"
+        ),
     }
 }
 
@@ -7465,8 +7616,9 @@ async fn try_reflex(
         rec.outcome = "no_receipt".to_string();
         let seq = super::host::record::persist(app, &rec);
         brain.remember_decision(seq, &rec);
-        return Some(Reflexed::Unanswered(format!(
+        return Some(Reflexed::Unanswered(crate::tr!(
             "[reflex] 按剧本 [P:{playbook_id}] 发了「{keys}」，但提示仍在（{}），请你看一下现场再决定",
+            "[reflex] Sent \"{keys}\" per playbook [P:{playbook_id}], but the prompt is still there ({}); take a look before deciding",
             sit.kind.as_str()
         )));
     }
@@ -7478,14 +7630,18 @@ async fn try_reflex(
             contract_id: h.contract_id().to_string(),
             seq,
             kind: "keys",
-            text: format!("自动代答（按剧本 [P:{playbook_id}]）：回答了「{keys}」"),
+            text: crate::tr!(
+                "自动代答（按剧本 [P:{playbook_id}]）：回答了「{keys}」",
+                "Auto-answered (playbook [P:{playbook_id}]): replied \"{keys}\""
+            ),
             undo_window_ms: ctx.authority.undo_window_ms,
             ts_ms: super::steward::now_ms(),
         };
         let _ = app.emit(&format!("nx://host/{}/notify", h.contract_id()), notice);
     }
-    Some(Reflexed::Answered(format!(
+    Some(Reflexed::Answered(crate::tr!(
         "[reflex] 按剧本 [P:{playbook_id}] 回答了「{keys}」（局面：{}），没有叫醒模型；继续盯着",
+        "[reflex] Replied \"{keys}\" per playbook [P:{playbook_id}] (state: {}) without waking the model; still watching",
         sit.kind.as_str()
     )))
 }
@@ -7647,7 +7803,12 @@ async fn hosted_authorize(
             let reasons: Vec<String> = reasons.iter().map(|r| super::redact::redact(r)).collect();
             let reasons = if matches!(action, AgentAction::Exec { .. } | AgentAction::Run { .. }) { with_cwd_note(reasons) } else { reasons };
             let ok = h.approve(hosted_approval_card(text, &reasons)).await;
-            (!ok).then(|| "用户没有批准，没有写入。换一个做法，或用 nx_ask_user 问清楚".to_string())
+            (!ok).then(|| {
+                crate::tr!(
+                    "用户没有批准，没有写入。换一个做法，或用 nx_ask_user 问清楚",
+                    "Not approved, nothing was written. Try another approach, or ask with nx_ask_user"
+                )
+            })
         }
         Gate::Allow | Gate::Notify => None,
     };
@@ -7677,7 +7838,10 @@ fn hosted_applied(app: &AppHandle, h: &HostShared, session: &str, step: usize, w
         let _ = app.emit(&format!("nx://host/{}/notify", h.contract_id()), notice);
         let shown = match &w.sit {
             Some(s) if s.kind == super::situation::SituationKind::Password && w.kind == "keys" => {
-                "发送按键（屏幕被认成密码提示，按键内容不显示）".to_string()
+                crate::tr!(
+                    "发送按键（屏幕被认成密码提示，按键内容不显示）",
+                    "Send keys (screen recognised as a password prompt; keys hidden)"
+                )
             }
             _ => super::redact::redact(&w.text),
         };
@@ -7833,11 +7997,11 @@ fn apply_grant(mut b: budget::RunBudget, g: super::host::BudgetGrant) -> budget:
 fn ask_text(question: &str, options: &[super::host::CardOption], recommendation: Option<&str>) -> String {
     let mut s = question.trim().to_string();
     if !options.is_empty() {
-        s.push_str("\n\n可选：");
+        s.push_str(zh_en("\n\n可选：", "\n\nOptions: "));
         s.push_str(&options.iter().map(|o| o.label.trim()).collect::<Vec<_>>().join(" / "));
     }
     if let Some(r) = recommendation {
-        s.push_str(&format!("\n建议：{}", r.trim()));
+        s.push_str(&crate::tr!("\n建议：{}", "\nSuggested: {}", r.trim()));
     }
     s
 }
@@ -7975,7 +8139,7 @@ mod tests {
             park_on_no_action(&h2, "  ", &mut msgs, &mut fb).await
         });
         settle().await;
-        assert!(matches!(h.phase(), HostPhase::WaitingHuman { ref card } if card.question == HOSTED_EMPTY_REPLY_QUESTION));
+        assert!(matches!(h.phase(), HostPhase::WaitingHuman { ref card } if card.question == hosted_empty_reply_question()));
         h.send(HostEvent::Stop);
         assert!(!task.await.unwrap());
         assert_eq!(h.phase(), HostPhase::Stopped);

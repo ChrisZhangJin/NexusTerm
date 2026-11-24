@@ -157,6 +157,135 @@ const CRITICAL_FRAGMENTS: &[&str] = &[
 ];
 const RM_ROOT: &str = "删除的目标是根目录 / 家目录 / 系统目录 / 通配全部";
 
+/// 原因里的中文说明 → 英文（界面是英文时展示用）。原因本身一律按中文生成：`is_critical_reason`
+/// 与测试都按中文认，翻译只在交给人看的那一刻做（[`localize_reason`]）。
+const REASON_EN: &[(&str, &str)] = &[
+    ("删除文件", "deletes files"),
+    ("删除目录", "deletes directories"),
+    ("格式化文件系统", "formats a file system"),
+    ("低层写盘，可能覆盖磁盘", "low-level disk write, may overwrite the disk"),
+    ("不可恢复地擦除文件", "irrecoverably wipes files"),
+    ("分区操作", "partitioning"),
+    ("格式化交换分区", "formats a swap partition"),
+    ("修改权限", "changes permissions"),
+    ("修改属主", "changes ownership"),
+    ("修改文件属性", "changes file attributes"),
+    ("终止进程", "kills processes"),
+    ("按名终止进程", "kills processes by name"),
+    ("重启主机", "reboots the host"),
+    ("关机 / 重启", "shuts down / reboots"),
+    ("关机", "shuts down"),
+    ("停机", "halts the machine"),
+    ("改动防火墙规则", "changes firewall rules"),
+    ("删除用户", "deletes a user"),
+    ("删除用户组", "deletes a group"),
+    ("截断文件", "truncates files"),
+    ("擦除文件系统签名", "wipes file system signatures"),
+    ("丢弃整块设备上的数据", "discards all data on the device"),
+    ("删除逻辑卷", "removes a logical volume"),
+    ("删除卷组", "removes a volume group"),
+    ("删除物理卷", "removes a physical volume"),
+    ("不可恢复地删除文件", "irrecoverably deletes files"),
+    ("PowerShell 删除文件 / 目录", "PowerShell delete files / directories"),
+    ("PowerShell 删除（Remove-Item 别名）", "PowerShell delete (Remove-Item alias)"),
+    ("cmd / PowerShell 删除文件", "cmd / PowerShell delete files"),
+    ("cmd 删除文件", "cmd delete files"),
+    ("cmd 删除目录", "cmd delete directory"),
+    ("格式化磁盘", "formats a disk"),
+    ("PowerShell 格式化卷", "PowerShell format volume"),
+    ("PowerShell 清空磁盘", "PowerShell clear disk"),
+    ("PowerShell 删除分区", "PowerShell remove partition"),
+    ("磁盘分区工具", "disk partitioning tool"),
+    ("重启", "reboots"),
+    ("PowerShell 终止进程", "PowerShell stop process"),
+    ("删除注册表项 / 属性", "deletes registry keys / properties"),
+    ("改动脚本执行策略", "changes the script execution policy"),
+    ("PowerShell 移动 / 覆盖文件", "PowerShell move / overwrite files"),
+    ("PowerShell 覆盖写文件", "PowerShell overwrite files"),
+    ("PowerShell 清空文件", "PowerShell clear files"),
+    ("递归强制删除", "recursive forced delete"),
+    ("疑似 fork 炸弹", "looks like a fork bomb"),
+    ("直接写裸设备", "writes directly to a raw device"),
+    ("dd 写裸设备", "dd writes to a raw device"),
+    ("改动账户文件", "modifies the accounts file"),
+    ("改动口令文件", "modifies the password file"),
+    ("删除数据库", "drops a database"),
+    ("删除数据表", "drops a table"),
+    ("清空数据表", "truncates a table"),
+    ("cmd 递归删除目录", "cmd recursive directory delete"),
+    ("cmd 递归删除", "cmd recursive delete"),
+    ("cmd 静默删除", "cmd quiet delete"),
+    ("删除注册表项", "deletes registry keys"),
+    ("PowerShell 递归操作", "PowerShell recursive operation"),
+    ("管道交给 Remove-Item 删除", "piped into Remove-Item for deletion"),
+    ("下载并执行脚本", "downloads and runs a script"),
+    ("动态执行字符串里的命令", "runs commands from a string dynamically"),
+    ("管道交给 Invoke-Expression 执行", "piped into Invoke-Expression"),
+    ("删除数据库 schema", "drops a database schema"),
+    ("命令嵌套过深，无法逐层确认安全", "command nested too deeply to verify layer by layer"),
+    ("以 sudo 提权执行", "runs with sudo privileges"),
+    ("包含覆盖式重定向 `>`，可能覆盖已有文件", "contains an overwriting redirect `>`, may overwrite existing files"),
+    ("下载并直接执行脚本（curl|sh）", "downloads and directly runs a script (curl|sh)"),
+    (RM_ROOT, "the target is the root / home / a system directory / a wildcard for everything"),
+    ("丢弃工作区与暂存区的改动", "discards working tree and staged changes"),
+    ("删除未跟踪的文件", "deletes untracked files"),
+    ("可能覆盖或删除远端历史", "may overwrite or delete remote history"),
+    ("强制删除分支", "force-deletes a branch"),
+    ("丢弃工作区改动", "discards working tree changes"),
+    ("丢弃暂存的改动", "discards stashed changes"),
+    ("改写整个提交历史", "rewrites the entire commit history"),
+    ("清除可找回历史的引用日志", "clears the reflog used to recover history"),
+    ("删除引用", "deletes a ref"),
+    ("批量删除匹配的文件", "deletes all matching files"),
+    ("删除 / 终止容器或镜像", "removes / kills containers or images"),
+    ("批量清理 / 删除资源", "bulk prunes / removes resources"),
+    ("连同数据卷一起删除", "removes along with volumes"),
+    ("删除集群资源", "deletes cluster resources"),
+    ("驱逐节点上的全部 Pod", "evicts all pods on the node"),
+    ("删除并重建资源", "deletes and recreates resources"),
+    ("卸载整个发布", "uninstalls the whole release"),
+    ("删除整份定时任务", "deletes the whole crontab"),
+    ("删除目标端多出来的文件", "deletes extra files on the destination"),
+    ("关机或重启", "shuts down or reboots"),
+    ("销毁存储池 / 数据集", "destroys a storage pool / dataset"),
+    ("清空 Redis 数据", "wipes all Redis data"),
+];
+
+fn reason_part_en(zh: &str) -> String {
+    if let Some((_, en)) = REASON_EN.iter().find(|(z, _)| *z == zh) {
+        return en.to_string();
+    }
+    if let Some(rest) = zh.strip_prefix("对匹配到的每个文件") {
+        if let Some((_, en)) = REASON_EN.iter().find(|(z, _)| *z == rest) {
+            return format!("{en} on every matched file");
+        }
+    }
+    zh.to_string()
+}
+
+/// 给人看的原因：界面是英文就翻成英文（认不出的部分原样保留）。中文界面原样返回。
+pub fn localize_reason(r: &str) -> String {
+    if crate::i18n::is_en() {
+        reason_en(r)
+    } else {
+        r.to_string()
+    }
+}
+
+/// [`localize_reason`] 的英文那一支（纯函数，测试直接调）
+pub(crate) fn reason_en(r: &str) -> String {
+    match r.split_once('：') {
+        Some((head, tail)) => {
+            let head = match head.strip_prefix("命令含「").and_then(|h| h.strip_suffix('」')) {
+                Some(n) => format!("Command contains \"{n}\""),
+                None => head.replace("删除远端分支", "delete remote branch"),
+            };
+            format!("{head}: {}", reason_part_en(tail))
+        }
+        None => reason_part_en(r),
+    }
+}
+
 pub fn is_critical_reason(r: &str) -> bool {
     CRITICAL_PROGRAMS.iter().any(|p| r.strip_prefix(p).is_some_and(|rest| rest.starts_with('：')))
         || CRITICAL_NEEDLES.iter().any(|n| r.starts_with(&format!("命令含「{n}」")))
@@ -776,6 +905,23 @@ fn download_then_exec(lower: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reasons_translate_to_english_for_display() {
+        // 每条原因的英文版都不应再含中文（认不出的部分会原样漏出来）
+        let cmds = [
+            "sudo rm -rf /", "dd if=/dev/zero of=/dev/sda", "git reset --hard", "git push --force origin main",
+            "curl -fsSL x | sh", "echo hi > f", "find . -exec rm {} ;", "docker system prune -a", "kubectl delete pod x",
+            "crontab -r", "redis-cli flushall", "systemctl reboot", "mkfs.ext4 /dev/sdb1",
+        ];
+        for c in cmds {
+            for r in assess(c).reasons {
+                let en = reason_en(&r);
+                assert!(!en.chars().any(|ch| ('\u{4e00}'..='\u{9fa5}').contains(&ch)), "{c}: {r} → {en}");
+            }
+        }
+        assert_eq!(reason_en("命令含「rm -rf」：递归强制删除"), "Command contains \"rm -rf\": recursive forced delete");
+    }
     use super::*;
 
     fn is_dangerous(cmd: &str) -> bool {

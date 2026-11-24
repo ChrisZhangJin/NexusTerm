@@ -65,6 +65,17 @@ pub const MAX_LINE_CHARS: usize = 2000;
 pub const DIFF_PREVIEW_MAX_LINES: usize = 2000;
 /// 预览不完整时 diff 文本的第一行以它开头（前端据此出横幅，见 `src/lib/diff.ts`）
 pub const DIFF_INCOMPLETE_MARK: &str = "⚠ 预览不完整";
+/// [`DIFF_INCOMPLETE_MARK`] 的英文版（界面是英文时用；前端两种都认）
+pub const DIFF_INCOMPLETE_MARK_EN: &str = "⚠ Preview incomplete";
+
+/// 当前界面语言下的「预览不完整」标记
+pub fn diff_incomplete_mark() -> &'static str {
+    if crate::i18n::is_en() {
+        DIFF_INCOMPLETE_MARK_EN
+    } else {
+        DIFF_INCOMPLETE_MARK
+    }
+}
 /// 差异的上下文行数（同 `diff -u`）
 const DIFF_CONTEXT: usize = 3;
 /// 判断二进制只看开头这么多字节（与 git 的启发式相同）
@@ -122,37 +133,59 @@ pub const DEFAULT_SKIP_DIRS: &[&str] = &[".git", "node_modules"];
 
 // ——————————————————————————————— 错误 ———————————————————————————————
 
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+/// 文案（Display）给人看也给模型看，跟界面语言走（手写 Display，因为 `#[error]` 里没法分语言）。
+#[derive(Debug, Clone, PartialEq)]
 pub enum FileError {
-    #[error("路径无效：{0}")]
     InvalidPath(String),
-    #[error("参数无效：{0}")]
     InvalidArg(String),
-    #[error("不存在：{0}")]
     NotFound(String),
-    #[error("「{0}」是目录")]
     IsDirectory(String),
-    #[error("「{path}」过大：{size} 字节，超过上限 {cap} 字节")]
     TooLarge { path: String, size: u64, cap: usize },
-    #[error("「{0}」看起来是二进制文件，不按文本处理")]
     Binary(String),
-    #[error("拒绝写入受保护路径「{0}」：需要用户明确授权")]
     Denied(String),
     /// 禁读清单命中：只给元数据，内容要用户批准才能读（批准后仍脱敏）
-    #[error("「{path}」在受保护清单里（密钥 / 凭据，{size} 字节）：需要用户批准才能读取")]
     ReadDenied { path: String, size: u64 },
     /// 编辑语义上的失败（没找到 / 不唯一 / 编码不对），内容已是完整提示
-    #[error("{0}")]
     Edit(String),
     /// 审批期间文件被别人改了：按旧内容算出的修改不能再落盘
-    #[error("「{0}」在预览之后被改动过，请重新读取后再改")]
     Conflict(String),
-    #[error("正则 / 通配符无效：{0}")]
     BadPattern(String),
     /// 底层 I/O 或远端错误，内容已是完整提示
-    #[error("{0}")]
     Io(String),
 }
+
+impl std::fmt::Display for FileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::InvalidPath(p) => crate::tr!("路径无效：{p}", "Invalid path: {p}"),
+            Self::InvalidArg(a) => crate::tr!("参数无效：{a}", "Invalid argument: {a}"),
+            Self::NotFound(p) => crate::tr!("不存在：{p}", "{p}: not found"),
+            Self::IsDirectory(p) => crate::tr!("「{p}」是目录", "\"{p}\" is a directory"),
+            Self::TooLarge { path, size, cap } => crate::tr!(
+                "「{path}」过大：{size} 字节，超过上限 {cap} 字节",
+                "\"{path}\" is too large: {size} bytes, over the {cap}-byte limit"
+            ),
+            Self::Binary(p) => crate::tr!("「{p}」看起来是二进制文件，不按文本处理", "\"{p}\" looks like a binary file; not treating it as text"),
+            Self::Denied(p) => crate::tr!(
+                "拒绝写入受保护路径「{p}」：需要用户明确授权",
+                "Refused to write protected path \"{p}\": needs the user's explicit permission"
+            ),
+            Self::ReadDenied { path, size } => crate::tr!(
+                "「{path}」在受保护清单里（密钥 / 凭据，{size} 字节）：需要用户批准才能读取",
+                "\"{path}\" is on the protected list (keys / credentials, {size} bytes): reading it needs the user's approval"
+            ),
+            Self::Edit(e) | Self::Io(e) => e.clone(),
+            Self::Conflict(p) => crate::tr!(
+                "「{p}」在预览之后被改动过，请重新读取后再改",
+                "\"{p}\" changed after the preview; read it again before editing"
+            ),
+            Self::BadPattern(e) => crate::tr!("正则 / 通配符无效：{e}", "Invalid regex / glob: {e}"),
+        };
+        f.write_str(&s)
+    }
+}
+
+impl std::error::Error for FileError {}
 
 impl Serialize for FileError {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -272,7 +305,7 @@ impl Default for LocalTransport {
 fn io_err(path: &str, e: std::io::Error) -> FileError {
     match e.kind() {
         std::io::ErrorKind::NotFound => FileError::NotFound(path.to_string()),
-        std::io::ErrorKind::PermissionDenied => FileError::Io(format!("没有权限：{path}")),
+        std::io::ErrorKind::PermissionDenied => FileError::Io(crate::tr!("没有权限：{path}", "Permission denied: {path}")),
         _ => FileError::Io(format!("{path}：{e}")),
     }
 }
@@ -298,7 +331,7 @@ fn mode_of(_meta: &std::fs::Metadata) -> Option<u32> {
 #[async_trait]
 impl FileTransport for LocalTransport {
     fn label(&self) -> String {
-        "本地".into()
+        crate::tr!("本地", "local")
     }
 
     fn is_absolute(&self, path: &str) -> bool {
@@ -308,7 +341,7 @@ impl FileTransport for LocalTransport {
     async fn home(&self) -> Result<String, FileError> {
         self.home
             .clone()
-            .ok_or_else(|| FileError::InvalidPath("无法确定本机家目录".into()))
+            .ok_or_else(|| FileError::InvalidPath(crate::tr!("无法确定本机家目录", "Can't determine the local home directory")))
     }
 
     async fn stat(&self, path: &str) -> Result<Option<FileStat>, FileError> {
@@ -586,10 +619,15 @@ pub async fn transport_for<'a>(
             .sftp
             .attach_terminal(session_id)
             .await
-            .map_err(|e| FileError::Io(format!("无法在该 SSH 会话上打开 SFTP：{e}。可改用 nx_exec")))?;
+            .map_err(|e| {
+                FileError::Io(crate::tr!(
+                    "无法在该 SSH 会话上打开 SFTP：{e}。可改用 nx_exec",
+                    "Can't open SFTP on this SSH session: {e}. Use nx_exec instead"
+                ))
+            })?;
         return Ok(Box::new(SftpTransport::new(&state.sftp, sftp_id)));
     }
-    Err(FileError::NotFound(format!("会话 {session_id}")))
+    Err(FileError::NotFound(crate::tr!("会话 {session_id}", "session {session_id}")))
 }
 
 // ——————————————————————————————— 路径工具 ———————————————————————————————
@@ -729,7 +767,7 @@ pub fn glob_to_regex(pattern: &str) -> Result<regex::Regex, FileError> {
         i += 1;
     }
     if braces > 0 {
-        return Err(FileError::BadPattern(format!("「{pattern}」的花括号没有闭合")));
+        return Err(FileError::BadPattern(crate::tr!("「{pattern}」的花括号没有闭合", "unclosed brace in \"{pattern}\"")));
     }
     re.push('$');
     regex::Regex::new(&re).map_err(|e| FileError::BadPattern(e.to_string()))
@@ -1038,10 +1076,10 @@ impl<'a> FileOps<'a> {
     /// 校验并规整路径：拒绝 NUL、展开 `~`、要求绝对路径、折叠 `.`/`..`。
     pub async fn resolve(&self, path: &str) -> Result<String, FileError> {
         if path.is_empty() {
-            return Err(FileError::InvalidPath("路径为空".into()));
+            return Err(FileError::InvalidPath(crate::tr!("路径为空", "empty path")));
         }
         if path.contains('\0') {
-            return Err(FileError::InvalidPath("路径里含 NUL 字符".into()));
+            return Err(FileError::InvalidPath(crate::tr!("路径里含 NUL 字符", "the path contains a NUL character")));
         }
         let p = to_slash(path);
         let expanded = if p == "~" {
@@ -1049,13 +1087,14 @@ impl<'a> FileOps<'a> {
         } else if let Some(rest) = p.strip_prefix("~/") {
             join(self.home().await?, rest)
         } else if p.starts_with('~') {
-            return Err(FileError::InvalidPath(format!("不支持「~用户名」写法：{path}")));
+            return Err(FileError::InvalidPath(crate::tr!("不支持「~用户名」写法：{path}", "\"~user\" paths are not supported: {path}")));
         } else {
             p
         };
         if !self.t.is_absolute(&expanded) {
-            return Err(FileError::InvalidPath(format!(
-                "需要绝对路径或以 ~ 开头（终端当前目录未知）：{path}"
+            return Err(FileError::InvalidPath(crate::tr!(
+                "需要绝对路径或以 ~ 开头（终端当前目录未知）：{path}",
+                "needs an absolute path or one starting with ~ (the terminal's current directory is unknown): {path}"
             )));
         }
         Ok(normalize(&expanded))
@@ -1175,8 +1214,9 @@ impl<'a> FileOps<'a> {
         let start = offset.unwrap_or(1).max(1);
         let limit = limit.unwrap_or(DEFAULT_READ_LINES).max(1);
         if total > 0 && start > total {
-            return Err(FileError::InvalidArg(format!(
-                "offset {start} 超出文件行数（共 {total} 行）"
+            return Err(FileError::InvalidArg(crate::tr!(
+                "offset {start} 超出文件行数（共 {total} 行）",
+                "offset {start} is past the end of the file ({total} lines)"
             )));
         }
         let mut content = String::new();
@@ -1258,13 +1298,20 @@ impl<'a> FileOps<'a> {
         let after = content.as_bytes();
         let (diff, complete) = match &before {
             Some(b) if looks_binary(b) => (
-                format!("{DIFF_INCOMPLETE_MARK}：原文件是二进制，看不到差异，将被整个替换为 {} 字节的新内容", after.len()),
+                crate::tr!(
+                    "{}：原文件是二进制，看不到差异，将被整个替换为 {} 字节的新内容",
+                    "{}: the original file is binary, so no diff is shown; it will be replaced entirely with {} bytes of new content",
+                    diff_incomplete_mark(),
+                    after.len()
+                ),
                 false,
             ),
             Some(b) => diff_preview(&path, &String::from_utf8_lossy(b), content),
             None if st.is_some() => (
-                format!(
-                    "{DIFF_INCOMPLETE_MARK}：原文件过大（{} 字节），不生成差异，将被整个替换为 {} 字节的新内容",
+                crate::tr!(
+                    "{}：原文件过大（{} 字节），不生成差异，将被整个替换为 {} 字节的新内容",
+                    "{}: the original file is too large ({} bytes) for a diff; it will be replaced entirely with {} bytes of new content",
+                    diff_incomplete_mark(),
                     st.as_ref().map_or(0, |s| s.size),
                     after.len()
                 ),
@@ -1311,10 +1358,16 @@ impl<'a> FileOps<'a> {
         allow_sensitive: bool,
     ) -> Result<PendingChange, FileError> {
         if old_string.is_empty() {
-            return Err(FileError::InvalidArg("old_string 不能为空（新建文件请用 nx_write）".into()));
+            return Err(FileError::InvalidArg(crate::tr!(
+                "old_string 不能为空（新建文件请用 nx_write）",
+                "old_string can't be empty (use nx_write to create a file)"
+            )));
         }
         if old_string == new_string {
-            return Err(FileError::InvalidArg("old_string 与 new_string 相同，没有可改的".into()));
+            return Err(FileError::InvalidArg(crate::tr!(
+                "old_string 与 new_string 相同，没有可改的",
+                "old_string and new_string are identical; nothing to change"
+            )));
         }
         let path = self.resolve(path).await?;
         self.check_writable(&path, allow_sensitive).await?;
@@ -1330,7 +1383,10 @@ impl<'a> FileOps<'a> {
             return Err(FileError::Binary(path));
         }
         let text = std::str::from_utf8(&bytes).map_err(|_| {
-            FileError::Edit(format!("「{path}」不是合法 UTF-8，拒绝编辑以免损坏内容"))
+            FileError::Edit(crate::tr!(
+                "「{path}」不是合法 UTF-8，拒绝编辑以免损坏内容",
+                "\"{path}\" isn't valid UTF-8; refusing to edit it to avoid corrupting it"
+            ))
         })?;
 
         // 模型给的总是 LF；文件若是 CRLF，换成 CRLF 再找一次
@@ -1346,13 +1402,15 @@ impl<'a> FileOps<'a> {
             }
         }
         if count == 0 {
-            return Err(FileError::Edit(format!(
-                "在「{path}」里没找到 old_string。请先 nx_read 确认原文（缩进、空白、换行都要一字不差）"
+            return Err(FileError::Edit(crate::tr!(
+                "在「{path}」里没找到 old_string。请先 nx_read 确认原文（缩进、空白、换行都要一字不差）",
+                "old_string not found in \"{path}\". nx_read the file first to confirm the exact text (indentation, whitespace and line breaks must match)"
             )));
         }
         if count > 1 && !replace_all {
-            return Err(FileError::Edit(format!(
-                "old_string 在「{path}」里出现了 {count} 次，不唯一：加上更多上下文使其唯一，或设 replaceAll=true"
+            return Err(FileError::Edit(crate::tr!(
+                "old_string 在「{path}」里出现了 {count} 次，不唯一：加上更多上下文使其唯一，或设 replaceAll=true",
+                "old_string occurs {count} times in \"{path}\" and isn't unique: add more context to make it unique, or set replaceAll=true"
             )));
         }
         let after = if replace_all { text.replace(&old, &new) } else { text.replacen(&old, &new, 1) };
@@ -1443,14 +1501,15 @@ impl<'a> FileOps<'a> {
     /// 父目录必须存在且是目录；`create` 时逐级创建
     async fn check_parent(&self, path: &str, create: bool) -> Result<(), FileError> {
         let Some(parent) = parent_of(path) else {
-            return Err(FileError::InvalidPath(format!("「{path}」没有父目录")));
+            return Err(FileError::InvalidPath(crate::tr!("「{path}」没有父目录", "\"{path}\" has no parent directory")));
         };
         match self.t.stat(parent).await? {
             Some(s) if s.is_dir => Ok(()),
-            Some(_) => Err(FileError::InvalidPath(format!("「{parent}」不是目录"))),
+            Some(_) => Err(FileError::InvalidPath(crate::tr!("「{parent}」不是目录", "\"{parent}\" is not a directory"))),
             None if create => self.mkdir_p(parent).await,
-            None => Err(FileError::NotFound(format!(
-                "父目录 {parent}（如需创建请设 createDirs=true）"
+            None => Err(FileError::NotFound(crate::tr!(
+                "父目录 {parent}（如需创建请设 createDirs=true）",
+                "parent directory {parent} (set createDirs=true to create it)"
             ))),
         }
     }
@@ -1462,7 +1521,7 @@ impl<'a> FileOps<'a> {
         loop {
             match self.t.stat(&cur).await? {
                 Some(s) if s.is_dir => break,
-                Some(_) => return Err(FileError::InvalidPath(format!("「{cur}」不是目录"))),
+                Some(_) => return Err(FileError::InvalidPath(crate::tr!("「{cur}」不是目录", "\"{cur}\" is not a directory"))),
                 None => {
                     missing.push(cur.clone());
                     match parent_of(&cur) {
@@ -1516,7 +1575,7 @@ impl<'a> FileOps<'a> {
         }
 
         let parent = parent_of(path)
-            .ok_or_else(|| FileError::InvalidPath(format!("「{path}」没有父目录")))?;
+            .ok_or_else(|| FileError::InvalidPath(crate::tr!("「{path}」没有父目录", "\"{path}\" has no parent directory")))?;
         let name = file_name(path);
         let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
         let tmp = join(parent, &format!(".{name}.nxtmp-{tag}"));
@@ -1566,11 +1625,13 @@ impl<'a> FileOps<'a> {
         if let Err(e) = self.t.rename(&tmp, path).await {
             let _ = self.t.remove(&tmp).await;
             return Err(match self.t.rename(&bak, path).await {
-                Ok(()) => FileError::Io(format!(
-                    "替换「{path}」失败，原文件已还原（若还原不完整，备份可能残留在 {bak}）：{e}"
+                Ok(()) => FileError::Io(crate::tr!(
+                    "替换「{path}」失败，原文件已还原（若还原不完整，备份可能残留在 {bak}）：{e}",
+                    "Replacing \"{path}\" failed; the original was restored (if the restore was incomplete, a backup may remain at {bak}): {e}"
                 )),
-                Err(e2) => FileError::Io(format!(
-                    "替换「{path}」失败且未能还原：原文件现位于 {bak}，请手动改回。替换错误：{e}；还原错误：{e2}"
+                Err(e2) => FileError::Io(crate::tr!(
+                    "替换「{path}」失败且未能还原：原文件现位于 {bak}，请手动改回。替换错误：{e}；还原错误：{e2}",
+                    "Replacing \"{path}\" failed and couldn't be undone: the original is now at {bak}; move it back by hand. Replace error: {e}; restore error: {e2}"
                 )),
             });
         }
@@ -1640,13 +1701,16 @@ impl<'a> FileOps<'a> {
         max_results: usize,
     ) -> Result<GlobResult, FileError> {
         if pattern.is_empty() {
-            return Err(FileError::InvalidArg("pattern 为空".into()));
+            return Err(FileError::InvalidArg(crate::tr!("pattern 为空", "pattern is empty")));
         }
         let (root, pattern) = if pattern.starts_with('/') || pattern.starts_with('~') {
             let segs: Vec<&str> = pattern.split('/').collect();
             let lit = segs.iter().take_while(|s| !has_glob_meta(s)).count();
             if lit == segs.len() {
-                return Err(FileError::InvalidArg("pattern 里没有通配符，直接用 nx_read".into()));
+                return Err(FileError::InvalidArg(crate::tr!(
+                    "pattern 里没有通配符，直接用 nx_read",
+                    "pattern has no wildcards; use nx_read directly"
+                )));
             }
             let root = segs[..lit].join("/");
             let root = if root.is_empty() { "/".to_string() } else { root };
@@ -1882,7 +1946,7 @@ fn diff_ops(a: &[&str], b: &[&str]) -> Vec<DiffOp> {
 /// 审批卡据此出横幅；调用方据此强制审批（见 [`PendingChange::preview_complete`]）。
 pub fn diff_preview(path: &str, before: &str, after: &str) -> (String, bool) {
     if before == after {
-        return ("（内容无变化）".into(), true);
+        return (crate::tr!("（内容无变化）", "(no changes)"), true);
     }
     let a: Vec<&str> = before.lines().collect();
     let b: Vec<&str> = after.lines().collect();
@@ -1937,10 +2001,15 @@ pub fn diff_preview(path: &str, before: &str, after: &str) -> (String, bool) {
     if lines.len() > DIFF_PREVIEW_MAX_LINES {
         let dropped = lines.len() - DIFF_PREVIEW_MAX_LINES;
         lines.truncate(DIFF_PREVIEW_MAX_LINES);
-        lines.push(format!("…（差异过长，省略 {dropped} 行）"));
+        lines.push(crate::tr!("…（差异过长，省略 {dropped} 行）", "…(diff too long, {dropped} lines omitted)"));
         lines.insert(
             0,
-            format!("{DIFF_INCOMPLETE_MARK}：差异共 {} 行，只显示前 {DIFF_PREVIEW_MAX_LINES} 行；批准即按完整内容写入", dropped + DIFF_PREVIEW_MAX_LINES),
+            crate::tr!(
+                "{}：差异共 {} 行，只显示前 {DIFF_PREVIEW_MAX_LINES} 行；批准即按完整内容写入",
+                "{}: the diff has {} lines, only the first {DIFF_PREVIEW_MAX_LINES} are shown; approving writes the full content",
+                diff_incomplete_mark(),
+                dropped + DIFF_PREVIEW_MAX_LINES
+            ),
         );
         return (lines.join("\n"), false);
     }

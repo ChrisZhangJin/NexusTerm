@@ -89,7 +89,7 @@ pub fn resume_verdict(
 ) -> ResumeVerdict {
     if cp.state == "completed" {
         return ResumeVerdict::Expired {
-            reason: "该契约已完成，无需恢复".to_string(),
+            reason: crate::tr!("该契约已完成，无需恢复", "This contract is already complete, nothing to resume"),
         };
     }
     let born = if cp.created_wall_ms > 0 {
@@ -99,8 +99,9 @@ pub fn resume_verdict(
     };
     if now_wall_ms - born > CHECKPOINT_TTL_MS {
         return ResumeVerdict::Expired {
-            reason: format!(
+            reason: crate::tr!(
                 "Checkpoint 已超过 {} 小时，现场可能早已变化",
+                "The checkpoint is over {} hours old; things have probably changed since",
                 CHECKPOINT_TTL_MS / 3_600_000
             ),
         };
@@ -114,7 +115,10 @@ pub fn resume_verdict(
     // 调用方应当等首帧到了再判一次。
     let Some(h) = current_hash else {
         return ResumeVerdict::Suspended {
-            reason: "还没有屏幕帧，无法核对现场：等首帧到达后再判定是否恢复".to_string(),
+            reason: crate::tr!(
+                "还没有屏幕帧，无法核对现场：等首帧到达后再判定是否恢复",
+                "No screen frame yet, can't check the terminal: will decide whether to resume once the first frame arrives"
+            ),
         };
     };
     // checkpoint 里没存屏幕 hash（契约刚开就退出）同样无从比对，按漂移处理、降到 approve。

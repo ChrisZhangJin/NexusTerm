@@ -35,7 +35,7 @@ fn view(state: &AppState, session_id: &str, label: &str) -> HostMemoryView {
 }
 
 fn parse_kind(kind: &str) -> Result<Kind, String> {
-    Kind::parse(kind.trim()).ok_or_else(|| format!("未知类别：{kind}"))
+    Kind::parse(kind.trim()).ok_or_else(|| crate::tr!("未知类别：{kind}", "Unknown category: {kind}"))
 }
 
 /// 当前标签所在主机的备忘。
@@ -54,7 +54,7 @@ pub fn host_memory_add(
     state: State<'_, AppState>,
 ) -> Result<HostNote, String> {
     let host = hostmem::resolve_host(&state, &session_id, &label)
-        .ok_or_else(|| "无法确定这个标签属于哪台主机".to_string())?;
+        .ok_or_else(|| crate::tr!("无法确定这个标签属于哪台主机", "Can't tell which host this tab belongs to"))?;
     state
         .store
         .host_memory_add(&host.key, &text, parse_kind(&kind)?, Source::User)
@@ -82,6 +82,6 @@ pub fn host_memory_delete(id: String, state: State<'_, AppState>) -> Result<(), 
 #[tauri::command]
 pub fn host_memory_clear(session_id: String, label: String, state: State<'_, AppState>) -> Result<usize, String> {
     let host = hostmem::resolve_host(&state, &session_id, &label)
-        .ok_or_else(|| "无法确定这个标签属于哪台主机".to_string())?;
+        .ok_or_else(|| crate::tr!("无法确定这个标签属于哪台主机", "Can't tell which host this tab belongs to"))?;
     state.store.host_memory_clear_host(&host.key)
 }

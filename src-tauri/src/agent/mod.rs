@@ -92,34 +92,56 @@ const CONFIG_KEY: &str = "agent.config";
 /// AI 助手相关错误。
 ///
 /// 与 SSH 那边的约定一致：命令层统一转成 `String`（带中文提示）交给前端。
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum AgentError {
-    #[error("AI 会话不存在：{0}")]
     NoSession(String),
-    #[error("AI 上下文序列化失败：{0}")]
     Serialize(String),
-    #[error("AI 配置持久化失败：{0}")]
     Store(String),
 
     // ——— 以下供 LLM 调用层（llm.rs）使用 ———
-    #[error("AI 助手未启用：请先在设置里打开总开关")]
     Disabled,
-    #[error("尚未填写 API Key：请到设置里填写后再提问")]
     MissingKey,
-    #[error("尚未填写模型名称：请到设置里填写后再提问")]
     MissingModel,
-    #[error("请先输入你要问的问题")]
     EmptyQuestion,
     /// 同一会话已有流在跑：两条流交错会把前端的答案搅成一团，故直接拒绝。
     /// 不带 session_id：提示是弹在提问那个标签页里的，带 id 只是噪音。
-    #[error("该会话已有提问在进行中：请等它结束，或先点“取消”")]
     Busy,
-    #[error("请求构造失败：{0}")]
     BadRequest(String),
-    /// 文案已由 llm.rs 翻译成中文，这里只负责往上抛
-    #[error("{0}")]
+    /// 文案已由 llm.rs 翻译好（跟界面语言），这里只负责往上抛
     Transport(String),
 }
+
+impl std::fmt::Display for AgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::NoSession(x) => crate::tr!("AI 会话不存在：{x}", "AI session not found: {x}"),
+            Self::Serialize(x) => crate::tr!("AI 上下文序列化失败：{x}", "Failed to serialize the AI context: {x}"),
+            Self::Store(x) => crate::tr!("AI 配置持久化失败：{x}", "Failed to save the AI settings: {x}"),
+            Self::Disabled => crate::tr!(
+                "AI 助手未启用：请先在设置里打开总开关",
+                "The AI assistant is off: turn on the main switch in Settings first"
+            ),
+            Self::MissingKey => crate::tr!(
+                "尚未填写 API Key：请到设置里填写后再提问",
+                "No API key yet: add it in Settings before asking"
+            ),
+            Self::MissingModel => crate::tr!(
+                "尚未填写模型名称：请到设置里填写后再提问",
+                "No model name yet: add it in Settings before asking"
+            ),
+            Self::EmptyQuestion => crate::tr!("请先输入你要问的问题", "Type your question first"),
+            Self::Busy => crate::tr!(
+                "该会话已有提问在进行中：请等它结束，或先点“取消”",
+                "A question is already running in this session: wait for it to finish, or click \"Cancel\" first"
+            ),
+            Self::BadRequest(x) => crate::tr!("请求构造失败：{x}", "Failed to build the request: {x}"),
+            Self::Transport(x) => x.clone(),
+        };
+        f.write_str(&s)
+    }
+}
+
+impl std::error::Error for AgentError {}
 
 /// 单个 AI 账号的连接与行为配置。
 ///
@@ -419,7 +441,7 @@ pub fn save_config(store: &Store, cfg: &AgentConfig) -> Result<(), AgentError> {
     // 看起来就是「没配」—— 放行保存，用户按一下就把真实的 key 清掉了，
     // 而他完全不知道刚才发生了什么。
     if store.vault_locked() {
-        return Err(AgentError::Store("保险库已锁定，请先输入主密码".into()));
+        return Err(AgentError::Store(crate::tr!("保险库已锁定，请先输入主密码", "The vault is locked, enter the master password first")));
     }
 
     let mut cfg = cfg.clone();

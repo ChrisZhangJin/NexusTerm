@@ -24,7 +24,8 @@ pub const DRAFT_SYSTEM: &str = "你是终端托管助手。把用户的托管目
 终端里跑着 Claude Code / vim 等也照样能核验；别写依赖前台程序状态的命令。";
 
 pub fn fallback() -> Vec<Check> {
-    vec![Check::Manual { text: FALLBACK_TEXT.to_string() }]
+    let text = if crate::i18n::is_en() { "You confirm it's done".to_string() } else { FALLBACK_TEXT.to_string() };
+    vec![Check::Manual { text }]
 }
 
 /// 起草请求里的用户消息。
@@ -47,7 +48,7 @@ fn tidy(c: Check) -> Option<Check> {
             if re.is_empty() {
                 None
             } else if regex::Regex::new(&re).is_err() {
-                Some(Check::Manual { text: format!("屏幕上出现：{re}") })
+                Some(Check::Manual { text: crate::tr!("屏幕上出现：{re}", "Screen shows: {re}") })
             } else {
                 Some(Check::ScreenMatches { re })
             }

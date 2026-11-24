@@ -79,7 +79,9 @@ const MAX_FEEDBACK_ERRORS: usize = 20;
 /// 回退警告里最多带几条原因。
 const MAX_FALLBACK_REASONS: usize = 4;
 /// 回退草稿的名称前缀。
-const FALLBACK_NAME: &str = "录制的操作";
+fn fallback_name() -> String {
+    crate::tr!("录制的操作", "Recorded actions")
+}
 
 // ——————————————————————————————— 对外模型 ———————————————————————————————
 
@@ -276,8 +278,13 @@ fn parse_notes(v: Option<&Value>) -> Vec<String> {
 /// 宽松解析模型回复。错误文案会原样反馈给模型。
 pub fn parse_reply(text: &str) -> Result<Parsed, String> {
     let root = extract_json_object(text)
-        .ok_or_else(|| "回复里找不到 JSON 对象（需要一个含 name / steps 的 JSON，不要用自然语言回答）".to_string())?;
-    let Value::Object(root) = root else { return Err("回复不是 JSON 对象".into()) };
+        .ok_or_else(|| {
+            crate::tr!(
+                "回复里找不到 JSON 对象（需要一个含 name / steps 的 JSON，不要用自然语言回答）",
+                "No JSON object found in the reply (a JSON with name / steps is required; don't answer in natural language)"
+            )
+        })?;
+    let Value::Object(root) = root else { return Err(crate::tr!("回复不是 JSON 对象", "The reply isn't a JSON object")) };
     // 兼容 {"skill": {...}, "notes": [...]}
     let (obj, outer_notes) = match root.get("skill") {
         Some(Value::Object(inner)) => (inner.clone(), root.get("notes").cloned()),
@@ -297,14 +304,14 @@ pub fn parse_reply(text: &str) -> Result<Parsed, String> {
             for (i, s) in a.iter().enumerate() {
                 match serde_json::from_value::<SkillStep>(s.clone()) {
                     Ok(step) => out.steps.push(step),
-                    Err(e) => errs.push(format!("steps[{i}] 无法解析：{e}")),
+                    Err(e) => errs.push(crate::tr!("steps[{i}] 无法解析：{e}", "steps[{i}] can't be parsed: {e}")),
                 }
             }
             if !errs.is_empty() {
                 return Err(errs.join("\n"));
             }
         }
-        _ => return Err("缺少 steps 数组".into()),
+        _ => return Err(crate::tr!("缺少 steps 数组", "Missing steps array")),
     }
     match obj.get("params") {
         None | Some(Value::Null) => {}
@@ -313,20 +320,23 @@ pub fn parse_reply(text: &str) -> Result<Parsed, String> {
             for (i, p) in a.iter().enumerate() {
                 match serde_json::from_value::<SkillParam>(p.clone()) {
                     Ok(p) => out.params.push(p),
-                    Err(e) => errs.push(format!("params[{i}] 无法解析：{e}")),
+                    Err(e) => errs.push(crate::tr!("params[{i}] 无法解析：{e}", "params[{i}] can't be parsed: {e}")),
                 }
             }
             if !errs.is_empty() {
                 return Err(errs.join("\n"));
             }
         }
-        Some(_) => return Err("params 必须是数组".into()),
+        Some(_) => return Err(crate::tr!("params 必须是数组", "params must be an array")),
     }
     out.verify = match obj.get("verify") {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) if s.trim().is_empty() => None,
         Some(Value::String(s)) => Some(SkillCheck { expect: s.clone(), timeout_ms: None }),
-        Some(v) => Some(serde_json::from_value::<SkillCheck>(v.clone()).map_err(|e| format!("verify 无法解析：{e}"))?),
+        Some(v) => Some(
+            serde_json::from_value::<SkillCheck>(v.clone())
+                .map_err(|e| crate::tr!("verify 无法解析：{e}", "verify can't be parsed: {e}"))?,
+        ),
     };
     // 风险：认不出的值当没给（反正只会被抬高）
     out.risk = obj.get("risk").and_then(|v| serde_json::from_value::<Risk>(v.clone()).ok());
@@ -367,7 +377,10 @@ pub fn clamp_host_scope(draft: &RecordingDraft) -> (HostScope, Option<String>) {
         Some(h) => (HostScope::List { hosts: vec![h] }, None),
         None => (
             HostScope::Any,
-            Some("无法从录制的标签确定主机名，适用主机已设为「不限」；请在编辑器里确认是否要限定主机。".into()),
+            Some(crate::tr!(
+                "无法从录制的标签确定主机名，适用主机已设为「不限」；请在编辑器里确认是否要限定主机。",
+                "Couldn't tell the host name from the recorded tab, so the host scope was set to \"any\"; check in the editor whether to restrict it."
+            )),
         ),
     }
 }
@@ -411,7 +424,7 @@ fn step_texts(s: &SkillStep) -> Vec<&str> {
 
 fn clip(s: &str, max: usize, what: &str, warnings: &mut Vec<String>) -> String {
     if s.chars().count() > max {
-        warnings.push(format!("{what}超过 {max} 字符，已截断"));
+        warnings.push(crate::tr!("{what}超过 {max} 字符，已截断", "{what} was longer than {max} characters and was truncated"));
         // truncate_chars 会在末尾追加「…」，所以先留一个字符的位置，保证总长 ≤ max
         truncate_chars(s, max.saturating_sub(1))
     } else {
@@ -435,66 +448,86 @@ pub fn finalize(parsed: Parsed, draft: &RecordingDraft) -> Result<Finalized, Vec
     let Parsed { name, description, mut params, mut steps, verify, risk, notes } = parsed;
 
     // —— 长度类：截断并提醒，不当成硬错误 ——
-    let name = clip(name.trim(), MAX_NAME_CHARS, "名称", &mut warnings);
-    let description = clip(description.trim(), MAX_DESC_CHARS, "描述", &mut warnings);
+    let name = clip(name.trim(), MAX_NAME_CHARS, &crate::tr!("名称", "The name"), &mut warnings);
+    let description = clip(description.trim(), MAX_DESC_CHARS, &crate::tr!("描述", "The description"), &mut warnings);
     for p in &mut params {
-        p.description = clip(&p.description, MAX_PARAM_DESC_CHARS, &format!("参数「{}」的描述", p.name), &mut warnings);
+        let what = crate::tr!("参数「{}」的描述", "The description of parameter \"{}\"", p.name);
+        p.description = clip(&p.description, MAX_PARAM_DESC_CHARS, &what, &mut warnings);
     }
 
     // —— secret：不许带默认值；像口令的参数强制 secret ——
     for p in &mut params {
         if !p.secret && credential_like_name(&p.name) {
             p.secret = true;
-            warnings.push(format!("参数「{}」名字像口令 / 令牌，已强制设为 secret（运行时由密码通道提供）。", p.name));
+            warnings.push(crate::tr!(
+                "参数「{}」名字像口令 / 令牌，已强制设为 secret（运行时由密码通道提供）。",
+                "Parameter \"{}\" is named like a password / token, so it was made secret (supplied at run time through the password channel).",
+                p.name
+            ));
         }
         if p.secret && p.default_value.take().is_some() {
-            warnings.push(format!("secret 参数「{}」不允许有默认值，已清除。", p.name));
+            warnings.push(crate::tr!(
+                "secret 参数「{}」不允许有默认值，已清除。",
+                "secret parameter \"{}\" can't have a default value; it was cleared.",
+                p.name
+            ));
         }
     }
 
     // —— 脱敏占位符不得进入功能性字段 ——
     for (i, s) in steps.iter().enumerate() {
         if step_texts(s).iter().any(|t| t.contains(PLACEHOLDER)) {
-            errors.push(format!(
+            errors.push(crate::tr!(
                 "第 {} 步含脱敏占位符 {PLACEHOLDER}：那是被隐藏的真实值，请把对应位置改成 {{{{参数名}}}} 并声明参数（不要带默认值）",
+                "Step {} contains the redaction placeholder {PLACEHOLDER}: it stands for a hidden real value; replace it with {{{{param_name}}}} and declare the parameter (without a default)",
                 i + 1
             ));
         }
     }
     for p in &params {
         if p.default_value.as_deref().is_some_and(|d| d.contains(PLACEHOLDER)) {
-            errors.push(format!("参数「{}」的默认值含脱敏占位符 {PLACEHOLDER}，请去掉 default", p.name));
+            errors.push(crate::tr!(
+                "参数「{}」的默认值含脱敏占位符 {PLACEHOLDER}，请去掉 default",
+                "Parameter \"{}\" has the redaction placeholder {PLACEHOLDER} in its default value; remove the default",
+                p.name
+            ));
         }
     }
     if verify.as_ref().is_some_and(|v| v.expect.contains(PLACEHOLDER)) {
-        errors.push(format!("verify 含脱敏占位符 {PLACEHOLDER}，请改写或去掉"));
+        errors.push(crate::tr!(
+            "verify 含脱敏占位符 {PLACEHOLDER}，请改写或去掉",
+            "verify contains the redaction placeholder {PLACEHOLDER}; rewrite or remove it"
+        ));
     }
 
     // —— 不丢密码步骤、不凭空加操作 ——
     let orig_secret = draft.steps.iter().filter(|s| is_secret_step(s)).count();
     let new_secret = steps.iter().filter(|s| is_secret_step(s)).count();
     if new_secret < orig_secret {
-        errors.push(format!(
-            "录制里有 {orig_secret} 个密码输入步骤，整理后只剩 {new_secret} 个：密码步骤不能删除或合并"
+        errors.push(crate::tr!(
+            "录制里有 {orig_secret} 个密码输入步骤，整理后只剩 {new_secret} 个：密码步骤不能删除或合并",
+            "The recording has {orig_secret} password steps but only {new_secret} remain after refining: password steps can't be removed or merged"
         ));
     }
     let orig_actions = draft.steps.iter().filter(|s| is_action_step(s)).count();
     let new_actions = steps.iter().filter(|s| is_action_step(s)).count();
     if new_actions > orig_actions {
-        errors.push(format!(
-            "整理后有 {new_actions} 个操作步骤，多于录制的 {orig_actions} 个：不能新增录制里没有的命令 / 按键（只允许新增 screen_check 检查步骤）"
+        errors.push(crate::tr!(
+            "整理后有 {new_actions} 个操作步骤，多于录制的 {orig_actions} 个：不能新增录制里没有的命令 / 按键（只允许新增 screen_check 检查步骤）",
+            "After refining there are {new_actions} action steps, more than the {orig_actions} recorded: commands / keys that weren't recorded can't be added (only screen_check steps may be added)"
         ));
     }
     if steps.len() > MAX_STEPS {
-        errors.push(format!("步骤最多 {MAX_STEPS} 个"));
+        errors.push(crate::tr!("步骤最多 {MAX_STEPS} 个", "At most {MAX_STEPS} steps"));
     }
 
     // —— onUnexpected：非只读步骤不许交给 LLM ——
     for (i, s) in steps.iter_mut().enumerate() {
         if s.on_unexpected() == OnUnexpected::Llm && assess_risk(std::slice::from_ref(s)).risk > Risk::Low {
             set_on_unexpected(s, OnUnexpected::Ask);
-            warnings.push(format!(
+            warnings.push(crate::tr!(
                 "第 {} 步会修改系统，onUnexpected 由 llm 改为 ask（改动系统的步骤不交给 LLM 自行处理）。",
+                "Step {} changes the system, so onUnexpected was changed from llm to ask (steps that change the system aren't left to the LLM).",
                 i + 1
             ));
         }
@@ -551,10 +584,13 @@ pub fn mechanical_input(draft: &RecordingDraft) -> Result<(SkillInput, Vec<Strin
     let (host_scope, w) = clamp_host_scope(draft);
     warnings.extend(w);
     let label = host_entry(&draft.host.label).unwrap_or_default();
-    let name = if label.is_empty() { FALLBACK_NAME.to_string() } else { format!("{FALLBACK_NAME}（{label}）") };
+    let name = if label.is_empty() { fallback_name() } else { crate::tr!("{}（{label}）", "{} ({label})", fallback_name()) };
     let input = SkillInput {
         name: truncate_chars(&name, MAX_NAME_CHARS),
-        description: "由终端录制直接生成的草稿，未经整理：没有提取参数、没有期望与验证，请编辑后再保存。".into(),
+        description: crate::tr!(
+            "由终端录制直接生成的草稿，未经整理：没有提取参数、没有期望与验证，请编辑后再保存。",
+            "A draft generated straight from the terminal recording, not refined: no parameters, expectations or verification yet. Edit it before saving."
+        ),
         params: Vec::new(),
         steps: draft.steps.clone(),
         verify: None,
@@ -589,7 +625,11 @@ pub fn decide_after_failure(attempt: u32, errors: &[String]) -> Decision {
 
 fn fallback_warning(errors: &[String]) -> String {
     let why: Vec<String> = errors.iter().take(MAX_FALLBACK_REASONS).map(|e| truncate_chars(e, 120)).collect();
-    format!("Agent 整理的结果两次都没有通过校验，已退回为未整理的录制草稿。原因：{}", why.join("；"))
+    crate::tr!(
+        "Agent 整理的结果两次都没有通过校验，已退回为未整理的录制草稿。原因：{}",
+        "The agent's refined result failed validation twice, so this is the unrefined recording draft. Reasons: {}",
+        why.join(if crate::i18n::is_en() { "; " } else { "；" })
+    )
 }
 
 /// 整理一份草稿。
@@ -603,16 +643,18 @@ pub async fn refine<L: RefineLlm>(
     redact_on: bool,
 ) -> Result<RefinedSkillDraft, String> {
     if draft.steps.is_empty() {
-        return Err("草稿里没有可整理的步骤".into());
+        return Err(crate::tr!("草稿里没有可整理的步骤", "The draft has no steps to refine"));
     }
     if draft.steps.len() > MAX_STEPS {
-        return Err(format!("草稿步骤过多（最多 {MAX_STEPS} 步）"));
+        return Err(crate::tr!("草稿步骤过多（最多 {MAX_STEPS} 步）", "The draft has too many steps (at most {MAX_STEPS})"));
     }
     let mut messages = vec![ChatMessage::user(build_user_message(draft, hint, redact_on))];
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        let reply = llm.complete(SYSTEM_PROMPT, &messages).await?;
+        // 整理出的名称 / 描述 / 说明给人看：界面是英文就让模型用英文写
+        let system = format!("{SYSTEM_PROMPT}{}", crate::i18n::reply_language_note());
+        let reply = llm.complete(&system, &messages).await?;
         let outcome = parse_reply(&reply).map_err(|e| vec![e]).and_then(|p| finalize(p, draft));
         let errors = match outcome {
             Ok(f) => {
@@ -633,7 +675,13 @@ pub async fn refine<L: RefineLlm>(
             }
             Decision::Fallback => {
                 let (input, mut warnings) = mechanical_input(draft)
-                    .map_err(|e| format!("Agent 整理失败，且录制草稿本身也未通过校验：{}", e.join("；")))?;
+                    .map_err(|e| {
+                        crate::tr!(
+                            "Agent 整理失败，且录制草稿本身也未通过校验：{}",
+                            "The agent's refining failed, and the recording draft itself also failed validation: {}",
+                            e.join(if crate::i18n::is_en() { "; " } else { "；" })
+                        )
+                    })?;
                 warnings.insert(0, fallback_warning(&errors));
                 return Ok(RefinedSkillDraft {
                     draft: input,

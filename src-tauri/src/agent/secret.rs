@@ -113,11 +113,11 @@ impl SecretStatus {
     /// 给人看的一句话（步骤卡文案）。
     pub fn label(&self) -> String {
         match self {
-            Self::Provided => "用户已输入，已写入终端".into(),
-            Self::Declined => "用户选择跳过，没有输入".into(),
-            Self::TimedOut => "等待超时，用户没有输入".into(),
-            Self::Cancelled => "已取消".into(),
-            Self::WriteFailed(why) => format!("写入终端失败：{why}"),
+            Self::Provided => crate::tr!("用户已输入，已写入终端", "Entered by you and written to the terminal"),
+            Self::Declined => crate::tr!("用户选择跳过，没有输入", "You skipped it, nothing entered"),
+            Self::TimedOut => crate::tr!("等待超时，用户没有输入", "Timed out waiting, nothing entered"),
+            Self::Cancelled => crate::tr!("已取消", "Cancelled"),
+            Self::WriteFailed(why) => crate::tr!("写入终端失败：{why}", "Failed to write to the terminal: {why}"),
         }
     }
 }
@@ -149,10 +149,14 @@ pub fn sanitize_secret(raw: String) -> Result<Zeroizing<String>, &'static str> {
     let kept = v.trim_end_matches(['\r', '\n']).len();
     v.truncate(kept);
     if v.len() > MAX_SECRET_BYTES {
-        return Err("输入过长");
+        return Err(if crate::i18n::is_en() { "The input is too long" } else { "输入过长" });
     }
     if v.chars().any(|c| c.is_control()) {
-        return Err("输入里含有换行或控制字符，无法安全地发送到终端");
+        return Err(if crate::i18n::is_en() {
+            "The input contains a newline or control character and can't be sent to the terminal safely"
+        } else {
+            "输入里含有换行或控制字符，无法安全地发送到终端"
+        });
     }
     Ok(v)
 }
@@ -246,6 +250,9 @@ where
 pub const PROMPT_GONE: &str =
     "终端已经不在密码 / 口令提示上（可能用户自己输入了、提示超时退出了，或屏幕切到了别的程序），为安全起见没有写入";
 
+const PROMPT_GONE_EN: &str = "The terminal is no longer at a password / passphrase prompt (you may have typed it \
+     yourself, the prompt timed out, or the screen switched to another program), so nothing was written for safety";
+
 /// 写入前的最后一道复核：用户填卡片可能花了两分钟，这期间口令提示可能已经没了——
 /// 此时写进去的密码会被回显，甚至被 shell 当成一条命令执行（进历史记录）。
 ///
@@ -261,7 +268,11 @@ pub fn guard_prompt(
                 Ok(SecretOutcome::Provided(value))
             } else {
                 drop(value);
-                Err(SecretStatus::WriteFailed(PROMPT_GONE.to_string()))
+                Err(SecretStatus::WriteFailed(if crate::i18n::is_en() {
+                    PROMPT_GONE_EN.to_string()
+                } else {
+                    PROMPT_GONE.to_string()
+                }))
             }
         }
         other => Ok(other),
@@ -288,7 +299,7 @@ pub fn clean_reason(raw: Option<&str>) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     if one_line.is_empty() {
-        return "终端正在请求输入密码".to_string();
+        return crate::tr!("终端正在请求输入密码", "The terminal is asking for a password");
     }
     if one_line.chars().count() > MAX_REASON_CHARS {
         let head: String = one_line.chars().take(MAX_REASON_CHARS).collect();

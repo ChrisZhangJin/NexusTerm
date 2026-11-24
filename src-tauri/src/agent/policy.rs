@@ -352,24 +352,24 @@ pub fn evaluate(
         || auth.deny_keywords().any(|d| payload.contains(&d.to_lowercase()))
     {
         return PolicyVerdict::Deny {
-            reason: format!("命中 Authority.deny（{}）", risk.as_str()),
+            reason: crate::tr!("命中 Authority.deny（{}）", "Hits Authority.deny ({})", risk.as_str()),
         };
     }
     // 2. 密码 / 永久扩权：fail-closed，任何档位都不放行
     if risk == Risk::Secret {
         return PolicyVerdict::Deny {
-            reason: "密码 / 凭据只走 secret 通道，Steward 不代填".to_string(),
+            reason: crate::tr!("密码 / 凭据只走 secret 通道，Steward 不代填", "Passwords / credentials only go through the secret channel; Steward never fills them in"),
         };
     }
     if risk == Risk::Permanent && !auth.allow_permanent_grant {
         return PolicyVerdict::Deny {
-            reason: "会永久扩大授权：默认只允许「本次允许」，绝不误选永久项".to_string(),
+            reason: crate::tr!("会永久扩大授权：默认只允许「本次允许」，绝不误选永久项", "Would permanently widen permissions: only \"allow once\" is allowed by default, never a permanent option"),
         };
     }
     // 3. host_scope fail-closed：作用范围不明一律降档
     if !host_in_scope {
         return PolicyVerdict::Approve {
-            reason: "目标主机不在授权作用域内：fail-closed 降为确认档".to_string(),
+            reason: crate::tr!("目标主机不在授权作用域内：fail-closed 降为确认档", "Target host is outside the authorized scope: fail-closed, lowered to Ask first"),
         };
     }
     // 4. 现场不可信时策略层再复核一次（compile 已经判过，这里是第二道闸）
@@ -378,8 +378,9 @@ pub fn evaluate(
         || matches!(sit.kind, SituationKind::AltScreen | SituationKind::Unknown)
     {
         return PolicyVerdict::Approve {
-            reason: format!(
+            reason: crate::tr!(
                 "现场置信度不足（{:.2} / 断流 {}ms）：只读观察或先确认",
+                "Low confidence in the screen ({:.2} / no frames for {}ms): observe read-only or confirm first",
                 sit.confidence, sit.stale_ms
             ),
         };
@@ -387,7 +388,7 @@ pub fn evaluate(
     // 5. approve 档一律先给卡
     if auth.tier == TIER_APPROVE {
         return PolicyVerdict::Approve {
-            reason: "契约档位为「确认」：先给建议与倒计时，再决定是否执行".to_string(),
+            reason: crate::tr!("契约档位为「确认」：先给建议与倒计时，再决定是否执行", "The contract's level is \"Ask first\": suggest with a countdown first, then decide whether to run"),
         };
     }
     // 6. allow 白名单可以把 Notify 提到 Auto
@@ -397,7 +398,7 @@ pub fn evaluate(
     // 7. 破坏性动作在任何档位都要人确认（即便 auto）
     if risk >= Risk::Destructive {
         return PolicyVerdict::Approve {
-            reason: format!("动作风险 {}：需要人一键确认", risk.as_str()),
+            reason: crate::tr!("动作风险 {}：需要人一键确认", "Action risk {}: needs a one-click confirmation", risk.as_str()),
         };
     }
     // 8. notify 档：执行但留撤销窗口

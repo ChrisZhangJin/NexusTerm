@@ -68,8 +68,21 @@ use crate::store::{MacroRecord, MacroStep, Store};
 /// 低于这个值的 sleep / wait 超时不当作「上一步很慢」的提示。
 const MIN_HINT_MS: u64 = 2000;
 /// 口令占位的理由（给用户看的、运行时的输入提示）。刻意通用：不含任何原文。
-const SECRET_REASON: &str = "需要输入密码（旧宏里录下的口令已丢弃，运行时由你现场输入）";
-const SECRET_REASON_CMD: &str = "原命令行含疑似口令，已丢弃；请改用密码通道重写这一步";
+fn secret_reason() -> String {
+    crate::tr!(
+        "需要输入密码（旧宏里录下的口令已丢弃，运行时由你现场输入）",
+        "Needs a password (the one recorded in the old macro was discarded; you'll enter it at run time)"
+    )
+}
+/// 「命令行含疑似写死的口令」那类理由的开头（中 / 英）：据此把占位理由换成「原命令行含疑似口令」那句
+const CMD_LINE_CRED: &str = "命令行含疑似写死的口令";
+const CMD_LINE_CRED_EN: &str = "command line seems to contain a hard-coded password";
+fn secret_reason_cmd() -> String {
+    crate::tr!(
+        "原命令行含疑似口令，已丢弃；请改用密码通道重写这一步",
+        "The original command line seemed to contain a password and was discarded; rewrite this step using the password channel"
+    )
+}
 
 // ——————————————————————————————— 转义与按键词法 ———————————————————————————————
 
@@ -277,22 +290,24 @@ fn esc_braces(cmd: &str) -> String {
 
 /// 额外的「写死凭据」形状（`skill::literal_secret_hint` 之外的补充）。返回命中类别。
 fn extra_literal_secret(t: &str) -> Option<&'static str> {
-    static RES: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
+    let en = crate::i18n::is_en();
+    // (正则, 中文说明, 英文说明)：说明会进迁移告警给人看
+    static RES: OnceLock<Vec<(Regex, &'static str, &'static str)>> = OnceLock::new();
     let res = RES.get_or_init(|| {
         [
-            (r#"(?i)\becho\b[^|\n]*\|\s*(?:sudo\s+-S|su\b|ssh\b|kinit\b|passwd\b)"#, "把口令管道给 sudo / su"),
-            (r#"[A-Za-z][A-Za-z0-9+.\-]*://[^/\s:@]+:[^/\s@]+@"#, "URL 里内嵌了账号口令"),
-            (r#"(?i)\bcurl\b[^\n]*\s(?:-u|--user)[=\s]+[^\s:]+:\S+"#, "curl -u 账号:口令"),
-            (r#"(?i)\bredis-cli\b[^\n]*\s-a\s+\S+"#, "redis-cli -a 口令"),
-            (r#"(?i)\bchpasswd\b"#, "chpasswd"),
+            (r#"(?i)\becho\b[^|\n]*\|\s*(?:sudo\s+-S|su\b|ssh\b|kinit\b|passwd\b)"#, "把口令管道给 sudo / su", "password piped into sudo / su"),
+            (r#"[A-Za-z][A-Za-z0-9+.\-]*://[^/\s:@]+:[^/\s@]+@"#, "URL 里内嵌了账号口令", "credentials embedded in a URL"),
+            (r#"(?i)\bcurl\b[^\n]*\s(?:-u|--user)[=\s]+[^\s:]+:\S+"#, "curl -u 账号:口令", "curl -u user:password"),
+            (r#"(?i)\bredis-cli\b[^\n]*\s-a\s+\S+"#, "redis-cli -a 口令", "redis-cli -a password"),
+            (r#"(?i)\bchpasswd\b"#, "chpasswd", "chpasswd"),
         ]
         .iter()
-        .map(|(p, why)| (Regex::new(p).unwrap_or_else(|e| panic!("宏迁移口令正则编译失败 {p}：{e}")), *why))
+        .map(|(p, zh, en)| (Regex::new(p).unwrap_or_else(|e| panic!("宏迁移口令正则编译失败 {p}：{e}")), *zh, *en))
         .collect()
     });
-    for (re, why) in res {
+    for (re, zh, en_why) in res {
         if re.is_match(t) {
-            return Some(why);
+            return Some(if en { en_why } else { zh });
         }
     }
     // FOO_PASS=xxx / API_TOKEN=xxx：值是 `$VAR` / `{{…}}` 引用则放过
@@ -303,7 +318,7 @@ fn extra_literal_secret(t: &str) -> Option<&'static str> {
     });
     for cap in env.captures_iter(t) {
         if !matches!(&cap[1], "$" | "{") {
-            return Some("口令 / 令牌类变量赋了字面值");
+            return Some(if en { "a password / token variable assigned a literal value" } else { "口令 / 令牌类变量赋了字面值" });
         }
     }
     None
@@ -633,25 +648,28 @@ impl Builder {
     /// 本行（或本个片段）是否像口令。命中返回类别（不含原文）。
     fn suspect(&mut self, text: &str, has_prompt: bool) -> Option<String> {
         if has_prompt {
-            return Some("紧跟在口令提示之后".into());
+            return Some(crate::tr!("紧跟在口令提示之后", "right after a password prompt"));
         }
         let t = text.trim();
         if t.is_empty() {
             return None;
         }
         if let Some(why) = literal_cred(t) {
-            return Some(format!("命令行含疑似写死的口令（{why}）"));
+            return Some(crate::tr!("{CMD_LINE_CRED}（{why}）", "{CMD_LINE_CRED_EN} ({why})"));
         }
         let login = std::mem::take(&mut self.login);
         let after_secret = std::mem::take(&mut self.after_secret);
         if login && !obviously_not_password(t) {
-            return Some("紧跟在 ssh / sudo / su 等会要口令的命令之后".into());
+            return Some(crate::tr!(
+                "紧跟在 ssh / sudo / su 等会要口令的命令之后",
+                "right after a command that asks for a password (ssh / sudo / su, etc.)"
+            ));
         }
         if after_secret && otp_like(t) {
-            return Some("紧跟在口令之后的纯数字，疑似验证码".into());
+            return Some(crate::tr!("紧跟在口令之后的纯数字，疑似验证码", "digits right after a password, likely a verification code"));
         }
         if password_shaped(t) {
-            return Some("形似口令的单个词".into());
+            return Some(crate::tr!("形似口令的单个词", "a single word shaped like a password"));
         }
         None
     }
@@ -672,8 +690,9 @@ impl Builder {
             self.secrets += 1;
             self.after_secret = true;
             self.login = false;
-            self.warnings.push(format!(
-                "技能第 {n} 步：疑似口令（{why}），内容已丢弃，改为密码占位（secret）。请核对是否确为口令"
+            self.warnings.push(crate::tr!(
+                "技能第 {n} 步：疑似口令（{why}），内容已丢弃，改为密码占位（secret）。请核对是否确为口令",
+                "Skill step {n}: looks like a password ({why}); the content was discarded and replaced with a password placeholder (secret). Check that it really was a password"
             ));
             let step = match prompt.as_ref().and_then(|p| p.pattern.clone().map(|e| (e, p.timeout))) {
                 Some((expect, timeout_ms)) => SkillStep::ExpectRespond {
@@ -684,8 +703,10 @@ impl Builder {
                     expect_after: None,
                     on_unexpected: OnUnexpected::Ask,
                 },
-                None if why.starts_with("命令行含") => secret_step(SECRET_REASON_CMD),
-                None => secret_step(SECRET_REASON),
+                None if why.starts_with(CMD_LINE_CRED) || why.starts_with(CMD_LINE_CRED_EN) => {
+                    secret_step(&secret_reason_cmd())
+                }
+                None => secret_step(&secret_reason()),
             };
             self.steps.push(step);
             return;
@@ -709,8 +730,9 @@ impl Builder {
         let launch = launches_interactive(&cmd);
         if self.depth > 0 || cred || launch {
             if launch && self.depth == 0 {
-                self.warnings.push(format!(
-                    "技能第 {n} 步起含交互式会话（ssh / 菜单 / 数据库客户端等）：这一行及其后各行（到 exit / Ctrl-D 为止）按 keys 回放，不等命令结束"
+                self.warnings.push(crate::tr!(
+                    "技能第 {n} 步起含交互式会话（ssh / 菜单 / 数据库客户端等）：这一行及其后各行（到 exit / Ctrl-D 为止）按 keys 回放，不等命令结束",
+                    "From skill step {n} there's an interactive session (ssh / menus / database clients, etc.): this line and the following ones (up to exit / Ctrl-D) are replayed as keys without waiting for commands to finish"
                 ));
             }
             self.steps.push(keys_step(format!("{}<Enter>", esc_keys(&cmd))));
@@ -799,15 +821,24 @@ impl Builder {
         self.emit_line(false);
         self.resolve_prompt();
         if self.unmapped > 0 {
-            self.warnings.push(format!("有 {} 处无法映射的按键序列已丢弃", self.unmapped));
+            self.warnings.push(crate::tr!(
+                "有 {} 处无法映射的按键序列已丢弃",
+                "{} key sequences that couldn't be mapped were dropped",
+                self.unmapped
+            ));
         }
         if self.bad_patterns > 0 {
-            self.warnings.push(format!("有 {} 处等待的 pattern 不合法，已忽略", self.bad_patterns));
+            self.warnings.push(crate::tr!(
+                "有 {} 处等待的 pattern 不合法，已忽略",
+                "{} wait patterns were invalid and ignored",
+                self.bad_patterns
+            ));
         }
         if self.secrets > 0 {
-            self.warnings.push(
-                "原宏里仍保存着当时录下的明文内容（迁移不会修改或删除原宏），建议确认后编辑或删除原宏".into(),
-            );
+            self.warnings.push(crate::tr!(
+                "原宏里仍保存着当时录下的明文内容（迁移不会修改或删除原宏），建议确认后编辑或删除原宏",
+                "The original macro still holds the plaintext it recorded (migration doesn't change or delete it); review it, then edit or delete the original macro"
+            ));
         }
     }
 }
@@ -835,7 +866,8 @@ pub struct Conversion {
 pub fn unique_name(base: &str, taken: &HashSet<String>) -> String {
     let cleaned: String = base.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
     let cleaned = cleaned.trim();
-    let base: String = if cleaned.is_empty() { "未命名宏".into() } else { cleaned.chars().take(MAX_NAME_CHARS).collect() };
+    let base: String =
+        if cleaned.is_empty() { crate::tr!("未命名宏", "Untitled macro") } else { cleaned.chars().take(MAX_NAME_CHARS).collect() };
     if !taken.contains(&base) {
         return base;
     }
@@ -853,8 +885,9 @@ pub fn unique_name(base: &str, taken: &HashSet<String>) -> String {
 /// `validate` 报的「第 N 步」里的 N（从 1 起）。
 fn error_step_index(e: &str) -> Option<usize> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"^第 (\d+) 步").unwrap_or_else(|e| panic!("正则编译失败：{e}")));
-    re.captures(e).and_then(|c| c[1].parse().ok())
+    // 中英两种校验文案：「第 N 步」/「Step N」
+    let re = RE.get_or_init(|| Regex::new(r"^(?:第 (\d+) 步|Step (\d+)\b)").unwrap_or_else(|e| panic!("正则编译失败：{e}")));
+    re.captures(e).and_then(|c| c.get(1).or_else(|| c.get(2))).and_then(|m| m.as_str().parse().ok())
 }
 
 /// 校验草稿；若因凭据类问题失败，把对应步骤换成 `secret` 占位并报告，直到通过或剩下无法自动处理的错误。
@@ -872,7 +905,8 @@ fn finalize(mut input: SkillInput, warnings: &mut Vec<String>) -> Result<SkillIn
         };
         let bad: BTreeSet<usize> = errs
             .iter()
-            .filter(|e| e.contains("口令") || e.contains("密钥"))
+            // 英文校验文案里凭据类问题都带 password（见 skill::Ctx::literal_secret）
+            .filter(|e| e.contains("口令") || e.contains("密钥") || e.contains("password"))
             .filter_map(|e| error_step_index(e))
             .filter(|i| {
                 matches!(
@@ -886,13 +920,17 @@ fn finalize(mut input: SkillInput, warnings: &mut Vec<String>) -> Result<SkillIn
             return Err(errs);
         }
         for i in bad {
-            input.steps[i - 1] = secret_step(SECRET_REASON_CMD);
-            warnings.push(format!(
-                "技能第 {i} 步：校验判定含凭据类内容，内容已丢弃，改为密码占位（secret）。请核对"
+            input.steps[i - 1] = secret_step(&secret_reason_cmd());
+            warnings.push(crate::tr!(
+                "技能第 {i} 步：校验判定含凭据类内容，内容已丢弃，改为密码占位（secret）。请核对",
+                "Skill step {i}: validation found credential-like content; it was discarded and replaced with a password placeholder (secret). Please check"
             ));
         }
     }
-    Err(vec!["无法在合理次数内清除凭据类内容".into()])
+    Err(vec![crate::tr!(
+        "无法在合理次数内清除凭据类内容",
+        "Couldn't remove the credential-like content within a reasonable number of attempts"
+    )])
 }
 
 /// 宏 → skill 草稿。**纯函数**。`taken` 是已被占用的 skill 名称（用于去重）。
@@ -913,7 +951,12 @@ pub fn convert_macro(m: &MacroRecord, taken: &HashSet<String>) -> Conversion {
 
     if b.steps.iter().all(|s| matches!(s, SkillStep::ScreenCheck { .. })) {
         return Conversion {
-            verdict: Verdict::Skipped { reason: "宏里没有可迁移的操作（没有步骤，或只有等待 / 延时）".into() },
+            verdict: Verdict::Skipped {
+                reason: crate::tr!(
+                    "宏里没有可迁移的操作（没有步骤，或只有等待 / 延时）",
+                    "The macro has nothing to migrate (no steps, or only waits / delays)"
+                ),
+            },
             warnings,
         };
     }
@@ -921,7 +964,13 @@ pub fn convert_macro(m: &MacroRecord, taken: &HashSet<String>) -> Conversion {
     let name = unique_name(&m.name, taken);
     let short: String = name.chars().take(60).collect();
     let description: String =
-        format!("由旧宏「{short}」迁移而来（原宏保留）。回放前请核对每一步。").chars().take(MAX_DESC_CHARS).collect();
+        crate::tr!(
+            "由旧宏「{short}」迁移而来（原宏保留）。回放前请核对每一步。",
+            "Migrated from the old macro \"{short}\" (the original is kept). Check each step before playback."
+        )
+        .chars()
+        .take(MAX_DESC_CHARS)
+        .collect();
     let input = SkillInput {
         name,
         description,
@@ -993,10 +1042,15 @@ fn plan_one(store: &Store, m: &MacroRecord, explicit: bool, taken: &mut HashSet<
     // 幂等：已迁移过就不再迁移
     if let Some(sid) = store.macro_migration_get(&m.id) {
         match store.skill_get(&sid) {
-            Some(s) => return Plan::Skipped(format!("已迁移为技能「{}」", s.name), Vec::new()),
+            Some(s) => {
+                return Plan::Skipped(crate::tr!("已迁移为技能「{}」", "Already migrated to skill \"{}\"", s.name), Vec::new())
+            }
             None if !explicit => {
                 return Plan::Skipped(
-                    "此前已迁移过，对应的技能已被删除；如需重新迁移，请在这条宏上单独点「转为技能」".into(),
+                    crate::tr!(
+                        "此前已迁移过，对应的技能已被删除；如需重新迁移，请在这条宏上单独点「转为技能」",
+                        "Migrated before, but that skill was deleted; to migrate again, click \"Convert to skill\" on this macro"
+                    ),
                     Vec::new(),
                 )
             }
@@ -1030,7 +1084,7 @@ pub fn preview(store: &Store, ids: Option<&[String]>) -> Result<Vec<MigrationPre
                 macro_name: String::new(),
                 draft: None,
                 skip_reason: None,
-                errors: vec!["宏不存在".into()],
+                errors: vec![crate::tr!("宏不存在", "Macro not found")],
                 warnings: Vec::new(),
             },
             Ok(m) => {
@@ -1074,7 +1128,7 @@ pub fn migrate(store: &Store, ids: Option<&[String]>) -> Result<Vec<MigrationRes
                     return MigrationResult {
                         macro_id: id,
                         macro_name: String::new(),
-                        outcome: MigrationOutcome::Failed { errors: vec!["宏不存在".into()] },
+                        outcome: MigrationOutcome::Failed { errors: vec![crate::tr!("宏不存在", "Macro not found")] },
                         warnings: Vec::new(),
                     }
                 }
@@ -1098,7 +1152,9 @@ fn save(store: &Store, m: &MacroRecord, draft: SkillInput) -> MigrationOutcome {
     };
     if let Err(e) = store.macro_migration_put(&m.id, &skill.id) {
         let _ = store.skill_delete(&skill.id);
-        return MigrationOutcome::Failed { errors: vec![format!("记录迁移标记失败：{e}")] };
+        return MigrationOutcome::Failed {
+            errors: vec![crate::tr!("记录迁移标记失败：{e}", "Couldn't record the migration marker: {e}")],
+        };
     }
     MigrationOutcome::Migrated { skill_id: skill.id }
 }

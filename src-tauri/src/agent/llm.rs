@@ -619,7 +619,7 @@ pub fn build_messages_with_tools(
     tools: &[ToolSpec],
 ) -> Result<PreparedRequest, AgentError> {
     if acct.base_url.trim().is_empty() {
-        return Err(AgentError::BadRequest("尚未填写接口地址（Base URL）".into()));
+        return Err(AgentError::BadRequest(crate::tr!("尚未填写接口地址（Base URL）", "Base URL is not set")));
     }
     let model = acct.model.trim();
     if model.is_empty() {
@@ -693,10 +693,13 @@ pub(crate) fn header_map(headers: &[(String, String)]) -> Result<HeaderMap, Agen
     let mut map = HeaderMap::new();
     for (name, value) in headers {
         let name = HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| AgentError::BadRequest("请求头名非法，请检查配置".into()))?;
+            .map_err(|_| AgentError::BadRequest(crate::tr!("请求头名非法，请检查配置", "Invalid request header name; check your settings")))?;
         let value = HeaderValue::from_str(value).map_err(|_| {
             // 九成是 API Key 被复制时带进了换行
-            AgentError::BadRequest("API Key 含有非法字符（换行等），请重新复制".into())
+            AgentError::BadRequest(crate::tr!(
+                "API Key 含有非法字符（换行等），请重新复制",
+                "The API key contains invalid characters (e.g. a line break); copy it again"
+            ))
         })?;
         map.append(name, value);
     }
@@ -716,7 +719,7 @@ pub fn validate(cfg: &AgentConfig) -> Result<(), AgentError> {
         return Err(AgentError::MissingModel);
     }
     if acct.base_url.trim().is_empty() {
-        return Err(AgentError::BadRequest("尚未填写接口地址（Base URL）".into()));
+        return Err(AgentError::BadRequest(crate::tr!("尚未填写接口地址（Base URL）", "Base URL is not set")));
     }
     Ok(())
 }
@@ -1122,17 +1125,29 @@ pub fn extract_error_detail(body: &str) -> String {
 /// 原始错误落在尾部小字里供排障。
 pub fn http_status_message(status: StatusCode, body: &str) -> String {
     let main = match status.as_u16() {
-        401 | 403 => "API Key 无效、已过期，或没有该模型的访问权限：请到设置里重新填写",
-        429 => "请求被限流：提问太频繁或额度已耗尽，请稍后重试",
-        404 => "模型或接口地址不存在：请检查模型名称与 Base URL 是否匹配",
-        402 => "账户余额不足：请到服务商处充值后重试",
-        400 => "请求被拒绝：通常是模型不支持流式输出，或参数不合法",
-        408 | 409 => "请求超时或冲突，请稍后重试",
-        500..=599 => "模型服务端故障，请稍后重试",
-        _ => "模型服务返回了异常状态码",
+        401 | 403 => crate::tr!(
+            "API Key 无效、已过期，或没有该模型的访问权限：请到设置里重新填写",
+            "The API key is invalid, expired, or has no access to this model; re-enter it in Settings"
+        ),
+        429 => crate::tr!(
+            "请求被限流：提问太频繁或额度已耗尽，请稍后重试",
+            "Rate limited: too many requests or quota used up; try again later"
+        ),
+        404 => crate::tr!(
+            "模型或接口地址不存在：请检查模型名称与 Base URL 是否匹配",
+            "Model or endpoint not found: check that the model name matches the Base URL"
+        ),
+        402 => crate::tr!("账户余额不足：请到服务商处充值后重试", "Insufficient account balance: top up with your provider and retry"),
+        400 => crate::tr!(
+            "请求被拒绝：通常是模型不支持流式输出，或参数不合法",
+            "Request rejected: usually the model doesn't support streaming, or a parameter is invalid"
+        ),
+        408 | 409 => crate::tr!("请求超时或冲突，请稍后重试", "Request timed out or conflicted; try again later"),
+        500..=599 => crate::tr!("模型服务端故障，请稍后重试", "The model service had a server error; try again later"),
+        _ => crate::tr!("模型服务返回了异常状态码", "The model service returned an unexpected status code"),
     };
     errors::compose(
-        &format!("{}（HTTP {}）", main, status.as_u16()),
+        &crate::tr!("{}（HTTP {}）", "{} (HTTP {})", main, status.as_u16()),
         &extract_error_detail(body),
     )
 }
@@ -1142,8 +1157,9 @@ pub fn transport_error(err: &reqwest::Error) -> String {
     let raw = err.to_string();
     if err.is_timeout() {
         return errors::compose(
-            &format!(
+            &crate::tr!(
                 "请求超时：{} 秒内没有拿到模型服务的响应。请稍后重试，或换一个更快的模型",
+                "Request timed out: no response from the model service within {} seconds. Try again later, or use a faster model",
                 REQUEST_TIMEOUT.as_secs()
             ),
             &raw,
@@ -1151,23 +1167,32 @@ pub fn transport_error(err: &reqwest::Error) -> String {
     }
     if err.is_connect() {
         return errors::compose(
-            "连不上模型服务：请检查网络与代理设置，以及 Base URL 是否正确",
+            &crate::tr!(
+                "连不上模型服务：请检查网络与代理设置，以及 Base URL 是否正确",
+                "Can't reach the model service: check your network and proxy settings, and the Base URL"
+            ),
             &raw,
         );
     }
     if err.is_decode() {
         return errors::compose(
-            "模型服务返回了无法解析的响应：请确认 Base URL 指向的是兼容 OpenAI 的接口",
+            &crate::tr!(
+                "模型服务返回了无法解析的响应：请确认 Base URL 指向的是兼容 OpenAI 的接口",
+                "The model service returned a response that couldn't be parsed: make sure the Base URL points to an OpenAI-compatible API"
+            ),
             &raw,
         );
     }
     if err.is_builder() {
         return errors::compose(
-            "请求构造失败：请检查 API Key 与 Base URL 是否含非法字符（换行、空格等）",
+            &crate::tr!(
+                "请求构造失败：请检查 API Key 与 Base URL 是否含非法字符（换行、空格等）",
+                "Couldn't build the request: check the API key and Base URL for invalid characters (line breaks, spaces, etc.)"
+            ),
             &raw,
         );
     }
-    errors::compose("网络请求失败：请检查网络与代理设置", &raw)
+    errors::compose(&crate::tr!("网络请求失败：请检查网络与代理设置", "Network request failed: check your network and proxy settings"), &raw)
 }
 
 /// 读响应体，**限长**。
@@ -1498,7 +1523,7 @@ async fn stream_answer(
         let name = match HeaderName::from_bytes(name.as_bytes()) {
             Ok(n) => n,
             Err(_) => {
-                emit_error(&app, &session, "请求头非法，请检查配置");
+                emit_error(&app, &session, &crate::tr!("请求头非法，请检查配置", "Invalid request header; check your settings"));
                 return;
             }
         };
@@ -1506,7 +1531,14 @@ async fn stream_answer(
             Ok(v) => v,
             // 九成是 API Key 被复制时带进了换行
             Err(_) => {
-                emit_error(&app, &session, "API Key 含有非法字符（换行等），请重新复制");
+                emit_error(
+                    &app,
+                    &session,
+                    &crate::tr!(
+                        "API Key 含有非法字符（换行等），请重新复制",
+                        "The API key contains invalid characters (e.g. a line break); copy it again"
+                    ),
+                );
                 return;
             }
         };
@@ -1782,7 +1814,7 @@ impl LlmFailure {
         Self { error: AgentError::Transport(msg), kind, retry_after: None }
     }
     fn cancelled() -> Self {
-        Self::new(FailureKind::Cancelled, "已取消".into())
+        Self::new(FailureKind::Cancelled, crate::tr!("已取消", "Cancelled"))
     }
 }
 
@@ -1969,7 +2001,10 @@ pub async fn complete_reply_once(
         // 偶发的空回复（网关抖动、模型把 token 全花在推理上）重试往往就好
         return Err(LlmFailure::new(
             FailureKind::Transient,
-            "模型返回了空回复：请确认该模型可用于对话接口".into(),
+            crate::tr!(
+                "模型返回了空回复：请确认该模型可用于对话接口",
+                "The model returned an empty reply: make sure this model works with the chat API"
+            ),
         ));
     }
     Ok(reply)
@@ -2080,13 +2115,15 @@ pub async fn test_connection(cfg: &AgentConfig) -> Result<String, AgentError> {
     }
 
     match extract_answer_text(provider, &body) {
-        Some(text) if !text.trim().is_empty() => Ok(format!(
+        Some(text) if !text.trim().is_empty() => Ok(crate::tr!(
             "连接成功：模型 {} 已响应，回复「{}」",
+            "Connected: model {} replied \"{}\"",
             acct.model.trim(),
             truncate_chars(text.trim(), 60)
         )),
-        _ => Ok(format!(
+        _ => Ok(crate::tr!(
             "连接成功：模型 {} 已响应，但正文为空（请确认该模型可用于对话接口）",
+            "Connected: model {} responded, but the reply was empty (make sure this model works with the chat API)",
             acct.model.trim()
         )),
     }

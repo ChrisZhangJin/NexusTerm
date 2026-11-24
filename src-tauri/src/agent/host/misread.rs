@@ -214,7 +214,11 @@ pub fn write_report(dir: &Path, r: &MisreadReport) -> std::io::Result<PathBuf> {
 /// 告诉模型：用户说屏幕被认错了。同一屏幕上原样重试仍会被同一条规则拦下，所以要换路子。
 /// `retry_ok`：这一屏已经担保过（见 [`Vouch`]），同一屏上可以原样再试一次。
 pub fn model_note(ev: &GateEvidence, note: &str, retry_ok: bool) -> String {
-    let seen = ev.classified.label.trim_start_matches("屏幕被识别为：");
+    let seen = ev
+        .classified
+        .label
+        .trim_start_matches(super::gate::SCREEN_LINE_HEAD)
+        .trim_start_matches(super::gate::SCREEN_LINE_HEAD_EN);
     let mut s = if ev.action.trim().is_empty() {
         format!("用户反馈：系统对屏幕的判断是**误判** —— 把屏幕认成了「{seen}」，用户说不是。")
     } else {
