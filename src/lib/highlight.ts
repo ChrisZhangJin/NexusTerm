@@ -1,4 +1,5 @@
 import type { IDecoration, Terminal } from "@xterm/xterm";
+import { t } from "../i18n";
 
 /**
  * 终端关键字「标记」：把整个缓冲区（含滚动历史）里命中的文本用指定底色高亮。
@@ -19,9 +20,9 @@ export interface MarkRule {
 }
 
 export const MARK_COLORS = [
-  { key: "yellow", label: "高亮黄", color: "#ffd84d" },
-  { key: "green", label: "高亮绿", color: "#6fdc8c" },
-  { key: "blue", label: "高亮蓝", color: "#6cb6ff" },
+  { key: "yellow", get label() { return t("高亮黄", "Yellow"); }, color: "#ffd84d" },
+  { key: "green", get label() { return t("高亮绿", "Green"); }, color: "#6fdc8c" },
+  { key: "blue", get label() { return t("高亮蓝", "Blue"); }, color: "#6cb6ff" },
 ] as const;
 
 /** 防止超长缓冲区里命中过多拖垮渲染 */

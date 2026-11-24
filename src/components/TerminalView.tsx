@@ -56,6 +56,7 @@ import { isSftpCommand } from "../lib/sftpCmd";
 import { opensLink } from "../lib/links";
 import { attachZmodem, type ZmodemGate } from "../lib/zmodem";
 import type { ClosedInfo, TerminalTab, Theme } from "../types";
+import { t, useLocale } from "../i18n";
 
 /** HH:MM:SS，本地时区 */
 export function clock(ts: number): string {
@@ -283,6 +284,7 @@ export default function TerminalView({
   reconnectAttempt,
   reconnectMax,
 }: Props) {
+  useLocale();
   // 事件回调在 mount 时注册一次，用 ref 拿最新的 props
   const onClosedRef = useRef(onClosed);
   onClosedRef.current = onClosed;
@@ -340,8 +342,8 @@ export default function TerminalView({
       if (alive) {
         onNotifyRef.current?.(
           next
-            ? `正在记录输入日志 → ${INPUT_LOG_HINT}；再按 ⌘⌃⌥L 停止`
-            : `输入日志已停止（文件：${INPUT_LOG_HINT}）`
+            ? t("正在记录输入日志 → {f}；再按 ⌘⌃⌥L 停止", "Logging input → {f}; press ⌘⌃⌥L again to stop", { f: INPUT_LOG_HINT })
+            : t("输入日志已停止（文件：{f}）", "Input logging stopped (file: {f})", { f: INPUT_LOG_HINT })
         );
       }
     };
@@ -532,11 +534,11 @@ export default function TerminalView({
 
   /** 把当前行列数同步给后端（SSH 是 window_change，本地是 PTY resize） */
   const syncSize = useCallback(() => {
-    const t = termRef.current;
-    if (!t) return;
+    const tm = termRef.current;
+    if (!tm) return;
     const push = kind === "local"
-      ? api.localResize(tabId, t.cols, t.rows)
-      : api.sshResize(tabId, t.cols, t.rows);
+      ? api.localResize(tabId, tm.cols, tm.rows)
+      : api.sshResize(tabId, tm.cols, tm.rows);
     push.catch(() => {});
   }, [kind, tabId]);
 
@@ -589,7 +591,9 @@ export default function TerminalView({
         },
         {
           hover: () => {
-            if (host) host.title = isMacOS() ? "⌘+点击 在浏览器中打开" : "Ctrl+点击 在浏览器中打开";
+            if (host) host.title = isMacOS()
+                ? t("⌘+点击 在浏览器中打开", "⌘+click to open in browser")
+                : t("Ctrl+点击 在浏览器中打开", "Ctrl+click to open in browser");
           },
           leave: () => {
             if (host) host.title = "";
@@ -704,7 +708,7 @@ export default function TerminalView({
     if (isLocal) {
       onLocalClosed(tabId, (code) => {
         if (disposed) return;
-        writeOut(`\r\n\x1b[90m[Shell 已退出，退出码 ${code}]\x1b[0m\r\n`);
+        writeOut(`\r\n\x1b[90m[${t("Shell 已退出，退出码 {code}", "Shell exited with code {code}", { code: String(code) })}]\x1b[0m\r\n`);
         onClosedRef.current?.({ code, reason: "exit" });
       }).then((u) => cleanups.push(u));
     } else {
@@ -845,7 +849,9 @@ export default function TerminalView({
       localStorage.setItem(LS_MAC_INPUT, next ? "1" : "0");
       applyMacInput();
       onNotifyRef.current?.(
-        next ? "已开启 mac 输入接管层（⌘⌃⌥K 可再关）" : "已关闭 mac 输入接管层，走 xterm 原生路径（⌘⌃⌥K 恢复）"
+        next
+          ? t("已开启 mac 输入接管层（⌘⌃⌥K 可再关）", "Mac input layer on (⌘⌃⌥K to turn off)")
+          : t("已关闭 mac 输入接管层，走 xterm 原生路径（⌘⌃⌥K 恢复）", "Mac input layer off, using xterm's native path (⌘⌃⌥K to restore)")
       );
     };
 
@@ -1011,7 +1017,10 @@ export default function TerminalView({
       } catch (e) {
         if (isSidecarDenied(e) && markCompat(configId, tabId)) {
           onNotify?.(
-            "该服务器（堡垒机）不支持并行通道，已切换为兼容模式：不再采集远端资源，下次连接也不会再开额外通道"
+            t(
+              "该服务器（堡垒机）不支持并行通道，已切换为兼容模式：不再采集远端资源，下次连接也不会再开额外通道",
+              "This server (bastion host) doesn't allow parallel channels. Switched to compatibility mode: remote resources are no longer collected, and future connections won't open extra channels"
+            )
           );
         }
         throw e;
@@ -1057,7 +1066,7 @@ export default function TerminalView({
     } else if (status === "connected" && prev === "reconnecting") {
       out(`\x1b[32mReconnected to ${peerHost ?? "remote host"} at ${now}.\x1b[0m\r\n\r\n`);
     } else if (status === "closed" && prev === "reconnecting") {
-      out(`\x1b[31mReconnect failed at ${now}. 右键标签页可「重新连接」。\x1b[0m\r\n`);
+      out(`\x1b[31mReconnect failed at ${now}. ${t("右键标签页可「重新连接」。", "Right-click the tab to reconnect.")}\x1b[0m\r\n`);
     }
   }, [status, reconnectAttempt, reconnectMax, peerHost, isLocal]);
 
@@ -1103,7 +1112,7 @@ export default function TerminalView({
   const doCopy = useCallback(() => {
     const sel = termRef.current?.getSelection();
     setCtxMenu(null);
-    if (sel) api.clipboardWrite(sel).catch((e) => onNotify?.(`复制失败：${String(e)}`));
+    if (sel) api.clipboardWrite(sel).catch((e) => onNotify?.(t("复制失败：{e}", "Copy failed: {e}", { e: String(e) })));
     termRef.current?.focus();
   }, [onNotify]);
 
@@ -1111,12 +1120,12 @@ export default function TerminalView({
     setCtxMenu(null);
     api
       .clipboardRead(tabId)
-      .then((t) => {
-        if (!t) return;
+      .then((txt) => {
+        if (!txt) return;
         // 走 xterm.paste：自动处理换行规范化与 bracketed paste，和键盘粘贴行为一致
-        termRef.current?.paste(t);
+        termRef.current?.paste(txt);
       })
-      .catch((e) => onNotify?.(`粘贴失败：${String(e)}`));
+      .catch((e) => onNotify?.(t("粘贴失败：{e}", "Paste failed: {e}", { e: String(e) })));
     termRef.current?.focus();
   }, [onNotify, tabId]);
 
@@ -1127,12 +1136,12 @@ export default function TerminalView({
 
   const doClearScreen = useCallback(() => {
     setCtxMenu(null);
-    const t = termRef.current;
-    if (!t) return;
-    t.clear();
+    const tm = termRef.current;
+    if (!tm) return;
+    tm.clear();
     // 再让远端 shell 重绘提示符（Ctrl+L），否则清完是一片空白
     (isLocal ? api.localWrite(tabId, [0x0c]) : api.sshWrite(tabId, [0x0c])).catch(() => {});
-    t.focus();
+    tm.focus();
   }, [isLocal, tabId]);
 
   /**
@@ -1163,7 +1172,7 @@ export default function TerminalView({
         if (isLocal) {
           const abs = /^([A-Za-z]:[\\/]|[\\/]|~)/.test(p);
           if (!abs) {
-            onNotify?.("本地终端请选中完整路径（如 C:\\docs\\README.md）");
+            onNotify?.(t("本地终端请选中完整路径（如 C:\\docs\\README.md）", "In a local terminal, select a full path (e.g. C:\\docs\\README.md)"));
             return;
           }
           await api.viewerOpenLocal(p);
@@ -1182,19 +1191,26 @@ export default function TerminalView({
             // 兼容模式（堡垒机只放行一条通道）下探测目录本来就会被拒绝，
             // 说清原因，别让人以为是 bug
             onNotify?.(
-              probeErr?.includes("兼容模式")
-                ? "该连接处于兼容模式（服务器不支持并行通道），无法自动获取远端目录，请选中完整路径（/… 或 ~/…）"
-                : "无法确定远端当前目录，请选中完整路径（/… 或 ~/…）"
+              // 后端 SIDECAR_OFF 随界面语言：中文含「兼容模式」，英文含 compatibility mode
+              probeErr?.includes("兼容模式") || /compatibility mode/i.test(probeErr ?? "")
+                ? t(
+                    "该连接处于兼容模式（服务器不支持并行通道），无法自动获取远端目录，请选中完整路径（/… 或 ~/…）",
+                    "This connection is in compatibility mode (the server doesn't allow parallel channels), so the remote directory can't be detected. Select a full path (/… or ~/…)"
+                  )
+                : t(
+                    "无法确定远端当前目录，请选中完整路径（/… 或 ~/…）",
+                    "Couldn't determine the remote working directory. Select a full path (/… or ~/…)"
+                  )
             );
             return;
           }
           full = (ctx.cwd.endsWith("/") ? ctx.cwd : ctx.cwd + "/") + p.replace(/^\.\//, "");
         }
-        onNotify?.(`正在打开「${name}」…`);
+        onNotify?.(t("正在打开「{name}」…", "Opening \"{name}\"…", { name }));
         const where = peerHostRef.current ? `${peerHostRef.current}:` : "";
         await api.viewerOpenSsh(tabId, full, `${where}${full}`);
       } catch (e) {
-        onNotify?.(`浏览失败：${String(e)}`);
+        onNotify?.(t("浏览失败：{e}", "Couldn't open: {e}", { e: String(e) }));
       }
     },
     [isLocal, tabId, onNotify]
@@ -1216,9 +1232,9 @@ export default function TerminalView({
   /** 导出整个缓冲区（含滚动历史）为 UTF-8 文本 */
   const doExport = useCallback(async () => {
     setCtxMenu(null);
-    const t = termRef.current;
-    if (!t) return;
-    const text = bufferText(t);
+    const tm = termRef.current;
+    if (!tm) return;
+    const text = bufferText(tm);
     const p = (n: number) => String(n).padStart(2, "0");
     const d = new Date();
     const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
@@ -1226,18 +1242,18 @@ export default function TerminalView({
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");
       const path = await save({
-        title: "导出终端输出",
+        title: t("导出终端输出", "Export terminal output"),
         defaultPath: `${base}-${stamp}.txt`,
         filters: [
-          { name: "文本文件", extensions: ["txt", "log"] },
+          { name: t("文本文件", "Text files"), extensions: ["txt", "log"] },
         ],
       });
       if (!path) return;
       await api.writeFile(path, Array.from(new TextEncoder().encode(text)));
       const lines = text.split("\n").length - 1;
-      onNotify?.(`已导出 ${lines} 行到 ${path}`);
+      onNotify?.(t("已导出 {n} 行到 {path}", "Exported {n} lines to {path}", { n: lines, path }));
     } catch (e) {
-      onNotify?.(`导出失败：${String(e)}`);
+      onNotify?.(t("导出失败：{e}", "Export failed: {e}", { e: String(e) }));
     } finally {
       termRef.current?.focus();
     }
@@ -1302,32 +1318,36 @@ export default function TerminalView({
       setDropHint(false);
       const files = Array.from(e.dataTransfer.files ?? []).filter((f) => f.size > 0 || f.type !== "");
       if (files.length === 0) {
-        onNotify?.("没有可上传的文件（不支持直接拖入文件夹）");
+        onNotify?.(t("没有可上传的文件（不支持直接拖入文件夹）", "Nothing to upload (folders can't be dropped)"));
         return;
       }
       if (isLocal) {
-        onNotify?.("本地终端不支持拖拽上传，请在 SSH 会话中使用");
+        onNotify?.(t("本地终端不支持拖拽上传，请在 SSH 会话中使用", "Drag-and-drop upload isn't available in local terminals; use it in an SSH session"));
         return;
       }
       if (statusRef.current !== "connected") {
-        onNotify?.("会话未连接，无法上传");
+        onNotify?.(t("会话未连接，无法上传", "Session not connected; can't upload"));
         return;
       }
       const z = zmodemRef.current;
       if (!z) return;
       if (z.isActive()) {
-        onNotify?.("已有 ZMODEM 传输在进行中，请稍后再试");
+        onNotify?.(t("已有 ZMODEM 传输在进行中，请稍后再试", "A ZMODEM transfer is already running; try again later"));
         return;
       }
       z.queueUpload(files);
       // -E：远端已有同名文件时自动改名，避免覆盖也避免被拒收
       const cmd = "rz -E\r";
       (isLocal ? api.localWrite(tabId, stringToBytes(cmd)) : api.sshWrite(tabId, stringToBytes(cmd))).catch(
-        (err) => onNotify?.(`发送 rz 失败：${String(err)}`)
+        (err) => onNotify?.(t("发送 rz 失败：{e}", "Failed to send rz: {e}", { e: String(err) }))
       );
       const total = files.reduce((n, f) => n + f.size, 0);
       onNotify?.(
-        `正在通过 rz 上传 ${files.length} 个文件（${(total / 1024 / 1024).toFixed(1)} MB）到远端当前目录；远端需已安装 lrzsz`
+        t(
+          "正在通过 rz 上传 {n} 个文件（{mb} MB）到远端当前目录；远端需已安装 lrzsz",
+          "Uploading {n} file(s) ({mb} MB) via rz to the remote working directory; the remote needs lrzsz installed",
+          { n: files.length, mb: (total / 1024 / 1024).toFixed(1) }
+        )
       );
       termRef.current?.focus();
     },
@@ -1338,7 +1358,7 @@ export default function TerminalView({
     (rules: MarkRule[], cs: boolean) => {
       const n = hlRef.current?.apply(rules, cs) ?? 0;
       setMarkCount(hlRef.current?.active.length ?? 0);
-      if (rules.some((r) => r.text)) onNotify?.(`标记完成：共高亮 ${n} 处`);
+      if (rules.some((r) => r.text)) onNotify?.(t("标记完成：共高亮 {n} 处", "Marked: {n} match(es) highlighted", { n }));
       return n;
     },
     [onNotify]
@@ -1384,8 +1404,10 @@ export default function TerminalView({
         <div className="term-drop">
           <div className="term-drop-box">
             <div className="term-drop-icon">⇪</div>
-            <div className="term-drop-title">松开以上传到远端当前目录</div>
-            <div className="term-drop-sub">通过 rz（lrzsz / ZMODEM）传输 · 同名文件自动改名</div>
+            <div className="term-drop-title">{t("松开以上传到远端当前目录", "Drop to upload to the remote working directory")}</div>
+            <div className="term-drop-sub">
+              {t("通过 rz（lrzsz / ZMODEM）传输 · 同名文件自动改名", "Sent via rz (lrzsz / ZMODEM) · same-name files are renamed automatically")}
+            </div>
           </div>
         </div>
       )}
@@ -1398,7 +1420,7 @@ export default function TerminalView({
           />
           <div ref={ctxRef} className="ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
             <button className="ctx-item" onClick={doDisconnect}>
-              断开
+              {t("断开", "Disconnect")}
               <Kbd combo={sc.disconnect} />
             </button>
             {!isLocal && (
@@ -1410,7 +1432,7 @@ export default function TerminalView({
                   onOpenSftp?.();
                 }}
               >
-                SFTP 文件管理
+                {t("SFTP 文件管理", "SFTP file manager")}
               </button>
             )}
             <div className="ctx-sep" />
@@ -1421,42 +1443,42 @@ export default function TerminalView({
                 <button
                   className="ctx-item"
                   disabled={!p || (!isLocal && status !== "connected")}
-                  title={p ? "在新窗口中渲染查看" : "鼠标移到一个可预览的文件名上再右键"}
+                  title={p ? t("在新窗口中渲染查看", "Render in a new window") : t("鼠标移到一个可预览的文件名上再右键", "Right-click on a previewable file name")}
                   onClick={() => p && void doView(ctxMenu.target)}
                 >
-                  <span className="ctx-ellipsis">{name ? `浏览「${name}」` : "浏览"}</span>
+                  <span className="ctx-ellipsis">{name ? t("浏览「{name}」", "View \"{name}\"", { name }) : t("浏览", "View")}</span>
                 </button>
               );
             })()}
             <div className="ctx-sep" />
             <button className="ctx-item" onClick={doCopy}>
-              复制
+              {t("复制", "Copy")}
               <Kbd combo={sc.copy} />
             </button>
             <button className="ctx-item" onClick={doPaste}>
-              粘贴
+              {t("粘贴", "Paste")}
               <Kbd combo={sc.paste} />
             </button>
             <div className="ctx-sep" />
             <button className="ctx-item" onClick={doSelectAll}>
-              全选
+              {t("全选", "Select all")}
               <Kbd combo={sc.selectAll} />
             </button>
             <button className="ctx-item" onClick={doClearScreen}>
-              清屏
+              {t("清屏", "Clear screen")}
               <Kbd combo={sc.clearScreen} />
             </button>
             <div className="ctx-sep" />
             <button className="ctx-item" onClick={doFind}>
-              查找…
+              {t("查找…", "Find…")}
               <Kbd combo={sc.find} />
             </button>
             <button className="ctx-item" onClick={doMark}>
-              标记…
-              {markCount > 0 && <span className="ctx-shortcut">{markCount} 条生效</span>}
+              {t("标记…", "Mark…")}
+              {markCount > 0 && <span className="ctx-shortcut">{t("{n} 条生效", "{n} active", { n: markCount })}</span>}
             </button>
             <button className="ctx-item" onClick={doExport}>
-              导出…
+              {t("导出…", "Export…")}
               <Kbd combo={sc.exportBuffer} />
             </button>
           </div>
@@ -1465,8 +1487,10 @@ export default function TerminalView({
       {active && aiLocked && (
         <div key={lockNudge} className={`ai-lock-banner${lockNudge > 0 ? " nudge" : ""}`} onMouseDown={(e) => e.stopPropagation()}>
           <span className="ai-lock-dot" />
-          <span>AI 托管中 · 只读</span>
-          <span className="ai-lock-hint">要动手请点「接管」· Ctrl+C 立即接管并中断</span>
+          <span>{t("AI 托管中 · 只读", "AI on autopilot · read-only")}</span>
+          <span className="ai-lock-hint">
+            {t("要动手请点「接管」· Ctrl+C 立即接管并中断", "Click Take over to type · Ctrl+C takes over and interrupts")}
+          </span>
           <button
             className="st-btn primary"
             onClick={() => {
@@ -1474,7 +1498,7 @@ export default function TerminalView({
               api.agentControlTakeover(tabId).catch(() => {});
             }}
           >
-            接管
+            {t("接管", "Take over")}
           </button>
         </div>
       )}
@@ -1539,6 +1563,7 @@ function FindBar({
   initial: string;
   onClose: () => void;
 }) {
+  useLocale();
   const [q, setQ] = useState(initial.split("\n")[0] ?? "");
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [wholeWord, setWholeWord] = useState(false);
@@ -1606,11 +1631,11 @@ function FindBar({
   const status = !q
     ? ""
     : bad
-      ? "正则无效"
+      ? t("正则无效", "Invalid regex")
       : !result || result.count === 0
-        ? "无结果"
+        ? t("无结果", "No results")
         : result.index < 0
-          ? `${result.count}+ 处`
+          ? t("{n}+ 处", "{n}+", { n: result.count })
           : `${result.index + 1} / ${result.count}`;
 
   return (
@@ -1620,7 +1645,7 @@ function FindBar({
           ref={inputRef}
           className={`find-input${bad || (result && result.count === 0 && q) ? " miss" : ""}`}
           value={q}
-          placeholder="查找关键字"
+          placeholder={t("查找关键字", "Find")}
           onChange={(e) => setQ(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
@@ -1634,13 +1659,16 @@ function FindBar({
           }}
         />
         <span className="find-status">{status}</span>
-        <button className="find-btn" onClick={prev} title="上一个 (Shift+Enter)">↑</button>
-        <button className="find-btn" onClick={next} title="下一个 (Enter)">↓</button>
-        <button className="find-btn" onClick={onClose} title="关闭 (Esc)">×</button>
+        <button className="find-btn" onClick={prev} title={t("上一个 (Shift+Enter)", "Previous (Shift+Enter)")}>↑</button>
+        <button className="find-btn" onClick={next} title={t("下一个 (Enter)", "Next (Enter)")}>↓</button>
+        <button className="find-btn" onClick={onClose} title={t("关闭 (Esc)", "Close (Esc)")}>×</button>
       </div>
       {altScreen && (
         <div className="find-hint">
-          当前在全屏程序（tmux / screen / less 等）里，只能搜索当前这一屏；它自己的滚动历史请用它自带的搜索（tmux：Ctrl+B 后按 [，再按 Ctrl+S）。
+          {t(
+            "当前在全屏程序（tmux / screen / less 等）里，只能搜索当前这一屏；它自己的滚动历史请用它自带的搜索（tmux：Ctrl+B 后按 [，再按 Ctrl+S）。",
+            "You're in a full-screen program (tmux / screen / less, etc.), so only the current screen can be searched. Use its own search for its scrollback (tmux: Ctrl+B, then [, then Ctrl+S)."
+          )}
         </div>
       )}
       <div className="find-opts">
@@ -1650,7 +1678,7 @@ function FindBar({
             checked={caseSensitive}
             onChange={(e) => setCaseSensitive(e.target.checked)}
           />
-          大小写敏感
+          {t("大小写敏感", "Match case")}
         </label>
         <label>
           <input
@@ -1658,11 +1686,11 @@ function FindBar({
             checked={wholeWord}
             onChange={(e) => setWholeWord(e.target.checked)}
           />
-          全词匹配
+          {t("全词匹配", "Whole word")}
         </label>
         <label>
           <input type="checkbox" checked={regex} onChange={(e) => setRegex(e.target.checked)} />
-          正则
+          {t("正则", "Regex")}
         </label>
       </div>
     </div>
@@ -1687,14 +1715,15 @@ function MarkDialog({
   onClear: () => void;
   onClose: () => void;
 }) {
+  useLocale();
   const [texts, setTexts] = useState<string[]>(() => {
-    const t = MARK_COLORS.map((c) => initial.find((r) => r.color === c.color)?.text ?? "");
+    const arr = MARK_COLORS.map((c) => initial.find((r) => r.color === c.color)?.text ?? "");
     const s = seed.split("\n")[0]?.trim();
-    if (s && !t.includes(s)) {
-      const i = t.findIndex((x) => !x);
-      if (i >= 0) t[i] = s;
+    if (s && !arr.includes(s)) {
+      const i = arr.findIndex((x) => !x);
+      if (i >= 0) arr[i] = s;
     }
-    return t;
+    return arr;
   });
   const [cs, setCs] = useState(initialCase);
   const firstRef = useRef<HTMLInputElement>(null);
@@ -1726,8 +1755,13 @@ function MarkDialog({
           }
         }}
       >
-        <h2>标记关键字</h2>
-        <p className="mark-hint">为每种颜色输入要高亮的文本，留空则不使用。新输出会自动按规则继续高亮。</p>
+        <h2>{t("标记关键字", "Mark keywords")}</h2>
+        <p className="mark-hint">
+          {t(
+            "为每种颜色输入要高亮的文本，留空则不使用。新输出会自动按规则继续高亮。",
+            "Enter text to highlight for each color; leave empty to skip. New output keeps being highlighted."
+          )}
+        </p>
         {MARK_COLORS.map((c, i) => (
           <div key={c.key} className="mark-row">
             <span className="mark-swatch" style={{ background: c.color }} />
@@ -1735,7 +1769,7 @@ function MarkDialog({
             <input
               ref={i === 0 ? firstRef : undefined}
               value={texts[i]}
-              placeholder="要高亮的文本"
+              placeholder={t("要高亮的文本", "Text to highlight")}
               onChange={(e) =>
                 setTexts((prev) => prev.map((x, j) => (j === i ? e.target.value : x)))
               }
@@ -1743,7 +1777,7 @@ function MarkDialog({
             {texts[i] && (
               <button
                 className="mark-x"
-                title="清空"
+                title={t("清空", "Clear")}
                 onClick={() => setTexts((prev) => prev.map((x, j) => (j === i ? "" : x)))}
               >
                 ×
@@ -1753,7 +1787,7 @@ function MarkDialog({
         ))}
         <label className="mark-case">
           <input type="checkbox" checked={cs} onChange={(e) => setCs(e.target.checked)} />
-          大小写敏感
+          {t("大小写敏感", "Match case")}
         </label>
         <div className="modal-actions">
           <button
@@ -1764,13 +1798,13 @@ function MarkDialog({
               onClose();
             }}
           >
-            清除全部标记
+            {t("清除全部标记", "Clear all marks")}
           </button>
           <button className="btn" onClick={onClose}>
-            取消
+            {t("取消", "Cancel")}
           </button>
           <button className="btn primary" onClick={submit}>
-            确定
+            {t("确定", "OK")}
           </button>
         </div>
       </div>

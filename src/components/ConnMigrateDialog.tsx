@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
 import { api } from "../api";
+import { t, useLocale } from "../i18n";
 import {
   describeExport,
   describeImport,
@@ -27,6 +28,7 @@ export default function ConnMigrateDialog({
   /** 成功后回调；导入成功时调用方负责刷新连接列表 */
   onDone: (report: MigrateReport) => void;
 }): ReactElement {
+  useLocale();
   const isExport = mode.kind === "export";
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -62,7 +64,7 @@ export default function ConnMigrateDialog({
         return;
       }
     } else if (!password) {
-      setErr("请输入导出密码。");
+      setErr(t("请输入导出密码。", "Enter the export password."));
       return;
     }
     setErr("");
@@ -71,9 +73,9 @@ export default function ConnMigrateDialog({
       if (isExport) {
         const { save } = await import("@tauri-apps/plugin-dialog");
         const path = await save({
-          title: "导出全部连接",
+          title: t("导出全部连接", "Export all connections"),
           defaultPath: exportFileName(),
-          filters: [{ name: "NexusTerm 连接迁移文件", extensions: [CONN_FILE_EXT] }],
+          filters: [{ name: t("NexusTerm 连接迁移文件", "NexusTerm connection export"), extensions: [CONN_FILE_EXT] }],
         });
         if (!path) {
           setBusy(false);
@@ -103,21 +105,26 @@ export default function ConnMigrateDialog({
           void submit();
         }}
       >
-        <h2>{isExport ? "导出全部连接" : "导入连接"}</h2>
+        <h2>{isExport ? t("导出全部连接", "Export all connections") : t("导入连接", "Import connections")}</h2>
 
         {isExport ? (
           <p className="hint" style={{ margin: "0 0 12px" }}>
-            设一个<strong>导出密码</strong>
-            来加密这个文件。它和主密码无关，也不会被保存 —— 到新电脑导入时要用它，忘了就打不开。
+            {t("设一个", "Set an ")}
+            <strong>{t("导出密码", "export password")}</strong>
+            {t(
+              "来加密这个文件。它和主密码无关，也不会被保存 —— 到新电脑导入时要用它，忘了就打不开。",
+              " to encrypt this file. It's unrelated to your master password and isn't saved — you'll need it to import on the new computer, and the file can't be opened without it."
+            )}
           </p>
         ) : (
           <p className="hint" style={{ margin: "0 0 12px", wordBreak: "break-all" }}>
-            文件：{mode.path}
+            {t("文件：", "File: ")}
+            {mode.path}
           </p>
         )}
 
         <div className="row">
-          <label htmlFor="mig-pw">导出密码</label>
+          <label htmlFor="mig-pw">{t("导出密码", "Export password")}</label>
           <input
             id="mig-pw"
             ref={pwRef}
@@ -130,7 +137,7 @@ export default function ConnMigrateDialog({
         </div>
         {isExport && (
           <div className="row">
-            <label htmlFor="mig-pw2">再输一遍</label>
+            <label htmlFor="mig-pw2">{t("再输一遍", "Confirm")}</label>
             <input
               id="mig-pw2"
               type="password"
@@ -152,15 +159,24 @@ export default function ConnMigrateDialog({
                 disabled={busy}
               />
               <span>
-                包含私钥文件
-                <em>勾选后密钥认证的连接在新电脑上可直接登录。</em>
+                {t("包含私钥文件", "Include private key files")}
+                <em>
+                  {t(
+                    "勾选后密钥认证的连接在新电脑上可直接登录。",
+                    "Key-based connections will then sign in directly on the new computer."
+                  )}
+                </em>
               </span>
             </label>
             {includeKeys && (
               <div className="vault-danger">
-                <strong>文件里会带上你的私钥。</strong>
-                拿到这个文件<strong>并且</strong>知道导出密码的人，可以登录这些连接对应的服务器。
-                导出密码请单独告知自己，不要和文件放在一起。
+                <strong>{t("文件里会带上你的私钥。", "The file will contain your private keys.")}</strong>
+                {t("拿到这个文件", " Anyone who has this file ")}
+                <strong>{t("并且", "and")}</strong>
+                {t(
+                  "知道导出密码的人，可以登录这些连接对应的服务器。导出密码请单独告知自己，不要和文件放在一起。",
+                  " knows the export password can sign in to these servers. Keep the export password separate from the file."
+                )}
               </div>
             )}
           </>
@@ -170,10 +186,16 @@ export default function ConnMigrateDialog({
 
         <div className="modal-actions">
           <button type="button" className="btn" onClick={onClose} disabled={busy}>
-            取消
+            {t("取消", "Cancel")}
           </button>
           <button type="submit" className="btn primary" disabled={busy}>
-            {busy ? (isExport ? "导出中…" : "导入中…") : isExport ? "选择位置并导出…" : "导入"}
+            {busy
+              ? isExport
+                ? t("导出中…", "Exporting…")
+                : t("导入中…", "Importing…")
+              : isExport
+                ? t("选择位置并导出…", "Choose location & export…")
+                : t("导入", "Import")}
           </button>
         </div>
       </form>

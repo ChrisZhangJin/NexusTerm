@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactElement, type ReactNode } from "react";
 import { api } from "../api";
+import { t, useLocale } from "../i18n";
 import MasterPasswordDialog from "./MasterPasswordDialog";
 import type { VaultStatus } from "../types";
 
@@ -21,6 +22,7 @@ export default function VaultGate({
   initial: VaultStatus | null;
   children: ReactNode;
 }): ReactElement {
+  useLocale();
   const needsGate = initial?.enabled === true && !initial.unlocked;
   /** 已放行：直接渲染 children */
   const [passed, setPassed] = useState(!needsGate);
@@ -58,7 +60,7 @@ export default function VaultGate({
       <MasterPasswordDialog mode="unlock" onClose={null} onDone={() => setPassed(true)} />
       {/* 解不开也得让人进来：锁定态下界面照用，只是碰不到凭据 */}
       <button type="button" className="btn-link" onClick={() => setPassed(true)}>
-        稍后再说，先进入（保险库保持锁定）
+        {t("稍后再说，先进入（保险库保持锁定）", "Not now — continue with the vault locked")}
       </button>
     </div>
   );

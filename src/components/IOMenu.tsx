@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { t, useLocale } from "../i18n";
 
 interface Props {
   canExportSession: boolean;
@@ -22,6 +23,7 @@ export default function IOMenu({
   onExportSession,
   onExportAll,
 }: Props) {
+  useLocale();
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -65,7 +67,7 @@ export default function IOMenu({
         ref={btnRef}
         className={`btn-icon io-btn${open ? " active" : ""}`}
         onClick={toggle}
-        title="导入 / 导出"
+        title={t("导入 / 导出", "Import / export")}
         aria-haspopup="menu"
         aria-expanded={open}
       >
@@ -86,14 +88,22 @@ export default function IOMenu({
           <button className="io-item" role="menuitem" onClick={pick(onImport)}>
             <span className="io-glyph">⤓</span>
             <span className="io-text">
-              导入 Xshell 连接 (.xsh)…
-              <small>支持多选；同机同用户的密码会自动解密导入</small>
+              {t("导入 Xshell 连接 (.xsh)…", "Import Xshell connections (.xsh)…")}
+              <small>
+                {t(
+                  "支持多选；同机同用户的密码会自动解密导入",
+                  "Multiple files allowed; passwords saved by the same user on this machine are decrypted and imported"
+                )}
+              </small>
             </span>
           </button>
 
           <button className="io-item" role="menuitem" onClick={pick(onImportTermius)}>
             <span className="io-glyph">⤓</span>
-            <span className="io-text">从 Termius / OpenSSH 导入…<small>选择 SSH config 或主机 CSV，预览后导入</small></span>
+            <span className="io-text">
+              {t("从 Termius / OpenSSH 导入…", "Import from Termius / OpenSSH…")}
+              <small>{t("选择 SSH config 或主机 CSV，预览后导入", "Pick an SSH config or host CSV, preview, then import")}</small>
+            </span>
           </button>
 
           <div className="io-sep" />
@@ -107,16 +117,25 @@ export default function IOMenu({
           >
             <span className="io-glyph">⤒</span>
             <span className="io-text">
-              导出当前标签的连接为 .xsh…
-              <small>{canExportSession ? "不包含密码" : exportSessionHint ?? "不包含密码"}</small>
+              {t("导出当前标签的连接为 .xsh…", "Export this tab's connection as .xsh…")}
+              <small>
+                {canExportSession
+                  ? t("不包含密码", "Passwords not included")
+                  : exportSessionHint ?? t("不包含密码", "Passwords not included")}
+              </small>
             </span>
           </button>
 
           <button className="io-item" role="menuitem" onClick={pick(onExportAll)}>
             <span className="io-glyph">⤒</span>
             <span className="io-text">
-              导出全部连接到文件夹…
-              <small>每个连接一个 .xsh 文件；单个连接/分组可在列表里右键导出</small>
+              {t("导出全部连接到文件夹…", "Export all connections to a folder…")}
+              <small>
+                {t(
+                  "每个连接一个 .xsh 文件；单个连接/分组可在列表里右键导出",
+                  "One .xsh file per connection; right-click in the list to export a single connection or folder"
+                )}
+              </small>
             </span>
           </button>
         </div>

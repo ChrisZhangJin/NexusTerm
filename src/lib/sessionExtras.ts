@@ -86,7 +86,8 @@ export function subscribeExtras(fn: () => void): () => void {
  */
 export function isSidecarDenied(err: unknown): boolean {
   const text = err instanceof Error ? err.message : String(err ?? "");
-  return text.includes("不支持并行通道");
+  // 后端文案随界面语言：中文含「不支持并行通道」，英文含 does not allow parallel channels
+  return text.includes("不支持并行通道") || text.includes("does not allow parallel channels");
 }
 
 /** 记录一次「这台机器只让开一条通道」，让后续连接直接跳过旁路通道 */

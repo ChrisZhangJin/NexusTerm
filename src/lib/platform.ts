@@ -6,6 +6,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { t } from "../i18n";
 
 export type Platform = "windows" | "macos" | "linux" | "unknown";
 
@@ -44,7 +45,7 @@ export const modKeyLabel = () => (isMacOS() ? "⌘" : "Ctrl");
 /** 密码存放处的名称。三端是三套不同的系统凭据服务，提示文案不能写死 macOS。 */
 export const credentialServiceName = () => {
   if (isMacOS()) return "macOS Keychain";
-  if (isWindows()) return "Windows 凭据管理器";
+  if (isWindows()) return t("Windows 凭据管理器", "Windows Credential Manager");
   return "Secret Service";
 };
 

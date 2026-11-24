@@ -10,6 +10,8 @@
  */
 
 /** 同时用 GPU 渲染的终端数上限（留足余量，低于 WebKit 的上下文上限） */
+import { t } from "../i18n";
+
 export const GPU_SLOTS = 8;
 /** 同一个终端丢失 GPU 上下文几次后不再尝试 */
 export const MAX_CONTEXT_LOSSES = 3;
@@ -38,11 +40,11 @@ export function detectGpu(): GpuInfo {
 }
 
 function probe(): GpuInfo {
-  if (typeof document === "undefined") return { ok: false, renderer: "", reason: "非浏览器环境" };
+  if (typeof document === "undefined") return { ok: false, renderer: "", reason: t("非浏览器环境", "Not a browser environment") };
   try {
     const canvas = document.createElement("canvas");
     const gl = canvas.getContext("webgl2");
-    if (!gl) return { ok: false, renderer: "", reason: "这个 WebView 不支持 WebGL 2" };
+    if (!gl) return { ok: false, renderer: "", reason: t("这个 WebView 不支持 WebGL 2", "This WebView doesn't support WebGL 2") };
     const ext = gl.getExtension("WEBGL_debug_renderer_info");
     const renderer = String(
       (ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) ?? ""
@@ -50,11 +52,11 @@ function probe(): GpuInfo {
     // 用完立即释放，别占一个上下文名额
     gl.getExtension("WEBGL_lose_context")?.loseContext();
     if (isSoftwareRenderer(renderer)) {
-      return { ok: false, renderer, reason: "只有软件模拟的 WebGL（比 CPU 渲染还慢）" };
+      return { ok: false, renderer, reason: t("只有软件模拟的 WebGL（比 CPU 渲染还慢）", "Only software-emulated WebGL (slower than CPU rendering)") };
     }
     return { ok: true, renderer };
   } catch {
-    return { ok: false, renderer: "", reason: "探测 WebGL 失败" };
+    return { ok: false, renderer: "", reason: t("探测 WebGL 失败", "WebGL detection failed") };
   }
 }
 

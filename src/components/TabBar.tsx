@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { TerminalTab } from "../types";
 import { isMacOS } from "../lib/platform";
+import { t, useLocale } from "../i18n";
 
 interface Props {
   tabs: TerminalTab[];
@@ -60,6 +61,7 @@ export default function TabBar({
   onToggleAgent,
   hostBadges,
 }: Props) {
+  useLocale();
   const mac = isMacOS();
   const [ctx, setCtx] = useState<{ x: number; y: number; id: string } | null>(null);
   const ctxRef = useRef<HTMLDivElement>(null);
@@ -200,31 +202,31 @@ export default function TabBar({
       <button
         className={`tb-action tabbar-conn sp-toggle ${sessionPopupOpen ? "active" : ""}`}
         onClick={onToggleSessionPopup}
-        title="打开连接列表（新建 / 导入 / 导出也在这里）"
+        title={t("打开连接列表（新建 / 导入 / 导出也在这里）", "Open the connection list (new / import / export are here too)")}
       >
         <span className="tb-glyph">☰</span>
-        连接
+        {t("连接", "Connections")}
       </button>
       <div className="tabs">
-        {tabs.map((t) => {
-          const isDragging = drag?.id === t.id; // drag 只在越过阈值后才被设置
-          const dropBefore = drag?.overId === t.id && drag.id !== t.id && !drag.after;
-          const dropAfter = drag?.overId === t.id && drag.id !== t.id && drag.after;
-          const hostBadge = t.sessionId ? hostBadges?.[t.sessionId] : undefined;
+        {tabs.map((tab) => {
+          const isDragging = drag?.id === tab.id; // drag 只在越过阈值后才被设置
+          const dropBefore = drag?.overId === tab.id && drag.id !== tab.id && !drag.after;
+          const dropAfter = drag?.overId === tab.id && drag.id !== tab.id && drag.after;
+          const hostBadge = tab.sessionId ? hostBadges?.[tab.sessionId] : undefined;
           return (
             <div
-              key={t.id}
+              key={tab.id}
               ref={(el) => {
-                if (el) tabEls.current.set(t.id, el);
-                else tabEls.current.delete(t.id);
+                if (el) tabEls.current.set(tab.id, el);
+                else tabEls.current.delete(tab.id);
               }}
               className={[
                 "tab",
-                t.id === activeTab ? "active" : "",
-                renaming === t.id ? "renaming" : "",
-                t.status === "error" ? "tab-error" : "",
+                tab.id === activeTab ? "active" : "",
+                renaming === tab.id ? "renaming" : "",
+                tab.status === "error" ? "tab-error" : "",
                 // 不在前台时收到过新输出：点亮提醒动效。已经是当前标签就不用再提醒自己。
-                t.hasActivity && t.id !== activeTab ? "tab-activity" : "",
+                tab.hasActivity && tab.id !== activeTab ? "tab-activity" : "",
                 hostBadge ? "tab-host-wait" : "",
                 isDragging ? "tab-dragging" : "",
                 dropBefore ? "drop-before" : "",
@@ -234,59 +236,59 @@ export default function TabBar({
               // Tauri 自动排除：单击会被吞、双击触发系统最大化/还原。显式关掉。
               data-tauri-drag-region="false"
               onPointerDown={(e) => {
-                if (e.button !== 0 || renaming === t.id) return;
+                if (e.button !== 0 || renaming === tab.id) return;
                 if ((e.target as HTMLElement).closest(".tab-close")) return;
-                dragStart.current = { id: t.id, x: e.clientX, started: false };
+                dragStart.current = { id: tab.id, x: e.clientX, started: false };
               }}
-              onClick={() => onSelect(t.id)}
+              onClick={() => onSelect(tab.id)}
               onDoubleClick={() => {
-                renamingRef.current = t.id;
-                setRenaming(t.id);
+                renamingRef.current = tab.id;
+                setRenaming(tab.id);
               }}
               onContextMenu={(e) => {
                 e.preventDefault();
-                onSelect(t.id);
+                onSelect(tab.id);
                 setCtx({
                   x: Math.min(e.clientX, window.innerWidth - 200),
                   y: e.clientY,
-                  id: t.id,
+                  id: tab.id,
                 });
               }}
-              title={hostBadge ? `${tabLabel(t)}\n${hostBadge}` : tabLabel(t)}
+              title={hostBadge ? `${tabLabel(tab)}\n${hostBadge}` : tabLabel(tab)}
             >
-              {t.status === "reconnecting" && <span className="spinner sm" title="正在重连" />}
+              {tab.status === "reconnecting" && <span className="spinner sm" title={t("正在重连", "Reconnecting")} />}
               {hostBadge && <span className="tab-host-dot" aria-label={hostBadge} />}
-              {renaming === t.id ? (
+              {renaming === tab.id ? (
                 <input
                   className="tab-rename"
                   autoFocus
-                  defaultValue={tabLabel(t)}
+                  defaultValue={tabLabel(tab)}
                   onFocus={(e) => e.currentTarget.select()}
                   onClick={(e) => e.stopPropagation()}
                   onKeyDown={(e) => {
                     e.stopPropagation();
-                    if (e.key === "Enter") finishRename(t.id, e.currentTarget.value);
-                    else if (e.key === "Escape") finishRename(t.id, null);
+                    if (e.key === "Enter") finishRename(tab.id, e.currentTarget.value);
+                    else if (e.key === "Escape") finishRename(tab.id, null);
                   }}
-                  onBlur={(e) => finishRename(t.id, e.currentTarget.value)}
+                  onBlur={(e) => finishRename(tab.id, e.currentTarget.value)}
                 />
               ) : (
-                <span className="tab-title">{tabLabel(t)}</span>
+                <span className="tab-title">{tabLabel(tab)}</span>
               )}
               <button
                 className="tab-close"
                 onClick={(e) => {
                   e.stopPropagation();
-                  onClose(t.id);
+                  onClose(tab.id);
                 }}
-                title="关闭"
+                title={t("关闭", "Close")}
               >
                 ×
               </button>
             </div>
           );
         })}
-        <button className="tab-new" title="新标签页（本地终端）" onClick={() => onNewTab()}>
+        <button className="tab-new" title={t("新标签页（本地终端）", "New tab (local terminal)")} onClick={() => onNewTab()}>
           +
         </button>
       </div>
@@ -297,8 +299,11 @@ export default function TabBar({
         onClick={onToggleAgent}
         title={
           agentOpen
-            ? "收起 Nexus AI Agent 面板"
-            : "展开 Nexus AI Agent 面板（它能看到当前会话的终端输出，用来带上下文回答问题）"
+            ? t("收起 Nexus AI Agent 面板", "Hide the Nexus AI Agent panel")
+            : t(
+                "展开 Nexus AI Agent 面板（它能看到当前会话的终端输出，用来带上下文回答问题）",
+                "Show the Nexus AI Agent panel (it sees this session's terminal output and answers with that context)"
+              )
         }
         aria-pressed={agentOpen}
       >
@@ -312,8 +317,8 @@ export default function TabBar({
           <button
             className="win-btn"
             onClick={() => appWindow.minimize().catch(() => {})}
-            title="最小化"
-            aria-label="最小化"
+            title={t("最小化", "Minimize")}
+            aria-label={t("最小化", "Minimize")}
           >
             <svg viewBox="0 0 10 10" aria-hidden>
               <rect x="0" y="4.5" width="10" height="1" />
@@ -322,8 +327,8 @@ export default function TabBar({
           <button
             className="win-btn"
             onClick={() => appWindow.toggleMaximize().catch(() => {})}
-            title={maximized ? "向下还原" : "最大化"}
-            aria-label={maximized ? "向下还原" : "最大化"}
+            title={maximized ? t("向下还原", "Restore") : t("最大化", "Maximize")}
+            aria-label={maximized ? t("向下还原", "Restore") : t("最大化", "Maximize")}
           >
             {maximized ? (
               <svg viewBox="0 0 10 10" aria-hidden>
@@ -339,8 +344,8 @@ export default function TabBar({
           <button
             className="win-btn win-btn-close"
             onClick={() => appWindow.close().catch(() => {})}
-            title="关闭"
-            aria-label="关闭"
+            title={t("关闭", "Close")}
+            aria-label={t("关闭", "Close")}
           >
             <svg viewBox="0 0 10 10" aria-hidden>
               <path d="M0.5 0.5 L9.5 9.5 M9.5 0.5 L0.5 9.5" strokeWidth="1" />
@@ -353,34 +358,37 @@ export default function TabBar({
         <div ref={ctxRef} className="ctx-menu" style={{ left: ctx.x, top: ctx.y }}>
           {(ctxTab.status === "closed" || ctxTab.status === "error") && !ctxTab.local ? (
             <button className="ctx-item" onClick={run(() => onReconnect(ctxTab.id))}>
-              重新连接
+              {t("重新连接", "Reconnect")}
             </button>
           ) : !ctxTab.local ? (
             <button className="ctx-item" onClick={run(() => onDisconnect(ctxTab.id))}>
-              断开
+              {t("断开", "Disconnect")}
             </button>
           ) : null}
           {!ctxTab.local && (
             <button
               className="ctx-item"
               disabled={ctxTab.status !== "connected"}
-              title={ctxTab.status === "connected" ? "" : "会话连接后可用"}
+              title={ctxTab.status === "connected" ? "" : t("会话连接后可用", "Available once the session is connected")}
               onClick={run(() => onOpenSftp(ctxTab.id))}
             >
-              SFTP 文件管理
+              {t("SFTP 文件管理", "SFTP file manager")}
             </button>
           )}
           <div className="ctx-sep" />
           <button className="ctx-item" onClick={run(() => onDuplicate(ctxTab.id))}>
-            复制会话
+            {t("复制会话", "Duplicate session")}
           </button>
           {!ctxTab.local && (
             <button
               className="ctx-item"
-              title="新会话会进入当前目录，并以分组会话方式接入同一个 tmux"
+              title={t(
+                "新会话会进入当前目录，并以分组会话方式接入同一个 tmux",
+                "The new session opens in the current directory and joins the same tmux as a grouped session"
+              )}
               onClick={run(() => onDuplicateWithState(ctxTab.id))}
             >
-              复制会话并携带状态
+              {t("复制会话并携带状态", "Duplicate with state")}
             </button>
           )}
           <div className="ctx-sep" />
@@ -391,12 +399,12 @@ export default function TabBar({
               setRenaming(ctxTab.id);
             })}
           >
-            重命名
-            <span className="ctx-shortcut">双击标签</span>
+            {t("重命名", "Rename")}
+            <span className="ctx-shortcut">{t("双击标签", "Double-click tab")}</span>
           </button>
           <div className="ctx-sep" />
           <button className="ctx-item danger" onClick={run(() => onClose(ctxTab.id))}>
-            关闭标签
+            {t("关闭标签", "Close tab")}
           </button>
         </div>
       )}

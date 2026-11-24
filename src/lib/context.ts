@@ -5,6 +5,8 @@
  * 这里负责把原始 KEY=VALUE 解释成结构化上下文，并生成「还原命令」。
  */
 
+import { t } from "../i18n";
+
 export interface TermContext {
   /** 交互 shell（或 tmux 当前 pane）的工作目录 */
   cwd?: string;
@@ -192,20 +194,34 @@ export function restoreNotice(
   mode: "reconnect" | "duplicate"
 ): [string, string][] {
   const rows: [string, string][] = [];
-  if (ctx.cwd) rows.push(["目录", ctx.cwd]);
+  if (ctx.cwd) rows.push([t("目录", "Directory"), ctx.cwd]);
   if (ctx.tmux) {
     rows.push([
       "tmux",
       mode === "reconnect"
-        ? `重新附着会话 ${ctx.tmux}`
-        : `进入会话 ${ctx.tmux}（分组会话：窗口共享、视图独立，关闭标签自动清理）`,
+        ? t("重新附着会话 {s}", "Reattach session {s}", { s: ctx.tmux })
+        : t(
+            "进入会话 {s}（分组会话：窗口共享、视图独立，关闭标签自动清理）",
+            "Join session {s} (grouped session: shared windows, independent view, cleaned up when the tab closes)",
+            { s: ctx.tmux }
+          ),
     ]);
   }
   if (ctx.docker) {
-    rows.push(["docker", `原会话在容器 ${ctx.docker.container} 中，未自动进入`]);
+    rows.push([
+      "docker",
+      t("原会话在容器 {c} 中，未自动进入", "The original session was in container {c}; not re-entered automatically", {
+        c: ctx.docker.container,
+      }),
+    ]);
   }
   if (ctx.k8s) {
-    rows.push(["k8s", `原会话在 pod ${ctx.k8s.pod} 中，未自动进入`]);
+    rows.push([
+      "k8s",
+      t("原会话在 pod {p} 中，未自动进入", "The original session was in pod {p}; not re-entered automatically", {
+        p: ctx.k8s.pod,
+      }),
+    ]);
   }
   return rows;
 }
