@@ -13,6 +13,7 @@ import sql from "highlight.js/lib/languages/sql";
 import plaintext from "highlight.js/lib/languages/plaintext";
 import "highlight.js/styles/github.css";
 import { api } from "../api";
+import { t, useLocale } from "../i18n";
 
 hljs.registerLanguage("json", json);
 hljs.registerLanguage("yaml", yaml);
@@ -59,6 +60,7 @@ export default function CodeView({
   zoom: number;
   onNotify: (msg: string) => void;
 }) {
+  useLocale();
   const [wrap, setWrap] = useState(() => localStorage.getItem("nx.viewer.wrap") === "1");
   const [pretty, setPretty] = useState(false);
 
@@ -86,9 +88,9 @@ export default function CodeView({
   const copy = async () => {
     try {
       await api.clipboardWrite(shown);
-      onNotify("已复制全部内容");
+      onNotify(t("已复制全部内容", "Copied everything"));
     } catch (e) {
-      onNotify(`复制失败：${e}`);
+      onNotify(t("复制失败：{e}", "Copy failed: {e}", { e: String(e) }));
     }
   };
 
@@ -99,29 +101,34 @@ export default function CodeView({
       <div className="rd-img-tools">
         {js &&
           (js.ok ? (
-            <span className="rd-ok">✓ JSON 语法正确</span>
+            <span className="rd-ok">{t("✓ JSON 语法正确", "✓ Valid JSON")}</span>
           ) : (
             <span className="rd-bad" title={js.msg}>
-              ✗ JSON 语法错误{js.line ? `（第 ${js.line} 行）` : ""}：{js.msg}
+              {t("✗ JSON 语法错误", "✗ Invalid JSON")}
+              {js.line ? t("（第 {n} 行）", " (line {n})", { n: js.line }) : ""}
+              {t("：", ": ")}
+              {js.msg}
             </span>
           ))}
         {js?.ok && (
           <label className="rd-js">
             <input type="checkbox" checked={pretty} onChange={(e) => setPretty(e.target.checked)} />
-            格式化
+            {t("格式化", "Format")}
           </label>
         )}
         <label className="rd-js">
           <input type="checkbox" checked={wrap} onChange={(e) => setWrap(e.target.checked)} />
-          自动换行
+          {t("自动换行", "Wrap lines")}
         </label>
         <span className="rd-spacer" />
         <span className="rd-img-hint">
-          {lang === "plaintext" ? "纯文本" : lang} · {lines} 行
-          {html === null && shown.length > HL_LIMIT ? " · 文件较大，已关闭高亮" : ""}
+          {lang === "plaintext" ? t("纯文本", "Plain text") : lang} · {t("{n} 行", "{n} lines", { n: lines })}
+          {html === null && shown.length > HL_LIMIT
+            ? t(" · 文件较大，已关闭高亮", " · Large file, highlighting off")
+            : ""}
         </span>
         <button className="rd-btn" onClick={copy}>
-          复制全部
+          {t("复制全部", "Copy all")}
         </button>
       </div>
       <div className="rd-code-scroll">

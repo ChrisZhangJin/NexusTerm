@@ -24,6 +24,7 @@ import type {
   HostStartOpts,
   HostStatus,
 } from "../types";
+import { t, useLocale } from "../i18n";
 import HostCard from "./HostCard";
 import HostHistory from "./HostHistory";
 import DenyEditor from "./DenyEditor";
@@ -127,10 +128,15 @@ export interface StewardPanelProps {
 }
 
 /** 以前常驻页面顶部的说明段，现在只在表单头的「?」上悬停可见 */
-const INTRO =
-  "AI 托管：由大模型替你在这个终端里执行命令、操作交互程序（含 Claude Code 之类的控制台工具），并用屏幕识别盯着长任务跑完。" +
-  "危险命令仍会先问你；密码只会请你本人输入；不会替你选「不再询问 / 永久允许」这类选项。你一敲键它就让路。" +
-  "下方「诊断」里是屏幕识别（不调大模型、不写终端）与决策记录的细节。";
+const intro = () =>
+  t(
+    "AI 托管：由大模型替你在这个终端里执行命令、操作交互程序（含 Claude Code 之类的控制台工具），并用屏幕识别盯着长任务跑完。" +
+      "危险命令仍会先问你；密码只会请你本人输入；不会替你选「不再询问 / 永久允许」这类选项。你一敲键它就让路。" +
+      "下方「诊断」里是屏幕识别（不调大模型、不写终端）与决策记录的细节。",
+    "Autopilot: an AI model runs commands and drives interactive programs (including console tools like Claude Code) in this terminal for you, and watches long tasks to completion with screen recognition. " +
+      "Risky commands still ask you first; passwords are only ever typed by you; it never picks options like \"don't ask again / always allow\". It steps aside as soon as you type. " +
+      "The Diagnostics section below shows screen recognition details (no model calls, no terminal writes) and the decision log."
+  );
 
 const readTierPref = (): StewardTier => {
   try {
@@ -153,6 +159,7 @@ const hhmmss = (ms: number) => {
 };
 
 export default function StewardPanel({ sessionId, sessions, runFor }: StewardPanelProps) {
+  useLocale();
   const [consoles, setConsoles] = useState<ConsoleInfo[]>([]);
   const [contracts, setContracts] = useState<StewardContract[]>([]);
   const [snapshot, setSnapshot] = useState<ScreenSnapshot | null>(null);
@@ -263,7 +270,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
       setSnapshot(snap);
       setErr(null);
     } catch (e) {
-      setErr(`读取常驻 Steward 失败：${String(e)}`);
+      setErr(t("读取常驻 Steward 失败：{e}", "Failed to read Steward state: {e}", { e: String(e) }));
     }
   }, []);
 
@@ -373,7 +380,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
     try {
       setExplanation(await stewardApi.explain(seq));
     } catch (e) {
-      setErr(`解释链读取失败：${String(e)}`);
+      setErr(t("解释链读取失败：{e}", "Failed to load the explanation: {e}", { e: String(e) }));
     }
   };
 
@@ -382,7 +389,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
       setReview(await stewardApi.review(contract?.id));
       setAudit(await stewardApi.audit(contract?.id));
     } catch (e) {
-      setErr(`复盘读取失败：${String(e)}`);
+      setErr(t("复盘读取失败：{e}", "Failed to load the review: {e}", { e: String(e) }));
     }
   };
 
@@ -422,7 +429,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
       setManual(null);
       await refresh();
     } catch (e) {
-      setErr(`停止托管失败：${String(e)}`);
+      setErr(t("停止托管失败：{e}", "Failed to stop autopilot: {e}", { e: String(e) }));
     } finally {
       setBusy(false);
     }
@@ -436,7 +443,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
       setManual(null);
       await refresh();
     } catch (e) {
-      setErr(`停止托管失败：${String(e)}`);
+      setErr(t("停止托管失败：{e}", "Failed to stop autopilot: {e}", { e: String(e) }));
     } finally {
       setBusy(false);
     }
@@ -449,7 +456,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
       setManual(s);
       await stewardApi.wake();
     } catch (e) {
-      setErr(`立即分类失败：${String(e)}`);
+      setErr(t("立即分类失败：{e}", "Classify now failed: {e}", { e: String(e) }));
     }
   };
 
@@ -459,7 +466,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
       await stewardApi.wake();
       await refresh();
     } catch (e) {
-      setErr(`调整空转阈值失败：${String(e)}`);
+      setErr(t("调整空转阈值失败：{e}", "Failed to change the idle threshold: {e}", { e: String(e) }));
     }
   };
 
@@ -469,7 +476,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
       setManual(null);
       await refresh();
     } catch (e) {
-      setErr(`清空事件失败：${String(e)}`);
+      setErr(t("清空事件失败：{e}", "Failed to clear events: {e}", { e: String(e) }));
     }
   };
 
@@ -478,7 +485,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
       await stewardApi.clearDecisions();
       await refresh();
     } catch (e) {
-      setErr(`清空决策失败：${String(e)}`);
+      setErr(t("清空决策失败：{e}", "Failed to clear decisions: {e}", { e: String(e) }));
     }
   };
 
@@ -492,14 +499,14 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
   const liveHost = selectedHost && !isTerminal(selectedHost.phase) ? selectedHost : null;
   /** 开始表单下的一行提醒：只说挡着你开始的事 */
   const formWarn: string | null = run.otherBusy
-    ? "对话 / 技能正在运行，结束后才能开始托管"
+    ? t("对话 / 技能正在运行，结束后才能开始托管", "A chat or skill is running; autopilot can start once it finishes")
     : !run.ready
-      ? (run.notReadyReason ?? "Nexus AI Agent 尚未配置完成，请先去设置")
+      ? (run.notReadyReason ?? t("Nexus AI Agent 尚未配置完成，请先去设置", "Nexus AI Agent isn't set up yet; finish it in Settings first"))
       : contract && state?.stale
-        ? "屏幕帧断流 — 终端可能已关闭"
+        ? t("屏幕帧断流 — 终端可能已关闭", "Screen feed stalled — the terminal may be closed")
         : null;
   const formSummary = hostSettingsSummary(tier, deny);
-  const durationLabel = STEWARD_DURATION_OPTIONS.find((o) => o.minutes === budgetPref.maxMinutes)?.label ?? `${budgetPref.maxMinutes} 分钟`;
+  const durationLabel = STEWARD_DURATION_OPTIONS.find((o) => o.minutes === budgetPref.maxMinutes)?.label ?? t("{m} 分钟", "{m} min", { m: budgetPref.maxMinutes });
 
   /** 一条决策记录（托管写入 / 反射代答各一条），可展开依据与解释链 */
   const renderDecision = (d: DecisionRecord) => {
@@ -511,18 +518,24 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
                   <span className="st-badge">{tierLabel(d.tier)}</span>
                   <span className="st-badge outcome">{OUTCOME_LABELS[d.outcome] ?? d.outcome}</span>
                   <span className="st-meta">
-                    {label(d.consoleId)} · {hhmmss(d.tsMs)} · 置信度 {d.confidence.toFixed(2)} · LLM{" "}
-                    {d.llmUsed ? 1 : 0}
+                    {t("{who} · {time} · 置信度 {conf} · LLM {llm}", "{who} · {time} · confidence {conf} · LLM {llm}", {
+                      who: label(d.consoleId),
+                      time: hhmmss(d.tsMs),
+                      conf: d.confidence.toFixed(2),
+                      llm: d.llmUsed ? 1 : 0,
+                    })}
                   </span>
-                  <button className="st-btn" onClick={() => void doExplain(d.seq)} title="展开解释链：为什么这次这么做">
-                    为什么
+                  <button className="st-btn" onClick={() => void doExplain(d.seq)} title={t("展开解释链：为什么这次这么做", "Show the explanation: why it did this")}>
+                    {t("为什么", "Why")}
                   </button>
                 </div>
                 <div className="st-dec-text">{d.chosen.text}</div>
                 <div className="st-evidence">{d.rationale}</div>
-                {d.receipt && <div className="st-evidence">回执：{d.receipt}</div>}
+                {d.receipt && <div className="st-evidence">{t("回执：{r}", "Receipt: {r}", { r: d.receipt })}</div>}
                 <details className="st-dec-details">
-                  <summary>依据 {d.ctxRefs.length} 条 · 备选 {d.candidates.length} 个</summary>
+                  <summary>
+                    {t("依据 {refs} 条 · 备选 {cands} 个", "{refs} refs · {cands} alternatives", { refs: d.ctxRefs.length, cands: d.candidates.length })}
+                  </summary>
                   <div className="st-refs">
                     {d.ctxRefs.map((r, i) => (
                       <div key={`${r.id}-${i}`} className="st-ref">
@@ -533,7 +546,8 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
                     ))}
                   </div>
                   <div className="st-evidence">
-                    备选：{d.candidates.map((c) => `${ACTION_LABELS[c.kind] ?? c.kind}「${c.text}」`).join(" / ") || "—"}
+                    {t("备选：", "Alternatives: ")}
+                    {d.candidates.map((c) => t("{kind}「{text}」", "{kind} \"{text}\"", { kind: ACTION_LABELS[c.kind] ?? c.kind, text: c.text })).join(" / ") || "—"}
                   </div>
                 </details>
               </div>
@@ -584,34 +598,50 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
       {!liveHost && (
         <div className="st-main">
           <div className="st-main-head">
-            <span className={`st-dot${runtime?.running ? " live" : ""}`} title={runtime?.running ? "Steward 运行中" : "Steward 未运行"} />
+            <span className={`st-dot${runtime?.running ? " live" : ""}`} title={runtime?.running ? t("Steward 运行中", "Steward running") : t("Steward 未运行", "Steward not running")} />
             <span className="st-name">
-              {selectedHost ? "新的托管" : "托管"} · {label(selected)}
+              {selectedHost ? t("新的托管", "New autopilot") : t("托管", "Autopilot")} · {label(selected)}
             </span>
             {contract && <span className="st-badge on">{contractStatusLabel(contract.status)}</span>}
-            <span className="hc-help" title={INTRO}>
+            <span className="hc-help" title={intro()}>
               ?
             </span>
           </div>
           {!selectedHost && (
-            <div className="hc-hint">写下目标，AI 替你在这个终端里一步步做完；危险操作先问你，密码只由你本人输入。</div>
+            <div className="hc-hint">
+              {t(
+                "写下目标，AI 替你在这个终端里一步步做完；危险操作先问你，密码只由你本人输入。",
+                "Describe the goal and the AI works through it step by step in this terminal. Risky actions ask you first; passwords are typed only by you."
+              )}
+            </div>
           )}
           <textarea
             className="st-goal"
             value={goal}
             disabled={busy}
             onChange={(e) => setGoal(e.target.value)}
-            placeholder="写下要它完成的事，例如：把 /srv/app 的依赖升级后跑完测试并汇报；或：盯着这个安装脚本跑完，遇到确认就替我答"
+            placeholder={t(
+              "写下要它完成的事，例如：把 /srv/app 的依赖升级后跑完测试并汇报；或：盯着这个安装脚本跑完，遇到确认就替我答",
+              "What should it get done? E.g. upgrade the dependencies in /srv/app, run the tests and report back; or: watch this install script to the end and answer its prompts for me"
+            )}
             rows={3}
           />
           {extraOptions.length > 0 && (
             <details className="hc-more hc-extra">
               <summary
-                title="目标要跨几台机器时（例如在 A 上搭代理、再从 B 上测试），把其余终端也勾上：它们一起交给 AI、一起只读锁定，你在其中任何一个上动手，整个托管都会让路"
+                title={t(
+                  "目标要跨几台机器时（例如在 A 上搭代理、再从 B 上测试），把其余终端也勾上：它们一起交给 AI、一起只读锁定，你在其中任何一个上动手，整个托管都会让路",
+                  "When the goal spans several machines (e.g. set up a proxy on A, then test from B), tick the other terminals too: they're handed to the AI and locked read-only together, and acting in any of them makes the whole autopilot step aside"
+                )}
               >
-                同时操作的终端（可选）
+                {t("同时操作的终端（可选）", "Other terminals to drive (optional)")}
                 <span className="st-meta">
-                  {extraChosen.length > 0 ? ` · 主终端「${label(selected)}」+ ${extraChosen.map((id) => `「${label(id)}」`).join("")}` : " · 只操作这一个"}
+                  {extraChosen.length > 0
+                    ? t(" · 主终端「{main}」+ {rest}", " · main \"{main}\" + {rest}", {
+                        main: label(selected),
+                        rest: extraChosen.map((id) => t("「{l}」", "\"{l}\"", { l: label(id) })).join(t("", ", ")),
+                      })
+                    : t(" · 只操作这一个", " · this one only")}
                 </span>
               </summary>
               <div className="hc-settings-body">
@@ -626,11 +656,16 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
                     {o.label}
                   </label>
                 ))}
-                <div className="hc-hint">AI 默认在主终端上动手，要操作其余终端时会指明是哪一个；完成判据在主终端上核验。</div>
+                <div className="hc-hint">
+                  {t(
+                    "AI 默认在主终端上动手，要操作其余终端时会指明是哪一个；完成判据在主终端上核验。",
+                    "The AI works in the main terminal by default and names the terminal whenever it acts in another one; completion checks run on the main terminal."
+                  )}
+                </div>
               </div>
             </details>
           )}
-          <div className="hc-presets" role="radiogroup" aria-label="放手程度">
+          <div className="hc-presets" role="radiogroup" aria-label={t("放手程度", "Autonomy")}>
             {HOST_PRESETS.map((p) => (
               <button
                 key={p.tier}
@@ -647,12 +682,14 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
           </div>
           {tier === "yolo" ? (
             <div className="st-yolo-warn">
-              YOLO·完全放手：AI 会自己执行一切，包括格式化、重启、删库这类不可逆操作，不再问你。
-              只有越过「更多设置」里的禁止项时才会停下来问。生产机器慎用。
+              {t(
+                "YOLO·完全放手：AI 会自己执行一切，包括格式化、重启、删库这类不可逆操作，不再问你。只有越过「更多设置」里的禁止项时才会停下来问。生产机器慎用。",
+                "YOLO: the AI does everything on its own, including irreversible actions like formatting, rebooting or dropping databases, without asking. It only stops to ask when a blocked action from More settings comes up. Be careful on production machines."
+              )}
             </div>
           ) : (
             <div className="hc-hint">
-              {presetOfTier(tier) ? "" : `${TIER_LABELS[tier]}：`}
+              {presetOfTier(tier) ? "" : t("{tier}：", "{tier}: ", { tier: TIER_LABELS[tier] })}
               {TIER_HINTS[tier]}
             </div>
           )}
@@ -663,49 +700,52 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
               onClick={() => void startHosting()}
               title={
                 !run.ready
-                  ? (run.notReadyReason ?? "请先完成 Nexus AI Agent 配置")
+                  ? (run.notReadyReason ?? t("请先完成 Nexus AI Agent 配置", "Set up Nexus AI Agent first"))
                   : run.otherBusy
-                    ? "对话 / 技能正在运行，结束后才能开始托管"
-                    : "签下托管契约（开始盯屏）并让 AI 去执行这个目标"
+                    ? t("对话 / 技能正在运行，结束后才能开始托管", "A chat or skill is running; autopilot can start once it finishes")
+                    : t("签下托管契约（开始盯屏）并让 AI 去执行这个目标", "Sign the autopilot contract (start watching the screen) and let the AI work on this goal")
               }
             >
-              开始托管
+              {t("开始托管", "Start autopilot")}
             </button>
             {contract && (
-              <button className="st-btn danger" disabled={busy} onClick={() => void stop()} title="结束这个终端上残留的托管契约（停止盯屏）">
-                停止托管
+              <button className="st-btn danger" disabled={busy} onClick={() => void stop()} title={t("结束这个终端上残留的托管契约（停止盯屏）", "End the leftover autopilot contract on this terminal (stop watching the screen)")}>
+                {t("停止托管", "Stop autopilot")}
               </button>
             )}
           </div>
           <details className="hc-more">
             <summary>
-              更多设置
+              {t("更多设置", "More settings")}
               <span className="st-meta">
-                {" "}
-                · 最长 {durationLabel} · 最多 {budgetPref.maxSteps} 步
-                {budgetPref.maxCostUsd > 0 ? ` · 最多花 ${fmtUsd(budgetPref.maxCostUsd)}` : ""}
-                {confirmCriteria ? " · 先确认判据" : ""} · {formSummary.deny}
+                {t(" · 最长 {dur} · 最多 {steps} 步", " · up to {dur} · up to {steps} steps", { dur: durationLabel, steps: budgetPref.maxSteps })}
+                {budgetPref.maxCostUsd > 0 ? t(" · 最多花 {cost}", " · max spend {cost}", { cost: fmtUsd(budgetPref.maxCostUsd) }) : ""}
+                {confirmCriteria ? t(" · 先确认判据", " · confirm checks first") : ""} · {formSummary.deny}
               </span>
             </summary>
             <div className="hc-settings-body">
-              <label className="st-meta hc-row" title={"授权档位：" + TIER_HINTS[tier]}>
-                档位
+              <label className="st-meta hc-row" title={t("授权档位：{hint}", "Permission level: {hint}", { hint: TIER_HINTS[tier] })}>
+                {t("档位", "Level")}
                 <select
                   className={`st-select${tier === "yolo" ? " st-select-yolo" : ""}`}
                   value={tier}
                   disabled={busy}
                   onChange={(e) => chooseTier(e.target.value as StewardTier)}
                 >
-                  {HOST_TIERS.map((t) => (
-                    <option key={t} value={t} title={TIER_HINTS[t]}>
-                      {TIER_LABELS[t]}
+                  {HOST_TIERS.map((tr) => (
+                    <option key={tr} value={tr} title={TIER_HINTS[tr]}>
+                      {TIER_LABELS[tr]}
                     </option>
                   ))}
                 </select>
               </label>
               <div className="st-form-row st-center">
-                <label className="st-meta" title="这一轮最长跑多久，到点会暂停等你点「加预算继续」（后端上限 24 小时）">
-                  最长
+                <label className="st-meta" title={t(
+                    "这一轮最长跑多久，到点会暂停等你点「加预算继续」（后端上限 24 小时）",
+                    "How long this round may run; when time's up it pauses until you click Add budget & continue (backend limit 24 hours)"
+                  )}
+                >
+                  {t("最长", "Up to")}
                   <select
                     className="st-select"
                     value={budgetPref.maxMinutes}
@@ -719,8 +759,8 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
                     ))}
                   </select>
                 </label>
-                <label className="st-meta" title={`最多执行多少步动作（后端上限 ${MAX_STEPS_CEIL}）`}>
-                  最多
+                <label className="st-meta" title={t("最多执行多少步动作（后端上限 {max}）", "Maximum number of action steps (backend limit {max})", { max: MAX_STEPS_CEIL })}>
+                  {t("最多", "Up to")}
                   <input
                     className="st-num"
                     type="number"
@@ -734,19 +774,22 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
                       if (e.key === "Enter") commitSteps();
                     }}
                   />
-                  步
+                  {t("步", "steps")}
                 </label>
                 <label
                   className="st-meta"
-                  title="按模型单价折算的花费，到了就暂停等你点「加预算继续」。留空 = 不限。单价在 AI 设置的「模型单价」里改"
+                  title={t(
+                    "按模型单价折算的花费，到了就暂停等你点「加预算继续」。留空 = 不限。单价在 AI 设置的「模型单价」里改",
+                    "Spend computed from model prices; when reached it pauses until you click Add budget & continue. Leave empty for no limit. Set prices under Model prices in AI settings"
+                  )}
                 >
-                  最多花费 $
+                  {t("最多花费 $", "Max spend $")}
                   <input
                     className="st-num"
                     type="number"
                     min={0}
                     step={0.1}
-                    placeholder="不限"
+                    placeholder={t("不限", "No limit")}
                     value={costDraft ?? (budgetPref.maxCostUsd > 0 ? String(budgetPref.maxCostUsd) : "")}
                     disabled={busy}
                     onChange={(e) => setCostDraft(e.target.value)}
@@ -758,14 +801,22 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
                 </label>
               </div>
               {budgetPref.maxCostUsd > 0 && !modelPriced && (
-                <div className="st-status warn">当前模型没有设置单价，花费上限不会生效（只计 token）。可在 AI 设置的「模型单价」里补上。</div>
+                <div className="st-status warn">
+                  {t(
+                    "当前模型没有设置单价，花费上限不会生效（只计 token）。可在 AI 设置的「模型单价」里补上。",
+                    "The current model has no price set, so the spend limit won't apply (only tokens are counted). Add one under Model prices in AI settings."
+                  )}
+                </div>
               )}
               <label
                 className="st-meta hc-row"
-                title="勾上：开始前先出一张「确认完成判据」卡，你改好点接受才开始。不勾（默认）：直接采用 AI 起草的判据开始；未确认的判据只跑只读检查，跑不了的记「未核验」，不挡完成。"
+                title={t(
+                  "勾上：开始前先出一张「确认完成判据」卡，你改好点接受才开始。不勾（默认）：直接采用 AI 起草的判据开始；未确认的判据只跑只读检查，跑不了的记「未核验」，不挡完成。",
+                  "On: before starting, show a Confirm completion checks card; it starts after you edit and accept. Off (default): start right away with the AI-drafted checks; unconfirmed checks run read-only only, and any that can't run are marked unverified without blocking completion."
+                )}
               >
                 <input type="checkbox" checked={confirmCriteria} disabled={busy} onChange={(e) => setConfirmCriteria(e.target.checked)} />
-                开始前先确认完成判据
+                {t("开始前先确认完成判据", "Confirm completion checks before starting")}
               </label>
               <DenyEditor value={deny} onChange={setDeny} disabled={busy} />
             </div>
@@ -780,10 +831,17 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
       {runHere && (run.active || run.messages.length > 0) && (
         <details key={`${selected}:${promptsPending}`} className="hc-feed" open={run.active || promptsPending > 0}>
           <summary>
-            托管实况 · {label(selected)}
+            {t("托管实况 · {l}", "Autopilot live · {l}", { l: label(selected) })}
             <span className={promptsPending > 0 ? "hc-warn" : "st-meta"}>
               {" "}
-              · {promptsPending > 0 ? `有 ${promptsPending} 项等你处理（批准 / 输入密码）` : run.active ? (run.paused ? "已暂停" : "执行中") : "已结束"}
+              ·{" "}
+              {promptsPending > 0
+                ? t("有 {n} 项等你处理（批准 / 输入密码）", "{n} waiting for you (approval / password)", { n: promptsPending })
+                : run.active
+                  ? run.paused
+                    ? t("已暂停", "Paused")
+                    : t("执行中", "Running")
+                  : t("已结束", "Finished")}
             </span>
           </summary>
           <RunFeed
@@ -799,16 +857,16 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
       )}
 
       <div className="st-head">
-        <span>终端 · {consoles.length} 个</span>
+        <span>{t("终端 · {n} 个", "Terminals · {n}", { n: consoles.length })}</span>
         <div>
           <button className="st-btn" onClick={() => void refresh()}>
-            刷新
+            {t("刷新", "Refresh")}
           </button>
         </div>
       </div>
 
       <div className="st-list">
-        {consoles.length === 0 && <div className="st-empty">还没有检测到终端</div>}
+        {consoles.length === 0 && <div className="st-empty">{t("还没有检测到终端", "No terminals detected yet")}</div>}
         {consoles.map((c) => {
           const cs = runtime?.consoles.find((x) => x.consoleId === c.id);
           const h = run.hostFor(c.id);
@@ -827,7 +885,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
               <span className="st-name">{label(c.id)}</span>
               {pill && <span className={`st-badge host-pill ${pill.tone}`}>{pill.label}</span>}
               <span className="st-badge">{c.kind}</span>
-              {c.alt && <span className="st-badge alt">全屏</span>}
+              {c.alt && <span className="st-badge alt">{t("全屏", "Full screen")}</span>}
               {c.status !== "none" && !pill && <span className="st-badge on">{contractStatusLabel(c.status)}</span>}
               {cs?.kind && <span className="st-badge situation">{situationLabel(cs.kind)}</span>}
             </button>
@@ -841,8 +899,13 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
       {/* 当前局面：屏幕识别的结论，调试用，默认收起 */}
       <details className="st-diag">
         <summary>
-          当前局面 · {label(selected)}
-          {situation ? ` · ${situationLabel(situation.kind)}` : ""} · {state ? (state.stale ? "帧断流" : "帧新鲜") : "该终端尚未托管"}
+          {t("当前局面 · {l}", "Current situation · {l}", { l: label(selected) })}
+          {situation ? ` · ${situationLabel(situation.kind)}` : ""} ·{" "}
+          {state
+            ? state.stale
+              ? t("帧断流", "Feed stalled")
+              : t("帧新鲜", "Feed fresh")
+            : t("该终端尚未托管", "This terminal isn't on autopilot")}
         </summary>
         <div className="st-sit hc-sit">
         {situation ? (
@@ -850,65 +913,76 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
             <div className="st-sit-line">
               <span className="st-kind">{situationLabel(situation.kind)}</span>
               <span className="st-badge">{programLabel(situation.program)}</span>
-              <span className="st-meta">置信度 {situation.confidence.toFixed(2)}</span>
-              <span className="st-meta" title="屏幕没变时心跳帧只推进帧号，不会产生新的局面记录">
-                识别于帧 {situation.frameId}
+              <span className="st-meta">{t("置信度 {c}", "Confidence {c}", { c: situation.confidence.toFixed(2) })}</span>
+              <span
+                className="st-meta"
+                title={t("屏幕没变时心跳帧只推进帧号，不会产生新的局面记录", "When the screen doesn't change, heartbeat frames only bump the frame number and don't create a new situation record")}
+              >
+                {t("识别于帧 {f}", "Recognised at frame {f}", { f: situation.frameId })}
                 {consoleInfo?.hasScreen && consoleInfo.frameId !== situation.frameId
-                  ? `（之后未变，当前帧 ${consoleInfo.frameId}）`
+                  ? t("（之后未变，当前帧 {f}）", " (unchanged since; current frame {f})", { f: consoleInfo.frameId })
                   : ""}
               </span>
             </div>
-            {situation.topic && <div className="st-topic">主题：{situation.topic}</div>}
+            {situation.topic && <div className="st-topic">{t("主题：{x}", "Topic: {x}", { x: situation.topic })}</div>}
             {situation.options.length > 0 && (
               <div className="st-opts">
                 {situation.options.map((o, i) => (
                   <span key={`${o.index ?? i}-${i}`} className={`st-opt${o.grantsPermanent ? " perm" : ""}`}>
                     {o.index ? `${o.index}. ` : ""}
                     {o.text}
-                    {o.grantsPermanent ? " ⚠ 永久授权，不自动选" : ""}
+                    {o.grantsPermanent ? t(" ⚠ 永久授权，不自动选", " ⚠ Permanent grant, never auto-picked") : ""}
                   </span>
                 ))}
               </div>
             )}
-            <div className="st-evidence">判据：{situation.evidence.join(" · ")}</div>
+            <div className="st-evidence">{t("判据：{x}", "Evidence: {x}", { x: situation.evidence.join(" · ") })}</div>
             <button className="st-btn" onClick={() => setShowTail((v) => !v)}>
-              {showTail ? "收起脱敏屏幕" : "查看脱敏屏幕 / 签名"}
+              {showTail ? t("收起脱敏屏幕", "Hide redacted screen") : t("查看脱敏屏幕 / 签名", "Show redacted screen / signature")}
             </button>
             {showTail && (
               <>
-                <div className="st-evidence">签名：{situation.signature}</div>
-                <pre className="st-pre small">{situation.tail || "（空屏）"}</pre>
+                <div className="st-evidence">{t("签名：{x}", "Signature: {x}", { x: situation.signature })}</div>
+                <pre className="st-pre small">{situation.tail || t("（空屏）", "(empty screen)")}</pre>
               </>
             )}
           </div>
         ) : (
           <div className="st-empty">
-            还没有局面记录。开始托管后，终端屏幕一上报这里就会出现第一张局面卡片。
+            {t(
+              "还没有局面记录。开始托管后，终端屏幕一上报这里就会出现第一张局面卡片。",
+              "No situation records yet. Once autopilot starts, the first situation card appears here as soon as the terminal reports its screen."
+            )}
           </div>
         )}
         </div>
       </details>
 
       <details className="st-diag">
-        <summary>诊断（屏幕识别 / 决策记录 / 事件 / 屏幕快照 / 复盘）</summary>
+        <summary>{t("诊断（屏幕识别 / 决策记录 / 事件 / 屏幕快照 / 复盘）", "Diagnostics (screen recognition / decisions / events / screen snapshot / review)")}</summary>
         <div className="st-diag-body">
           <div className="st-form-row st-center">
-          <button className="st-btn" onClick={() => void classifyNow()} title="当场分类一帧，核对判据">
-            立即分类
+          <button className="st-btn" onClick={() => void classifyNow()} title={t("当场分类一帧，核对判据", "Classify a frame right now to check the evidence")}>
+            {t("立即分类", "Classify now")}
           </button>
           <button className="st-btn" onClick={() => setShowCtx((v) => !v)}>
-            {showCtx ? "收起依据" : "编辑依据"}
+            {showCtx ? t("收起依据", "Hide decision basis") : t("编辑依据", "Edit decision basis")}
           </button>
           </div>
 
       <div className="st-dec-wrap">
         <div className="st-sit-head">
-          <span>决策记录 · 最近 {decisions.length} 条</span>
-          <span className="st-meta">可展开看依据引用与备选动作</span>
+          <span>{t("决策记录 · 最近 {n} 条", "Decisions · last {n}", { n: decisions.length })}</span>
+          <span className="st-meta">{t("可展开看依据引用与备选动作", "Expand to see referenced basis and alternative actions")}</span>
         </div>
         <div className="st-dec-list">
           {decisions.length === 0 && (
-            <div className="st-empty">还没有决策。托管任务每次写入（含反射代答）都会在这里留一条。</div>
+            <div className="st-empty">
+              {t(
+                "还没有决策。托管任务每次写入（含反射代答）都会在这里留一条。",
+                "No decisions yet. Every write by autopilot (including reflex answers) leaves an entry here."
+              )}
+            </div>
           )}
           {[...decisions].reverse().map((d) => renderDecision(d))}
         </div>
@@ -916,15 +990,16 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
 
       <div className="st-runtime">
         <button className="st-btn" onClick={() => setShowReview((v) => !v)}>
-          {showReview ? "收起复盘" : "复盘（审计 / 解释链）"}
+          {showReview ? t("收起复盘", "Hide review") : t("复盘（审计 / 解释链）", "Review (audit / explanations)")}
         </button>
       </div>
 
       {explanation && (
         <div className="st-esc">
           <div className="st-esc-head">
-            解释链 · 决策 #{explanation.seq} · {OUTCOME_LABELS[explanation.outcome] ?? explanation.outcome} ·{" "}
-            {explanation.llmUsed ? "用过 LLM" : "零 LLM"}
+            {t("解释链 · 决策 #{seq}", "Explanation · decision #{seq}", { seq: explanation.seq })} ·{" "}
+            {OUTCOME_LABELS[explanation.outcome] ?? explanation.outcome} ·{" "}
+            {explanation.llmUsed ? t("用过 LLM", "used LLM") : t("零 LLM", "no LLM")}
           </div>
           <div className="st-esc-why">{explanation.whyAuto}</div>
           <div className="st-evidence">{explanation.rationale}</div>
@@ -944,24 +1019,35 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
         <div className="st-dec-wrap">
           <div className="st-sit-head">
             <span>
-              复盘 · {review ? contractName(review.contractId) : contract ? label(contract.consoleId) : "全部契约"}
+              {t("复盘 · ", "Review · ")}
+              {review ? contractName(review.contractId) : contract ? label(contract.consoleId) : t("全部契约", "All contracts")}
             </span>
             <div>
-              <button className="st-btn" onClick={() => void loadReview()} title="跨会话复盘 + 统一审计时间线">
-                生成复盘
+              <button className="st-btn" onClick={() => void loadReview()} title={t("跨会话复盘 + 统一审计时间线", "Cross-session review + unified audit timeline")}>
+                {t("生成复盘", "Generate review")}
               </button>
             </div>
           </div>
           {review && (
             <div className="st-card">
               <div className="st-esc-head">
-                决策 {review.total} 条 · 生效 {review.applied} · 待确认 {review.escalated} · 你否掉{" "}
-                {review.rejected} · 无回执 {review.noReceipt} · 注入 {review.injected}
+                {t(
+                  "决策 {total} 条 · 生效 {applied} · 待确认 {escalated} · 你否掉 {rejected} · 无回执 {noReceipt} · 注入 {injected}",
+                  "{total} decisions · {applied} applied · {escalated} awaiting confirmation · {rejected} rejected by you · {noReceipt} without receipt · {injected} injected",
+                  {
+                    total: review.total,
+                    applied: review.applied,
+                    escalated: review.escalated,
+                    rejected: review.rejected,
+                    noReceipt: review.noReceipt,
+                    injected: review.injected,
+                  }
+                )}
               </div>
-              <div className="st-evidence">高频依据：{review.topRefs.join(" / ") || "—"}</div>
-              <div className="st-esc-why">已完成：{review.done.join("；") || "—"}</div>
-              <div className="st-esc-why">未闭环：{review.pending.join("；") || "—"}</div>
-              <div className="st-evidence">风险动作：{review.risks.join(" / ") || "无"}</div>
+              <div className="st-evidence">{t("高频依据：{x}", "Most used basis: {x}", { x: review.topRefs.join(" / ") || "—" })}</div>
+              <div className="st-esc-why">{t("已完成：{x}", "Done: {x}", { x: review.done.join(t("；", "; ")) || "—" })}</div>
+              <div className="st-esc-why">{t("未闭环：{x}", "Open: {x}", { x: review.pending.join(t("；", "; ")) || "—" })}</div>
+              <div className="st-evidence">{t("风险动作：{x}", "Risky actions: {x}", { x: review.risks.join(" / ") || t("无", "none") })}</div>
             </div>
           )}
           {audit.length > 0 && (
@@ -989,10 +1075,10 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
 
       <div className="st-ev">
         <div className="st-sit-head">
-          <span>观察事件 · 最近 {Math.min(events.length, EVENTS_SHOWN)} 条</span>
+          <span>{t("观察事件 · 最近 {n} 条", "Observed events · last {n}", { n: Math.min(events.length, EVENTS_SHOWN) })}</span>
         </div>
         <div className="st-ev-list">
-          {events.length === 0 && <div className="st-empty">还没有事件</div>}
+          {events.length === 0 && <div className="st-empty">{t("还没有事件", "No events yet")}</div>}
           {events
             .slice(-EVENTS_SHOWN)
             .reverse()
@@ -1002,7 +1088,7 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
                 <span className="st-ev-tag">{eventLabel(e.kind)}</span>
                 <div className="st-ev-body">
                   <div className="st-ev-msg">{e.message}</div>
-                  {e.suggestion && <div className="st-card">建议：{e.suggestion}</div>}
+                  {e.suggestion && <div className="st-card">{t("建议：{x}", "Suggestion: {x}", { x: e.suggestion })}</div>}
                 </div>
               </div>
             ))}
@@ -1011,54 +1097,72 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
 
       <div className="st-screen">
         <div className="st-screen-head">
-          后端屏幕快照
+          {t("后端屏幕快照", "Backend screen snapshot")}
           {snapshot && (
             <span className="st-meta">
-              {snapshot.cols}×{snapshot.rows} · {snapshot.alt ? "全屏" : "普通"} · 帧 {snapshot.frameId}
+              {snapshot.cols}×{snapshot.rows} · {snapshot.alt ? t("全屏", "full screen") : t("普通", "normal")} ·{" "}
+              {t("帧 {f}", "frame {f}", { f: snapshot.frameId })}
             </span>
           )}
         </div>
         <pre className="st-pre">
           {snapshot
-            ? snapshot.lines.slice(-12).join("\n") || "（空屏）"
-            : "该终端还没有上报过屏幕帧（未托管的终端不上报，开始托管后会立刻补一帧）"}
+            ? snapshot.lines.slice(-12).join("\n") || t("（空屏）", "(empty screen)")
+            : t(
+                "该终端还没有上报过屏幕帧（未托管的终端不上报，开始托管后会立刻补一帧）",
+                "This terminal hasn't reported any screen frames yet (terminals not on autopilot don't report; one is sent right after autopilot starts)"
+              )}
         </pre>
       </div>
 
 
           <div className="st-evidence">
-            内部说明：签约后屏幕识别常驻读屏、识别局面、判空转与断流，只出建议、不写终端。
-            动手只有托管任务一个入口；你一敲键它就让路，交还后回到原来的状态。
+            {t(
+              "内部说明：签约后屏幕识别常驻读屏、识别局面、判空转与断流，只出建议、不写终端。动手只有托管任务一个入口；你一敲键它就让路，交还后回到原来的状态。",
+              "Internals: once a contract is signed, screen recognition keeps reading the screen, recognising the situation and detecting no-progress and stalled feeds. It only makes suggestions and never writes to the terminal. Only the autopilot task acts; it steps aside as soon as you type and returns to its previous state when you hand back."
+            )}
           </div>
           <div className="st-evidence">
-            {runtime?.running ? "屏幕识别运行中" : "屏幕识别未运行"} · tick {runtime?.tickCount ?? 0} · 分类{" "}
-            {runtime?.classifyCount ?? 0} · 事件 seq {runtime?.eventSeq ?? 0}
+            {runtime?.running ? t("屏幕识别运行中", "Screen recognition running") : t("屏幕识别未运行", "Screen recognition not running")} ·{" "}
+            {t("tick {tick} · 分类 {cls} · 事件 seq {seq}", "tick {tick} · classified {cls} · event seq {seq}", {
+              tick: runtime?.tickCount ?? 0,
+              cls: runtime?.classifyCount ?? 0,
+              seq: runtime?.eventSeq ?? 0,
+            })}
           </div>
           {state && (
             <div className="st-evidence">
-              {label(selected)}：心跳 {state.heartbeatMs}ms · 同局面 {state.sameTicks} 次
+              {t("{l}：心跳 {hb}ms · 同局面 {n} 次", "{l}: heartbeat {hb}ms · same situation ×{n}", { l: label(selected), hb: state.heartbeatMs, n: state.sameTicks })}
             </div>
           )}
           {consoleInfo && (
             <div className="st-evidence">
               {consoleInfo.hasScreen
-                ? `帧 ${consoleInfo.frameId} · 指纹 ${consoleInfo.screenHash.slice(0, 8)} · 空转帧 ${consoleInfo.idleFrames}`
-                : "无屏幕帧"}
-              {snapshot ? ` · 快照指纹 ${snapshot.hash.slice(0, 8)}` : ""}
+                ? t("帧 {f} · 指纹 {h} · 空转帧 {idle}", "frame {f} · hash {h} · idle frames {idle}", {
+                    f: consoleInfo.frameId,
+                    h: consoleInfo.screenHash.slice(0, 8),
+                    idle: consoleInfo.idleFrames,
+                  })
+                : t("无屏幕帧", "No screen frames")}
+              {snapshot ? t(" · 快照指纹 {h}", " · snapshot hash {h}", { h: snapshot.hash.slice(0, 8) }) : ""}
             </div>
           )}
           {contract && (
             <div className="st-contract">
-              契约 {contract.id} · {contract.hostKey} · {tierLabel(contract.authorityTier)} · 意向{" "}
-              {contract.intentIds.length} 条
+              {t("契约 {id} · {host} · {tier} · 意向 {n} 条", "Contract {id} · {host} · {tier} · {n} intents", {
+                id: contract.id,
+                host: contract.hostKey,
+                tier: tierLabel(contract.authorityTier),
+                n: contract.intentIds.length,
+              })}
             </div>
           )}
           <div className="st-form-row">
-            <button className="st-btn" onClick={() => void setTicks(1)} title="真机验收：一次心跳没变化就判空转">
-              空转判定：1 次心跳
+            <button className="st-btn" onClick={() => void setTicks(1)} title={t("真机验收：一次心跳没变化就判空转", "For on-device testing: treat one unchanged heartbeat as no progress")}>
+              {t("空转判定：1 次心跳", "No-progress after: 1 heartbeat")}
             </button>
-            <button className="st-btn" onClick={() => void setTicks(3)} title="恢复默认：连续 3 次心跳没变化才判空转">
-              空转判定：默认 3 次
+            <button className="st-btn" onClick={() => void setTicks(3)} title={t("恢复默认：连续 3 次心跳没变化才判空转", "Restore default: no progress after 3 unchanged heartbeats in a row")}>
+              {t("空转判定：默认 3 次", "No-progress after: 3 (default)")}
             </button>
             <button
               className="st-btn"
@@ -1066,15 +1170,15 @@ export default function StewardPanel({ sessionId, sessions, runFor }: StewardPan
                 captureNow(selected);
                 void refresh();
               }}
-              title="让前端立刻补一帧全量，验证前后端是否对齐"
+              title={t("让前端立刻补一帧全量，验证前后端是否对齐", "Have the frontend send a full frame now to verify frontend and backend are in sync")}
             >
-              强制全量帧
+              {t("强制全量帧", "Force full frame")}
             </button>
             <button className="st-btn danger" onClick={() => void clearDecisions()}>
-              清空决策
+              {t("清空决策", "Clear decisions")}
             </button>
             <button className="st-btn danger" onClick={() => void clear()}>
-              清空事件
+              {t("清空事件", "Clear events")}
             </button>
           </div>
         </div>

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { mediaErrorDetail } from "./mediaError";
+import { t, useLocale } from "../i18n";
 
 /**
  * 视频播放：Blob URL + 原生 &lt;video&gt;，与 ImageView 同一套「Blob URL 接到标签上」的模式。
@@ -8,7 +9,9 @@ import { mediaErrorDetail } from "./mediaError";
  */
 export default function VideoView({ bytes, mime }: { bytes: Uint8Array; mime: string }) {
   const [url, setUrl] = useState<string | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+  useLocale();
+  // 存原始 MediaError，渲染时再转文案：切换语言后提示跟着变
+  const [err, setErr] = useState<{ e: MediaError | null } | null>(null);
 
   useEffect(() => {
     const u = URL.createObjectURL(new Blob([bytes as BlobPart], { type: mime }));
@@ -19,7 +22,10 @@ export default function VideoView({ bytes, mime }: { bytes: Uint8Array; mime: st
   return (
     <div className="rd-video-root">
       {err ? (
-        <div className="rd-error">视频无法播放：{err}</div>
+        <div className="rd-error">
+          {t("视频无法播放：", "Can't play video: ")}
+          {mediaErrorDetail(err.e)}
+        </div>
       ) : (
         url && (
           <video
@@ -27,7 +33,7 @@ export default function VideoView({ bytes, mime }: { bytes: Uint8Array; mime: st
             src={url}
             controls
             preload="metadata"
-            onError={(e) => setErr(mediaErrorDetail(e.currentTarget.error))}
+            onError={(e) => setErr({ e: e.currentTarget.error })}
           />
         )
       )}

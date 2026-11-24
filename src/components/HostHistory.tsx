@@ -5,6 +5,7 @@
 
 import { useCallback, useState } from "react";
 import { api } from "../api";
+import { t, useLocale } from "../i18n";
 import { toFriendlyError } from "../lib/errors";
 import { checkLines, formatReport } from "../lib/host";
 import { fmtDuration, fmtWhen, historyStateLabel } from "../lib/hostHistory";
@@ -14,6 +15,7 @@ import HostText from "./HostText";
 import { fromHostSpent, spentLine, usageTooltip } from "../lib/usage";
 
 export default function HostHistory() {
+  useLocale();
   const [items, setItems] = useState<HostHistoryItem[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
@@ -34,17 +36,17 @@ export default function HostHistory() {
       }}
     >
       <summary>
-        历史托管
-        {items ? <span className="st-meta"> · {items.length} 条</span> : null}
+        {t("历史托管", "Autopilot history")}
+        {items ? <span className="st-meta">{t(" · {n} 条", " · {n}", { n: items.length })}</span> : null}
       </summary>
       <div className="host-history-body">
         <div className="st-form-row">
           <button className="st-btn" onClick={load}>
-            刷新
+            {t("刷新", "Refresh")}
           </button>
         </div>
         {err && <div className="st-status warn">{err}</div>}
-        {items && items.length === 0 && <div className="st-empty">还没有结束的托管</div>}
+        {items && items.length === 0 && <div className="st-empty">{t("还没有结束的托管", "No finished autopilot runs yet")}</div>}
         {items?.map((it) => {
           const st = historyStateLabel(it.state);
           const open = openId === it.contractId;
@@ -65,25 +67,29 @@ export default function HostHistory() {
               {open && (
                 <div className="host-report">
                   <div className="host-report-head">
-                    <span>{it.state === "completed" ? "完成报告" : it.state === "failed" ? "失败" : "已停止"}</span>
+                    <span>{it.state === "completed" ? t("完成报告", "Completion report") : it.state === "failed" ? t("失败", "Failed") : t("已停止", "Stopped")}</span>
                     <span className="st-meta">
-                      {fmtWhen(it.startedAt)} 开始 · 用时 {fmtDuration(it.durationMs)} · {it.spent.steps} 步
-                      {usage ? ` · 共 ${usage}` : ""}
+                      {t("{start} 开始 · 用时 {dur} · {steps} 步", "Started {start} · took {dur} · {steps} steps", {
+                        start: fmtWhen(it.startedAt),
+                        dur: fmtDuration(it.durationMs),
+                        steps: it.spent.steps,
+                      })}
+                      {usage ? t(" · 共 {usage}", " · total {usage}", { usage }) : ""}
                     </span>
                   </div>
                   {it.state === "completed" ? (
                     it.summary?.trim() ? (
                       <HostText className="host-report-body" text={formatReport(it.summary)} />
                     ) : (
-                      <div className="host-report-body">（AI 没有写完成报告）</div>
+                      <div className="host-report-body">{t("（AI 没有写完成报告）", "(The AI didn't write a completion report)")}</div>
                     )
                   ) : (
-                    <div className="host-report-body">{it.error?.trim() || (it.state === "stopped" ? "托管被停止，没有完成报告" : "（没有记录原因）")}</div>
+                    <div className="host-report-body">{it.error?.trim() || (it.state === "stopped" ? t("托管被停止，没有完成报告", "Autopilot was stopped; no completion report") : t("（没有记录原因）", "(No reason recorded)"))}</div>
                   )}
                   <HostChangesView contractId={it.contractId} data={{ changes: it.changes, backups: it.backups }} />
                   {it.checks.length > 0 && (
                     <details className="host-report-checks">
-                      <summary>核验依据（{it.checks.length} 条）</summary>
+                      <summary>{t("核验依据（{n} 条）", "Verification ({n})", { n: it.checks.length })}</summary>
                       <ul className="host-checks">
                         {checkLines(it.checks).map((l, i) => (
                           <li key={i} className={l.startsWith("✓") ? "ok" : l.startsWith("·") ? "info" : "no"}>

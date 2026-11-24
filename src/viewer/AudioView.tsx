@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { mediaErrorDetail } from "./mediaError";
+import { t, useLocale } from "../i18n";
 
 /**
  * 音频播放：Blob URL + 原生 &lt;audio&gt;，与 ImageView 同一套「Blob URL 接到标签上」的模式。
@@ -7,7 +8,9 @@ import { mediaErrorDetail } from "./mediaError";
  */
 export default function AudioView({ bytes, mime }: { bytes: Uint8Array; mime: string }) {
   const [url, setUrl] = useState<string | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+  useLocale();
+  // 存原始 MediaError，渲染时再转文案：切换语言后提示跟着变
+  const [err, setErr] = useState<{ e: MediaError | null } | null>(null);
 
   useEffect(() => {
     const u = URL.createObjectURL(new Blob([bytes as BlobPart], { type: mime }));
@@ -18,7 +21,10 @@ export default function AudioView({ bytes, mime }: { bytes: Uint8Array; mime: st
   return (
     <div className="rd-audio-root">
       {err ? (
-        <div className="rd-error">音频无法播放：{err}</div>
+        <div className="rd-error">
+          {t("音频无法播放：", "Can't play audio: ")}
+          {mediaErrorDetail(err.e)}
+        </div>
       ) : (
         url && (
           <audio
@@ -26,7 +32,7 @@ export default function AudioView({ bytes, mime }: { bytes: Uint8Array; mime: st
             src={url}
             controls
             preload="metadata"
-            onError={(e) => setErr(mediaErrorDetail(e.currentTarget.error))}
+            onError={(e) => setErr({ e: e.currentTarget.error })}
           />
         )
       )}

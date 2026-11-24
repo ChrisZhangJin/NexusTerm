@@ -17,6 +17,7 @@ import {
   type CtxItem,
   type CtxKind,
 } from "../lib/steward";
+import { t, useLocale } from "../i18n";
 
 export interface StewardContextProps {
   /** 当前选中的托管契约；意向栈按它过滤 */
@@ -25,35 +26,65 @@ export interface StewardContextProps {
   onChanged?: () => void;
 }
 
-const KINDS: Array<{ value: CtxKind; label: string; hint: string }> = [
-  { value: "preference", label: "偏好", hint: "硬约束 / 软偏好，决定能不能答、怎么答" },
-  { value: "intent", label: "意向", hint: "目标栈，栈顶那条决定本次回复" },
-  { value: "knowledge", label: "知识", hint: "项目背景 / 历史结论，标为不可信数据" },
-  { value: "playbook", label: "剧本", hint: "命中即确定性回答，不调模型" },
+const kinds = (): Array<{ value: CtxKind; label: string; hint: string }> => [
+  {
+    value: "preference",
+    label: t("偏好", "Preferences"),
+    hint: t("硬约束 / 软偏好，决定能不能答、怎么答", "Hard / soft rules that decide whether and how to answer"),
+  },
+  {
+    value: "intent",
+    label: t("意向", "Intents"),
+    hint: t("目标栈，栈顶那条决定本次回复", "Goal stack; the top entry drives the current reply"),
+  },
+  {
+    value: "knowledge",
+    label: t("知识", "Knowledge"),
+    hint: t("项目背景 / 历史结论，标为不可信数据", "Project background / past findings, treated as untrusted data"),
+  },
+  {
+    value: "playbook",
+    label: t("剧本", "Playbooks"),
+    hint: t("命中即确定性回答，不调模型", "Fixed answers on match, no model call"),
+  },
 ];
+
+/** 回复模板的占位提示：花括号是模板变量本身，原样显示（不传 vars，t() 不会替换） */
+const TEMPLATE_HINT = () =>
+  t(
+    "可选：完整回复模板，支持 {goal} {constraints} {hard} {options} {topic} {knowledge}",
+    "Optional: full reply template; supports {goal} {constraints} {hard} {options} {topic} {knowledge}"
+  );
 
 const extraSummary = (x: CtxItem): string => {
   const e = x.extra ?? {};
   if (x.kind === "knowledge") {
     const tags = Array.isArray(e.tags) ? (e.tags as unknown[]).join(" / ") : "";
-    return tags ? `标签：${tags}` : "";
+    return tags ? t("标签：{tags}", "Tags: {tags}", { tags }) : "";
   }
   if (x.kind === "intent") {
     const c = Array.isArray(e.constraints) ? (e.constraints as unknown[]).length : 0;
-    const tpl = typeof e.answerTemplate === "string" && e.answerTemplate ? " · 自定义回复模板" : "";
-    return `position ${x.position} · 约束 ${c} 条${tpl}`;
+    const tpl =
+      typeof e.answerTemplate === "string" && e.answerTemplate ? t(" · 自定义回复模板", " · custom reply template") : "";
+    return t("position {p} · 约束 {c} 条", "position {p} · {c} constraints", { p: x.position, c }) + tpl;
   }
   if (x.kind === "playbook") {
     const answer = typeof e.answer === "string" ? e.answer : "";
     const where = [e.matchProgram, e.matchKind, e.matchText]
       .filter((v): v is string => typeof v === "string" && !!v && v !== "*")
       .join("/");
-    return `→ 「${answer}」${where ? ` · 匹配 ${where}` : ""}${e.enabled === false ? " · 已停用" : ""}`;
+    return (
+      t("→ 「{answer}」", "→ \"{answer}\"", { answer }) +
+      (where ? t(" · 匹配 {where}", " · matches {where}", { where }) : "") +
+      (e.enabled === false ? t(" · 已停用", " · disabled") : "")
+    );
   }
-  return x.strength === "hard" ? "硬约束" : "软偏好";
+  return x.strength === "hard" ? t("硬约束", "Hard rule") : t("软偏好", "Soft preference");
 };
 
 export default function StewardContext({ contractId, onChanged }: StewardContextProps) {
+  useLocale();
+  const KINDS = kinds();
   const [items, setItems] = useState<CtxItem[]>([]);
   const [kind, setKind] = useState<CtxKind>("preference");
   const [editing, setEditing] = useState<string | null>(null);
@@ -78,7 +109,7 @@ export default function StewardContext({ contractId, onChanged }: StewardContext
       setItems(v.items);
       setErr(null);
     } catch (e) {
-      setErr(`读取依据失败：${String(e)}`);
+      setErr(t("读取依据失败：{e}", "Failed to load decision basis: {e}", { e: String(e) }));
     }
   }, []);
 
@@ -125,7 +156,7 @@ export default function StewardContext({ contractId, onChanged }: StewardContext
   const submit = async () => {
     if (!text.trim() || busy) return;
     if (kind === "intent" && !contractId) {
-      setErr("先开始托管，意向栈要挂在托管契约上");
+      setErr(t("先开始托管，意向栈要挂在托管契约上", "Start autopilot first — intents attach to the autopilot contract"));
       return;
     }
     let extra: Record<string, unknown> = {};
@@ -141,7 +172,7 @@ export default function StewardContext({ contractId, onChanged }: StewardContext
       extra = { tags: splitList(tags) };
     } else if (kind === "playbook") {
       if (!answer.trim()) {
-        setErr("剧本必须给出要发出的回复文本");
+        setErr(t("剧本必须给出要发出的回复文本", "A playbook needs the reply text to send"));
         return;
       }
       extra = {
@@ -182,7 +213,7 @@ export default function StewardContext({ contractId, onChanged }: StewardContext
       await load();
       onChanged?.();
     } catch (e) {
-      setErr(`保存失败：${String(e)}`);
+      setErr(t("保存失败：{e}", "Save failed: {e}", { e: String(e) }));
     } finally {
       setBusy(false);
     }
@@ -195,7 +226,7 @@ export default function StewardContext({ contractId, onChanged }: StewardContext
       await load();
       onChanged?.();
     } catch (e) {
-      setErr(`删除失败：${String(e)}`);
+      setErr(t("删除失败：{e}", "Delete failed: {e}", { e: String(e) }));
     }
   };
 
@@ -206,9 +237,11 @@ export default function StewardContext({ contractId, onChanged }: StewardContext
   return (
     <div className="st-ctx">
       <div className="st-sit-head">
-        <span>决策依据 · {KINDS.find((k) => k.value === kind)?.hint}</span>
+        <span>
+          {t("决策依据", "Decision basis")} · {KINDS.find((k) => k.value === kind)?.hint}
+        </span>
         <button className="st-btn" onClick={() => void load()}>
-          刷新
+          {t("刷新", "Refresh")}
         </button>
       </div>
 
@@ -233,15 +266,18 @@ export default function StewardContext({ contractId, onChanged }: StewardContext
         {shown.length === 0 && (
           <div className="st-empty">
             {kind === "intent" && !contractId
-              ? "先在上面开始托管，这里会出现由目标编译出的意向栈 I0"
-              : "这一类还没有条目"}
+              ? t(
+                  "先在上面开始托管，这里会出现由目标编译出的意向栈 I0",
+                  "Start autopilot above; the intent stack I0 compiled from your goal will appear here"
+                )
+              : t("这一类还没有条目", "No entries of this kind yet")}
           </div>
         )}
         {shown.map((x) => (
           <div key={x.id} className="st-ctx-row">
             <div className="st-ctx-text">
               <span className={`st-badge${x.strength === "hard" ? " hard" : ""}`}>
-                {x.strength === "hard" ? "硬" : "软"}
+                {x.strength === "hard" ? t("硬", "Hard") : t("软", "Soft")}
               </span>
               {x.source !== "user" && <span className="st-badge">{x.source}</span>}
               {x.scope !== "global" && <span className="st-badge">{x.scope}</span>}
@@ -250,10 +286,10 @@ export default function StewardContext({ contractId, onChanged }: StewardContext
             <div className="st-evidence">{extraSummary(x) || "—"}</div>
             <div className="st-ctx-acts">
               <button className="st-btn" onClick={() => edit(x)}>
-                编辑
+                {t("编辑", "Edit")}
               </button>
               <button className="st-btn danger" onClick={() => void remove(x.id)}>
-                删除
+                {t("删除", "Delete")}
               </button>
             </div>
           </div>
@@ -262,7 +298,7 @@ export default function StewardContext({ contractId, onChanged }: StewardContext
 
       <div className="st-ctx-form">
         <div className="st-form-title">
-          {editing ? "编辑条目" : "新增条目"} · {KINDS.find((k) => k.value === kind)?.label}
+          {editing ? t("编辑条目", "Edit entry") : t("新增条目", "New entry")} · {KINDS.find((k) => k.value === kind)?.label}
         </div>
         <input
           className="st-input"
@@ -270,47 +306,47 @@ export default function StewardContext({ contractId, onChanged }: StewardContext
           onChange={(e) => setText(e.target.value)}
           placeholder={
             kind === "preference"
-              ? "例如：不要改设置界面的记住开关"
+              ? t("例如：不要改设置界面的记住开关", "e.g. Don't change the \"remember\" toggle in Settings")
               : kind === "intent"
-                ? "例如：修复钥匙串二次弹窗并冷启动验证"
+                ? t("例如：修复钥匙串二次弹窗并冷启动验证", "e.g. Fix the duplicate keychain prompt and verify on cold start")
                 : kind === "knowledge"
-                  ? "例如：vault_try_remembered 被调用两次是根因"
-                  : "例如：SSH 首次连接确认回答 yes"
+                  ? t("例如：vault_try_remembered 被调用两次是根因", "e.g. Root cause: vault_try_remembered is called twice")
+                  : t("例如：SSH 首次连接确认回答 yes", "e.g. Answer yes to the SSH first-connection prompt")
           }
         />
         {kind === "preference" && (
           <div className="st-form-row">
             <select className="st-select" value={strength} onChange={(e) => setStrength(e.target.value)}>
-              <option value="hard">硬约束（不可越过）</option>
-              <option value="soft">软偏好</option>
+              <option value="hard">{t("硬约束（不可越过）", "Hard rule (never crossed)")}</option>
+              <option value="soft">{t("软偏好", "Soft preference")}</option>
             </select>
-            <input className="st-input" value={scope} onChange={(e) => setScope(e.target.value)} placeholder="作用域 global / claude_code / hostKey" />
+            <input className="st-input" value={scope} onChange={(e) => setScope(e.target.value)} placeholder={t("作用域 global / claude_code / hostKey", "Scope: global / claude_code / hostKey")} />
           </div>
         )}
         {kind === "knowledge" && (
-          <input className="st-input" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="标签，逗号分隔：keychain, vault, 钥匙串" />
+          <input className="st-input" value={tags} onChange={(e) => setTags(e.target.value)} placeholder={t("标签，逗号分隔：keychain, vault, 钥匙串", "Tags, comma-separated: keychain, vault")} />
         )}
         {kind === "intent" && (
           <>
-            <input className="st-input" value={constraints} onChange={(e) => setConstraints(e.target.value)} placeholder="本次约束，逗号分隔：别改设置 UI, 最小改动" />
+            <input className="st-input" value={constraints} onChange={(e) => setConstraints(e.target.value)} placeholder={t("本次约束，逗号分隔：别改设置 UI, 最小改动", "Constraints, comma-separated: don't touch Settings UI, minimal change")} />
             <input
               className="st-input"
               value={answerTemplate}
               onChange={(e) => setAnswerTemplate(e.target.value)}
-              placeholder="可选：完整回复模板，支持 {goal} {constraints} {hard} {options} {topic} {knowledge}"
+              placeholder={TEMPLATE_HINT()}
             />
           </>
         )}
         {kind === "playbook" && (
           <>
             <div className="st-form-row">
-              <input className="st-input" value={matchProgram} onChange={(e) => setMatchProgram(e.target.value)} placeholder="程序 * / claude_code / ssh" />
-              <input className="st-input" value={matchKind} onChange={(e) => setMatchKind(e.target.value)} placeholder="局面 * / question / pager" />
+              <input className="st-input" value={matchProgram} onChange={(e) => setMatchProgram(e.target.value)} placeholder={t("程序 * / claude_code / ssh", "Program: * / claude_code / ssh")} />
+              <input className="st-input" value={matchKind} onChange={(e) => setMatchKind(e.target.value)} placeholder={t("局面 * / question / pager", "Situation: * / question / pager")} />
             </div>
-            <input className="st-input" value={matchText} onChange={(e) => setMatchText(e.target.value)} placeholder="屏幕文本包含（不区分大小写）" />
+            <input className="st-input" value={matchText} onChange={(e) => setMatchText(e.target.value)} placeholder={t("屏幕文本包含（不区分大小写）", "Screen text contains (case-insensitive)")} />
             <div className="st-form-row">
-              <input className="st-input" value={answer} onChange={(e) => setAnswer(e.target.value)} placeholder="要发出的回复（单行）" />
-              <input className="st-input short" value={optionIndex} onChange={(e) => setOptionIndex(e.target.value)} placeholder="选项号" />
+              <input className="st-input" value={answer} onChange={(e) => setAnswer(e.target.value)} placeholder={t("要发出的回复（单行）", "Reply to send (single line)")} />
+              <input className="st-input short" value={optionIndex} onChange={(e) => setOptionIndex(e.target.value)} placeholder={t("选项号", "Option #")} />
               <select className="st-select" value={tier} onChange={(e) => setTier(e.target.value)}>
                 <option value="auto">{TIER_LABELS.auto}</option>
                 <option value="notify">{TIER_LABELS.notify}</option>
@@ -321,14 +357,19 @@ export default function StewardContext({ contractId, onChanged }: StewardContext
         )}
         <div className="st-form-row">
           <button className="st-btn primary" disabled={busy || !text.trim()} onClick={() => void submit()}>
-            {editing ? "保存" : "添加"}
+            {editing ? t("保存", "Save") : t("添加", "Add")}
           </button>
           {editing && (
             <button className="st-btn" onClick={reset}>
-              取消
+              {t("取消", "Cancel")}
             </button>
           )}
-          <span className="st-meta">seed 条目可编辑 / 删除；依据写错会直接影响自动答复</span>
+          <span className="st-meta">
+            {t(
+              "seed 条目可编辑 / 删除；依据写错会直接影响自动答复",
+              "Seed entries can be edited or deleted; a wrong entry directly affects automatic replies"
+            )}
+          </span>
         </div>
       </div>
     </div>

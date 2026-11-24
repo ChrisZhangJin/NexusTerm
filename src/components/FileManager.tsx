@@ -9,6 +9,7 @@ import type { AuthMethod, RemoteEntry, SessionRecord } from "../types";
 import { kindIcon, viewableKind } from "../lib/viewable";
 import { nameMatcher } from "../lib/nameFilter";
 import { registerSftpActivity } from "../lib/sftpActivity";
+import { t, useLocale } from "../i18n";
 
 export function formatSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -26,10 +27,10 @@ export function formatTime(sec: number | null): string {
 
 /** 「类型」列：简化版，不追求还原系统的完整文件类型数据库，够排序/辨认就行 */
 export function typeLabel(e: RemoteEntry): string {
-  if (e.isDir) return "文件夹";
+  if (e.isDir) return t("文件夹", "Folder");
   const i = e.name.lastIndexOf(".");
-  if (i <= 0 || i === e.name.length - 1) return "文件";
-  return `${e.name.slice(i + 1).toUpperCase()} 文件`;
+  if (i <= 0 || i === e.name.length - 1) return t("文件", "File");
+  return t("{ext} 文件", "{ext} file", { ext: e.name.slice(i + 1).toUpperCase() });
 }
 
 /** 传输列表的一行。`id` 由前端生成，贯穿整次传输：既用来对上后端推来的进度事件，也用来发取消指令。 */
@@ -161,6 +162,7 @@ function PathInput({
   path: string;
   onNavigate: (p: string) => Promise<boolean>;
 }) {
+  useLocale();
   const [value, setValue] = useState(path);
   const [invalid, setInvalid] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -185,7 +187,7 @@ function PathInput({
       className={`fm-path-input${invalid ? " invalid" : ""}`}
       value={value}
       spellCheck={false}
-      title="输入路径后回车跳转，Esc 还原"
+      title={t("输入路径后回车跳转，Esc 还原", "Type a path and press Enter to go; Esc to revert")}
       disabled={busy}
       onChange={(e) => {
         setValue(e.target.value);
@@ -223,6 +225,8 @@ const Row = memo(function Row({
   selected: boolean;
   cbs: MutableRefObject<RowCbs>;
 }) {
+  // 行是 memo 的：自己订阅语言，切换时「类型」列才会跟着变
+  useLocale();
   return (
     <div
       className={`fm-row ${selected ? "selected" : ""}`}
@@ -256,6 +260,7 @@ function FindBar({
   onApply: (q: string) => void;
   onClose: () => void;
 }) {
+  useLocale();
   const [draft, setDraft] = useState("");
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => {
@@ -269,8 +274,11 @@ function FindBar({
         className="fm-find-input"
         value={draft}
         spellCheck={false}
-        placeholder="精确匹配；* 通配，如 *.txt"
-        title="不带 * 是整名精确匹配（07.txt）；带 * 为通配（*07.txt = 以 07.txt 结尾）"
+        placeholder={t("精确匹配；* 通配，如 *.txt", "Exact match; * as wildcard, e.g. *.txt")}
+        title={t(
+          "不带 * 是整名精确匹配（07.txt）；带 * 为通配（*07.txt = 以 07.txt 结尾）",
+          "Without * the whole name must match (07.txt); with * it's a wildcard (*07.txt = ends with 07.txt)"
+        )}
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === "Enter") onApply(draft);
@@ -281,9 +289,9 @@ function FindBar({
         }}
       />
       <button className="btn" onClick={() => onApply(draft)}>
-        过滤
+        {t("过滤", "Filter")}
       </button>
-      <button className="btn fm-find-x" onClick={onClose} title="关闭 (Esc)">
+      <button className="btn fm-find-x" onClick={onClose} title={t("关闭 (Esc)", "Close (Esc)")}>
         ✕
       </button>
     </div>
@@ -305,6 +313,7 @@ function Pane({
   findToken,
   children,
 }: PaneProps) {
+  useLocale();
   const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: "name", dir: 1 });
   const sorted = useMemo(
     () => [...entries].sort((a, b) => compareEntries(a, b, sort.key, sort.dir)),
@@ -359,7 +368,7 @@ function Pane({
       <div className="fm-pane-head">
         <strong>{title}</strong>
         <PathInput path={path} onNavigate={onNavigate} />
-        <button className="btn-row" onClick={onUp} title="上级目录">
+        <button className="btn-row" onClick={onUp} title={t("上级目录", "Parent folder")}>
           ↑
         </button>
       </div>
@@ -367,16 +376,16 @@ function Pane({
       <div className="fm-list-head">
         <span className="fm-icon" />
         <button className="fm-name fm-col-btn" onClick={() => toggleSort("name")}>
-          名称{arrow("name")}
+          {t("名称", "Name")}{arrow("name")}
         </button>
         <button className="fm-size fm-col-btn" onClick={() => toggleSort("size")}>
-          大小{arrow("size")}
+          {t("大小", "Size")}{arrow("size")}
         </button>
         <button className="fm-type fm-col-btn" onClick={() => toggleSort("type")}>
-          类型{arrow("type")}
+          {t("类型", "Type")}{arrow("type")}
         </button>
         <button className="fm-mtime fm-col-btn" onClick={() => toggleSort("mtime")}>
-          修改时间{arrow("mtime")}
+          {t("修改时间", "Modified")}{arrow("mtime")}
         </button>
       </div>
 
@@ -389,13 +398,13 @@ function Pane({
             onContext(ev, null);
           }}
         >
-          {loading && <div className="empty">加载中…</div>}
+          {loading && <div className="empty">{t("加载中…", "Loading…")}</div>}
           {error && <div className="error">{error}</div>}
           {!loading && !error && entries.length === 0 && (
-            <div className="empty">空目录</div>
+            <div className="empty">{t("空目录", "Empty folder")}</div>
           )}
           {!loading && !error && entries.length > 0 && visible.length === 0 && (
-            <div className="empty">无匹配项</div>
+            <div className="empty">{t("无匹配项", "No matches")}</div>
           )}
           {visible.map((e) => (
             <Row key={e.path} e={e} selected={selected === e.path} cbs={cbs} />
@@ -430,6 +439,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
   // 连的是同一个已保存 session（同一台机器开两个标签），按 session.id 起的话
   // 第二个面板的 sftp_connect 会直接覆盖第一个在后端 map 里的同名条目，
   // 之后随便哪个面板一关（sftp_close）就把另一个也带断了（"会话不存在"）。
+  useLocale();
   const sftpId = `sftp-${tabId}`;
   const readyRef = useRef(false);
   const homeRef = useRef("/");
@@ -704,7 +714,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
       setLocalPath(p);
       return true;
     } catch (e) {
-      setTransferMsg(`无法打开本地路径「${p}」：${e}`);
+      setTransferMsg(t("无法打开本地路径「{p}」：{e}", "Can't open local path \"{p}\": {e}", { p, e: String(e) }));
       return false;
     }
   };
@@ -724,7 +734,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
       setRemotePath(p);
       return true;
     } catch (e) {
-      setTransferMsg(`无法打开远端路径「${p}」：${e}`);
+      setTransferMsg(t("无法打开远端路径「{p}」：{e}", "Can't open remote path \"{p}\": {e}", { p, e: String(e) }));
       return false;
     }
   };
@@ -797,7 +807,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
   const doUpload = async () => {
     const src = localEntries.find((e) => e.path === localSel);
     if (!src || src.isDir) {
-      setTransferMsg("请先在左侧选择一个本地文件");
+      setTransferMsg(t("请先在左侧选择一个本地文件", "Select a local file on the left first"));
       return;
     }
     runTransfer("upload", src.name, src.path, joinPath(remotePath, src.name), src.size, crypto.randomUUID());
@@ -806,7 +816,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
   const doDownload = async () => {
     const src = remoteEntries.find((e) => e.path === remoteSel);
     if (!src || src.isDir) {
-      setTransferMsg("请先在右侧选择一个远端文件");
+      setTransferMsg(t("请先在右侧选择一个远端文件", "Select a remote file on the right first"));
       return;
     }
     runTransfer("download", src.name, joinLocal(localPath, src.name), src.path, src.size, crypto.randomUUID());
@@ -816,7 +826,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
   const transferEntry = (side: "local" | "remote", e: RemoteEntry, queued: boolean) => {
     if (status !== "ready") return;
     if (e.isDir) {
-      setTransferMsg("暂不支持传输目录，请选择文件");
+      setTransferMsg(t("暂不支持传输目录，请选择文件", "Folder transfer isn't supported yet; select a file"));
       return;
     }
     const kind = side === "local" ? "upload" : "download";
@@ -892,7 +902,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
   /** 在新窗口中浏览：md / html 渲染，图片/音视频播放，配置文件高亮 */
   const doView = async (entry: RemoteEntry) => {
     setCtx(null);
-    setTransferMsg(`正在打开「${entry.name}」…`);
+    setTransferMsg(t("正在打开「{name}」…", "Opening \"{name}\"…", { name: entry.name }));
     try {
       await api.viewerOpenSftp(
         sftpId,
@@ -901,41 +911,41 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
       );
       setTransferMsg(null);
     } catch (e) {
-      setTransferMsg(`浏览失败：${e}`);
+      setTransferMsg(t("浏览失败：{e}", "Couldn't open viewer: {e}", { e: String(e) }));
     }
   };
 
   const doMkdir = async () => {
-    const name = prompt("新目录名称");
+    const name = prompt(t("新目录名称", "New folder name"));
     if (!name) return;
     try {
       await api.sftpMkdir(sftpId, joinPath(remotePath, name));
       await loadRemote(remotePath);
     } catch (e) {
-      setTransferMsg(`创建失败: ${e}`);
+      setTransferMsg(t("创建失败: {e}", "Create failed: {e}", { e: String(e) }));
     }
   };
 
   const doDelete = async (entry?: RemoteEntry) => {
     const src = entry ?? remoteEntries.find((e) => e.path === remoteSel);
     if (!src) {
-      setTransferMsg("请先在右侧选择要删除的条目");
+      setTransferMsg(t("请先在右侧选择要删除的条目", "Select an item on the right to delete first"));
       return;
     }
-    if (!confirm(`删除远端「${src.name}」？`)) return;
+    if (!confirm(t("删除远端「{name}」？", "Delete remote \"{name}\"?", { name: src.name }))) return;
     try {
       await api.sftpRemove(sftpId, src.path, src.isDir);
       setRemoteSel(null);
       await loadRemote(remotePath);
     } catch (e) {
-      setTransferMsg(`删除失败: ${e}`);
+      setTransferMsg(t("删除失败: {e}", "Delete failed: {e}", { e: String(e) }));
     }
   };
 
   const doRename = async (entry?: RemoteEntry) => {
     const src = entry ?? remoteEntries.find((e) => e.path === remoteSel);
     if (!src) {
-      setTransferMsg("请先在右侧选择要重命名的条目");
+      setTransferMsg(t("请先在右侧选择要重命名的条目", "Select an item on the right to rename first"));
       return;
     }
     const name = prompt("新名称", src.name);
@@ -944,7 +954,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
       await api.sftpRename(sftpId, src.path, joinPath(remotePath, name));
       await loadRemote(remotePath);
     } catch (e) {
-      setTransferMsg(`重命名失败: ${e}`);
+      setTransferMsg(t("重命名失败: {e}", "Rename failed: {e}", { e: String(e) }));
     }
   };
 
@@ -956,16 +966,16 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
       setLocalSel(null);
       await loadLocal(localPath);
     } catch (e) {
-      setTransferMsg(`重命名失败: ${e}`);
+      setTransferMsg(t("重命名失败: {e}", "Rename failed: {e}", { e: String(e) }));
     }
   };
 
   const copyRemotePath = async (p: string) => {
     try {
       await api.clipboardWrite(p);
-      setTransferMsg(`已复制路径：${p}`);
+      setTransferMsg(t("已复制路径：{p}", "Path copied: {p}", { p }));
     } catch (e) {
-      setTransferMsg(`复制失败: ${e}`);
+      setTransferMsg(t("复制失败: {e}", "Copy failed: {e}", { e: String(e) }));
     }
   };
 
@@ -982,16 +992,20 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
       <div className="fm-head">
         <strong>SFTP · {session.name}</strong>
         <span className={`fm-status fm-status-${status}`}>
-          {status === "ready" ? "已连接" : status === "connecting" ? "连接中…" : statusMsg || "失败"}
+          {status === "ready"
+            ? t("已连接", "Connected")
+            : status === "connecting"
+              ? t("连接中…", "Connecting…")
+              : statusMsg || t("失败", "Failed")}
         </span>
         <button className="btn" onClick={onClose}>
-          关闭
+          {t("关闭", "Close")}
         </button>
       </div>
 
       <div className="fm-body">
         <Pane
-          title="本地"
+          title={t("本地", "Local")}
           path={localPath}
           entries={localEntries}
           loading={localBusy}
@@ -1005,15 +1019,15 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
           findToken={localFind}
         >
           <button className="btn" onClick={doUpload} disabled={status !== "ready"}>
-            上传 →
+            {t("上传 →", "Upload →")}
           </button>
           <button className="btn" onClick={() => void loadLocal(localPath)}>
-            刷新
+            {t("刷新", "Refresh")}
           </button>
         </Pane>
 
         <Pane
-          title="远端"
+          title={t("远端", "Remote")}
           path={remotePath}
           entries={remoteEntries}
           loading={remoteBusy}
@@ -1031,23 +1045,23 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
           findToken={remoteFind}
         >
           <button className="btn" onClick={doDownload} disabled={status !== "ready"}>
-            ← 下载
+            {t("← 下载", "← Download")}
           </button>
           <button className="btn" onClick={() => void loadRemote(remotePath)} disabled={status !== "ready"}>
-            刷新
+            {t("刷新", "Refresh")}
           </button>
           <button className="btn" onClick={doMkdir} disabled={status !== "ready"}>
-            新建目录
+            {t("新建目录", "New folder")}
           </button>
           <button className="btn" onClick={() => void doRename()} disabled={status !== "ready"}>
-            重命名
+            {t("重命名", "Rename")}
           </button>
           <button
             className="btn danger"
             onClick={() => void doDelete()}
             disabled={status !== "ready"}
           >
-            删除
+            {t("删除", "Delete")}
           </button>
         </Pane>
       </div>
@@ -1062,53 +1076,53 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
         >
           <div
             className="fm-xfer-resize"
-            title="上下拖动调整高度，双击还原"
+            title={t("上下拖动调整高度，双击还原", "Drag to resize; double-click to reset")}
             onPointerDown={startXferResize}
             onDoubleClick={() => setXferH(null)}
           />
           <div className="fm-xfer-head">
-            <span>名称</span>
-            <span>状态</span>
-            <span>进度</span>
-            <span>大小</span>
-            <span>本地路径</span>
+            <span>{t("名称", "Name")}</span>
+            <span>{t("状态", "Status")}</span>
+            <span>{t("进度", "Progress")}</span>
+            <span>{t("大小", "Size")}</span>
+            <span>{t("本地路径", "Local path")}</span>
             <span>&lt;-&gt;</span>
-            <span>远程路径</span>
-            <span>速度</span>
-            <span>剩余</span>
-            <button className="btn-row fm-xfer-clear" onClick={clearFinishedTransfers} title="清除已完成">
+            <span>{t("远程路径", "Remote path")}</span>
+            <span>{t("速度", "Speed")}</span>
+            <span>{t("剩余", "Left")}</span>
+            <button className="btn-row fm-xfer-clear" onClick={clearFinishedTransfers} title={t("清除已完成", "Clear finished")}>
               ✕
             </button>
           </div>
           <div className="fm-xfer-list">
-            {transfers.map((t) => {
-              const pct = t.size > 0 ? Math.min(100, Math.round((t.transferred / t.size) * 100)) : 0;
+            {transfers.map((tf) => {
+              const pct = tf.size > 0 ? Math.min(100, Math.round((tf.transferred / tf.size) * 100)) : 0;
               return (
                 <div
-                  key={t.id}
+                  key={tf.id}
                   className="fm-xfer-row"
                   onContextMenu={(ev) => {
                     ev.preventDefault();
                     setTransferCtx({
                       x: Math.min(ev.clientX, window.innerWidth - 180),
                       y: Math.min(ev.clientY, window.innerHeight - 200),
-                      transfer: t,
+                      transfer: tf,
                     });
                   }}
                 >
-                  <span className="fm-xfer-name" title={t.name}>
-                    {t.name}
+                  <span className="fm-xfer-name" title={tf.name}>
+                    {tf.name}
                   </span>
-                  <span className={`fm-xfer-status fm-xfer-status-${t.status}`}>
-                    {t.status === "queued"
-                      ? "排队中"
-                      : t.status === "running"
-                      ? "进行中"
-                      : t.status === "done"
-                        ? "已完成"
-                        : t.status === "canceled"
-                          ? "已取消"
-                          : "失败"}
+                  <span className={`fm-xfer-status fm-xfer-status-${tf.status}`}>
+                    {tf.status === "queued"
+                      ? t("排队中", "Queued")
+                      : tf.status === "running"
+                      ? t("进行中", "In progress")
+                      : tf.status === "done"
+                        ? t("已完成", "Done")
+                        : tf.status === "canceled"
+                          ? t("已取消", "Canceled")
+                          : t("失败", "Failed")}
                   </span>
                   <span className="fm-xfer-progress">
                     <span className="fm-xfer-bar">
@@ -1117,18 +1131,18 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
                     {pct}%
                   </span>
                   <span className="fm-xfer-size">
-                    {formatSize(t.transferred)}
-                    {t.size > 0 ? ` / ${formatSize(t.size)}` : ""}
+                    {formatSize(tf.transferred)}
+                    {tf.size > 0 ? ` / ${formatSize(tf.size)}` : ""}
                   </span>
-                  <span className="fm-xfer-path" title={t.localPath}>
-                    {t.localPath}
+                  <span className="fm-xfer-path" title={tf.localPath}>
+                    {tf.localPath}
                   </span>
-                  <span className="fm-xfer-dir">{t.kind === "upload" ? "↑" : "↓"}</span>
-                  <span className="fm-xfer-path" title={t.remotePath}>
-                    {t.remotePath}
+                  <span className="fm-xfer-dir">{tf.kind === "upload" ? "↑" : "↓"}</span>
+                  <span className="fm-xfer-path" title={tf.remotePath}>
+                    {tf.remotePath}
                   </span>
-                  <span className="fm-xfer-speed">{t.status === "running" ? `${formatSize(t.speed)}/s` : "—"}</span>
-                  <span className="fm-xfer-eta">{formatEta(t)}</span>
+                  <span className="fm-xfer-speed">{tf.status === "running" ? `${formatSize(tf.speed)}/s` : "—"}</span>
+                  <span className="fm-xfer-eta">{formatEta(tf)}</span>
                 </div>
               );
             })}
@@ -1146,7 +1160,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
               setTransferCtx(null);
             }}
           >
-            取消
+            {t("取消", "Cancel")}
           </button>
           <button
             className="ctx-item"
@@ -1157,13 +1171,13 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
             }
             onClick={() => retryTransfer(transferCtx.transfer)}
           >
-            重试
+            {t("重试", "Retry")}
           </button>
           <button
             className="ctx-item"
             onClick={() => void revealLocal(transferCtx.transfer.localPath)}
           >
-            在资源管理器中打开
+            {t("在资源管理器中打开", "Show in folder")}
           </button>
           <div className="ctx-sep" />
           <button
@@ -1174,7 +1188,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
               setTransferCtx(null);
             }}
           >
-            删除本条记录
+            {t("删除本条记录", "Remove from list")}
           </button>
           <button
             className="ctx-item"
@@ -1183,7 +1197,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
               setTransferCtx(null);
             }}
           >
-            清除已完成
+            {t("清除已完成", "Clear finished")}
           </button>
           <button
             className="ctx-item danger"
@@ -1192,7 +1206,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
               setTransferCtx(null);
             }}
           >
-            全部取消
+            {t("全部取消", "Cancel all")}
           </button>
         </div>
       )}
@@ -1201,7 +1215,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
         const { side, entry } = ctx;
         const remote = side === "remote";
         const xferOk = status === "ready" && !!entry && !entry.isDir;
-        const xferTip = entry?.isDir ? "暂不支持传输目录" : undefined;
+        const xferTip = entry?.isDir ? t("暂不支持传输目录", "Folder transfer isn't supported yet") : undefined;
         const done = () => setCtx(null);
         return (
           <div ref={ctxRef} className="ctx-menu" style={{ left: ctx.x, top: ctx.y }}>
@@ -1213,7 +1227,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
                   enterRemote(entry);
                 }}
               >
-                打开
+                {t("打开", "Open")}
               </button>
             )}
             {remote && entry && !entry.isDir && (
@@ -1222,12 +1236,15 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
                 disabled={!viewableKind(entry.name)}
                 title={
                   viewableKind(entry.name)
-                    ? "在新窗口中查看"
-                    : "支持 Markdown、HTML、图片、音频、视频、文本与配置文件（json/yaml/toml/ini/conf/xml/sql…）"
+                    ? t("在新窗口中查看", "View in a new window")
+                    : t(
+                        "支持 Markdown、HTML、图片、音频、视频、文本与配置文件（json/yaml/toml/ini/conf/xml/sql…）",
+                        "Supports Markdown, HTML, images, audio, video, text and config files (json/yaml/toml/ini/conf/xml/sql…)"
+                      )
                 }
                 onClick={() => void doView(entry)}
               >
-                浏览
+                {t("浏览", "View")}
               </button>
             )}
             <button
@@ -1239,18 +1256,18 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
                 if (entry) transferEntry(side, entry, false);
               }}
             >
-              传输
+              {t("传输", "Transfer")}
             </button>
             <button
               className="ctx-item"
               disabled={!xferOk}
-              title={xferTip ?? "加入传输队列，按顺序逐个传输"}
+              title={xferTip ?? t("加入传输队列，按顺序逐个传输", "Add to the transfer queue; files go one at a time")}
               onClick={() => {
                 done();
                 if (entry) transferEntry(side, entry, true);
               }}
             >
-              队列
+              {t("队列", "Queue")}
             </button>
             <div className="ctx-sep" />
             <button
@@ -1261,7 +1278,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
                 else setLocalFind((n) => n + 1);
               }}
             >
-              搜索
+              {t("搜索", "Search")}
             </button>
             {remote && (
               <button
@@ -1271,7 +1288,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
                   void copyRemotePath(entry ? entry.path : remotePath);
                 }}
               >
-                复制路径
+                {t("复制路径", "Copy path")}
               </button>
             )}
             <button
@@ -1284,7 +1301,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
                 else void doRenameLocal(entry);
               }}
             >
-              重命名
+              {t("重命名", "Rename")}
             </button>
             {remote && (
               <button
@@ -1295,7 +1312,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
                   if (entry) void doDelete(entry);
                 }}
               >
-                删除
+                {t("删除", "Delete")}
               </button>
             )}
             <div className="ctx-sep" />
@@ -1308,7 +1325,7 @@ export default function FileManager({ session, tabId, passphrase, onClose, activ
                 else void loadLocal(localPath);
               }}
             >
-              刷新
+              {t("刷新", "Refresh")}
             </button>
           </div>
         );

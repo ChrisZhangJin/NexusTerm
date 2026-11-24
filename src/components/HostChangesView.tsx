@@ -8,12 +8,14 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
+import { t, useLocale } from "../i18n";
 import { toFriendlyError } from "../lib/errors";
 import { backupInfo, changeGroups, changesEmpty, fileRows, fmtWhen } from "../lib/hostHistory";
 import type { HostBackupEntry, HostChanges } from "../types";
 import ConfirmDialog, { type ConfirmOptions } from "./ConfirmDialog";
 
 export default function HostChangesView({ contractId, data }: { contractId: string; data?: HostChanges }) {
+  useLocale();
   const [fetched, setFetched] = useState<HostChanges | null>(null);
   const [restored, setRestored] = useState<Record<string, number>>({});
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
@@ -55,8 +57,8 @@ export default function HostChangesView({ contractId, data }: { contractId: stri
   if (changesEmpty(changes) && backups.length === 0) {
     return (
       <div className="host-changes">
-        <div className="host-changes-head">实际改动</div>
-        <div className="host-changes-none">没有执行过写入动作</div>
+        <div className="host-changes-head">{t("实际改动", "Actual changes")}</div>
+        <div className="host-changes-none">{t("没有执行过写入动作", "No write actions were run")}</div>
       </div>
     );
   }
@@ -64,12 +66,16 @@ export default function HostChangesView({ contractId, data }: { contractId: stri
   return (
     <div className="host-changes">
       <div className="host-changes-head">
-        实际改动
-        <span className="st-meta"> · 执行命令 {changes.commands} 条 · 按实际执行的命令与文件写入整理</span>
+        {t("实际改动", "Actual changes")}
+        <span className="st-meta">
+          {t(" · 执行命令 {n} 条 · 按实际执行的命令与文件写入整理", " · {n} commands run · compiled from the commands and file writes actually executed", {
+            n: changes.commands,
+          })}
+        </span>
       </div>
       {files.length > 0 && (
         <div className="host-changes-group">
-          <span className="host-changes-label">文件</span>
+          <span className="host-changes-label">{t("文件", "Files")}</span>
           <ul>
             {files.map((f) => {
               const b = f.backup;
@@ -83,26 +89,29 @@ export default function HostChangesView({ contractId, data }: { contractId: stri
                     <>
                       <span className="st-meta"> · {info.note}</span>
                       {at ? (
-                        <span className="st-meta"> · 已于 {fmtWhen(at)} 还原</span>
+                        <span className="st-meta">{t(" · 已于 {when} 还原", " · restored {when}", { when: fmtWhen(at) })}</span>
                       ) : null}
                       <button
                         className="st-btn host-changes-restore"
                         disabled={busy}
-                        title="把这个文件写回托管改动之前的内容"
+                        title={t("把这个文件写回托管改动之前的内容", "Write this file back to how it was before autopilot changed it")}
                         onClick={() =>
                           setConfirm({
                             backup: b,
                             opts: {
-                              title: "还原文件",
-                              message: `把「${b.path}」还原成托管改动之前的内容？`,
-                              detail: "会覆盖这个文件现在的内容（包括托管之后你自己做的修改）。经原来那个终端写回；终端已关闭时无法还原。",
-                              okText: "还原",
+                              title: t("还原文件", "Restore file"),
+                              message: t("把「{path}」还原成托管改动之前的内容？", "Restore \"{path}\" to how it was before autopilot changed it?", { path: b.path }),
+                              detail: t(
+                                "会覆盖这个文件现在的内容（包括托管之后你自己做的修改）。经原来那个终端写回；终端已关闭时无法还原。",
+                                "This overwrites the file's current content, including any edits you made after autopilot. It's written back through the original terminal, so it can't be restored if that terminal is closed."
+                              ),
+                              okText: t("还原", "Restore"),
                               danger: true,
                             },
                           })
                         }
                       >
-                        还原
+                        {t("还原", "Restore")}
                       </button>
                     </>
                   )}

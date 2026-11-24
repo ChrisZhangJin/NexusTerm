@@ -6,22 +6,24 @@
  */
 
 import type { AgentStep, HostNote, HostNoteKind, HostNoteSource } from "../types";
+import { t } from "../i18n";
+import { localized } from "./localized";
 
 /** 类别展示顺序 */
 export const NOTE_KINDS: HostNoteKind[] = ["prompt", "sudo", "path", "quirk", "other"];
 
-export const KIND_LABEL: Record<HostNoteKind, string> = {
-  prompt: "提示符",
-  sudo: "sudo",
-  path: "路径",
-  quirk: "特性",
-  other: "其他",
-};
+export const KIND_LABEL: Record<HostNoteKind, string> = localized({
+  prompt: ["提示符", "Prompt"],
+  sudo: ["sudo", "sudo"],
+  path: ["路径", "Paths"],
+  quirk: ["特性", "Quirks"],
+  other: ["其他", "Other"],
+});
 
-export const SOURCE_LABEL: Record<HostNoteSource, string> = {
-  agent: "助手记的",
-  user: "我写的",
-};
+export const SOURCE_LABEL: Record<HostNoteSource, string> = localized({
+  agent: ["助手记的", "Noted by assistant"],
+  user: ["我写的", "Written by me"],
+});
 
 /** 与后端 `validate_note_text` 同样的规整：控制字符 / 换行折成空格、空白折叠、去首尾空白。 */
 export function normalizeNoteText(text: string): string {
@@ -34,9 +36,9 @@ export type DraftCheck = { ok: true; text: string } | { ok: false; error: string
 /** 提交前的本地检查：空 / 超长。凭据检测留给后端（那里才是权威，前端不复制一份正则）。 */
 export function checkDraft(raw: string, maxChars: number): DraftCheck {
   const text = normalizeNoteText(raw);
-  if (!text) return { ok: false, error: "内容不能为空" };
+  if (!text) return { ok: false, error: t("内容不能为空", "Note can't be empty") };
   const n = [...text].length;
-  if (n > maxChars) return { ok: false, error: `过长（${n} 字，上限 ${maxChars}）` };
+  if (n > maxChars) return { ok: false, error: t("过长（{n} 字，上限 {max}）", "Too long ({n} characters, limit {max})", { n, max: maxChars }) };
   return { ok: true, text };
 }
 
@@ -54,7 +56,7 @@ export function groupNotes(notes: HostNote[]): { kind: HostNoteKind; notes: Host
 
 /** 条数 / 上限的展示。 */
 export function usageLabel(count: number, max: number): string {
-  return `${count} / ${max} 条`;
+  return t("{count} / {max} 条", "{count} / {max} notes", { count, max });
 }
 
 /** 这条备忘 Agent 能不能删：只有它自己写的。界面上用来标注「用户编辑过就归用户」。 */
@@ -79,13 +81,13 @@ export function memoryStepInfo(step: Pick<AgentStep, "command" | "text" | "memor
   };
 }
 
-export const MEMORY_OP_TAG: Record<MemoryStepInfo["op"], string> = {
-  add: "记忆",
-  forget: "忘记",
-  read: "回忆",
-};
+export const MEMORY_OP_TAG: Record<MemoryStepInfo["op"], string> = localized({
+  add: ["记忆", "Remember"],
+  forget: ["忘记", "Forget"],
+  read: ["回忆", "Recall"],
+});
 
-/** 后端对「这条已经不存在」的说法（卡片上点删除时判断是否其实早已被删）。 */
+/** 后端对「这条已经不存在」的说法（卡片上点删除时判断是否其实早已被删）。中文含「不存在」，英文含 `not found`。 */
 export function isGoneError(message: string): boolean {
-  return message.includes("不存在");
+  return message.includes("不存在") || /not found/i.test(message);
 }

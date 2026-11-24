@@ -154,3 +154,15 @@ test("formatDuration：不满一小时用 mm:ss，否则 hh:mm:ss", () => {
   assert.equal(formatDuration(65), "01:05");
   assert.equal(formatDuration(3661), "01:01:01");
 });
+
+test("typeLabel：英文界面下的类型文案", async () => {
+  const { __setLocaleForTest } = await import("../../src/i18n");
+  __setLocaleForTest("en");
+  try {
+    assert.equal(typeLabel(entry({ isDir: true, name: "logs" })), "Folder");
+    assert.equal(typeLabel(entry({ name: "readme.md" })), "MD file");
+    assert.equal(typeLabel(entry({ name: "README" })), "File");
+  } finally {
+    __setLocaleForTest("zh");
+  }
+});
