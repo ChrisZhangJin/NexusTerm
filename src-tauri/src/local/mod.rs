@@ -60,6 +60,7 @@ impl LocalManager {
         }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        cmd.env("NEXUSTERM_INLINE_IMAGES", "iterm2");
 
         let pty_system = native_pty_system();
         let pair = pty_system
