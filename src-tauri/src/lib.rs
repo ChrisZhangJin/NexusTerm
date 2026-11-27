@@ -310,6 +310,7 @@ pub fn run() {
             viewer::viewer_open_ssh,
             viewer::viewer_open_local,
             viewer::viewer_doc,
+            viewer::viewer_refresh,
             agent::cmd::agent_get_config,
             agent::cmd::agent_set_config,
             agent::cmd::agent_set_session,

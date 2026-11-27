@@ -54,6 +54,16 @@ import type {
 import type { ControlPayload, ControlState } from "./lib/control";
 import type { RecorderStatus, RecordingDraft } from "./lib/recorder";
 import type { RefinedSkillDraft } from "./lib/skillRefine";
+import type { ViewableKind } from "./lib/viewable";
+
+export type ViewerDocPayload = {
+  name: string;
+  source: string;
+  kind: ViewableKind;
+  data: string;
+  revision: number;
+  refreshError?: string;
+};
 
 export const api = {
   health: () => invoke<string>("health"),
@@ -505,13 +515,8 @@ export const api = {
   viewerOpenSsh: (id: string, path: string, source: string) =>
     invoke<void>("viewer_open_ssh", { id, path, source }),
   viewerOpenLocal: (path: string) => invoke<void>("viewer_open_local", { path }),
-  viewerDoc: (id: string) =>
-    invoke<{
-      name: string;
-      source: string;
-      kind: "markdown" | "html" | "image" | "audio" | "video" | "code";
-      data: string;
-    }>("viewer_doc", { id }),
+  viewerDoc: (id: string) => invoke<ViewerDocPayload>("viewer_doc", { id }),
+  viewerRefresh: (id: string) => invoke<ViewerDocPayload>("viewer_refresh", { id }),
 
   // ——— 连接迁移 ———
   //

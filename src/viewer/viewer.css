@@ -57,17 +57,24 @@ body { overflow: hidden; }
 .rd-seg button:hover, .rd-zoom button:hover { background: var(--bg-elev); color: var(--text); }
 .rd-seg button.on { background: var(--bg-elev); color: var(--accent); }
 .rd-zoom-val { min-width: 48px; }
-.rd-full {
+.rd-full, .rd-refresh {
   flex-shrink: 0; background: transparent; color: var(--text-dim);
   border: 1px solid var(--border); border-radius: 5px;
   padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer;
 }
-.rd-full:hover { background: var(--bg-elev); color: var(--text); }
+.rd-full:hover, .rd-refresh:hover:not(:disabled) { background: var(--bg-elev); color: var(--text); }
 .rd-full.on { background: var(--bg-elev); color: var(--accent); }
+.rd-refresh:disabled { opacity: 0.65; cursor: wait; }
+.rd-bar-html { flex: 0 0 auto; min-height: 38px; flex-wrap: wrap; gap: 4px 8px; padding: 4px 10px; box-sizing: border-box; }
+.rd-bar-html .rd-source { flex: 1; }
 
 .rd-body { flex: 1; min-height: 0; position: relative; }
 .rd-loading, .rd-error { padding: 40px; text-align: center; color: var(--text-dim); }
 .rd-error { color: var(--danger); }
+.rd-refresh-error {
+  padding: 6px 10px; color: var(--danger); background: var(--bg-panel);
+  border-bottom: 1px solid var(--border); overflow-wrap: anywhere; max-height: 25%; overflow: auto;
+}
 
 /* ——— 源码 ——— */
 .rd-src {

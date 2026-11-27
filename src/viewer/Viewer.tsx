@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { api, base64ToBytes } from "../api";
+import { api, base64ToBytes, type ViewerDocPayload } from "../api";
 import { BUILTIN_THEMES, DEFAULT_THEME } from "../lib/theme";
 import { applyChromeVars } from "../lib/chrome";
 import {
@@ -13,7 +13,6 @@ import {
   isSvg,
   kindLabel,
   videoMime,
-  type ViewableKind,
 } from "../lib/viewable";
 import ImageView from "./ImageView";
 import AudioView from "./AudioView";
@@ -30,7 +29,11 @@ import "./viewer.css";
  *   无论哪种都不给 allow-same-origin：页面是不透明源，碰不到应用的 IPC 与存储。
  */
 
-type Doc = { name: string; source: string; kind: ViewableKind; bytes: Uint8Array };
+type Doc = Omit<ViewerDocPayload, "data" | "refreshError"> & { bytes: Uint8Array };
+
+function toDoc({ name, source, kind, revision, data }: ViewerDocPayload): Doc {
+  return { name, source, kind, revision, bytes: base64ToBytes(data) };
+}
 
 /** UTF-8 优先；非法时回退 GBK（国内老文档常见） */
 function decode(bytes: Uint8Array): { text: string; enc: string; lossy?: boolean } {
@@ -46,10 +49,10 @@ function decode(bytes: Uint8Array): { text: string; enc: string; lossy?: boolean
 }
 
 /** iframe 的地址：Windows/Android 上自定义协议走 http://<scheme>.localhost，其它平台用 <scheme>:// */
-function docUrl(id: string, js: boolean) {
+function docUrl(id: string, js: boolean, revision: number) {
   const win = /Windows|Android/i.test(navigator.userAgent);
   const base = win ? "http://nxdoc.localhost/" : "nxdoc://localhost/";
-  return `${base}${encodeURIComponent(id)}${js ? "?js=1" : ""}`;
+  return `${base}${encodeURIComponent(id)}?v=${revision}${js ? "&js=1" : ""}`;
 }
 
 async function openExternal(href: string) {
@@ -65,6 +68,10 @@ export default function Viewer({ id }: { id: string }) {
   const lang = useLocale();
   const [doc, setDoc] = useState<Doc | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const refreshPending = useRef(false);
+  const initialLoad = useRef<{ id: string; doc: Promise<ViewerDocPayload> } | null>(null);
   const [mode, setMode] = useState<"render" | "source">("render");
   const [allowJs, setAllowJs] = useState(false);
   const [zoom, setZoom] = useState(() => Number(localStorage.getItem("nx.viewer.zoom")) || 100);
@@ -87,13 +94,54 @@ export default function Viewer({ id }: { id: string }) {
   }, []);
 
   useEffect(() => {
-    api
-      .viewerDoc(id)
+    // StrictMode 会重跑 effect；同一个页面只发一次加载请求（真正重载页面会重新取文档）。
+    if (initialLoad.current?.id !== id) initialLoad.current = { id, doc: api.viewerDoc(id) };
+    let active = true;
+    initialLoad.current.doc
       .then((d) => {
-        setDoc({ ...d, bytes: base64ToBytes(d.data) });
+        if (!active) return;
+        initialLoad.current = null; // 不保留已解码文档的 base64 副本（尤其是音视频）
+        setDoc(toDoc(d));
+        setRefreshError(d.refreshError ?? null);
       })
-      .catch((e) => setErr(String(e)));
+      .catch((e) => {
+        if (!active) return;
+        initialLoad.current = null;
+        setErr(String(e));
+      });
+    return () => { active = false; };
   }, [id]);
+
+  const isHtml = doc?.kind === "html";
+  const refresh = useCallback(async () => {
+    if (!isHtml || refreshPending.current) return;
+    refreshPending.current = true;
+    setRefreshing(true);
+    setRefreshError(null);
+    try {
+      setDoc(toDoc(await api.viewerRefresh(id)));
+    } catch (e) {
+      setRefreshError(String(e));
+    } finally {
+      refreshPending.current = false;
+      setRefreshing(false);
+    }
+  }, [id, isHtml]);
+
+  useEffect(() => {
+    if (!isHtml) return;
+    // 仅接收外壳快捷键；不尝试访问隔离 iframe 的键盘事件。
+    const key = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing || e.altKey || e.shiftKey) return;
+      const f5 = e.key === "F5" && !e.ctrlKey && !e.metaKey;
+      const modR = e.key.toLowerCase() === "r" && (e.ctrlKey || e.metaKey);
+      if (!f5 && !modR) return;
+      e.preventDefault();
+      if (!e.repeat) void refresh();
+    };
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  }, [isHtml, refresh]);
 
   // 窗口标题跟随语言切换
   const docName = doc?.name;
@@ -221,7 +269,6 @@ export default function Viewer({ id }: { id: string }) {
     );
   }
 
-  const isHtml = doc.kind === "html";
   const isCode = doc.kind === "code";
   // 源码切换：md / html / svg 有意义；配置文件本身就是源码，位图没有源码
   const hasSource = doc.kind === "markdown" || isHtml || (isImage && isSvg(doc.name));
@@ -235,7 +282,7 @@ export default function Viewer({ id }: { id: string }) {
 
   return (
     <div className="rd-root">
-      <div className="rd-bar">
+      <div className={`rd-bar${isHtml ? " rd-bar-html" : ""}`}>
         <span className={`rd-badge rd-${doc.kind}`}>{kindLabel(doc.name, doc.kind)}</span>
         <span className="rd-source" title={doc.source}>
           {doc.source}
@@ -245,6 +292,16 @@ export default function Viewer({ id }: { id: string }) {
           {isImage ? (imgInfo ? ` · ${imgInfo}` : "") : isAudio || isVideo ? "" : ` · ${decoded.lossy ? t("UTF-8(容错)", "UTF-8 (lossy)") : decoded.enc}`}
         </span>
         <span className="rd-spacer" />
+        {isHtml && (
+          <button
+            className="rd-refresh"
+            disabled={refreshing}
+            onClick={() => void refresh()}
+            title={t("重读原文件 (F5 / Ctrl+R / ⌘R)", "Read the original file again (F5 / Ctrl+R / ⌘R)")}
+          >
+            {refreshing ? t("刷新中…", "Refreshing…") : t("刷新", "Refresh")}
+          </button>
+        )}
         {isHtml && viewMode === "render" && (
           <label
             className="rd-js"
@@ -293,6 +350,11 @@ export default function Viewer({ id }: { id: string }) {
         </button>
       </div>
 
+      {refreshError !== null && (
+        <div className="rd-refresh-error" role="alert">
+          {t("无法刷新：", "Can't refresh: ")}{refreshError}
+        </div>
+      )}
       <div className="rd-body">
         {viewMode === "source" ? (
           <pre className="rd-src" style={{ fontSize: `${(13 * zoom) / 100}px` }}>
@@ -315,10 +377,10 @@ export default function Viewer({ id }: { id: string }) {
         ) : isHtml ? (
           <div className="rd-frame-wrap">
             <iframe
-              key={allowJs ? "js" : "nojs"}
+              key={`${doc.revision}-${allowJs}`}
               className="rd-frame"
               title={doc.name}
-              src={docUrl(id, allowJs)}
+              src={docUrl(id, allowJs, doc.revision)}
               sandbox={allowJs ? "allow-scripts allow-popups" : "allow-popups"}
               referrerPolicy="no-referrer"
               style={{
