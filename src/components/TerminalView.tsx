@@ -3,6 +3,8 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { CanvasAddon } from "@xterm/addon-canvas";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { ImageAddon } from "@xterm/addon-image";
+import { loadInlineImages } from "../lib/inlineImages";
 import { MAX_CONTEXT_LOSSES, detectGpu, gpuSlots, wantsGpu } from "../lib/gpuRender";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -606,6 +608,7 @@ export default function TerminalView({
     searchRef.current = search;
 
     term.open(host);
+    loadInlineImages(term, (options) => new ImageAddon(options));
     // 必须在 open() 之后：SelectionService 是 open() 里才创建的
     patchShiftSelection(term);
     termRef.current = term;

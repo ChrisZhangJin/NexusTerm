@@ -90,6 +90,24 @@ Markdown / HTML / 图片 / 配置文件的独立窗口，以及可以绑定到�
 从 [Releases](https://github.com/ChrisZhangJin/NexusTerm/releases) 下载安装包
 （Windows NSIS 安装包 / 免安装 exe，macOS universal）。
 
+### 在终端中显示图片
+
+本地 Shell 和 SSH 终端都支持基本的 iTerm2 内联图片协议。打开终端（先不要进入 tmux），粘贴下面的命令，应看到一张四色小图：
+
+```sh
+printf '\033]1337;File=inline=1;size=77;width=4:iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFElEQVR4nGP4z8DAAMIM////ZwAAHu8E/KPItPcAAAAASUVORK5CYII=\007\n'
+```
+
+只支持单条 `OSC 1337;File=...` 消息，需指定 `inline=1` 和 `size=`（Base64 编码前的文件字节数）。不支持分段传输、下载、SIXEL 或 Kitty 图像协议。NexusTerm 不修改 `TERM` 或 `TERM_PROGRAM` 来声明支持。不识别下述环境变量的图片工具需要显式选择 iTerm2 输出；请确认工具生成的序列带有 `size=`。tmux 等终端复用器可能过滤或改写序列，不保证可用。
+
+新开的本地终端标签页会自动为 Shell 设置 `NEXUSTERM_INLINE_IMAGES=iterm2`，从该 Shell 启动的子进程会继承此变量；已有标签页不受影响。SSH 会话不会自动设置此变量。若 nanopi 已实现对此变量的检测，可在远端 POSIX Shell 中按次启用，无需修改 SSH 配置：
+
+```sh
+NEXUSTERM_INLINE_IMAGES=iterm2 nanopi
+```
+
+单张图片的原始文件上限为 4 MB，原始及显示像素数均须低于 400 万；每个终端的图片缓存上限为 32 MB，较旧图片可能被淘汰。
+
 ### 从源码构建
 
 ```bash

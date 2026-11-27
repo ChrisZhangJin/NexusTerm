@@ -467,6 +467,8 @@ html[data-fullscreen="1"] .tabbar { padding-left: 12px; }
 
 .term-area { flex: 1; position: relative; background: var(--bg); min-height: 0; }
 .term-host { position: absolute; inset: 0; padding: 4px 8px; }
+/* 内联图片在文字画布上方，但不遮住光标或拦截终端的鼠标事件。 */
+.term-host .xterm-image-layer { z-index: 0; pointer-events: none; }
 
 /* Shift+Tab 历史面板：浮在光标附近（尺寸与 TerminalView 的 HIST_W / HIST_H 一致） */
 .hist-panel {
